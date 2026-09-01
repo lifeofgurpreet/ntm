@@ -71,6 +71,32 @@ func TestSendOperationBindingHashCanonicalizesSelectors(t *testing.T) {
 	if sendOperationBindingHash(withCASS) != sendOperationBindingHash(withCASS) {
 		t.Error("identical --with-cass command must bind identically regardless of injected content")
 	}
+	withActor := base
+	withActor.Actor = "orchestrator-1"
+	withActor.Origin = "robot.cli"
+	withActor.TargetAuthorization = "rbac:session:proj"
+	if sendOperationBindingHash(withActor) == a {
+		t.Error("receipt provenance did not change the binding hash")
+	}
+}
+
+func TestValidateSendReceiptProvenance(t *testing.T) {
+	if _, _, _, err := validateSendReceiptProvenance(SendOptions{}); err == nil {
+		t.Fatal("missing receipt provenance was accepted")
+	}
+	if _, _, _, err := validateSendReceiptProvenance(SendOptions{Actor: "orchestrator-1"}); err == nil {
+		t.Fatal("missing origin was accepted")
+	}
+	if _, _, _, err := validateSendReceiptProvenance(SendOptions{Origin: "robot.cli"}); err == nil {
+		t.Fatal("missing actor was accepted")
+	}
+	if _, _, _, err := validateSendReceiptProvenance(SendOptions{Actor: "orchestrator-1", Origin: "robot.cli"}); err == nil {
+		t.Fatal("missing target authorization was accepted")
+	}
+	actor, origin, authorization, err := validateSendReceiptProvenance(SendOptions{Session: "proj", Actor: "  orchestrator-1 ", Origin: " http.api.v1 ", TargetAuthorization: `{"scheme":"rbac","role":"operator","permission":"agents:write","resource":"session:proj"}`})
+	if err != nil || actor != "orchestrator-1" || origin != "http.api.v1" || authorization.Resource != "session:proj" {
+		t.Fatalf("valid provenance = actor=%q origin=%q authorization=%+v err=%v", actor, origin, authorization, err)
+	}
 }
 
 func TestSendPayloadDigest(t *testing.T) {
@@ -128,14 +154,17 @@ func TestApplyReplayedOutcomeRestoresOriginalResult(t *testing.T) {
 	}
 	completed := time.Now().UTC()
 	op := &state.SendOperation{
-		OperationID:   "op-replay",
-		SessionName:   "proj",
-		PayloadSHA256: "sha",
-		PayloadBytes:  10,
-		Status:        state.SendOperationCompleted,
-		OutcomeJSON:   string(data),
-		CreatedAt:     sentAt,
-		CompletedAt:   &completed,
+		OperationID:         "op-replay",
+		SessionName:         "proj",
+		PayloadSHA256:       "sha",
+		PayloadBytes:        10,
+		Actor:               "operator-1",
+		Origin:              "robot.test",
+		TargetAuthorization: "rbac:session:proj",
+		Status:              state.SendOperationCompleted,
+		OutcomeJSON:         string(data),
+		CreatedAt:           sentAt,
+		CompletedAt:         &completed,
 	}
 
 	var output SendOutput
@@ -148,6 +177,9 @@ func TestApplyReplayedOutcomeRestoresOriginalResult(t *testing.T) {
 	}
 	if output.Operation == nil || !output.Operation.Replayed {
 		t.Fatalf("operation info = %+v, want replayed=true", output.Operation)
+	}
+	if output.Operation.Actor != "operator-1" || output.Operation.Origin != "robot.test" || output.Operation.TargetAuthorization != "rbac:session:proj" {
+		t.Fatalf("operation provenance = actor=%q origin=%q authorization=%q, want persisted provenance", output.Operation.Actor, output.Operation.Origin, output.Operation.TargetAuthorization)
 	}
 	if len(output.Operation.Admissions) != 1 || output.Operation.Admissions[0].State != AdmissionSubmitted {
 		t.Errorf("replayed admissions = %+v", output.Operation.Admissions)

@@ -100,6 +100,33 @@ func TestRobotSendSingularPaneRealTmux(t *testing.T) {
 	}
 }
 
+func TestGetSendAndAckRejectsUntrustedTrackedSendBeforeTmux(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+	session, paneID := createIdempotencyBranchSession(t, "untrusted-track")
+	marker := "UNTRUSTED_TRACK_MUST_NOT_REACH_TMUX"
+
+	output, err := GetSendAndAck(SendAndAckOptions{SendOptions: SendOptions{
+		Session: session,
+		Pane:    paneID,
+		Message: "echo " + marker,
+		Actor:   "self-asserted-cli-actor",
+		Origin:  "robot.cli",
+	}})
+	if err != nil {
+		t.Fatalf("GetSendAndAck returned error: %v", err)
+	}
+	if output.Send.ErrorCode != ErrCodeReceiptProvenanceRequired {
+		t.Fatalf("send error code = %q, want %q", output.Send.ErrorCode, ErrCodeReceiptProvenanceRequired)
+	}
+	captured, captureErr := tmux.CapturePaneOutput(paneID, 50)
+	if captureErr != nil {
+		t.Fatalf("CapturePaneOutput: %v", captureErr)
+	}
+	if strings.Contains(captured, marker) {
+		t.Fatalf("untrusted tracked marker reached tmux: %q", captured)
+	}
+}
+
 func TestGetNewContent(t *testing.T) {
 	tests := []struct {
 		name     string

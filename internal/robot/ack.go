@@ -491,6 +491,43 @@ type SendAndAckOutput struct {
 // GetSendAndAck sends a message and waits for acknowledgment, returning the result.
 // This function returns the data struct directly, enabling CLI/REST parity.
 func GetSendAndAck(opts SendAndAckOptions) (*SendAndAckOutput, error) {
+	// A tracked send used to reimplement dispatch and capture a baseline before
+	// it proved provenance, which bypassed the durable send admission path.
+	// Route every mutation through GetSend first. That claims the receipt/event
+	// before any tmux access; untrusted CLI --track therefore fails closed.
+	// The guarded dispatch does not expose a pre-send baseline, so this path
+	// reports confirmation as unavailable rather than making an unverifiable
+	// acknowledgment claim.
+	if !opts.DryRun {
+		sendOutput, err := GetSend(opts.SendOptions)
+		if err != nil {
+			return nil, err
+		}
+		ackOutput := AckOutput{
+			RobotResponse: NewRobotResponse(sendOutput.Success),
+			Session:       opts.Session,
+			SentAt:        sendOutput.SentAt,
+			CompletedAt:   time.Now().UTC(),
+			Confirmations: []AckConfirmation{},
+			Pending:       append([]string(nil), sendOutput.Successful...),
+			Failed:        []AckFailure{},
+			TimeoutMs:     opts.AckTimeoutMs,
+		}
+		if len(ackOutput.Pending) > 0 {
+			ackOutput.RobotResponse = NewErrorResponse(
+				errors.New("acknowledgment tracking requires an authenticated pre-dispatch baseline"),
+				ErrCodeReceiptProvenanceRequired,
+				"Use the receipt to reconcile dispatch; tracked confirmation is unavailable on the guarded path",
+			)
+			ackOutput.Failed = append(ackOutput.Failed, AckFailure{Pane: "tracking", Reason: "guarded send does not capture an unaudited pre-dispatch baseline"})
+		}
+		combined := sendOutput.RobotResponse
+		if sendOutput.Success && !ackOutput.Success {
+			combined = ackOutput.RobotResponse
+		}
+		return &SendAndAckOutput{RobotResponse: combined, Send: *sendOutput, Ack: ackOutput}, nil
+	}
+
 	// First, send the message
 	sentAt := time.Now().UTC()
 	trace := normalizeActuationTrace(opts.RequestID, opts.CorrelationID, opts.IdempotencyKey)

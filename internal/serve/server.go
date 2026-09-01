@@ -41,7 +41,6 @@ import (
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/gorilla/websocket"
 
-	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	approvalpkg "github.com/Dicklesworthstone/ntm/internal/approval"
 	"github.com/Dicklesworthstone/ntm/internal/events"
@@ -1870,6 +1869,40 @@ func idempotencyPrincipal(r *http.Request) string {
 	return "anonymous"
 }
 
+// sendReceiptProvenance derives the complete receipt provenance only from an
+// authenticated request RBAC context. It deliberately does not fall back to
+// NTM_USER or USER: a receipt is an operational audit artifact, not a
+// best-effort local attribution claim. The recorded authorization names the
+// exact protected resource family and permission that admitted the send.
+func sendReceiptProvenance(r *http.Request, sessionID string) (actor, origin, targetAuthorization string) {
+	if r == nil {
+		return "", "", ""
+	}
+	rc := RoleFromContext(r.Context())
+	if rc == nil || !rc.Role.HasPermission(PermWriteAgents) {
+		return "", "", ""
+	}
+	actor = strings.TrimSpace(rc.UserID)
+	if actor == "" || actor == "anonymous" {
+		return "", "", ""
+	}
+	authorization, err := json.Marshal(struct {
+		Scheme     string     `json:"scheme"`
+		Role       Role       `json:"role"`
+		Permission Permission `json:"permission"`
+		Resource   string     `json:"resource"`
+	}{
+		Scheme:     "rbac",
+		Role:       rc.Role,
+		Permission: PermWriteAgents,
+		Resource:   "session:" + sessionID,
+	})
+	if err != nil {
+		return "", "", ""
+	}
+	return actor, "http.api.v1", string(authorization)
+}
+
 func cloneReplayHeaders(src http.Header) http.Header {
 	if len(src) == 0 {
 		return nil
@@ -2098,7 +2131,7 @@ func writeSuccessResponse(w http.ResponseWriter, status int, data map[string]int
 
 func robotErrorHTTPStatus(code string) int {
 	switch code {
-	case robot.ErrCodeInvalidFlag:
+	case robot.ErrCodeInvalidFlag, robot.ErrCodeInvalidArgs, robot.ErrCodeReceiptProvenanceRequired:
 		return http.StatusBadRequest
 	case robot.ErrCodeSessionNotFound, robot.ErrCodePaneNotFound, robot.ErrCodeNotFound:
 		return http.StatusNotFound
@@ -3708,77 +3741,11 @@ type PaneInputRequest struct {
 // handlePaneInputV1 handles POST /api/v1/sessions/{sessionId}/panes/{paneIdx}/input.
 func (s *Server) handlePaneInputV1(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
-	sessionID := chi.URLParam(r, "sessionId")
-	paneIdxStr := chi.URLParam(r, "paneIdx")
-
-	if !validateSessionParam(w, sessionID, reqID) {
-		return
-	}
-
-	paneIdx := validatePaneIdx(w, paneIdxStr, reqID)
-	if paneIdx < 0 {
-		return
-	}
-
-	var req PaneInputRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "invalid request body", nil, reqID)
-		return
-	}
-
-	if req.Text == "" {
-		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "text required", nil, reqID)
-		return
-	}
-
-	// Policy check: reject text that matches a blocked safety pattern.
-	// Graceful degradation: if policy cannot be loaded, allow through but log.
-	if p, policyErr := policy.LoadOrDefault(); policyErr != nil {
-		slog.Warn("pane input policy check skipped: failed to load policy",
-			"error", policyErr, "request_id", reqID)
-	} else if match := p.Check(req.Text); match != nil && match.Action == policy.ActionBlock {
-		slog.Warn("pane input blocked by policy",
-			"session", sessionID, "pane", paneIdx,
-			"pattern", match.Pattern, "request_id", reqID)
-		writeErrorResponse(w, http.StatusForbidden, ErrCodeForbidden,
-			fmt.Sprintf("blocked by safety policy: %s", match.Reason), nil, reqID)
-		return
-	}
-
-	// Build pane target. Resolve via the pane's tmux ID (the `%N` form) so
-	// the target is base-index-independent — `<session>:<paneIdx>` looks
-	// like a pane index but tmux interprets it as a window index, which
-	// breaks on hosts with `base-index = 1` (see #141).
-	pane, ok := s.resolvePaneForRequest(w, r, sessionID, paneIdx, reqID)
-	if !ok {
-		return
-	}
-	if err := pane.Type.ValidateAutomatedPromptDelivery(); err != nil {
-		writeErrorResponse(w, http.StatusNotImplemented, ErrCodeNotImplemented, err.Error(), map[string]interface{}{
-			"agent_type": pane.Type.Canonical().String(),
-			"hint":       agent.GrokPromptDeliveryCapabilityHint,
-		}, reqID)
-		return
-	}
-	paneTarget := pane.ID
-
-	sendKeys := tmux.SendKeys
-	if s.sendPaneKeys != nil {
-		sendKeys = s.sendPaneKeys
-	}
-	if err := sendKeys(paneTarget, req.Text, req.Enter); err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
-		return
-	}
-
-	slog.Info("pane input sent via API",
-		"session", sessionID, "pane", paneIdx,
-		"text_len", len(req.Text), "request_id", reqID)
-
-	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-		"sent": true,
-		"pane": paneTarget,
-	}, reqID)
+	// Retired: this raw SendKeys endpoint bypassed the robot dispatch receipt,
+	// resolved-target authorization, and durable audit event. It is intentionally
+	// a non-mutating terminal response; use the guarded agents/send endpoint.
+	writeErrorResponse(w, http.StatusGone, ErrCodeForbidden,
+		"raw pane input is retired; use the authenticated guarded agent send endpoint", nil, reqID)
 }
 
 // handlePaneInterruptV1 handles POST /api/v1/sessions/{sessionId}/panes/{paneIdx}/interrupt.
@@ -4184,15 +4151,19 @@ func (s *Server) handleAgentSendV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	actor, origin, targetAuthorization := sendReceiptProvenance(r, sessionID)
 	opts := robot.SendOptions{
-		Session:        sessionID,
-		Message:        req.Message,
-		Panes:          req.Panes,
-		AgentTypes:     req.AgentTypes,
-		All:            req.All,
-		RequestID:      reqID,
-		CorrelationID:  reqID,
-		IdempotencyKey: r.Header.Get("Idempotency-Key"),
+		Session:             sessionID,
+		Message:             req.Message,
+		Panes:               req.Panes,
+		AgentTypes:          req.AgentTypes,
+		All:                 req.All,
+		RequestID:           reqID,
+		CorrelationID:       reqID,
+		IdempotencyKey:      r.Header.Get("Idempotency-Key"),
+		Actor:               actor,
+		Origin:              origin,
+		TargetAuthorization: targetAuthorization,
 	}
 
 	sendAgents := robot.GetSend

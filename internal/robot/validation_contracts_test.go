@@ -215,7 +215,7 @@ func TestContract_ErrorCodeValues(t *testing.T) {
 
 	errorCodes := []string{
 		ErrCodeSessionNotFound, ErrCodePaneNotFound,
-		ErrCodeInvalidFlag, ErrCodeTimeout,
+		ErrCodeInvalidFlag, ErrCodeInvalidArgs, ErrCodeReceiptProvenanceRequired, ErrCodeTimeout,
 		ErrCodeNotImplemented, ErrCodeDependencyMissing,
 		ErrCodeInternalError, ErrCodeNotFound,
 		ErrCodePermissionDenied, ErrCodeResourceBusy,

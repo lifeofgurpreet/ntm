@@ -2808,7 +2808,10 @@ func GetReplay(opts ReplayOptions) (*ReplayOutput, error) {
 		return output, nil
 	}
 
-	// Execute the replay by calling send logic
+	// Execute the replay by calling send logic. Legacy history has no durable
+	// authenticated actor/origin/target grant, so GetSend intentionally fails
+	// closed for execution until replay is issued by a guarded control-plane
+	// endpoint. Dry-run replay remains read-only and compatible.
 	// Build pane filter from original targets
 	paneFilter := append([]string{}, target.Targets...)
 

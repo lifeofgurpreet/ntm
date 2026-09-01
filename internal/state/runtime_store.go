@@ -3151,6 +3151,9 @@ func (s *Store) ClaimSendOperation(op *SendOperation) (existing *SendOperation, 
 	if op.SessionName == "" {
 		return nil, false, fmt.Errorf("claim send operation: session name is required")
 	}
+	if strings.TrimSpace(op.Actor) == "" || strings.TrimSpace(op.Origin) == "" || strings.TrimSpace(op.TargetAuthorization) == "" {
+		return nil, false, fmt.Errorf("claim send operation: actor, origin, and target authorization provenance are required")
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -3159,13 +3162,19 @@ func (s *Store) ClaimSendOperation(op *SendOperation) (existing *SendOperation, 
 	if createdAt.IsZero() {
 		createdAt = time.Now().UTC()
 	}
-	result, err := s.db.Exec(`
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, false, fmt.Errorf("claim send operation: begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	result, err := tx.Exec(`
 		INSERT OR IGNORE INTO send_operations (
 			operation_id, session_name, binding_hash, payload_sha256,
-			payload_bytes, status, outcome_json, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, '', ?)`,
+			payload_bytes, actor, origin, target_authorization, status, outcome_json, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)`,
 		op.OperationID, op.SessionName, op.BindingHash, op.PayloadSHA256,
-		op.PayloadBytes, SendOperationInProgress, createdAt,
+		op.PayloadBytes, op.Actor, op.Origin, op.TargetAuthorization, SendOperationInProgress, createdAt,
 	)
 	if err != nil {
 		return nil, false, fmt.Errorf("claim send operation: %w", err)
@@ -3173,6 +3182,21 @@ func (s *Store) ClaimSendOperation(op *SendOperation) (existing *SendOperation, 
 	rows, err := result.RowsAffected()
 	if err != nil {
 		return nil, false, fmt.Errorf("claim send operation: %w", err)
+	}
+	if rows > 0 {
+		if _, err := tx.Exec(`
+			INSERT INTO send_operation_events (
+				operation_id, session_name, event_type, actor, origin,
+				target_authorization, payload_sha256, payload_bytes, created_at
+			) VALUES (?, ?, 'receipt_claimed', ?, ?, ?, ?, ?, ?)`,
+			op.OperationID, op.SessionName, op.Actor, op.Origin,
+			op.TargetAuthorization, op.PayloadSHA256, op.PayloadBytes, createdAt,
+		); err != nil {
+			return nil, false, fmt.Errorf("claim send operation: record receipt audit event: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, fmt.Errorf("claim send operation: commit transaction: %w", err)
 	}
 
 	stored, err := s.getSendOperationLocked(op.OperationID, op.SessionName)
@@ -3229,13 +3253,29 @@ func (s *Store) ReleaseSendOperation(operationID, sessionName string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, err := s.db.Exec(`
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("release send operation: begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+		DELETE FROM send_operation_events
+		WHERE operation_id = ? AND session_name = ?
+			AND EXISTS (SELECT 1 FROM send_operations WHERE operation_id = ? AND session_name = ? AND status = ?)`,
+		operationID, sessionName, operationID, sessionName, SendOperationInProgress,
+	); err != nil {
+		return fmt.Errorf("release send operation: delete audit events: %w", err)
+	}
+	_, err = tx.Exec(`
 		DELETE FROM send_operations
 		WHERE operation_id = ? AND session_name = ? AND status = ?`,
 		operationID, sessionName, SendOperationInProgress,
 	)
 	if err != nil {
 		return fmt.Errorf("release send operation: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("release send operation: commit transaction: %w", err)
 	}
 	return nil
 }
@@ -3283,7 +3323,7 @@ func (s *Store) GetSendOperationsByID(operationID string) ([]SendOperation, erro
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(`
-		SELECT operation_id, session_name, binding_hash, payload_sha256,
+		SELECT operation_id, session_name, actor, origin, target_authorization, binding_hash, payload_sha256,
 			payload_bytes, status, COALESCE(outcome_json, ''), created_at, completed_at
 		FROM send_operations WHERE operation_id = ?
 		ORDER BY created_at DESC`,
@@ -3298,7 +3338,7 @@ func (s *Store) GetSendOperationsByID(operationID string) ([]SendOperation, erro
 	for rows.Next() {
 		var op SendOperation
 		if err := rows.Scan(
-			&op.OperationID, &op.SessionName, &op.BindingHash, &op.PayloadSHA256,
+			&op.OperationID, &op.SessionName, &op.Actor, &op.Origin, &op.TargetAuthorization, &op.BindingHash, &op.PayloadSHA256,
 			&op.PayloadBytes, &op.Status, &op.OutcomeJSON, &op.CreatedAt, &op.CompletedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan send operation: %w", err)
@@ -3319,20 +3359,44 @@ func (s *Store) GCCompletedSendOperations(retention time.Duration) (int64, error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return execRowsAffected(s.db,
-		`DELETE FROM send_operations WHERE status = ? AND completed_at < ?`,
-		"gc completed send operations", SendOperationCompleted, cutoff)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("gc completed send operations: begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+		DELETE FROM send_operation_events
+		WHERE EXISTS (
+			SELECT 1 FROM send_operations
+			WHERE send_operations.operation_id = send_operation_events.operation_id
+				AND send_operations.session_name = send_operation_events.session_name
+				AND send_operations.status = ? AND send_operations.completed_at < ?
+		)`, SendOperationCompleted, cutoff); err != nil {
+		return 0, fmt.Errorf("gc completed send operations: delete audit events: %w", err)
+	}
+	result, err := tx.Exec(`DELETE FROM send_operations WHERE status = ? AND completed_at < ?`, SendOperationCompleted, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("gc completed send operations: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("gc completed send operations: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("gc completed send operations: commit transaction: %w", err)
+	}
+	return rows, nil
 }
 
 func (s *Store) getSendOperationLocked(operationID, sessionName string) (*SendOperation, error) {
 	op := &SendOperation{}
 	err := s.db.QueryRow(`
-		SELECT operation_id, session_name, binding_hash, payload_sha256,
+		SELECT operation_id, session_name, actor, origin, target_authorization, binding_hash, payload_sha256,
 			payload_bytes, status, COALESCE(outcome_json, ''), created_at, completed_at
 		FROM send_operations WHERE operation_id = ? AND session_name = ?`,
 		operationID, sessionName,
 	).Scan(
-		&op.OperationID, &op.SessionName, &op.BindingHash, &op.PayloadSHA256,
+		&op.OperationID, &op.SessionName, &op.Actor, &op.Origin, &op.TargetAuthorization, &op.BindingHash, &op.PayloadSHA256,
 		&op.PayloadBytes, &op.Status, &op.OutcomeJSON, &op.CreatedAt, &op.CompletedAt,
 	)
 	if err == sql.ErrNoRows {
