@@ -447,30 +447,33 @@ const (
 // ActuationRecord is a high-level description of an operator-triggered action
 // that should be published into the durable attention stream.
 type ActuationRecord struct {
-	Session        string
-	Action         string
-	Stage          ActuationStage
-	Source         string
-	Method         string
-	RequestID      string
-	CorrelationID  string
-	IdempotencyKey string
-	Targets        []string
-	Successful     []string
-	Failed         []map[string]any
-	Confirmations  []map[string]any
-	Pending        []string
-	MessagePreview string
-	Result         string
-	Verification   string
-	ErrorCode      string
-	Error          string
-	Blocked        bool
-	TimedOut       bool
-	ReasonCode     string
-	Summary        string
-	Actionability  Actionability
-	Severity       Severity
+	Session             string
+	Action              string
+	Stage               ActuationStage
+	Source              string
+	Method              string
+	RequestID           string
+	CorrelationID       string
+	IdempotencyKey      string
+	Actor               string
+	Origin              string
+	TargetAuthorization string
+	Targets             []string
+	Successful          []string
+	Failed              []map[string]any
+	Confirmations       []map[string]any
+	Pending             []string
+	MessagePreview      string
+	Result              string
+	Verification        string
+	ErrorCode           string
+	Error               string
+	Blocked             bool
+	TimedOut            bool
+	ReasonCode          string
+	Summary             string
+	Actionability       Actionability
+	Severity            Severity
 }
 
 // AttentionFeedOption is a functional option for configuring AttentionFeed.
@@ -2190,6 +2193,15 @@ func (f *AttentionFeed) PublishActuation(record ActuationRecord) AttentionEvent 
 	}
 	if record.IdempotencyKey != "" {
 		details["idempotency_key"] = record.IdempotencyKey
+	}
+	if record.Actor != "" {
+		details["actor"] = record.Actor
+	}
+	if record.Origin != "" {
+		details["origin"] = record.Origin
+	}
+	if record.TargetAuthorization != "" {
+		details["target_authorization"] = record.TargetAuthorization
 	}
 	if record.MessagePreview != "" {
 		details["message_preview"] = record.MessagePreview

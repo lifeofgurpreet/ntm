@@ -1870,6 +1870,40 @@ func idempotencyPrincipal(r *http.Request) string {
 	return "anonymous"
 }
 
+// sendReceiptProvenance derives the complete receipt provenance only from an
+// authenticated request RBAC context. It deliberately does not fall back to
+// NTM_USER or USER: a receipt is an operational audit artifact, not a
+// best-effort local attribution claim. The recorded authorization names the
+// exact protected resource family and permission that admitted the send.
+func sendReceiptProvenance(r *http.Request, sessionID string) (actor, origin, targetAuthorization string) {
+	if r == nil {
+		return "", "", ""
+	}
+	rc := RoleFromContext(r.Context())
+	if rc == nil || !rc.Role.HasPermission(PermWriteAgents) {
+		return "", "", ""
+	}
+	actor = strings.TrimSpace(rc.UserID)
+	if actor == "" || actor == "anonymous" {
+		return "", "", ""
+	}
+	authorization, err := json.Marshal(struct {
+		Scheme     string     `json:"scheme"`
+		Role       Role       `json:"role"`
+		Permission Permission `json:"permission"`
+		Resource   string     `json:"resource"`
+	}{
+		Scheme:     "rbac",
+		Role:       rc.Role,
+		Permission: PermWriteAgents,
+		Resource:   "session:" + sessionID,
+	})
+	if err != nil {
+		return "", "", ""
+	}
+	return actor, "http.api.v1", string(authorization)
+}
+
 func cloneReplayHeaders(src http.Header) http.Header {
 	if len(src) == 0 {
 		return nil
@@ -2098,7 +2132,7 @@ func writeSuccessResponse(w http.ResponseWriter, status int, data map[string]int
 
 func robotErrorHTTPStatus(code string) int {
 	switch code {
-	case robot.ErrCodeInvalidFlag:
+	case robot.ErrCodeInvalidFlag, robot.ErrCodeInvalidArgs, robot.ErrCodeReceiptProvenanceRequired:
 		return http.StatusBadRequest
 	case robot.ErrCodeSessionNotFound, robot.ErrCodePaneNotFound, robot.ErrCodeNotFound:
 		return http.StatusNotFound
@@ -4184,15 +4218,19 @@ func (s *Server) handleAgentSendV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	actor, origin, targetAuthorization := sendReceiptProvenance(r, sessionID)
 	opts := robot.SendOptions{
-		Session:        sessionID,
-		Message:        req.Message,
-		Panes:          req.Panes,
-		AgentTypes:     req.AgentTypes,
-		All:            req.All,
-		RequestID:      reqID,
-		CorrelationID:  reqID,
-		IdempotencyKey: r.Header.Get("Idempotency-Key"),
+		Session:             sessionID,
+		Message:             req.Message,
+		Panes:               req.Panes,
+		AgentTypes:          req.AgentTypes,
+		All:                 req.All,
+		RequestID:           reqID,
+		CorrelationID:       reqID,
+		IdempotencyKey:      r.Header.Get("Idempotency-Key"),
+		Actor:               actor,
+		Origin:              origin,
+		TargetAuthorization: targetAuthorization,
 	}
 
 	sendAgents := robot.GetSend

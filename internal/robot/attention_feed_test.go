@@ -915,22 +915,25 @@ func TestAttentionFeed_PublishActuationOutcome(t *testing.T) {
 	feed := newTestAttentionFeed(t)
 
 	published := feed.PublishActuation(ActuationRecord{
-		Session:        "proj",
-		Action:         "send",
-		Stage:          ActuationStageOutcome,
-		Source:         "robot.send",
-		Method:         "paste_enter",
-		RequestID:      "req-123",
-		CorrelationID:  "corr-123",
-		IdempotencyKey: "idem-123",
-		Targets:        []string{"2"},
-		Successful:     []string{"2"},
-		MessagePreview: "safe preview",
-		Result:         "succeeded",
-		Summary:        "send completed for 1 target(s)",
-		ReasonCode:     "actuation_succeeded",
-		Actionability:  ActionabilityInteresting,
-		Severity:       SeverityInfo,
+		Session:             "proj",
+		Action:              "send",
+		Stage:               ActuationStageOutcome,
+		Source:              "robot.send",
+		Method:              "paste_enter",
+		RequestID:           "req-123",
+		CorrelationID:       "corr-123",
+		IdempotencyKey:      "idem-123",
+		Actor:               "orchestrator-1",
+		Origin:              "robot.cli",
+		TargetAuthorization: "rbac:session:proj",
+		Targets:             []string{"2"},
+		Successful:          []string{"2"},
+		MessagePreview:      "safe preview",
+		Result:              "succeeded",
+		Summary:             "send completed for 1 target(s)",
+		ReasonCode:          "actuation_succeeded",
+		Actionability:       ActionabilityInteresting,
+		Severity:            SeverityInfo,
 	})
 
 	if published.Category != EventCategoryActuation {
@@ -950,6 +953,15 @@ func TestAttentionFeed_PublishActuationOutcome(t *testing.T) {
 	}
 	if got := published.Details["idempotency_key"]; got != "idem-123" {
 		t.Fatalf("idempotency_key = %#v, want idem-123", got)
+	}
+	if got := published.Details["actor"]; got != "orchestrator-1" {
+		t.Fatalf("actor = %#v, want orchestrator-1", got)
+	}
+	if got := published.Details["origin"]; got != "robot.cli" {
+		t.Fatalf("origin = %#v, want robot.cli", got)
+	}
+	if got := published.Details["target_authorization"]; got != "rbac:session:proj" {
+		t.Fatalf("target_authorization = %#v, want rbac:session:proj", got)
 	}
 	if got := published.Details["target_ref"]; got != "session:proj:2" {
 		t.Fatalf("target_ref = %#v, want session:proj:2", got)

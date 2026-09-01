@@ -11,11 +11,14 @@ func TestClaimSendOperationLifecycle(t *testing.T) {
 	store := testStore(t)
 
 	op := &SendOperation{
-		OperationID:   "op-1",
-		SessionName:   "proj",
-		BindingHash:   "bind-a",
-		PayloadSHA256: "sha-a",
-		PayloadBytes:  42,
+		OperationID:         "op-1",
+		SessionName:         "proj",
+		Actor:               "test-actor",
+		Origin:              "state.test",
+		TargetAuthorization: "test:session:proj",
+		BindingHash:         "bind-a",
+		PayloadSHA256:       "sha-a",
+		PayloadBytes:        42,
 	}
 
 	stored, claimed, err := store.ClaimSendOperation(op)
@@ -31,15 +34,32 @@ func TestClaimSendOperationLifecycle(t *testing.T) {
 	if stored.BindingHash != "bind-a" || stored.PayloadSHA256 != "sha-a" || stored.PayloadBytes != 42 {
 		t.Errorf("claimed record lost binding fields: %+v", stored)
 	}
+	if stored.Actor != "test-actor" || stored.Origin != "state.test" || stored.TargetAuthorization != "test:session:proj" {
+		t.Errorf("claimed record lost provenance: %+v", stored)
+	}
+	var eventType, actor, origin, authorization string
+	if err := store.db.QueryRow(`
+		SELECT event_type, actor, origin, target_authorization
+		FROM send_operation_events
+		WHERE operation_id = ? AND session_name = ?`, "op-1", "proj",
+	).Scan(&eventType, &actor, &origin, &authorization); err != nil {
+		t.Fatalf("receipt audit mirror missing: %v", err)
+	}
+	if eventType != "receipt_claimed" || actor != "test-actor" || origin != "state.test" || authorization != "test:session:proj" {
+		t.Fatalf("receipt audit mirror = type=%q actor=%q origin=%q authorization=%q", eventType, actor, origin, authorization)
+	}
 
 	// A second claim with the same ID observes the existing row (race-safe
 	// duplicate detection) and does not overwrite its binding.
 	dup := &SendOperation{
-		OperationID:   "op-1",
-		SessionName:   "proj",
-		BindingHash:   "bind-DIFFERENT",
-		PayloadSHA256: "sha-DIFFERENT",
-		PayloadBytes:  7,
+		OperationID:         "op-1",
+		SessionName:         "proj",
+		Actor:               "other-actor",
+		Origin:              "other.origin",
+		TargetAuthorization: "test:session:proj",
+		BindingHash:         "bind-DIFFERENT",
+		PayloadSHA256:       "sha-DIFFERENT",
+		PayloadBytes:        7,
 	}
 	existing, claimedAgain, err := store.ClaimSendOperation(dup)
 	if err != nil {
@@ -96,6 +116,9 @@ func TestClaimSendOperationRequiresID(t *testing.T) {
 	if _, _, err := store.ClaimSendOperation(&SendOperation{OperationID: "op"}); err == nil {
 		t.Fatal("claim without session succeeded; want error")
 	}
+	if _, _, err := store.ClaimSendOperation(&SendOperation{OperationID: "op", SessionName: "proj"}); err == nil {
+		t.Fatal("claim without receipt provenance succeeded; want error")
+	}
 }
 
 // Sessions form independent operation-ID namespaces: the same ID claimed in
@@ -104,13 +127,13 @@ func TestClaimSendOperationSessionScoped(t *testing.T) {
 	store := testStore(t)
 
 	_, claimedA, err := store.ClaimSendOperation(&SendOperation{
-		OperationID: "step-1", SessionName: "projA", BindingHash: "bind-a",
+		OperationID: "step-1", SessionName: "projA", Actor: "test-actor", Origin: "state.test", TargetAuthorization: "test:session:projA", BindingHash: "bind-a",
 	})
 	if err != nil || !claimedA {
 		t.Fatalf("session A claim = (claimed=%v, err=%v), want fresh claim", claimedA, err)
 	}
 	_, claimedB, err := store.ClaimSendOperation(&SendOperation{
-		OperationID: "step-1", SessionName: "projB", BindingHash: "bind-b",
+		OperationID: "step-1", SessionName: "projB", Actor: "test-actor", Origin: "state.test", TargetAuthorization: "test:session:projB", BindingHash: "bind-b",
 	})
 	if err != nil || !claimedB {
 		t.Fatalf("session B claim = (claimed=%v, err=%v), want independent fresh claim", claimedB, err)
@@ -127,7 +150,7 @@ func TestClaimSendOperationSessionScoped(t *testing.T) {
 
 func TestReleaseSendOperation(t *testing.T) {
 	store := testStore(t)
-	op := &SendOperation{OperationID: "op-r", SessionName: "proj", BindingHash: "b"}
+	op := &SendOperation{OperationID: "op-r", SessionName: "proj", Actor: "test-actor", Origin: "state.test", TargetAuthorization: "test:session:proj", BindingHash: "b"}
 	if _, _, err := store.ClaimSendOperation(op); err != nil {
 		t.Fatalf("claim error = %v", err)
 	}
@@ -158,7 +181,7 @@ func TestTakeOverStaleSendOperation(t *testing.T) {
 	store := testStore(t)
 	stale := time.Now().UTC().Add(-time.Hour)
 	if _, _, err := store.ClaimSendOperation(&SendOperation{
-		OperationID: "op-t", SessionName: "proj", BindingHash: "b", CreatedAt: stale,
+		OperationID: "op-t", SessionName: "proj", Actor: "test-actor", Origin: "state.test", TargetAuthorization: "test:session:proj", BindingHash: "b", CreatedAt: stale,
 	}); err != nil {
 		t.Fatalf("claim error = %v", err)
 	}
@@ -191,7 +214,7 @@ func TestTakeOverStaleSendOperation(t *testing.T) {
 func TestGCCompletedSendOperations(t *testing.T) {
 	store := testStore(t)
 	if _, _, err := store.ClaimSendOperation(&SendOperation{
-		OperationID: "op-old", SessionName: "proj", BindingHash: "b",
+		OperationID: "op-old", SessionName: "proj", Actor: "test-actor", Origin: "state.test", TargetAuthorization: "test:session:proj", BindingHash: "b",
 	}); err != nil {
 		t.Fatalf("claim error = %v", err)
 	}
@@ -200,7 +223,7 @@ func TestGCCompletedSendOperations(t *testing.T) {
 	}
 	// An in_progress row is never GC'd regardless of age.
 	if _, _, err := store.ClaimSendOperation(&SendOperation{
-		OperationID: "op-live", SessionName: "proj", BindingHash: "b",
+		OperationID: "op-live", SessionName: "proj", Actor: "test-actor", Origin: "state.test", TargetAuthorization: "test:session:proj", BindingHash: "b",
 		CreatedAt: time.Now().UTC().Add(-60 * 24 * time.Hour),
 	}); err != nil {
 		t.Fatalf("claim error = %v", err)

@@ -6239,6 +6239,13 @@ type SendOptions struct {
 	RequestID      string   // External request identifier for REST parity
 	CorrelationID  string   // Correlation identifier for tracing request/outcome/verification
 	IdempotencyKey string   // Idempotency key when provided by an upstream caller
+	// Actor, Origin, and TargetAuthorization are required for every non-dry-run
+	// pane mutation. The HTTP control plane derives them from its authenticated
+	// RBAC context; direct CLI dispatch intentionally cannot mutate panes.
+	// NTM never infers an actor from $USER.
+	Actor               string
+	Origin              string
+	TargetAuthorization string
 
 	// CASS injection options
 	WithCASS     bool          // Enable CASS context injection
@@ -6254,9 +6261,12 @@ type SendOptions struct {
 }
 
 type actuationTrace struct {
-	RequestID      string
-	CorrelationID  string
-	IdempotencyKey string
+	RequestID           string
+	CorrelationID       string
+	IdempotencyKey      string
+	Actor               string
+	Origin              string
+	TargetAuthorization string
 }
 
 func normalizeActuationTrace(requestID, correlationID, idempotencyKey string) actuationTrace {
@@ -6335,20 +6345,23 @@ func publishSendActuationRequest(trace actuationTrace, opts SendOptions, targets
 		targetWord = "target"
 	}
 	GetAttentionFeed().PublishActuation(ActuationRecord{
-		Session:        opts.Session,
-		Action:         "send",
-		Stage:          ActuationStageRequest,
-		Source:         "robot.send",
-		Method:         "paste_enter",
-		RequestID:      trace.RequestID,
-		CorrelationID:  trace.CorrelationID,
-		IdempotencyKey: trace.IdempotencyKey,
-		Targets:        targets,
-		MessagePreview: messagePreview,
-		Summary:        fmt.Sprintf("send requested for %d %s", len(targets), targetWord),
-		ReasonCode:     "actuation_requested",
-		Actionability:  ActionabilityInteresting,
-		Severity:       SeverityInfo,
+		Session:             opts.Session,
+		Action:              "send",
+		Stage:               ActuationStageRequest,
+		Source:              "robot.send",
+		Method:              "paste_enter",
+		RequestID:           trace.RequestID,
+		CorrelationID:       trace.CorrelationID,
+		IdempotencyKey:      trace.IdempotencyKey,
+		Actor:               trace.Actor,
+		Origin:              trace.Origin,
+		TargetAuthorization: trace.TargetAuthorization,
+		Targets:             targets,
+		MessagePreview:      messagePreview,
+		Summary:             fmt.Sprintf("send requested for %d %s", len(targets), targetWord),
+		ReasonCode:          "actuation_requested",
+		Actionability:       ActionabilityInteresting,
+		Severity:            SeverityInfo,
 	})
 }
 
@@ -6407,26 +6420,29 @@ func publishSendActuationOutcome(trace actuationTrace, opts SendOptions, output 
 	}
 
 	GetAttentionFeed().PublishActuation(ActuationRecord{
-		Session:        opts.Session,
-		Action:         "send",
-		Stage:          ActuationStageOutcome,
-		Source:         "robot.send",
-		Method:         "paste_enter",
-		RequestID:      trace.RequestID,
-		CorrelationID:  trace.CorrelationID,
-		IdempotencyKey: trace.IdempotencyKey,
-		Targets:        output.Targets,
-		Successful:     output.Successful,
-		Failed:         sendErrorsToDetails(output.Failed),
-		MessagePreview: output.MessagePreview,
-		Result:         result,
-		ErrorCode:      output.ErrorCode,
-		Error:          output.Error,
-		Blocked:        output.Blocked,
-		Summary:        summary,
-		ReasonCode:     reasonCode,
-		Actionability:  actionability,
-		Severity:       severity,
+		Session:             opts.Session,
+		Action:              "send",
+		Stage:               ActuationStageOutcome,
+		Source:              "robot.send",
+		Method:              "paste_enter",
+		RequestID:           trace.RequestID,
+		CorrelationID:       trace.CorrelationID,
+		IdempotencyKey:      trace.IdempotencyKey,
+		Actor:               trace.Actor,
+		Origin:              trace.Origin,
+		TargetAuthorization: trace.TargetAuthorization,
+		Targets:             output.Targets,
+		Successful:          output.Successful,
+		Failed:              sendErrorsToDetails(output.Failed),
+		MessagePreview:      output.MessagePreview,
+		Result:              result,
+		ErrorCode:           output.ErrorCode,
+		Error:               output.Error,
+		Blocked:             output.Blocked,
+		Summary:             summary,
+		ReasonCode:          reasonCode,
+		Actionability:       actionability,
+		Severity:            severity,
 	})
 }
 
@@ -6483,6 +6499,8 @@ func publishSendActuationVerification(trace actuationTrace, opts SendAndAckOptio
 		RequestID:      trace.RequestID,
 		CorrelationID:  trace.CorrelationID,
 		IdempotencyKey: trace.IdempotencyKey,
+		Actor:          trace.Actor,
+		Origin:         trace.Origin,
 		Targets:        targets,
 		Confirmations:  ackConfirmationsToDetails(ackOutput.Confirmations),
 		Pending:        ackOutput.Pending,
@@ -6988,6 +7006,9 @@ func finalizeRobotSendDispatchStatus(output *SendOutput) {
 // This function returns the data struct directly, enabling CLI/REST parity.
 func GetSend(opts SendOptions) (*SendOutput, error) {
 	trace := normalizeActuationTrace(opts.RequestID, opts.CorrelationID, opts.IdempotencyKey)
+	trace.Actor = strings.TrimSpace(opts.Actor)
+	trace.Origin = strings.TrimSpace(opts.Origin)
+	trace.TargetAuthorization = strings.TrimSpace(opts.TargetAuthorization)
 	redactCfg := normalizeSendRedactionConfig(opts.Redaction)
 	_, initialPreview, initialSummary, initialWarnings, initialBlocked := applySendMessageRedaction(opts.Message, redactCfg)
 
@@ -7008,6 +7029,34 @@ func GetSend(opts SendOptions) (*SendOutput, error) {
 			Failed:         []SendError{},
 			MessagePreview: initialPreview,
 		}), nil
+	}
+
+	if !opts.DryRun {
+		actor, origin, targetAuthorization, provenanceErr := validateSendReceiptProvenance(opts)
+		if provenanceErr != nil {
+			return finalizeTerminalSendActuation(trace, opts, &SendOutput{
+				RobotResponse:  NewErrorResponse(provenanceErr, ErrCodeReceiptProvenanceRequired, "Use an authenticated control-plane request with target authorization before using an operation ID"),
+				Session:        opts.Session,
+				SentAt:         time.Now().UTC(),
+				Redaction:      initialSummary,
+				Warnings:       initialWarnings,
+				Targets:        []string{},
+				Successful:     []string{},
+				Failed:         []SendError{{Pane: "provenance", Error: provenanceErr.Error()}},
+				MessagePreview: initialPreview,
+			}), nil
+		}
+		trace.Actor = actor
+		trace.Origin = origin
+		trace.TargetAuthorization = targetAuthorization
+		// Every authenticated pane mutation has a durable receipt. A client
+		// supplied key retains retry semantics; otherwise allocate an internal
+		// unique key so ordinary HTTP sends remain non-idempotent to callers
+		// while their authorization provenance is still persisted atomically.
+		if trace.IdempotencyKey == "" {
+			trace.IdempotencyKey = "audit-" + audit.NewCorrelationID()
+			opts.IdempotencyKey = trace.IdempotencyKey
+		}
 	}
 
 	if strings.TrimSpace(opts.Session) == "" {
@@ -7220,11 +7269,14 @@ func GetSend(opts SendOptions) (*SendOutput, error) {
 		// bytes about to be delivered. They differ under CASS injection.
 		payloadSHA, payloadBytes := sendPayloadDigest(messageToSend)
 		claim := &state.SendOperation{
-			OperationID:   trace.IdempotencyKey,
-			SessionName:   opts.Session,
-			BindingHash:   sendOperationBindingHash(opts),
-			PayloadSHA256: payloadSHA,
-			PayloadBytes:  payloadBytes,
+			OperationID:         trace.IdempotencyKey,
+			SessionName:         opts.Session,
+			Actor:               trace.Actor,
+			Origin:              trace.Origin,
+			TargetAuthorization: trace.TargetAuthorization,
+			BindingHash:         sendOperationBindingHash(opts),
+			PayloadSHA256:       payloadSHA,
+			PayloadBytes:        payloadBytes,
 		}
 		stored, claimed, claimErr := store.ClaimSendOperation(claim)
 		if claimErr != nil {

@@ -35,6 +35,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/audit"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 )
 
@@ -63,6 +64,11 @@ const ErrCodeIdempotencyConflict = "IDEMPOTENCY_CONFLICT"
 // outcome is not yet recorded (concurrent sender, or a crash mid-send).
 const ErrCodeOperationInProgress = "OPERATION_IN_PROGRESS"
 
+// ErrCodeReceiptProvenanceRequired means a pane mutation lacks authenticated
+// actor, origin, or target-authorization provenance. The send is refused
+// before a claim or keystroke is created.
+const ErrCodeReceiptProvenanceRequired = "RECEIPT_PROVENANCE_REQUIRED"
+
 // sendOperationStaleClaimWindow is how long an in_progress claim is trusted
 // before a retry may take it over. Sends complete in seconds; a claim this
 // old with no recorded outcome means the original claimant died before its
@@ -82,28 +88,34 @@ type SendAdmission struct {
 // SendOperationInfo is the public view of a durable send operation attached
 // to send output and returned by receipt queries.
 type SendOperationInfo struct {
-	OperationID   string          `json:"operation_id"`
-	Status        string          `json:"status"` // in_progress | completed
-	Replayed      bool            `json:"replayed,omitempty"`
-	PayloadSHA256 string          `json:"payload_sha256"`
-	PayloadBytes  int64           `json:"payload_bytes"`
-	Admissions    []SendAdmission `json:"admissions,omitempty"`
-	CreatedAt     time.Time       `json:"created_at"`
-	CompletedAt   *time.Time      `json:"completed_at,omitempty"`
+	OperationID         string          `json:"operation_id"`
+	Status              string          `json:"status"` // in_progress | completed
+	Actor               string          `json:"actor"`
+	Origin              string          `json:"origin"`
+	TargetAuthorization string          `json:"target_authorization"`
+	Replayed            bool            `json:"replayed,omitempty"`
+	PayloadSHA256       string          `json:"payload_sha256"`
+	PayloadBytes        int64           `json:"payload_bytes"`
+	Admissions          []SendAdmission `json:"admissions,omitempty"`
+	CreatedAt           time.Time       `json:"created_at"`
+	CompletedAt         *time.Time      `json:"completed_at,omitempty"`
 }
 
 // sendOperationOutcome is the durable outcome record stored as JSON in the
 // send_operations row and replayed verbatim to identical retries.
 type sendOperationOutcome struct {
-	Success        bool            `json:"success"`
-	SentAt         time.Time       `json:"sent_at"`
-	Targets        []string        `json:"targets"`
-	Successful     []string        `json:"successful"`
-	Failed         []SendError     `json:"failed"`
-	Admissions     []SendAdmission `json:"admissions"`
-	Error          string          `json:"error,omitempty"`
-	ErrorCode      string          `json:"error_code,omitempty"`
-	MessagePreview string          `json:"message_preview,omitempty"`
+	Actor               string          `json:"actor"`
+	Origin              string          `json:"origin"`
+	TargetAuthorization string          `json:"target_authorization"`
+	Success             bool            `json:"success"`
+	SentAt              time.Time       `json:"sent_at"`
+	Targets             []string        `json:"targets"`
+	Successful          []string        `json:"successful"`
+	Failed              []SendError     `json:"failed"`
+	Admissions          []SendAdmission `json:"admissions"`
+	Error               string          `json:"error,omitempty"`
+	ErrorCode           string          `json:"error_code,omitempty"`
+	MessagePreview      string          `json:"message_preview,omitempty"`
 }
 
 // sendPayloadDigest returns the SHA-256 digest (hex) and byte count of the
@@ -154,6 +166,9 @@ func sendOperationBindingHash(opts SendOptions) string {
 	}
 
 	writeField(opts.Session)
+	writeField(strings.TrimSpace(opts.Actor))
+	writeField(strings.TrimSpace(opts.Origin))
+	writeField(strings.TrimSpace(opts.TargetAuthorization))
 	if opts.All {
 		writeField("all")
 	}
@@ -234,13 +249,16 @@ func sendOperationInfoFromRecord(op *state.SendOperation, replayed bool) *SendOp
 		return nil
 	}
 	info := &SendOperationInfo{
-		OperationID:   op.OperationID,
-		Status:        op.Status,
-		Replayed:      replayed,
-		PayloadSHA256: op.PayloadSHA256,
-		PayloadBytes:  op.PayloadBytes,
-		CreatedAt:     op.CreatedAt,
-		CompletedAt:   op.CompletedAt,
+		OperationID:         op.OperationID,
+		Status:              op.Status,
+		Actor:               op.Actor,
+		Origin:              op.Origin,
+		TargetAuthorization: op.TargetAuthorization,
+		Replayed:            replayed,
+		PayloadSHA256:       op.PayloadSHA256,
+		PayloadBytes:        op.PayloadBytes,
+		CreatedAt:           op.CreatedAt,
+		CompletedAt:         op.CompletedAt,
 	}
 	if op.OutcomeJSON != "" {
 		var outcome sendOperationOutcome
@@ -249,6 +267,25 @@ func sendOperationInfoFromRecord(op *state.SendOperation, replayed bool) *SendOp
 		}
 	}
 	return info
+}
+
+func validateSendReceiptProvenance(opts SendOptions) (actor, origin, targetAuthorization string, err error) {
+	actor = strings.TrimSpace(opts.Actor)
+	origin = strings.TrimSpace(opts.Origin)
+	targetAuthorization = strings.TrimSpace(opts.TargetAuthorization)
+	if actor == "" && origin == "" && targetAuthorization == "" {
+		return "", "", "", fmt.Errorf("idempotent send receipt requires authenticated actor, origin, and target authorization provenance")
+	}
+	if actor == "" {
+		return "", "", "", fmt.Errorf("idempotent send receipt requires authenticated actor provenance")
+	}
+	if origin == "" {
+		return "", "", "", fmt.Errorf("idempotent send receipt requires origin provenance")
+	}
+	if targetAuthorization == "" {
+		return "", "", "", fmt.Errorf("idempotent send receipt requires target authorization provenance")
+	}
+	return actor, origin, targetAuthorization, nil
 }
 
 // applyReplayedOutcome restores a stored outcome onto a fresh SendOutput so
@@ -299,15 +336,18 @@ func releaseSendOperationClaim(store *state.Store, op *state.SendOperation, outp
 func completeSendOperationRecord(store *state.Store, op *state.SendOperation, output *SendOutput) {
 	admissions := admissionsFromSendOutput(output)
 	outcome := sendOperationOutcome{
-		Success:        output.Success,
-		SentAt:         output.SentAt,
-		Targets:        output.Targets,
-		Successful:     output.Successful,
-		Failed:         output.Failed,
-		Admissions:     admissions,
-		Error:          output.Error,
-		ErrorCode:      output.ErrorCode,
-		MessagePreview: output.MessagePreview,
+		Actor:               op.Actor,
+		Origin:              op.Origin,
+		TargetAuthorization: op.TargetAuthorization,
+		Success:             output.Success,
+		SentAt:              output.SentAt,
+		Targets:             output.Targets,
+		Successful:          output.Successful,
+		Failed:              output.Failed,
+		Admissions:          admissions,
+		Error:               output.Error,
+		ErrorCode:           output.ErrorCode,
+		MessagePreview:      output.MessagePreview,
 	}
 	data, err := json.Marshal(outcome)
 	if err != nil {
@@ -315,6 +355,24 @@ func completeSendOperationRecord(store *state.Store, op *state.SendOperation, ou
 		return
 	}
 	completedAt := time.Now().UTC()
+	// The attention event is emitted before this deferred completion path;
+	// mirror the receipt into the append-only audit log without retaining the
+	// prompt body. A logger failure is surfaced, but cannot erase a delivery
+	// that has already occurred.
+	if err := audit.LogEvent(op.SessionName, audit.EventTypeSend, audit.ActorAgent, "robot.send.receipt", map[string]interface{}{
+		"phase":                "receipt",
+		"operation_id":         op.OperationID,
+		"actor":                op.Actor,
+		"origin":               op.Origin,
+		"target_authorization": op.TargetAuthorization,
+		"payload_sha256":       op.PayloadSHA256,
+		"payload_bytes":        op.PayloadBytes,
+		"successful":           append([]string(nil), output.Successful...),
+		"failed":               sendErrorsToDetails(output.Failed),
+		"success":              output.Success,
+	}, map[string]interface{}{"correlation_id": op.OperationID}); err != nil {
+		output.Warnings = append(output.Warnings, fmt.Sprintf("send operation %s audit mirror not recorded: %v", op.OperationID, err))
+	}
 	if err := store.CompleteSendOperation(op.OperationID, op.SessionName, string(data), completedAt); err != nil {
 		output.Warnings = append(output.Warnings, fmt.Sprintf("send operation %s outcome not recorded: %v", op.OperationID, err))
 		return

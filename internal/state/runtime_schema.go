@@ -686,6 +686,11 @@ type SendOperation struct {
 	// Identity
 	OperationID string `json:"operation_id"`
 	SessionName string `json:"session_name"`
+	// Provenance is mandatory for newly-created receipts. Historical rows may
+	// be empty because the migration preserves their read compatibility.
+	Actor               string `json:"actor,omitempty"`
+	Origin              string `json:"origin,omitempty"`
+	TargetAuthorization string `json:"target_authorization,omitempty"`
 
 	// Binding — BindingHash covers canonical targets + payload digest so a
 	// conflicting reuse of the same operation ID is detectable.

@@ -110,6 +110,44 @@ func TestRoleFromContext(t *testing.T) {
 	}
 }
 
+func TestSendReceiptProvenanceUsesAuthenticatedPrincipalAndTargetAuthorization(t *testing.T) {
+	t.Run("authenticated principal", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/robot/send", nil)
+		req = req.WithContext(withRoleContext(req.Context(), &RoleContext{
+			Role:   RoleOperator,
+			UserID: "operator-42",
+		}))
+		actor, origin, authorization := sendReceiptProvenance(req, "proj")
+		if actor != "operator-42" || origin != "http.api.v1" {
+			t.Fatalf("receipt provenance = actor=%q origin=%q, want authenticated HTTP principal", actor, origin)
+		}
+		if authorization != `{"scheme":"rbac","role":"operator","permission":"agents:write","resource":"session:proj"}` {
+			t.Fatalf("target authorization = %q", authorization)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		rc   *RoleContext
+	}{
+		{name: "no role context"},
+		{name: "anonymous principal", rc: &RoleContext{Role: RoleAdmin, UserID: "anonymous"}},
+		{name: "empty principal", rc: &RoleContext{Role: RoleAdmin}},
+		{name: "unauthorized role", rc: &RoleContext{Role: RoleViewer, UserID: "viewer-1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/robot/send", nil)
+			if tc.rc != nil {
+				req = req.WithContext(withRoleContext(req.Context(), tc.rc))
+			}
+			actor, origin, authorization := sendReceiptProvenance(req, "proj")
+			if actor != "" || origin != "" || authorization != "" {
+				t.Fatalf("receipt provenance = actor=%q origin=%q authorization=%q, want none", actor, origin, authorization)
+			}
+		})
+	}
+}
+
 func TestExtractUserIDFromClaims(t *testing.T) {
 	tests := []struct {
 		name   string
