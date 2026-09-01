@@ -6239,10 +6239,15 @@ type SendOptions struct {
 	RequestID      string   // External request identifier for REST parity
 	CorrelationID  string   // Correlation identifier for tracing request/outcome/verification
 	IdempotencyKey string   // Idempotency key when provided by an upstream caller
-	// Actor, Origin, and TargetAuthorization are required for every non-dry-run
-	// pane mutation. The HTTP control plane derives them from its authenticated
-	// RBAC context; direct CLI dispatch intentionally cannot mutate panes.
-	// NTM never infers an actor from $USER.
+	// Admission is an opaque authenticated-control-plane capability. It is the
+	// only provenance accepted for a non-dry-run pane mutation. Actor, origin,
+	// and authorization strings are intentionally not accepted here: a CLI or
+	// other caller could forge those values. Direct robot/CLI dispatch therefore
+	// fails closed unless the HTTP RBAC control plane issued this capability.
+	Admission *AuthenticatedSendAdmission
+	// Deprecated untrusted caller assertions. They remain only so read-only
+	// callers and source compatibility compile; non-dry-run admission ignores
+	// them and never persists them.
 	Actor               string
 	Origin              string
 	TargetAuthorization string
@@ -7006,9 +7011,6 @@ func finalizeRobotSendDispatchStatus(output *SendOutput) {
 // This function returns the data struct directly, enabling CLI/REST parity.
 func GetSend(opts SendOptions) (*SendOutput, error) {
 	trace := normalizeActuationTrace(opts.RequestID, opts.CorrelationID, opts.IdempotencyKey)
-	trace.Actor = strings.TrimSpace(opts.Actor)
-	trace.Origin = strings.TrimSpace(opts.Origin)
-	trace.TargetAuthorization = strings.TrimSpace(opts.TargetAuthorization)
 	redactCfg := normalizeSendRedactionConfig(opts.Redaction)
 	_, initialPreview, initialSummary, initialWarnings, initialBlocked := applySendMessageRedaction(opts.Message, redactCfg)
 
@@ -7146,7 +7148,6 @@ func GetSend(opts SendOptions) (*SendOutput, error) {
 			output.RobotResponse = NewErrorResponse(authorizationErr, ErrCodeReceiptProvenanceRequired, "Resolve an authorized pane target before dispatch")
 			return finalizeTerminalSendActuation(trace, opts, &output), nil
 		}
-		opts.TargetAuthorization = targetAuthorization
 		trace.TargetAuthorization = targetAuthorization
 	}
 	var renderBaselines map[string]sendRenderBaseline

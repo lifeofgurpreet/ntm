@@ -66,6 +66,15 @@ func installIdempotencyBranchFeed(t *testing.T) {
 	t.Cleanup(func() { SetAttentionFeed(oldFeed) })
 }
 
+func mustTestHTTPSendAdmission(t *testing.T, session string) *AuthenticatedSendAdmission {
+	t.Helper()
+	admission, err := NewAuthenticatedHTTPSendAdmission("test-orchestrator", "operator", session)
+	if err != nil {
+		t.Fatalf("NewAuthenticatedHTTPSendAdmission: %v", err)
+	}
+	return admission
+}
+
 // createIdempotencyBranchSession creates a throwaway real tmux session with a
 // single interactive bash pane and waits for the shell to render. It returns
 // the session name and the pane's tmux ID (%N).
@@ -678,32 +687,24 @@ func TestGetSendIdempotency_StaleInProgressClaimTakenOver(t *testing.T) {
 
 // Branch (f): a preflight failure AFTER the claim (dispatch Prepare rejects
 // the target before any keystroke) releases the claim so the operation ID is
-// immediately reusable. The seam: a pane titled as a grok agent fails
-// dispatch's ValidatePromptDeliveryTargets during Prepare — which runs after
-// the claim block — with prompt_delivery_unsupported.
+// immediately reusable. The seam: a negative delay fails dispatch Prepare
+// after the claim block but before a tmux delivery is attempted.
 func TestGetSendIdempotency_PreflightFailureReleasesClaim(t *testing.T) {
 	testutil.RequireTmuxThrottled(t)
 	installIdempotencyBranchFeed(t)
 	store := installIdempotencyBranchStore(t)
 	session, paneID := createIdempotencyBranchSession(t, "preflight")
 
-	// Mark the pane as a grok agent; automated prompt delivery to grok is
-	// not implemented, so Prepare fails after the claim succeeded.
-	if err := tmux.SetPaneTitle(paneID, session+"__grok_1"); err != nil {
-		t.Fatalf("SetPaneTitle: %v", err)
-	}
-
 	opID := fmt.Sprintf("op-preflight-%d", time.Now().UnixNano())
 	opts := SendOptions{
-		Session:             session,
-		Message:             "echo ntm-idem-preflight",
-		Pane:                paneID,
-		IdempotencyKey:      opID,
-		Actor:               "test-orchestrator",
-		Origin:              "robot.test",
-		TargetAuthorization: sendTestAuthorization(session),
+		Session:        session,
+		Message:        "echo ntm-idem-preflight",
+		Pane:           paneID,
+		DelayMs:        -1,
+		IdempotencyKey: opID,
+		Admission:      mustTestHTTPSendAdmission(t, session),
 	}
-	t.Logf("seeded row: none (fresh claim against grok-titled pane %s)", paneID)
+	t.Logf("seeded row: none (fresh claim before invalid dispatch preflight for pane %s)", paneID)
 
 	output, err := GetSend(opts)
 	if err != nil {
@@ -712,10 +713,10 @@ func TestGetSendIdempotency_PreflightFailureReleasesClaim(t *testing.T) {
 	logSendEnvelopeSubset(t, output)
 
 	if output.Success {
-		t.Fatal("Success = true, want prompt-delivery preflight failure")
+		t.Fatal("Success = true, want dispatch preflight failure")
 	}
-	if output.ErrorCode != ErrCodeNotImplemented {
-		t.Fatalf("ErrorCode = %q, want %q (prompt_delivery_unsupported)", output.ErrorCode, ErrCodeNotImplemented)
+	if output.ErrorCode != ErrCodeInvalidFlag {
+		t.Fatalf("ErrorCode = %q, want %q (invalid dispatch delay)", output.ErrorCode, ErrCodeInvalidFlag)
 	}
 
 	// The claim must have been RELEASED: no row remains.
@@ -730,9 +731,9 @@ func TestGetSendIdempotency_PreflightFailureReleasesClaim(t *testing.T) {
 	_, reclaimed, err := store.ClaimSendOperation(&state.SendOperation{
 		OperationID:         opID,
 		SessionName:         session,
-		Actor:               opts.Actor,
-		Origin:              opts.Origin,
-		TargetAuthorization: opts.TargetAuthorization,
+		Actor:               "test-orchestrator",
+		Origin:              "http.api.v1",
+		TargetAuthorization: "test-reclaim-after-release",
 		BindingHash:         sendOperationBindingHash(opts),
 		PayloadSHA256:       payloadSHA,
 		PayloadBytes:        payloadBytes,

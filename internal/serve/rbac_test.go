@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -172,6 +173,43 @@ func TestPaneInputIsRetiredBeforeTmuxForSessionsWriteCaller(t *testing.T) {
 	}
 	if sendCalls != 0 {
 		t.Fatalf("raw pane input reached tmux %d time(s)", sendCalls)
+	}
+}
+
+func TestInterruptMutationRoutesAreRetiredBeforeTransport(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	interruptCalls := 0
+	srv.interruptAgents = func(robot.InterruptOptions) (*robot.InterruptOutput, error) {
+		interruptCalls++
+		return nil, nil
+	}
+
+	for _, tc := range []struct {
+		name string
+		path string
+		h    http.HandlerFunc
+	}{
+		{"pane", "/api/v1/sessions/proj/panes/2/interrupt", srv.handlePaneInterruptV1},
+		{"agents", "/api/v1/sessions/proj/agents/interrupt", srv.handleAgentInterruptV1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tc.path, nil)
+			rctx := chi.NewRouteContext()
+			rctx.URLParams.Add("sessionId", "proj")
+			if tc.name == "pane" {
+				rctx.URLParams.Add("paneIdx", "2")
+			}
+			req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+			req = req.WithContext(withRoleContext(req.Context(), &RoleContext{Role: RoleAdmin, UserID: "admin-42"}))
+			rec := httptest.NewRecorder()
+			tc.h(rec, req)
+			if rec.Code != http.StatusGone {
+				t.Fatalf("status = %d, want %d", rec.Code, http.StatusGone)
+			}
+		})
+	}
+	if interruptCalls != 0 {
+		t.Fatalf("retired agent interrupt reached robot transport %d time(s)", interruptCalls)
 	}
 }
 

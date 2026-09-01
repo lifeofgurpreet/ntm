@@ -1869,38 +1869,48 @@ func idempotencyPrincipal(r *http.Request) string {
 	return "anonymous"
 }
 
-// sendReceiptProvenance derives the complete receipt provenance only from an
+// sendReceiptAdmission derives the opaque send admission only from an
 // authenticated request RBAC context. It deliberately does not fall back to
 // NTM_USER or USER: a receipt is an operational audit artifact, not a
-// best-effort local attribution claim. The recorded authorization names the
-// exact protected resource family and permission that admitted the send.
-func sendReceiptProvenance(r *http.Request, sessionID string) (actor, origin, targetAuthorization string) {
+// best-effort local attribution claim.
+func sendReceiptAdmission(r *http.Request, sessionID string) *robot.AuthenticatedSendAdmission {
 	if r == nil {
-		return "", "", ""
+		return nil
 	}
 	rc := RoleFromContext(r.Context())
 	if rc == nil || !rc.Role.HasPermission(PermWriteAgents) {
-		return "", "", ""
+		return nil
 	}
-	actor = strings.TrimSpace(rc.UserID)
+	actor := strings.TrimSpace(rc.UserID)
 	if actor == "" || actor == "anonymous" {
+		return nil
+	}
+	admission, err := robot.NewAuthenticatedHTTPSendAdmission(actor, string(rc.Role), sessionID)
+	if err != nil {
+		return nil
+	}
+	return admission
+}
+
+// sendReceiptProvenance is retained for read-only diagnostics/tests. Mutation
+// handlers must use sendReceiptAdmission; this string view cannot authorize a
+// SendOptions dispatch.
+func sendReceiptProvenance(r *http.Request, sessionID string) (actor, origin, targetAuthorization string) {
+	admission := sendReceiptAdmission(r, sessionID)
+	if admission == nil {
 		return "", "", ""
 	}
+	rc := RoleFromContext(r.Context())
 	authorization, err := json.Marshal(struct {
 		Scheme     string     `json:"scheme"`
 		Role       Role       `json:"role"`
 		Permission Permission `json:"permission"`
 		Resource   string     `json:"resource"`
-	}{
-		Scheme:     "rbac",
-		Role:       rc.Role,
-		Permission: PermWriteAgents,
-		Resource:   "session:" + sessionID,
-	})
+	}{"rbac", rc.Role, PermWriteAgents, "session:" + sessionID})
 	if err != nil {
 		return "", "", ""
 	}
-	return actor, "http.api.v1", string(authorization)
+	return rc.UserID, "http.api.v1", string(authorization)
 }
 
 func cloneReplayHeaders(src http.Header) http.Header {
@@ -3751,33 +3761,11 @@ func (s *Server) handlePaneInputV1(w http.ResponseWriter, r *http.Request) {
 // handlePaneInterruptV1 handles POST /api/v1/sessions/{sessionId}/panes/{paneIdx}/interrupt.
 func (s *Server) handlePaneInterruptV1(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
-	sessionID := chi.URLParam(r, "sessionId")
-	paneIdxStr := chi.URLParam(r, "paneIdx")
-
-	if !validateSessionParam(w, sessionID, reqID) {
-		return
-	}
-
-	paneIdx := validatePaneIdx(w, paneIdxStr, reqID)
-	if paneIdx < 0 {
-		return
-	}
-
-	paneTarget, ok := s.resolvePaneTargetForRequest(w, r, sessionID, paneIdx, reqID)
-	if !ok {
-		return
-	}
-
-	// Send Ctrl+c to interrupt
-	if err := tmux.SendKeys(paneTarget, "C-c", false); err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
-		return
-	}
-
-	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-		"interrupted": true,
-		"pane":        paneTarget,
-	}, reqID)
+	// Bare Ctrl-C has no durable text receipt or per-target authenticated
+	// admission. Retire it until it can use the same guarded receipt path as
+	// agent send; do not leave an ambiguous mutation escape hatch.
+	writeErrorResponse(w, http.StatusGone, ErrCodeForbidden,
+		"bare pane interrupt is retired pending authenticated receipt admission", nil, reqID)
 }
 
 // handlePaneOutputV1 handles GET /api/v1/sessions/{sessionId}/panes/{paneIdx}/output.
@@ -4151,19 +4139,17 @@ func (s *Server) handleAgentSendV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	actor, origin, targetAuthorization := sendReceiptProvenance(r, sessionID)
+	admission := sendReceiptAdmission(r, sessionID)
 	opts := robot.SendOptions{
-		Session:             sessionID,
-		Message:             req.Message,
-		Panes:               req.Panes,
-		AgentTypes:          req.AgentTypes,
-		All:                 req.All,
-		RequestID:           reqID,
-		CorrelationID:       reqID,
-		IdempotencyKey:      r.Header.Get("Idempotency-Key"),
-		Actor:               actor,
-		Origin:              origin,
-		TargetAuthorization: targetAuthorization,
+		Session:        sessionID,
+		Message:        req.Message,
+		Panes:          req.Panes,
+		AgentTypes:     req.AgentTypes,
+		All:            req.All,
+		RequestID:      reqID,
+		CorrelationID:  reqID,
+		IdempotencyKey: r.Header.Get("Idempotency-Key"),
+		Admission:      admission,
 	}
 
 	sendAgents := robot.GetSend
@@ -4208,72 +4194,11 @@ type AgentInterruptRequest struct {
 // handleAgentInterruptV1 handles POST /api/v1/sessions/{sessionId}/agents/interrupt.
 func (s *Server) handleAgentInterruptV1(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
-	sessionID := chi.URLParam(r, "sessionId")
-
-	if !validateSessionParam(w, sessionID, reqID) {
-		return
-	}
-
-	var req AgentInterruptRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
-		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "invalid request body", nil, reqID)
-		return
-	}
-
-	// Policy check on the follow-up message (if any).
-	if req.Message != "" {
-		if p, policyErr := policy.LoadOrDefault(); policyErr != nil {
-			slog.Warn("agent interrupt policy check skipped: failed to load policy",
-				"error", policyErr, "request_id", reqID)
-		} else if match := p.Check(req.Message); match != nil && match.Action == policy.ActionBlock {
-			slog.Warn("agent interrupt message blocked by policy",
-				"session", sessionID, "pattern", match.Pattern, "request_id", reqID)
-			writeErrorResponse(w, http.StatusForbidden, ErrCodeForbidden,
-				fmt.Sprintf("blocked by safety policy: %s", match.Reason), nil, reqID)
-			return
-		}
-	}
-
-	opts := robot.InterruptOptions{
-		Session:        sessionID,
-		Panes:          req.Panes,
-		Message:        req.Message,
-		Force:          req.Force,
-		NoWait:         req.NoWait,
-		RequestID:      reqID,
-		CorrelationID:  reqID,
-		IdempotencyKey: r.Header.Get("Idempotency-Key"),
-	}
-
-	interruptAgents := robot.GetInterrupt
-	if s.interruptAgents != nil {
-		interruptAgents = s.interruptAgents
-	}
-	result, err := interruptAgents(opts)
-	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
-		return
-	}
-	if result == nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, "agent interrupt returned no result", nil, reqID)
-		return
-	}
-	if !result.Success {
-		details := map[string]interface{}{}
-		if result.Hint != "" {
-			details["hint"] = result.Hint
-		}
-		writeErrorResponse(w, robotErrorHTTPStatus(result.ErrorCode), result.ErrorCode, result.Error, details, reqID)
-		return
-	}
-
-	data, err := toJSONMap(result)
-	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to serialize response", nil, reqID)
-		return
-	}
-
-	writeSuccessResponse(w, http.StatusOK, data, reqID)
+	// This endpoint combines a bare Ctrl-C with an optional direct Dispatch
+	// follow-up. Neither can prove the required atomic receipt/event admission,
+	// so the entire mutation route is retired rather than partially guarded.
+	writeErrorResponse(w, http.StatusGone, ErrCodeForbidden,
+		"agent interrupt is retired pending authenticated receipt admission", nil, reqID)
 }
 
 // AgentWaitRequest is the request body for POST /sessions/{id}/agents/wait.

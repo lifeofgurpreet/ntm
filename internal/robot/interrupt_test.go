@@ -1,6 +1,7 @@
 package robot
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -10,6 +11,40 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
+
+// TestProgrammaticMutationInventoryFailsClosed documents the currently
+// supported programmatic mutation inventory: direct robot interrupt and bulk
+// assignment have no authenticated receipt admission, so both must stop before
+// their tmux/dependency transport paths. Guarded send is covered by the
+// non-idempotent and tracked-send no-tmux regressions in send_idempotency and
+// ack tests.
+func TestProgrammaticMutationInventoryFailsClosed(t *testing.T) {
+	interrupt, err := GetInterrupt(InterruptOptions{Session: "must-not-touch-tmux"})
+	if err != nil {
+		t.Fatalf("GetInterrupt: %v", err)
+	}
+	if interrupt.Success || interrupt.ErrorCode != ErrCodeReceiptProvenanceRequired {
+		t.Fatalf("interrupt = %+v, want fail-closed receipt admission refusal", interrupt)
+	}
+
+	listPanesCalls := 0
+	bulk, err := GetBulkAssign(context.Background(), BulkAssignOptions{
+		Session: "must-not-touch-tmux",
+		Deps: &BulkAssignDependencies{ListPanes: func(context.Context, string) ([]tmux.Pane, error) {
+			listPanesCalls++
+			return nil, errors.New("must not be called")
+		}},
+	})
+	if err != nil {
+		t.Fatalf("GetBulkAssign: %v", err)
+	}
+	if bulk.Success || bulk.ErrorCode != ErrCodeReceiptProvenanceRequired {
+		t.Fatalf("bulk = %+v, want fail-closed receipt admission refusal", bulk)
+	}
+	if listPanesCalls != 0 {
+		t.Fatalf("bulk assignment reached pane discovery %d time(s)", listPanesCalls)
+	}
+}
 
 func TestResolveInterruptTargetsSelectorsDeduplicateAndFailTyped(t *testing.T) {
 	panes := []tmux.Pane{

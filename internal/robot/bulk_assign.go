@@ -202,6 +202,18 @@ func GetBulkAssign(ctx context.Context, opts BulkAssignOptions) (*BulkAssignOutp
 		)
 		return output, nil
 	}
+	if !opts.DryRun {
+		// Bulk assignment eventually invokes Dispatch directly for every plan
+		// entry. It has no authenticated receipt/event admission capability, so
+		// refuse before pane discovery, claims, or tmux transport rather than
+		// accepting caller-filled provenance.
+		output.RobotResponse = NewErrorResponse(
+			fmt.Errorf("mutating bulk assignment is retired pending authenticated receipt admission"),
+			ErrCodeReceiptProvenanceRequired,
+			"Use --dry-run; guarded per-target dispatch is not available for bulk assignment",
+		)
+		return output, nil
+	}
 
 	deps := bulkAssignDeps(opts.Deps)
 	strategy, err := normalizeBulkAssignStrategy(opts.Strategy)

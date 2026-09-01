@@ -167,8 +167,13 @@ func sendOperationBindingHash(opts SendOptions) string {
 	}
 
 	writeField(opts.Session)
-	writeField(strings.TrimSpace(opts.Actor))
-	writeField(strings.TrimSpace(opts.Origin))
+	if opts.Admission != nil {
+		writeField(opts.Admission.actor)
+		writeField(opts.Admission.origin)
+	} else {
+		writeField("")
+		writeField("")
+	}
 	if opts.All {
 		writeField("all")
 	}
@@ -276,26 +281,49 @@ type receiptAuthorizationSeed struct {
 	Resource   string `json:"resource"`
 }
 
-// validateSendReceiptProvenance accepts only an authenticated HTTP RBAC grant
-// seed. The durable target authorization itself is constructed below from the
-// stable resolved tmux pane IDs; caller-provided target strings are never
-// persisted as authorization evidence.
+// AuthenticatedSendAdmission is an opaque capability created by the HTTP RBAC
+// control plane after it has authenticated a non-anonymous principal and
+// checked agents:write. Its fields are deliberately private so SendOptions
+// callers cannot self-assert actor/origin/authorization strings.
+type AuthenticatedSendAdmission struct {
+	actor   string
+	origin  string
+	role    string
+	session string
+}
+
+// NewAuthenticatedHTTPSendAdmission creates the only capability accepted by
+// the robot send transport. It is for the HTTP RBAC boundary; command-line and
+// robot callers have no authenticated principal and must be rejected.
+func NewAuthenticatedHTTPSendAdmission(actor, role, session string) (*AuthenticatedSendAdmission, error) {
+	actor = strings.TrimSpace(actor)
+	role = strings.TrimSpace(role)
+	session = strings.TrimSpace(session)
+	if actor == "" || actor == "anonymous" {
+		return nil, fmt.Errorf("authenticated non-anonymous actor is required")
+	}
+	if role == "" || session == "" {
+		return nil, fmt.Errorf("authenticated role and session are required")
+	}
+	return &AuthenticatedSendAdmission{
+		actor: actor, origin: "http.api.v1", role: role, session: session,
+	}, nil
+}
+
+// validateSendReceiptProvenance accepts only an opaque authenticated HTTP RBAC
+// capability. The durable target authorization itself is constructed below
+// from stable resolved tmux pane IDs; caller-provided target strings are never
+// accepted or persisted as authorization evidence.
 func validateSendReceiptProvenance(opts SendOptions) (actor, origin string, seed receiptAuthorizationSeed, err error) {
-	actor = strings.TrimSpace(opts.Actor)
-	origin = strings.TrimSpace(opts.Origin)
-	if actor == "" && origin == "" && strings.TrimSpace(opts.TargetAuthorization) == "" {
-		return "", "", receiptAuthorizationSeed{}, fmt.Errorf("pane mutation requires authenticated actor, origin, and target authorization provenance")
+	if opts.Admission == nil {
+		return "", "", receiptAuthorizationSeed{}, fmt.Errorf("pane mutation requires an authenticated HTTP RBAC admission")
 	}
-	if actor == "" {
-		return "", "", receiptAuthorizationSeed{}, fmt.Errorf("pane mutation requires authenticated actor provenance")
-	}
-	if origin == "" {
-		return "", "", receiptAuthorizationSeed{}, fmt.Errorf("pane mutation requires origin provenance")
-	}
-	if err := json.Unmarshal([]byte(opts.TargetAuthorization), &seed); err != nil || seed.Scheme != "rbac" || seed.Permission != "agents:write" || seed.Resource != "session:"+opts.Session {
+	if opts.Admission.session != opts.Session || opts.Admission.actor == "" || opts.Admission.actor == "anonymous" || opts.Admission.origin != "http.api.v1" || opts.Admission.role == "" {
 		return "", "", receiptAuthorizationSeed{}, fmt.Errorf("pane mutation requires an authenticated agents:write authorization grant for session %q", opts.Session)
 	}
-	return actor, origin, seed, nil
+	return opts.Admission.actor, opts.Admission.origin, receiptAuthorizationSeed{
+		Scheme: "rbac", Role: opts.Admission.role, Permission: "agents:write", Resource: "session:" + opts.Session,
+	}, nil
 }
 
 func resolvedTargetAuthorization(seed receiptAuthorizationSeed, panes []tmux.Pane) (string, error) {

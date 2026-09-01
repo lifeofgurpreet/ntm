@@ -95,6 +95,18 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 		TimeoutMs:      opts.TimeoutMs,
 		TimedOut:       false,
 	}
+	if !opts.DryRun {
+		// A bare Ctrl-C and this command's optional follow-up Dispatch do not
+		// currently enter the authenticated send receipt transaction. Retire the
+		// mutation instead of allowing a partial provenance bypass.
+		output.RobotResponse = NewErrorResponse(
+			fmt.Errorf("robot interrupt is retired pending authenticated receipt admission"),
+			ErrCodeReceiptProvenanceRequired,
+			"Use a guarded authenticated agent send; bare interrupts are unavailable",
+		)
+		output.CompletedAt = time.Now().UTC()
+		return finalizeTerminalInterruptActuation(trace, opts, nil, output), nil
+	}
 
 	if interruptMessageBlocked(&opts, output) {
 		output.CompletedAt = time.Now().UTC()
