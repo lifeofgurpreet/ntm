@@ -22,8 +22,20 @@ import (
 type RoutingStateStore interface {
 	GetRoutingState(session, filterKey string) (*state.RoutingState, error)
 	SaveRoutingState(*state.RoutingState) error
+	// SaveRoutingStateIfUnchanged persists only while the stored row still
+	// matches what this decision was routed from, reporting false when
+	// another writer advanced it first. Stateful strategies need it because
+	// selection is a read-modify-write spread across two store calls in
+	// separate processes.
+	SaveRoutingStateIfUnchanged(rs *state.RoutingState, expected *state.RoutingState) (bool, error)
 	PurgeRoutingStateOlderThan(maxAge time.Duration) (int64, error)
 }
+
+// routingStateAttempts bounds the optimistic-concurrency retry. Contention is
+// two operators (or two agents) dispatching to one session at the same instant,
+// so a couple of attempts settles it; past that, taking the slightly unfair
+// route beats spinning while the operator waits.
+const routingStateAttempts = 3
 
 // openRoutingStateStore opens (and migrates) the state DB for routing state.
 // Best-effort: callers proceed without persistence when it fails. This is the
@@ -63,7 +75,7 @@ func openRoutingStateStoreReadOnly() (*state.Store, error) {
 // diverging into per-spelling rows.
 func routingStateFilterKey(opts RouteOptions) string {
 	agentType := strings.ToLower(strings.TrimSpace(opts.AgentType))
-	if agentType == "" && len(opts.ExcludePanes) == 0 {
+	if agentType == "" && len(opts.ExcludePanes) == 0 && len(opts.ExcludePaneIDs) == 0 {
 		return ""
 	}
 	if agentType != "" {
@@ -75,7 +87,13 @@ func routingStateFilterKey(opts RouteOptions) string {
 	for _, idx := range excludes {
 		parts = append(parts, strconv.Itoa(idx))
 	}
-	return "type=" + agentType + ";exclude=" + strings.Join(parts, ",")
+	key := "type=" + agentType + ";exclude=" + strings.Join(parts, ",")
+	if len(opts.ExcludePaneIDs) > 0 {
+		ids := append([]string(nil), opts.ExcludePaneIDs...)
+		sort.Strings(ids)
+		key += ";exclude_ids=" + strings.Join(ids, ",")
+	}
+	return key
 }
 
 // routingStateTTL bounds how long a routing-state row can sit untouched
@@ -104,30 +122,59 @@ func routingStrategyIsStateful(strategy StrategyName) bool {
 // never fails the routing decision.
 func routeWithSessionState(agents []ScoredAgent, opts RouteOptions, store RoutingStateStore, persist bool) RoutingResult {
 	router := NewRouter()
-	ctx := RoutingContext{
-		Prompt:       opts.Prompt,
-		LastAgent:    opts.LastAgent,
-		ExcludePanes: opts.ExcludePanes,
-		ExplicitPane: -1,
-	}
 	filterKey := routingStateFilterKey(opts)
-	if store != nil && ctx.LastAgent == "" {
-		rs, err := store.GetRoutingState(opts.Session, filterKey)
-		switch {
-		case err != nil:
-			slog.Warn("[robot.route] cannot load persisted routing state", "session", opts.Session, "error", err)
-		case rs != nil:
-			ctx.LastAgent = rs.LastAgent
-			if rs.RotationCursor >= 0 {
-				ctx.RotationCursor = rs.RotationCursor
-				ctx.HasRotationCursor = true
+
+	baseCtx := RoutingContext{
+		Prompt:         opts.Prompt,
+		LastAgent:      opts.LastAgent,
+		ExcludePanes:   opts.ExcludePanes,
+		ExcludePaneIDs: opts.ExcludePaneIDs,
+		ExplicitPane:   -1,
+	}
+
+	// Selection is a read-modify-write over the persisted cursor, so the load
+	// and the guarded store have to be one attempt: if another process
+	// advanced the cursor in between, this decision was made from a stale
+	// cursor and must be recomputed, not dispatched (see
+	// SaveRoutingStateIfUnchanged). A read-only or stateless route takes the
+	// single pass below and never loops.
+	var result RoutingResult
+	for attempt := 1; ; attempt++ {
+		ctx := baseCtx
+
+		// The row is read whenever there is a store, even when the caller
+		// supplied LastAgent and the decision will not be derived from it:
+		// the guarded write below needs a baseline either way. Reading only
+		// in the no-override case left that baseline nil, which turns the
+		// write into an insert that the existing row rejects — so an explicit
+		// --robot-route-last-agent stopped advancing the cursor at all and
+		// reported contention that never happened.
+		var observed *state.RoutingState
+		if store != nil {
+			rs, err := store.GetRoutingState(opts.Session, filterKey)
+			switch {
+			case err != nil:
+				slog.Warn("[robot.route] cannot load persisted routing state", "session", opts.Session, "error", err)
+			case rs != nil:
+				observed = rs
+				// An explicit LastAgent is an override: it wins over the
+				// persisted one, and the stored cursor is not consulted.
+				if ctx.LastAgent == "" {
+					ctx.LastAgent = rs.LastAgent
+					if rs.RotationCursor >= 0 {
+						ctx.RotationCursor = rs.RotationCursor
+						ctx.HasRotationCursor = true
+					}
+				}
 			}
 		}
-	}
 
-	result := router.Route(agents, opts.Strategy, ctx)
+		result = router.Route(agents, opts.Strategy, ctx)
 
-	if persist && store != nil && result.Selected != nil && routingStrategyIsStateful(opts.Strategy) {
+		if !persist || store == nil || result.Selected == nil || !routingStrategyIsStateful(opts.Strategy) {
+			return result
+		}
+
 		cursor := -1
 		for i := range agents {
 			if agents[i].PaneID == result.Selected.PaneID {
@@ -141,10 +188,14 @@ func routeWithSessionState(agents []ScoredAgent, opts RouteOptions, store Routin
 			LastAgent:      result.Selected.PaneID,
 			RotationCursor: cursor,
 		}
-		if err := store.SaveRoutingState(rs); err != nil {
+
+		stored, err := store.SaveRoutingStateIfUnchanged(rs, observed)
+		switch {
+		case err != nil:
 			slog.Warn("[robot.route] cannot persist routing state",
 				"session", opts.Session, "strategy", opts.Strategy, "error", err)
-		} else {
+			return result
+		case stored:
 			slog.Info("[robot.route] routing state persisted",
 				"session", opts.Session, "strategy", opts.Strategy,
 				"pane_id", result.Selected.PaneID, "pane_index", result.Selected.PaneIndex,
@@ -154,21 +205,32 @@ func routeWithSessionState(agents []ScoredAgent, opts RouteOptions, store Routin
 			if purged, err := store.PurgeRoutingStateOlderThan(routingStateTTL); err == nil && purged > 0 {
 				slog.Debug("[robot.route] purged stale routing state rows", "purged", purged)
 			}
+			return result
+		case attempt >= routingStateAttempts:
+			// Give the caller the decision anyway: routing must not fail
+			// because a peer is dispatching to the same session, and the
+			// worst case is the fairness slip this guard usually prevents.
+			slog.Warn("[robot.route] routing state contended; using the last selection",
+				"session", opts.Session, "strategy", opts.Strategy, "attempts", attempt)
+			return result
+		default:
+			slog.Debug("[robot.route] routing state changed under us; re-selecting",
+				"session", opts.Session, "strategy", opts.Strategy, "attempt", attempt)
 		}
 	}
-	return result
 }
 
 // RouteOptions configures the routing recommendation request.
 type RouteOptions struct {
-	Session      string         // Required: session name
-	AgentType    string         // Optional: filter by agent type (claude/cc, codex/cod, gemini/gmi)
-	Strategy     StrategyName   // Optional: routing strategy (default: least-loaded)
-	ExcludePanes []int          // Optional: pane indices to exclude
-	Prompt       string         // Optional: prompt for affinity matching
-	LastAgent    string         // Optional: last used agent pane ID for sticky routing
-	Config       *config.Config // Optional: loaded routing configuration
-	NoPersist    bool           // Optional: preview only — never advance persisted routing state (e.g. send --dry-run)
+	Session        string         // Required: session name
+	AgentType      string         // Optional: filter by agent type (claude/cc, codex/cod, gemini/gmi)
+	Strategy       StrategyName   // Optional: routing strategy (default: least-loaded)
+	ExcludePanes   []int          // Optional: explicit pane indices to exclude
+	ExcludePaneIDs []string       // Optional: physical pane IDs excluded by automatic filters
+	Prompt         string         // Optional: prompt for affinity matching
+	LastAgent      string         // Optional: last used agent pane ID for sticky routing
+	Config         *config.Config // Optional: loaded routing configuration
+	NoPersist      bool           // Optional: preview only — never advance persisted routing state (e.g. send --dry-run)
 }
 
 // RouteOutput is the structured output for --robot-route.
@@ -192,6 +254,10 @@ type RouteRecommendation struct {
 	Reason       string  `json:"reason"`
 	ContextUsage float64 `json:"context_usage"`
 	State        string  `json:"state"`
+	// ReservationWarning names files in the routed message that other agents
+	// hold live Agent Mail reservations for; absent when there are none or
+	// reservations are not wired (affinity off).
+	ReservationWarning *ReservationWarning `json:"reservation_warning,omitempty"`
 }
 
 // RouteCandidate represents an agent that was considered for routing.
@@ -204,6 +270,10 @@ type RouteCandidate struct {
 	State        string  `json:"state"`
 	StateScore   float64 `json:"state_score"`
 	RecencyScore float64 `json:"recency_score"`
+	// AffinityMatch is the fraction (0-1) of files named in the routed
+	// message that this agent holds live Agent Mail reservations for;
+	// absent when the agent holds none (or reservations are not wired).
+	AffinityMatch float64 `json:"affinity_match,omitempty"`
 }
 
 // RouteExcluded represents an agent that was excluded from routing.
@@ -256,6 +326,14 @@ func GetRoute(opts RouteOptions) (*RouteOutput, int) {
 		)
 		return output, 1
 	}
+	if err := validateRoutePrompt(opts); err != nil {
+		output.RobotResponse = NewErrorResponse(
+			err,
+			ErrCodeInvalidArgs,
+			"Pass the message being routed: ntm --robot-route=SESSION --strategy=affinity --msg='...' (or --msg-file)",
+		)
+		return output, 1
+	}
 
 	// Check session exists
 	if !tmux.SessionExists(opts.Session) {
@@ -281,9 +359,10 @@ func GetRoute(opts RouteOptions) (*RouteOutput, int) {
 	contextUsage := getContextUsageByPane(opts.Session)
 
 	// Create scorer and score agents. Reservation affinity is wired
-	// best-effort from Agent Mail when enabled (bd-ws2-wire-or-delete-ykmcz.3).
+	// best-effort from Agent Mail when enabled or when the affinity strategy
+	// asks for it (bd-ws2-wire-or-delete-ykmcz.3).
 	scorer := NewAgentScorerFromConfig(opts.Config)
-	scorer.wireReservationAffinity(opts.Config, opts.Session)
+	scorer.wireReservationAffinity(opts.Config, opts.Session, opts.Strategy)
 	var agents []ScoredAgent
 
 	for _, pane := range panes {
@@ -300,6 +379,7 @@ func GetRoute(opts RouteOptions) (*RouteOutput, int) {
 		// Get activity state
 		classifier := scorer.monitor.GetOrCreate(pane.ID)
 		classifier.SetAgentType(agentType)
+		classifier.setPaneDimensions(pane.Width, pane.Height)
 		activity, err := classifier.Classify()
 		if err != nil {
 			// Add to excluded with error
@@ -332,8 +412,8 @@ func GetRoute(opts RouteOptions) (*RouteOutput, int) {
 	}
 
 	// Apply pane exclusions from options
-	if len(opts.ExcludePanes) > 0 {
-		agents = ExcludePanes(agents, opts.ExcludePanes)
+	if len(opts.ExcludePanes) > 0 || len(opts.ExcludePaneIDs) > 0 {
+		agents = ExcludePanes(agents, opts.ExcludePanes, opts.ExcludePaneIDs)
 	}
 
 	// Build candidates and excluded lists
@@ -348,14 +428,15 @@ func GetRoute(opts RouteOptions) (*RouteOutput, int) {
 			})
 		} else {
 			output.Candidates = append(output.Candidates, RouteCandidate{
-				PaneID:       agent.PaneID,
-				PaneIndex:    agent.PaneIndex,
-				AgentType:    agent.AgentType,
-				Score:        agent.Score,
-				ContextUsage: agent.ContextUsage,
-				State:        string(agent.State),
-				StateScore:   agent.ScoreDetail.StateScore,
-				RecencyScore: agent.ScoreDetail.RecencyScore,
+				PaneID:        agent.PaneID,
+				PaneIndex:     agent.PaneIndex,
+				AgentType:     agent.AgentType,
+				Score:         agent.Score,
+				ContextUsage:  agent.ContextUsage,
+				State:         string(agent.State),
+				StateScore:    agent.ScoreDetail.StateScore,
+				RecencyScore:  agent.ScoreDetail.RecencyScore,
+				AffinityMatch: agent.ScoreDetail.AffinityMatch,
 			})
 		}
 	}
@@ -376,13 +457,14 @@ func GetRoute(opts RouteOptions) (*RouteOutput, int) {
 
 	if result.Selected != nil {
 		output.Recommendation = &RouteRecommendation{
-			PaneID:       result.Selected.PaneID,
-			PaneIndex:    result.Selected.PaneIndex,
-			AgentType:    result.Selected.AgentType,
-			Score:        result.Selected.Score,
-			Reason:       result.Reason,
-			ContextUsage: result.Selected.ContextUsage,
-			State:        string(result.Selected.State),
+			PaneID:             result.Selected.PaneID,
+			PaneIndex:          result.Selected.PaneIndex,
+			AgentType:          result.Selected.AgentType,
+			Score:              result.Selected.Score,
+			Reason:             result.Reason,
+			ContextUsage:       result.Selected.ContextUsage,
+			State:              string(result.Selected.State),
+			ReservationWarning: routeReservationWarning(scorer, opts.Prompt, result.Selected.PaneID),
 		}
 	}
 
@@ -428,10 +510,10 @@ func generateRouteHints(opts RouteOptions, output RouteOutput) *RouteAgentHints 
 
 	if output.Recommendation != nil {
 		rec := output.Recommendation
-		hints.Summary = fmt.Sprintf("Route to %s (pane %d) with score %.1f - %s",
-			rec.AgentType, rec.PaneIndex, rec.Score, rec.State)
-		hints.SendCommand = fmt.Sprintf("ntm --robot-send=%s --panes=%d --msg='YOUR_MESSAGE'",
-			opts.Session, rec.PaneIndex)
+		hints.Summary = fmt.Sprintf("Route to %s (pane %s) with score %.1f - %s",
+			rec.AgentType, rec.PaneID, rec.Score, rec.State)
+		hints.SendCommand = fmt.Sprintf("ntm --robot-send=%s --panes=%s --msg='YOUR_MESSAGE'",
+			opts.Session, rec.PaneID)
 	} else if len(output.Candidates) == 0 {
 		hints.Summary = "No agents available for routing"
 		if len(output.Excluded) > 0 {
@@ -443,11 +525,34 @@ func generateRouteHints(opts RouteOptions, output RouteOutput) *RouteAgentHints 
 		hints.Summary = fmt.Sprintf("%d candidates available, but strategy returned no selection", len(output.Candidates))
 	}
 
+	if rec := output.Recommendation; rec != nil && rec.ReservationWarning != nil {
+		hints.Suggestions = append(hints.Suggestions, fmt.Sprintf(
+			"%s: %s reserved by %s - coordinate through Agent Mail before sending, or route to the holder",
+			rec.ReservationWarning.Message, strings.Join(rec.ReservationWarning.Paths, ", "),
+			strings.Join(rec.ReservationWarning.Holders, ", ")))
+	}
+
 	if output.FallbackUsed {
-		hints.Suggestions = append(hints.Suggestions, "Primary strategy failed - fallback was used")
+		if opts.Strategy == StrategyAffinity {
+			hints.Suggestions = append(hints.Suggestions, "No available agent holds Agent Mail reservations for files named in the message - least-loaded fallback was used (affinity needs [agent_mail] enabled=true and a session agent registry)")
+		} else {
+			hints.Suggestions = append(hints.Suggestions, "Primary strategy failed - fallback was used")
+		}
 	}
 
 	return hints
+}
+
+// validateRoutePrompt rejects an affinity route without the message being
+// routed. Affinity matches the files a message names against Agent Mail
+// reservations, so with no message it could only ever fall back to
+// least-loaded — a request that cannot mean what it says fails instead of
+// quietly answering a different question.
+func validateRoutePrompt(opts RouteOptions) error {
+	if opts.Strategy == StrategyAffinity && strings.TrimSpace(opts.Prompt) == "" {
+		return fmt.Errorf("strategy %q needs the message being routed: it matches the files the message names against Agent Mail reservations", StrategyAffinity)
+	}
+	return nil
 }
 
 // strategyNames returns list of valid strategy names as strings.
@@ -497,6 +602,9 @@ func GetRouteRecommendation(opts RouteOptions) (*RouteRecommendation, error) {
 	if !IsValidStrategy(opts.Strategy) {
 		return nil, fmt.Errorf("invalid strategy: %s", opts.Strategy)
 	}
+	if err := validateRoutePrompt(opts); err != nil {
+		return nil, err
+	}
 
 	// Check session exists
 	if !tmux.SessionExists(opts.Session) {
@@ -512,10 +620,11 @@ func GetRouteRecommendation(opts RouteOptions) (*RouteRecommendation, error) {
 	contextUsage := getContextUsageByPane(opts.Session)
 
 	// Create scorer and score agents. Reservation affinity is wired
-	// best-effort from Agent Mail when enabled (bd-ws2-wire-or-delete-ykmcz.3)
-	// — this is the send path, so the bonus influences real dispatch.
+	// best-effort from Agent Mail when enabled or when the affinity strategy
+	// asks for it (bd-ws2-wire-or-delete-ykmcz.3) — this is the send path, so
+	// the signal influences real dispatch.
 	scorer := NewAgentScorerFromConfig(opts.Config)
-	scorer.wireReservationAffinity(opts.Config, opts.Session)
+	scorer.wireReservationAffinity(opts.Config, opts.Session, opts.Strategy)
 	var agents []ScoredAgent
 
 	for _, pane := range panes {
@@ -532,6 +641,7 @@ func GetRouteRecommendation(opts RouteOptions) (*RouteRecommendation, error) {
 		// Get activity state
 		classifier := scorer.monitor.GetOrCreate(pane.ID)
 		classifier.SetAgentType(agentType)
+		classifier.setPaneDimensions(pane.Width, pane.Height)
 		activity, err := classifier.Classify()
 		if err != nil {
 			continue // Skip agents that can't be classified
@@ -557,8 +667,8 @@ func GetRouteRecommendation(opts RouteOptions) (*RouteRecommendation, error) {
 	}
 
 	// Apply pane exclusions from options
-	if len(opts.ExcludePanes) > 0 {
-		agents = ExcludePanes(agents, opts.ExcludePanes)
+	if len(opts.ExcludePanes) > 0 || len(opts.ExcludePaneIDs) > 0 {
+		agents = ExcludePanes(agents, opts.ExcludePanes, opts.ExcludePaneIDs)
 	}
 
 	// Route with persisted per-session state, ADVANCING it on selection: this
@@ -577,12 +687,27 @@ func GetRouteRecommendation(opts RouteOptions) (*RouteRecommendation, error) {
 	}
 
 	return &RouteRecommendation{
-		PaneID:       result.Selected.PaneID,
-		PaneIndex:    result.Selected.PaneIndex,
-		AgentType:    result.Selected.AgentType,
-		Score:        result.Selected.Score,
-		Reason:       result.Reason,
-		ContextUsage: result.Selected.ContextUsage,
-		State:        string(result.Selected.State),
+		PaneID:             result.Selected.PaneID,
+		PaneIndex:          result.Selected.PaneIndex,
+		AgentType:          result.Selected.AgentType,
+		Score:              result.Selected.Score,
+		Reason:             result.Reason,
+		ContextUsage:       result.Selected.ContextUsage,
+		State:              string(result.Selected.State),
+		ReservationWarning: routeReservationWarning(scorer, opts.Prompt, result.Selected.PaneID),
 	}, nil
+}
+
+// routeReservationWarning reports Agent Mail reservations that other agents
+// hold on files the routed message names, so a caller sees that the pick
+// would edit someone else's reserved files. It is nil when the selected
+// agent is the only holder, and whenever the reservation cache was not wired
+// (wireReservationAffinity: affinity enabled or the affinity strategy).
+func routeReservationWarning(scorer *AgentScorer, prompt, paneID string) *ReservationWarning {
+	w := scorer.CheckReservationWarning(prompt, paneID)
+	if w == nil || (w.SelectedHas && len(w.Holders) == 1) {
+		return nil
+	}
+	sort.Strings(w.Holders) // collected from a map
+	return w
 }

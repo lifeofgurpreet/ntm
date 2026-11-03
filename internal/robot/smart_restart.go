@@ -302,6 +302,10 @@ func GetSmartRestart(ctx context.Context, opts SmartRestartOptions) (*SmartResta
 		output.RobotResponse = NewErrorResponse(err, ErrCodeTimeout, "Retry after the cancellation or timeout condition clears")
 		return output, nil
 	}
+	if err := requireLocalAgentProcessOperations(); err != nil {
+		output.RobotResponse = NewErrorResponse(err, ErrCodeInvalidFlag, remoteAgentProcessOperationsHint)
+		return output, nil
+	}
 
 	// Step 1: Pre-check all panes using IsWorking
 	isWorkingOpts := IsWorkingOptions{
@@ -869,6 +873,10 @@ func executeRestart(ctx context.Context, session string, win, pane int, agentTyp
 	if err := ctx.Err(); err != nil {
 		return seq, err
 	}
+	if err := requireLocalAgentProcessOperations(); err != nil {
+		return seq, newRestartError(ErrCodeInvalidFlag, err.Error(), "preflight", pane, agentType, nil, "").
+			WithRecoveryHint(remoteAgentProcessOperationsHint)
+	}
 	if err := agent.AgentType(agentType).ValidateAutomatedRelaunch(); err != nil {
 		return seq, newRestartError(
 			ErrCodeNotImplemented,
@@ -923,7 +931,7 @@ func executeRestart(ctx context.Context, session string, win, pane int, agentTyp
 					agentType,
 					attemptedActions,
 					"",
-				).WithRecoveryHint(fmt.Sprintf("Try ntm --robot-smart-restart=%s --panes=%d --hard-kill to use kill -9 fallback", session, pane))
+				).WithRecoveryHint(fmt.Sprintf("Try ntm --robot-smart-restart=%s --panes=%d.%d --hard-kill to use kill -9 fallback", session, win, pane))
 				return seq, structErr
 			}
 		}
@@ -958,7 +966,7 @@ func executeRestart(ctx context.Context, session string, win, pane int, agentTyp
 					agentType,
 					attemptedActions,
 					lastOutput,
-				).WithRecoveryHint(fmt.Sprintf("Try ntm --robot-smart-restart=%s --panes=%d --hard-kill, or manually kill the process", session, pane))
+				).WithRecoveryHint(fmt.Sprintf("Try ntm --robot-smart-restart=%s --panes=%d.%d --hard-kill, or manually kill the process", session, win, pane))
 				return seq, structErr
 			}
 			softExitFailed = true
@@ -1064,7 +1072,7 @@ func executeRestart(ctx context.Context, session string, win, pane int, agentTyp
 			observeSmartRestartLaunchAfterCancellation(ctx, session, win, pane, agentType, target, executor, seq)
 			return seq, cancelErr
 		}
-		shellPID = 0 // ready-gate falls back to content-only detection
+		shellPID = 0 // the ready gate refuses readiness without a verified pane root
 	} else if shellPID > 0 {
 		seq.ShellPID = shellPID
 		processAlive := executor.hasChildAlive(shellPID)
@@ -1105,13 +1113,7 @@ func executeRestart(ctx context.Context, session string, win, pane int, agentTyp
 	// Step 6: Send the optional prompt through the shared dispatch application
 	// service. PromptSent is only true after the service returns one delivered
 	// receipt for this exact physical pane.
-	seq.AgentLaunched = true
-	seq.AgentLaunchStatus = SmartRestartLaunchReady
-	if shellPID > 0 {
-		seq.ShellPID = shellPID
-		processAlive := executor.hasChildAlive(shellPID)
-		seq.ProcessAlive = &processAlive
-	}
+	updateSmartRestartLaunchObservation(seq, executor, shellPID, true)
 	if opts.Prompt != "" {
 		attemptedActions = append(attemptedActions, "send-prompt")
 		promptOutcome, promptErr := dispatchSmartRestartPrompt(
@@ -1199,7 +1201,9 @@ func updateSmartRestartLaunchObservation(
 		return
 	}
 	seq.ShellPID = shellPID
-	processAlive := executor.hasChildAlive(shellPID)
+	// Readiness already proves a running foreground process, including an
+	// agent that execs over the pane root and therefore has no child process.
+	processAlive := ready || executor.hasChildAlive(shellPID)
 	seq.ProcessAlive = &processAlive
 	if !ready && !processAlive {
 		seq.AgentLaunchStatus = SmartRestartLaunchNotReady
@@ -1476,6 +1480,7 @@ func restartCanonicalAgentType(agentType string) agent.AgentType {
 		agent.AgentTypeWindsurf,
 		agent.AgentTypeAider,
 		agent.AgentTypeOpencode,
+		agent.AgentTypeOmp,
 		agent.AgentTypeOllama,
 		agent.AgentTypeUser,
 		agent.AgentTypeUnknown:
@@ -1492,6 +1497,10 @@ func restartLaunchAlias(agentType string) string {
 		// the official autonomous approval flag, matching the phase-1 spawn
 		// template (GH#251 phase 2).
 		return "grok --always-approve"
+	case agent.AgentTypeOmp:
+		// Relaunch omp with its skip-approval flag, matching the spawn
+		// default; omp picks its own default model.
+		return "omp --auto-approve"
 	case "", agent.AgentTypeUnknown:
 		return string(agent.AgentTypeClaudeCode)
 	default:

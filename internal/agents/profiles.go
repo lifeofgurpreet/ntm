@@ -61,9 +61,22 @@ type Preferences struct {
 // Performance tracks historical performance metrics for an agent.
 type Performance struct {
 	AvgCompletionTime time.Duration `json:"avg_completion_time"`
-	SuccessRate       float64       `json:"success_rate"` // 0.0 to 1.0
-	TasksCompleted    int           `json:"tasks_completed"`
-	LastUpdated       time.Time     `json:"last_updated"`
+	// SuccessRate is the seeded routing prior until ApplyObservedPerformance
+	// replaces it with the observed completed/(completed+failed) ratio of
+	// recorded assignment outcomes. Callers must not present it as observed
+	// performance without checking Measured first — `ntm agents profile`
+	// once printed "Tasks Completed: 0" directly above "Success Rate: 90.0%".
+	SuccessRate    float64 `json:"success_rate"` // 0.0 to 1.0
+	TasksCompleted int     `json:"tasks_completed"`
+	// LastUpdated is the latest recorded outcome; zero when none.
+	LastUpdated time.Time `json:"last_updated"`
+}
+
+// Measured reports whether any real task outcome has been recorded for this
+// profile. While false, SuccessRate and AvgCompletionTime are seeded defaults
+// and must not be displayed as statistics.
+func (p Performance) Measured() bool {
+	return p.TasksCompleted > 0 || !p.LastUpdated.IsZero()
 }
 
 // ProfileMatcher matches tasks to the best available agents based on capabilities.
@@ -296,7 +309,9 @@ func (pm *ProfileMatcher) ScoreAssignment(agentType AgentType, task TaskInfo) Sc
 	result.LabelMatchScore = labelScore
 	score *= labelScore
 
-	// 5. Historical performance bonus
+	// 5. Performance. Observed task outcomes when ApplyObservedPerformance
+	// supplied them; otherwise the seeded SuccessRate, where (0.9 for claude,
+	// 0.85 elsewhere) neither branch fires.
 	if profile.Performance.SuccessRate > 0.9 {
 		score *= 1.1
 		result.PerformanceBonus = 0.1
@@ -494,6 +509,22 @@ func (pm *ProfileMatcher) RecommendAgent(task TaskInfo) (AgentType, ScoreResult)
 	return bestAgent, bestResult
 }
 
+// ApplyObservedPerformance replaces each profile's seeded performance prior
+// with the observed task outcomes of the agent types that have any, so
+// statistics and the ScoreAssignment performance bonus read real history.
+func (pm *ProfileMatcher) ApplyObservedPerformance(observed map[AgentType]Performance) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	for agentType, perf := range observed {
+		if !perf.Measured() {
+			continue
+		}
+		if profile, ok := pm.profiles[agentType]; ok {
+			profile.Performance = perf
+		}
+	}
+}
+
 // GetPerformanceStats returns performance statistics for all agents.
 func (pm *ProfileMatcher) GetPerformanceStats() map[AgentType]Performance {
 	pm.mu.RLock()
@@ -512,7 +543,7 @@ func NormalizeAgentType(t string) string {
 	switch normalized {
 	case "opus", "sonnet", "haiku":
 		return "claude"
-	case "gpt", "gpt-5", "gpt-5.5", "gpt-5.6-sol", "gpt-5-codex", "gpt-5.3-codex":
+	case "gpt", "gpt-5", "gpt-5.5", "gpt-5.6-sol", "gpt-6-astra", "gpt-5-codex", "gpt-5.3-codex":
 		return "codex"
 	case "gemini-pro", "gemini-ultra", "gemini-3-pro-preview":
 		return "gemini"
@@ -527,6 +558,8 @@ func NormalizeAgentType(t string) string {
 		return "gemini"
 	case agentpkg.AgentTypeAntigravity:
 		return "antigravity"
+	case agentpkg.AgentTypeOmp:
+		return "omp"
 	case agentpkg.AgentTypeCursor:
 		return "cursor"
 	case agentpkg.AgentTypeWindsurf:

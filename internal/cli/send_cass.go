@@ -21,18 +21,6 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 )
 
-func init() {
-	// G2 config-key liveness claims (bd-ws2-wire-or-delete-ykmcz.11): the
-	// send-scoped [cass.context] keys are read here for both send surfaces.
-	config.RegisterReader("cass.context.enabled", robotSendCASSOptions)
-	config.RegisterReader("cass.context.max_sessions", robotSendCASSOptions)
-	config.RegisterReader("cass.context.lookback_days", robotSendCASSOptions)
-	config.RegisterReader("cass.context.max_tokens", robotSendCASSOptions)
-	config.RegisterReader("cass.context.min_relevance", robotSendCASSOptions)
-	config.RegisterReader("cass.context.skip_if_context_above", robotSendCASSOptions)
-	config.RegisterReader("cass.context.prefer_same_project", robotSendCASSOptions)
-}
-
 // resolveSendCASSEnabled applies the shared flag/config precedence:
 // --no-cass > --with-cass > [cass] enabled && [cass.context] enabled.
 func resolveSendCASSEnabled(withFlag, noFlag bool, cfg *config.Config) bool {
@@ -92,6 +80,21 @@ func robotSendCASSOptions(withFlag, noFlag bool, cfg *config.Config) (bool, *rob
 	return enabled, &query, &filter, &inject
 }
 
+// resolvePromptContextOptions resolves --with-cass / --no-cass / --with-memory
+// against cfg exactly as --robot-send does, for the assignment surfaces that
+// enrich prompts through robot.EnrichAssignmentPrompt (`ntm assign`,
+// `--robot-bulk-assign`, and the session coordinator's auto-assign, which
+// passes no flags and so follows [cass.context] enabled and [memory]
+// send_injection).
+func resolvePromptContextOptions(withCASS, noCASS, withMemory bool, cfg *config.Config) robot.PromptContextOptions {
+	cassEnabled, cassQuery, cassFilter, cassInject := robotSendCASSOptions(withCASS, noCASS, cfg)
+	memoryEnabled, memoryInject := robotSendMemoryOptions(withMemory, cfg)
+	return robot.PromptContextOptions{
+		WithCASS: cassEnabled, CASSConfig: cassQuery, FilterConfig: cassFilter, InjectConfig: cassInject,
+		WithMemory: memoryEnabled, MemoryInject: memoryInject,
+	}
+}
+
 // sendCASSInjectionConfigs resolves the cobra `ntm send` CASS injection state
 // and internal/cass engine parameters from the same flag/config precedence.
 func sendCASSInjectionConfigs(withFlag, noFlag bool, cfg *config.Config) (bool, cass.CASSConfig, cass.FilterConfig, cass.InjectConfig) {
@@ -117,6 +120,9 @@ func sendCASSInjectionConfigs(withFlag, noFlag bool, cfg *config.Config) (bool, 
 	query.Enabled = cfg.CASS.Enabled
 	if cfg.CASS.BinaryPath != "" {
 		query.BinaryPath = cfg.CASS.BinaryPath
+	}
+	if cfg.CASS.Timeout > 0 {
+		query.Timeout = time.Duration(cfg.CASS.Timeout) * time.Second
 	}
 
 	cc := cfg.CASS.Context
@@ -162,7 +168,7 @@ func sendCASSInjectionInfo(result cass.InjectionResult, query string, hits []cas
 	}
 	now := time.Now()
 	for _, hit := range hits {
-		sessionDate := cass.ExtractSessionDate(hit.SourcePath)
+		sessionDate := hit.SessionDate()
 		ageDays := 0
 		if !sessionDate.IsZero() {
 			ageDays = int(now.Sub(sessionDate).Hours() / 24)

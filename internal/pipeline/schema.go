@@ -48,8 +48,9 @@ type Workflow struct {
 	// Step definitions
 	Steps []Step `yaml:"steps" toml:"steps" json:"steps"`
 
-	// PostPipelineSteps run after the main step graph completes successfully.
-	// Failures here are reported but don't retroactively fail the pipeline.
+	// PostPipelineSteps run after the main graph succeeds or fails, unless
+	// cancelled. Resume adopts completed hooks when continuing a partial tail,
+	// and runs a fresh tail if main work reopens. Hook failures are advisory.
 	PostPipelineSteps []Step `yaml:"post_pipeline_steps,omitempty" toml:"post_pipeline_steps,omitempty" json:"post_pipeline_steps,omitempty"`
 }
 
@@ -235,29 +236,36 @@ type LimitsConfig struct {
 	MaxCommandStdoutBytes int64 `yaml:"max_command_stdout_bytes,omitempty" toml:"max_command_stdout_bytes,omitempty" json:"max_command_stdout_bytes,omitempty"`
 	MaxCommandStderrBytes int64 `yaml:"max_command_stderr_bytes,omitempty" toml:"max_command_stderr_bytes,omitempty" json:"max_command_stderr_bytes,omitempty"`
 	MaxCommandStdinBytes  int64 `yaml:"max_command_stdin_bytes,omitempty" toml:"max_command_stdin_bytes,omitempty" json:"max_command_stdin_bytes,omitempty"`
-	MaxForeachRounds      int   `yaml:"max_foreach_rounds,omitempty" toml:"max_foreach_rounds,omitempty" json:"max_foreach_rounds,omitempty"`
-	SubstepParallelMax    int   `yaml:"substep_parallel_max,omitempty" toml:"substep_parallel_max,omitempty" json:"substep_parallel_max,omitempty"`
+	// MaxSelectorOutputBytesTotal bounds retained selector output plus full
+	// stdout reservations for active or unresolved selector commands. This
+	// limits the command-evaluation journal, not the entire checkpoint.
+	MaxSelectorOutputBytesTotal int64 `yaml:"max_selector_output_bytes_total,omitempty" toml:"max_selector_output_bytes_total,omitempty" json:"max_selector_output_bytes_total,omitempty"`
+	MaxForeachRounds            int   `yaml:"max_foreach_rounds,omitempty" toml:"max_foreach_rounds,omitempty" json:"max_foreach_rounds,omitempty"`
+	SubstepParallelMax          int   `yaml:"substep_parallel_max,omitempty" toml:"substep_parallel_max,omitempty" json:"substep_parallel_max,omitempty"`
 	// MaxParallelSteps bounds how many simultaneously-ready independent
 	// top-level steps the executor dispatches concurrently (bd-jio7h).
 	// Zero/unset means DefaultMaxParallelSteps; 1 forces the legacy serial
 	// scheduling.
-	MaxParallelSteps     int   `yaml:"max_parallel_steps,omitempty" toml:"max_parallel_steps,omitempty" json:"max_parallel_steps,omitempty"`
-	MaxTemplateBytes     int64 `yaml:"max_template_bytes,omitempty" toml:"max_template_bytes,omitempty" json:"max_template_bytes,omitempty"`
-	MaxStepCountTotal    int   `yaml:"max_step_count_total,omitempty" toml:"max_step_count_total,omitempty" json:"max_step_count_total,omitempty"`
-	MaxSubstitutionDepth int   `yaml:"max_substitution_recursion,omitempty" toml:"max_substitution_recursion,omitempty" json:"max_substitution_recursion,omitempty"`
+	MaxParallelSteps         int   `yaml:"max_parallel_steps,omitempty" toml:"max_parallel_steps,omitempty" json:"max_parallel_steps,omitempty"`
+	MaxTemplateBytes         int64 `yaml:"max_template_bytes,omitempty" toml:"max_template_bytes,omitempty" json:"max_template_bytes,omitempty"`
+	MaxStepCountTotal        int   `yaml:"max_step_count_total,omitempty" toml:"max_step_count_total,omitempty" json:"max_step_count_total,omitempty"`
+	MaxMaterializedStepNodes int   `yaml:"max_materialized_step_nodes,omitempty" toml:"max_materialized_step_nodes,omitempty" json:"max_materialized_step_nodes,omitempty"`
+	MaxSubstitutionDepth     int   `yaml:"max_substitution_recursion,omitempty" toml:"max_substitution_recursion,omitempty" json:"max_substitution_recursion,omitempty"`
 }
 
 const (
-	DefaultMaxForeachIterations  = 10000
-	DefaultMaxConcurrentForeach  = 16
-	DefaultMaxCommandStdoutBytes = 16 * 1024 * 1024 // 16 MB
-	DefaultMaxCommandStderrBytes = 4 * 1024 * 1024  // 4 MB
-	DefaultMaxCommandStdinBytes  = 1 * 1024 * 1024  // 1 MB (bd-1ka2t)
-	DefaultSubstepParallelMax    = 8                // bd-dmjn3
-	DefaultMaxParallelSteps      = 4                // bd-jio7h
-	DefaultMaxTemplateBytes      = 256 * 1024       // 256 KB
-	DefaultMaxStepCountTotal     = 100000
-	DefaultMaxSubstitutionDepth  = 8
+	DefaultMaxForeachIterations        = 10000
+	DefaultMaxConcurrentForeach        = 16
+	DefaultMaxCommandStdoutBytes       = 16 * 1024 * 1024 // 16 MB
+	DefaultMaxCommandStderrBytes       = 4 * 1024 * 1024  // 4 MB
+	DefaultMaxCommandStdinBytes        = 1 * 1024 * 1024  // 1 MB (bd-1ka2t)
+	DefaultMaxSelectorOutputBytesTotal = 32 * 1024 * 1024 // 32 MiB of retained output and reservations
+	DefaultSubstepParallelMax          = 8                // bd-dmjn3
+	DefaultMaxParallelSteps            = 4                // bd-jio7h
+	DefaultMaxTemplateBytes            = 256 * 1024       // 256 KB
+	DefaultMaxStepCountTotal           = 100000
+	DefaultMaxMaterializedStepNodes    = 100000
+	DefaultMaxSubstitutionDepth        = 8
 )
 
 // EffectiveLimits returns the limits config with defaults applied for zero values.
@@ -277,6 +285,9 @@ func (lc LimitsConfig) EffectiveLimits() LimitsConfig {
 	if lc.MaxCommandStdinBytes <= 0 {
 		lc.MaxCommandStdinBytes = DefaultMaxCommandStdinBytes
 	}
+	if lc.MaxSelectorOutputBytesTotal <= 0 {
+		lc.MaxSelectorOutputBytesTotal = DefaultMaxSelectorOutputBytesTotal
+	}
 	if lc.MaxForeachRounds <= 0 {
 		lc.MaxForeachRounds = DefaultMaxRounds
 	}
@@ -291,6 +302,9 @@ func (lc LimitsConfig) EffectiveLimits() LimitsConfig {
 	}
 	if lc.MaxStepCountTotal <= 0 {
 		lc.MaxStepCountTotal = DefaultMaxStepCountTotal
+	}
+	if lc.MaxMaterializedStepNodes <= 0 {
+		lc.MaxMaterializedStepNodes = DefaultMaxMaterializedStepNodes
 	}
 	if lc.MaxSubstitutionDepth <= 0 {
 		lc.MaxSubstitutionDepth = DefaultMaxSubstitutionDepth
@@ -1308,6 +1322,13 @@ const (
 	SkipKindForeachBreak     SkipKind = "foreach_loop_control_break_after"
 	SkipKindCancelled        SkipKind = "cancelled"
 	SkipKindLimit            SkipKind = "resource_limit_exceeded"
+	// SkipKindCancelledBeforeDispatch is positive scheduler evidence that a
+	// cancelled child never entered its executor. Unlike generic cancellation,
+	// this permits ordinary resume when no attempts or launch evidence conflict.
+	SkipKindCancelledBeforeDispatch SkipKind = "cancelled_before_dispatch"
+	// Admission denied before entering execution is affirmative no-launch
+	// evidence, distinct from historic generic resource-limit failures.
+	SkipKindAdmissionDenied SkipKind = "admission_denied"
 	// SkipKindResumeAlreadyCompleted marks a foreach iteration that was
 	// fully completed in a prior run and is being skipped on resume to
 	// avoid duplicating side effects (bd-qeatk).
@@ -1316,6 +1337,11 @@ const (
 	// StatusSkipped by on_failure setting a runtime variable (bd-2ytru).
 	// Distinguishes user-driven recovery from unclassified skips.
 	SkipKindOnFailureAction SkipKind = "on_failure_action"
+	// SkipKindPaneBusy marks a step that was NOT dispatched because another
+	// ntm process held the target pane for the whole wait budget (ntm#324).
+	// It is deliberately distinct from cancelled: nothing was pasted and no
+	// prompt was queued, so the step is safe to re-run once the pane frees.
+	SkipKindPaneBusy SkipKind = "pane_busy_other_process"
 )
 
 // StepResult contains the result of executing a step
@@ -1354,27 +1380,36 @@ type StepError struct {
 
 // ExecutionState contains the complete state of a workflow execution
 type ExecutionState struct {
-	RunID        string                 `json:"run_id"`
-	WorkflowID   string                 `json:"workflow_id"`
-	WorkflowFile string                 `json:"workflow_file,omitempty"`
-	Session      string                 `json:"session,omitempty"`
-	Status       ExecutionStatus        `json:"status"`
-	StartedAt    time.Time              `json:"started_at"`
-	UpdatedAt    time.Time              `json:"updated_at"`
-	FinishedAt   time.Time              `json:"finished_at,omitempty"`
-	CancelledAt  *time.Time             `json:"cancelled_at,omitempty"`
-	CurrentStep  string                 `json:"current_step,omitempty"`
-	Steps        map[string]StepResult  `json:"steps"`
-	Variables    map[string]interface{} `json:"variables"` // Runtime variables including step outputs
-	Errors       []ExecutionError       `json:"errors,omitempty"`
+	RunID          string                 `json:"run_id"`
+	WorkflowID     string                 `json:"workflow_id"`
+	WorkflowFile   string                 `json:"workflow_file,omitempty"`
+	Session        string                 `json:"session,omitempty"`
+	Status         ExecutionStatus        `json:"status"`
+	StartedAt      time.Time              `json:"started_at"`
+	UpdatedAt      time.Time              `json:"updated_at"`
+	FinishedAt     time.Time              `json:"finished_at,omitempty"`
+	CancelledAt    *time.Time             `json:"cancelled_at,omitempty"`
+	CurrentStep    string                 `json:"current_step,omitempty"`
+	Steps          map[string]StepResult  `json:"steps"`
+	StepAdmissions *StepAdmissionState    `json:"step_admissions,omitempty"`
+	Variables      map[string]interface{} `json:"variables"` // Runtime variables including step outputs
+	Errors         []ExecutionError       `json:"errors,omitempty"`
 
 	// Phase-B resume metadata. This is ntm's internal persisted execution
 	// format and may change between pipeline schema revisions.
-	LastCheckpointAt time.Time                        `json:"last_checkpoint_at,omitempty"`
-	ForeachState     map[string]ForeachIterationState `json:"foreach_state,omitempty"`
-	ParallelState    map[string]ParallelGroupState    `json:"parallel_state,omitempty"`
-	ScopeStack       []ScopeFrame                     `json:"scope_stack,omitempty"`
-	InFlightSteps    map[string]InFlightStepState     `json:"in_flight_steps,omitempty"`
+	LastCheckpointAt   time.Time                         `json:"last_checkpoint_at,omitempty"`
+	ForeachState       map[string]ForeachIterationState  `json:"foreach_state,omitempty"`
+	ParallelState      map[string]ParallelGroupState     `json:"parallel_state,omitempty"`
+	ScopeStack         []ScopeFrame                      `json:"scope_stack,omitempty"`
+	InFlightSteps      map[string]InFlightStepState      `json:"in_flight_steps,omitempty"`
+	AgentDeliveries    map[string]AgentDeliveryState     `json:"agent_deliveries,omitempty"`
+	CommandExecutions  map[string]CommandExecutionState  `json:"command_executions,omitempty"`
+	CommandEvaluations map[string]CommandEvaluationState `json:"command_evaluations,omitempty"`
+	// Version 2 retains successful selector output as well as launch intent.
+	// Earlier journals can lose completion between command exit and admission.
+	CommandEvaluationVersion int                             `json:"command_evaluation_version,omitempty"`
+	MailSends                map[string]MailSendState        `json:"mail_sends,omitempty"`
+	ReservationSteps         map[string]ReservationStepState `json:"reservation_steps,omitempty"`
 
 	// OutputValidation records the post-run check of Workflow.Outputs (bd-3uqce).
 	// nil when the workflow declared no outputs or validation was skipped (e.g.
@@ -1429,6 +1464,8 @@ func NormalizeAgentType(t string) string {
 		return "gemini"
 	case agent.AgentTypeAntigravity:
 		return "antigravity"
+	case agent.AgentTypeOmp:
+		return "omp"
 	case agent.AgentTypeCursor:
 		return "cursor"
 	case agent.AgentTypeWindsurf:
@@ -1446,7 +1483,7 @@ func NormalizeAgentType(t string) string {
 // Case-insensitive: "Claude", "CLAUDE", "claude" are all valid.
 func IsValidAgentType(t string) bool {
 	switch NormalizeAgentType(t) {
-	case "claude", "codex", "gemini", "antigravity", "cursor", "windsurf", "aider", "oc", "ollama":
+	case "claude", "codex", "gemini", "antigravity", "omp", "cursor", "windsurf", "aider", "oc", "ollama":
 		return true
 	default:
 		return false

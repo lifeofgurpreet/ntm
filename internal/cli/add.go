@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -16,17 +15,21 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/agentsession"
 	"github.com/Dicklesworthstone/ntm/internal/checkpoint"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/gemini"
 	"github.com/Dicklesworthstone/ntm/internal/hooks"
-	"github.com/Dicklesworthstone/ntm/internal/integrations/dcg"
 	"github.com/Dicklesworthstone/ntm/internal/output"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/plugins"
+	"github.com/Dicklesworthstone/ntm/internal/policy"
+	"github.com/Dicklesworthstone/ntm/internal/pressure"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
+	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/Dicklesworthstone/ntm/internal/spawnidentity"
 	"github.com/Dicklesworthstone/ntm/internal/swarm"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/webhook"
@@ -41,6 +44,26 @@ type AddOptions struct {
 	CassContextQuery string
 	NoCassContext    bool
 	Prompt           string
+
+	// Outcome, when non-nil, receives what the add ACTUALLY did. A composed
+	// caller (ntm scale) passes emitResult=false, so it sees neither the JSON
+	// response nor the terminal warnings and would otherwise have to assume
+	// every requested pane launched. That assumption is wrong whenever CAAM
+	// seat selection refuses a pool (ntm#319): the add succeeds, having
+	// launched fewer panes than asked for, and a caller that credits the
+	// requested count reports a swarm that does not exist.
+	Outcome *AddOutcome
+}
+
+// AddOutcome is the machine-readable summary of one add.
+type AddOutcome struct {
+	// Added is the number of panes that actually launched.
+	Added int
+	// SeatSkips lists the panes CAAM seat selection refused, with reasons.
+	SeatSkips []output.SeatSkipResponse
+	// Admission is the shared fleet decision, including a refusal before any
+	// panes were added. Composed scale callers retain the same evidence.
+	Admission *pressure.SpawnAdmission
 }
 
 // promptSendFailure distinguishes a requested prompt delivery failure from
@@ -83,7 +106,8 @@ type agentLifecycleFailureResponse struct {
 	AffectedPaneIDs []string `json:"affected_pane_ids"`
 	// AffectedWorktreePaths is present when spawn provisioned one or more
 	// isolated checkouts before a later lifecycle failure.
-	AffectedWorktreePaths []string `json:"affected_worktree_paths,omitempty"`
+	AffectedWorktreePaths []string                 `json:"affected_worktree_paths,omitempty"`
+	Admission             *pressure.SpawnAdmission `json:"admission,omitempty"`
 }
 
 func newAgentLifecycleFailureResponse(
@@ -94,6 +118,11 @@ func newAgentLifecycleFailureResponse(
 	affectedWorktreePaths []string,
 ) agentLifecycleFailureResponse {
 	code := robot.ErrCodeInternalError
+	var admissionErr *robot.SpawnAdmissionError
+	var admission *pressure.SpawnAdmission
+	if errors.As(err, &admissionErr) {
+		admission = admissionErr.Admission
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		code = robot.ErrCodeTimeout
 	} else {
@@ -103,6 +132,8 @@ func newAgentLifecycleFailureResponse(
 			code = robot.ErrCodePromptSendFailed
 		case errors.Is(err, errCLIInvalidInput):
 			code = robot.ErrCodeInvalidFlag
+		case admissionErr != nil:
+			code = admissionErr.ErrorCode
 		}
 	}
 	normalizedPaneIDs := make([]string, 0, len(affectedPaneIDs))
@@ -142,6 +173,7 @@ func newAgentLifecycleFailureResponse(
 		SessionMayExist:       sessionMayExist,
 		AffectedPaneIDs:       normalizedPaneIDs,
 		AffectedWorktreePaths: normalizedWorktreePaths,
+		Admission:             admission,
 	}
 }
 
@@ -197,6 +229,8 @@ func resolveAddAgentCommandTemplate(agentType AgentType, pluginMap map[string]pl
 		// `ntm spawn --oc=N` and `ntm add --oc=N` behave identically and a
 		// model override is honored. See ntm#193.
 		return opencodeCommandOrDefault(cfg.Agents.Opencode), nil, nil
+	case AgentTypeOmp:
+		return config.OmpCommandOrDefault(cfg.Agents.Omp), nil, nil
 	default:
 		if p, ok := pluginMap[string(agentType)]; ok {
 			return p.Command, p.Env, nil
@@ -210,8 +244,8 @@ func resolveAddAgentCommandTemplate(agentType AgentType, pluginMap map[string]pl
 // has no system-prompt flag or env var). --prompt and CASS context now flow
 // through the grok-aware readiness/composer/verify protocol.
 func validateGrokPhaseOneAdd(opts AddOptions) error {
-	for _, spec := range opts.Agents.Flatten() {
-		if spec.Type != AgentTypeGrok {
+	for _, spec := range opts.Agents {
+		if spec.Count <= 0 || spec.Type != AgentTypeGrok {
 			continue
 		}
 		if profile, ok := opts.PersonaMap[spec.Model]; ok && profile != nil {
@@ -340,13 +374,14 @@ func newAddCmd() *cobra.Command {
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeClaude, &agentSpecs), "cc", "Claude agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeCodex, &agentSpecs), "cod", "Codex agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGemini, &agentSpecs), "gmi", "Gemini agents (N or N:model)")
-	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAntigravity, &agentSpecs), "agy", "Antigravity (agy) agents (N; model pinned to Gemini 3.7 Flash (High))")
+	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAntigravity, &agentSpecs), "agy", "Antigravity (agy) agents (N; model pinned to Gemini 4 Argon (High))")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGrok, &agentSpecs), "grok", "Grok Build agents (N or N:model[:effort])")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeOllama, &agentSpecs), "ollama", "Ollama agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeCursor, &agentSpecs), "cursor", "Cursor agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeWindsurf, &agentSpecs), "windsurf", "Windsurf agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAider, &agentSpecs), "aider", "Aider agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeOpencode, &agentSpecs), "oc", "Opencode agents (N or N:model)")
+	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeOmp, &agentSpecs), "omp", "Oh My Pi (omp) agents (N or N:model[:effort]; effort maps to omp --thinking)")
 	cmd.Flags().Var(&personaSpecs, "persona", "Persona-defined agents (name or name:count)")
 
 	// Goal label for multi-session support (bd-1933u)
@@ -401,10 +436,31 @@ func runAdd(ctx context.Context, opts AddOptions) error {
 	return executeAdd(ctx, opts, true)
 }
 
+// addAdmissionCounts counts before Flatten allocates one entry per agent. Large
+// rejected requests must reach admission without first allocating that fleet.
+func addAdmissionCounts(specs AgentSpecs) (map[string]int, int, error) {
+	counts := make(map[string]int)
+	total, maxCount := 0, int(^uint(0)>>1)
+	for _, spec := range specs {
+		if spec.Count < 0 || spec.Count > maxCount-total {
+			return nil, 0, markCLIInvalidInput(errors.New("requested agent count exceeds supported pane capacity or is negative"))
+		}
+		if spec.Count == 0 {
+			continue
+		}
+		total += spec.Count
+		counts[string(spec.Type)] += spec.Count
+	}
+	return counts, total, nil
+}
+
 // executeAdd performs the add workflow. Composing commands such as scale pass
 // emitResult=false so the outer command remains the sole owner of terminal
 // JSON output while add still returns the underlying execution error.
 func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
+	if opts.Outcome != nil {
+		*opts.Outcome = AddOutcome{}
+	}
 	session := opts.Session
 	sessionMayExist := false
 	partialMutation := false
@@ -430,7 +486,10 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 	if err := ctx.Err(); err != nil {
 		return outputError(fmt.Errorf("add canceled: %w", err))
 	}
-	totalAgents := opts.Agents.TotalCount()
+	requestedCounts, totalAgents, err := addAdmissionCounts(opts.Agents)
+	if err != nil {
+		return outputError(err)
+	}
 	if err := validateAgentSpecModelOverrides(opts.Agents, opts.PersonaMap); err != nil {
 		return outputError(err)
 	}
@@ -507,6 +566,20 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 		}
 	}
 
+	// Evaluate after pre-add hooks, which may themselves launch work, but
+	// before checkpointing, per-agent expansion, index selection or splitting.
+	// Retain the SAME fence as robot/HTTP spawning through the entire add loop,
+	// including its prompt/readiness work. No per-agent release can authorize
+	// two requests to spend the same remaining slots.
+	releaseAdmission, admission, err := robot.BeginAgentAddition(ctx, session, requestedCounts, cfg)
+	if opts.Outcome != nil {
+		opts.Outcome.Admission = admission
+	}
+	if err != nil {
+		return outputError(err)
+	}
+	defer releaseAdmission()
+
 	if !IsJSONOutput() {
 		fmt.Printf("Adding %d agent(s) to session '%s'...\n", totalAgents, session)
 	}
@@ -541,7 +614,7 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 	// the launch loop, exactly like spawn does (#240). Without this, panes
 	// added to a live session never got an Agent Mail identity, so they could
 	// not send or receive mail and `ntm lock` had no identity to attribute.
-	var addedAgents []spawnedAgentInfo
+	var addedAgents []spawnidentity.Agent
 
 	// Get existing panes to determine next indices
 	panes, err := tmux.GetPanesContext(ctx, session)
@@ -590,7 +663,7 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 
 	// Add agents
 	flatAgents := opts.Agents.Flatten()
-	ccCount, codCount, gmiCount, agyCount, grokCount, ollamaCount, cursorCount, windsurfCount, aiderCount, opencodeCount := 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+	ccCount, codCount, gmiCount, agyCount, grokCount, ollamaCount, cursorCount, windsurfCount, aiderCount, opencodeCount, ompCount := 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 	var rateLimitTracker *ratelimit.RateLimitTracker
 	openAICooldownWaited := false
 	ollamaHost := ""
@@ -617,6 +690,22 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 		ollamaHost = resolveOllamaHost("")
 	}
 
+	// CAAM seat selection (ntm#319). Resolved BEFORE the first pane is split
+	// so a pane whose seat cannot be determined is never created at all —
+	// skipping after the split would leave an empty pane behind. Off by
+	// default; a pinned pane is not offered to the planner, so its pin stands.
+	seatCandidates := make([]caamSeatCandidate, 0, len(flatAgents))
+	for i, agent := range flatAgents {
+		_, pinned := opts.PersonaMap[agent.Model]
+		seatCandidates = append(seatCandidates, caamSeatCandidate{
+			Index:  i,
+			Type:   agent.Type,
+			Pinned: pinned,
+		})
+	}
+	seatPlan := planCAAMSeats(ctx, cfg, dir, seatCandidates)
+	var seatSkips []output.SeatSkipResponse
+
 	// Get pane initialization delay from config (same as spawn command)
 	paneInitDelay := time.Duration(cfg.Tmux.PaneInitDelayMs) * time.Millisecond
 	if flag.Lookup("test.v") != nil {
@@ -627,10 +716,26 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 		}
 	}
 
-	for _, agent := range flatAgents {
+	for agentIdx, agent := range flatAgents {
 		agentTypeStr := string(agent.Type)
 		if err := ctx.Err(); err != nil {
 			return outputError(fmt.Errorf("add canceled before creating %s pane: %w", agentTypeStr, err))
+		}
+
+		// Seat selection refused this pane's pool. Skip the pane — do NOT
+		// create it and do NOT fall through to a static template pin — and
+		// keep placing its siblings, which may be on a provider that answered.
+		if reason, skipped := seatPlan.SkipReason(agentIdx); skipped {
+			decision, _ := seatPlan.For(agentIdx)
+			seatSkips = append(seatSkips, output.SeatSkipResponse{
+				AgentType: agentTypeStr,
+				Provider:  decision.Provider,
+				Reason:    reason,
+			})
+			if !IsJSONOutput() {
+				output.PrintWarningf("%s", caamSeatSkipMessage(agent.Type, reason))
+			}
+			continue
 		}
 
 		paneID, err := tmux.SplitWindowContext(ctx, session, dir)
@@ -685,61 +790,18 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 			aiderCount++
 		case AgentTypeOpencode:
 			opencodeCount++
+		case AgentTypeOmp:
+			ompCount++
 		}
 
-		// Configure Claude hooks for DCG and RCH integrations
+		// Claude Code reads hooks only from settings: the safety policy, dcg
+		// and rch hooks ride on the launch command as --settings.
+		var claudeLaunch policy.ClaudeAgentLaunch
 		if agent.Type == AgentTypeClaude {
-			var preToolHooks []dcg.HookEntry
-			var hookSources []string
-
-			if cfg.Integrations.DCG.Enabled && dcg.ShouldConfigureHooks(cfg.Integrations.DCG.Enabled, cfg.Integrations.DCG.BinaryPath) {
-				dcgOpts := dcg.DCGHookOptions{
-					BinaryPath:      cfg.Integrations.DCG.BinaryPath,
-					AuditLog:        cfg.Integrations.DCG.AuditLog,
-					Timeout:         5,
-					CustomBlocklist: cfg.Integrations.DCG.CustomBlocklist,
-					CustomWhitelist: cfg.Integrations.DCG.CustomWhitelist,
-				}
-				dcgConfig, err := dcg.GenerateHookConfig(dcgOpts)
-				if err == nil {
-					preToolHooks = append(preToolHooks, dcgConfig.Hooks.PreToolUse...)
-					hookSources = append(hookSources, "dcg")
-				} else if !IsJSONOutput() {
-					output.PrintWarningf("Failed to configure DCG hooks for agent %d: %v", num, err)
-				}
-			}
-
-			if dcg.ShouldConfigureRCHHooks(cfg.Integrations.RCH.Enabled, cfg.Integrations.RCH.InterceptPatterns) {
-				rchHook, err := dcg.GenerateRCHHookEntry(dcg.RCHHookOptions{
-					BinaryPath: cfg.Integrations.RCH.BinaryPath,
-					Patterns:   cfg.Integrations.RCH.InterceptPatterns,
-					Timeout:    5,
-				})
-				if err == nil {
-					preToolHooks = append(preToolHooks, rchHook)
-					hookSources = append(hookSources, "rch")
-				} else if !IsJSONOutput() {
-					output.PrintWarningf("Failed to configure RCH hooks for agent %d: %v", num, err)
-				}
-			}
-
-			if len(preToolHooks) > 0 {
-				hookConfig := dcg.ClaudeHookConfig{
-					Hooks: dcg.HooksSection{
-						PreToolUse: preToolHooks,
-					},
-				}
-				hookJSON, err := json.Marshal(hookConfig)
-				if err == nil {
-					if envVars == nil {
-						envVars = make(map[string]string)
-					}
-					envVars["CLAUDE_CODE_HOOKS"] = string(hookJSON)
-					if !IsJSONOutput() {
-						output.PrintInfof("Claude hooks configured for agent %d (%s)", num, strings.Join(hookSources, ", "))
-					}
-				} else if !IsJSONOutput() {
-					output.PrintWarningf("Failed to configure Claude hooks for agent %d: %v", num, err)
+			claudeLaunch = policy.ClaudeAgentLaunchSettings(cfg)
+			if !IsJSONOutput() {
+				for _, warning := range claudeLaunch.Warnings {
+					output.PrintWarningf("Agent %d: %s", num, warning)
 				}
 			}
 		}
@@ -780,6 +842,34 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 			}
 		}
 
+		// No persona pin: take the seat CAAM ranked for this provider
+		// (ntm#319). Only reached when seat_selection is on — a pinned pane
+		// never gets here, because the planner records no decision for it.
+		if personaName == "" {
+			if seat, ok := seatPlan.Seat(agentIdx); ok {
+				personaName = seat.Persona
+				if p := seat.Registered; p != nil {
+					if model, ok := caamSeatModelOverride(p, modelRequested); ok {
+						modelRequested = true
+						resolvedModel = resolveAgentModel(agent.Type, model, opts.PluginMap)
+					}
+					if strings.TrimSpace(p.ReasoningEffort) != "" {
+						resolvedReasoningEffort = p.ReasoningEffort
+					}
+					promptFile, err := prepareRequiredPersonaSystemPrompt(p, dir)
+					if err != nil {
+						return outputError(fmt.Errorf(
+							"preparing system prompt for CAAM-selected seat persona %s after creating pane %s: %w; the pane still exists",
+							p.Name, paneID, err,
+						))
+					}
+					systemPromptFile = promptFile
+				} else if seat.TypeMismatch && !IsJSONOutput() {
+					output.PrintWarningf("%s", caamSeatTypeMismatchMessage(agent.Type, seat.Persona))
+				}
+			}
+		}
+
 		finalCmd, err := config.GenerateAgentCommand(agentCmd, config.AgentTemplateVars{
 			Model:            resolvedModel,
 			ModelAlias:       agent.Model,
@@ -791,10 +881,34 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 			SystemPromptFile: systemPromptFile,
 			PersonaName:      personaName,
 			ReasoningEffort:  resolvedReasoningEffort,
+			ClaudeSettings:   claudeLaunch.Settings,
 		})
 		if err != nil {
 			return outputError(fmt.Errorf("generating command for %s agent: %w", agent.Type, err))
 		}
+		if agentsession.ResumeProvider(agentTypeStr) == "pi" {
+			finalCmd = agentsession.PinPiLaunchSession(finalCmd)
+		}
+		if warning := policy.LogClaudeHooksNotApplied("add", finalCmd, claudeLaunch.Settings); warning != "" {
+			if !IsJSONOutput() {
+				output.PrintWarningf("Agent %d: %s", num, warning)
+			}
+		} else if len(claudeLaunch.Sources) > 0 && !IsJSONOutput() {
+			output.PrintInfof("Claude hooks configured for agent %d (%s)", num, strings.Join(claudeLaunch.Sources, ", "))
+		}
+		launchSpec, err := captureAgentLaunchSpec(agent.Type, finalCmd, resolvedModel, agent.Model, personaName, resolvedReasoningEffort, systemPromptFile, envVars)
+		if err != nil {
+			return outputError(fmt.Errorf("capturing %s launch specification: %w", agent.Type, err))
+		}
+
+		// Persist only the environment-free launch command. Credential
+		// isolation and plugin environment are applied below for the live
+		// process, but are deliberately excluded from restart metadata.
+		manifestAgentCmd, err := tmux.SanitizePaneCommand(finalCmd)
+		if err != nil {
+			return outputError(fmt.Errorf("invalid %s resilience command: %w", agent.Type, err))
+		}
+		launchBinding := resilience.CaptureLaunchBinding(agentTypeStr)
 
 		// Per-pane Claude credential isolation (GH#237). A pane added to an
 		// existing swarm joins the same subscription as the panes already in
@@ -846,6 +960,9 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 		if err != nil {
 			return outputError(fmt.Errorf("building agent command: %w", err))
 		}
+		if err := tmux.SetPaneLaunchSpecContext(ctx, paneID, launchSpec); err != nil {
+			return outputError(fmt.Errorf("recording launch specification for %s agent in pane %s: %w; the pane still exists", agent.Type, paneID, err))
+		}
 
 		if err := tmux.SendKeysContext(ctx, paneID, cmd, true); err != nil {
 			launchErr := fmt.Errorf("launching agent in pane %s: %w; the pane still exists", paneID, err)
@@ -854,13 +971,31 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 			}
 			return outputError(launchErr)
 		}
-		if agent.Type == AgentTypeGrok {
-			if _, err := tmux.WaitForPaneProcessStartContext(ctx, session, paneID); err != nil {
-				return outputError(fmt.Errorf(
-					"launching %s agent in pane %s did not start a stable process: %w",
-					agent.Type, paneID, err,
-				))
-			}
+		// Wait until the agent CLI actually replaced the shell in the pane, for
+		// every agent type, exactly as spawn does. Everything after this reads
+		// the pane's foreground process: the Agent Mail badge reconciliation in
+		// registerSpawnedAgents (which recorded a still-starting agent as
+		// "exited", ntm#358), prompt/context delivery, and any `ntm send` issued
+		// as soon as add returns (PANE_AGENT_DEAD). The stability requirement
+		// also turns a CLI that exits at once into a failed add.
+		if _, err := tmux.WaitForPaneProcessStartContext(ctx, session, paneID); err != nil {
+			return outputError(fmt.Errorf(
+				"launching %s agent in pane %s did not start a stable process: %w",
+				agent.Type, paneID, err,
+			))
+		}
+		if err := resilience.UpsertAgentConfig(session, dir, resilience.AgentConfig{
+			PaneID:        paneID,
+			PaneIndex:     num,
+			Type:          agentTypeStr,
+			Model:         agent.Model,
+			Command:       manifestAgentCmd,
+			LaunchBinding: launchBinding,
+		}); err != nil {
+			return outputError(fmt.Errorf(
+				"persisting restart metadata for pane %s: %w; the pane and launched agent still exist",
+				paneID, err,
+			))
 		}
 		if rateLimitTracker != nil && agent.Type == AgentTypeCodex {
 			rateLimitTracker.RecordSuccess("openai")
@@ -970,14 +1105,32 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 		})
 
 		// Track for Agent Mail registration (#240)
-		addedAgents = append(addedAgents, spawnedAgentInfo{
-			paneIndex:     num,
-			paneID:        paneID,
-			paneTitle:     title,
-			agentType:     agentTypeStr,
-			model:         agent.Model,
-			resolvedModel: resolvedModel,
+		addedAgents = append(addedAgents, spawnidentity.Agent{
+			PaneIndex:     num,
+			PaneID:        paneID,
+			PaneTitle:     title,
+			AgentType:     agentTypeStr,
+			Model:         agent.Model,
+			ResolvedModel: resolvedModel,
 		})
+	}
+
+	// No future launch remains. Registration and post-add hooks must not hold
+	// capacity ownership; the deferred call still covers every early return.
+	releaseAdmission()
+
+	// Panes that seat selection refused were never created, so the requested
+	// count is no longer the added count. Report what actually launched
+	// (ntm#319) — a partially-placed add that claims the full number would
+	// hide the very refusal the feature exists to make loud. Counted from the
+	// panes that exist rather than by subtraction, so the number cannot drift
+	// from reality. Guarded so a run with no skips is untouched.
+	if len(seatSkips) > 0 {
+		totalAgents = len(newPanes)
+	}
+	if opts.Outcome != nil {
+		opts.Outcome.Added = totalAgents
+		opts.Outcome.SeatSkips = seatSkips
 	}
 
 	// Register the newly added agents with Agent Mail so panes added to a live
@@ -985,7 +1138,7 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 	// helper self-guards on a disabled config or an unreachable server, and it
 	// merges into the session's existing registry rather than replacing it, so
 	// identities created by the original spawn are preserved.
-	var agentMailStatus *output.AgentMailSpawnStatus
+	var agentMailStatus *spawnidentity.AgentMailSpawnStatus
 	if len(addedAgents) > 0 {
 		// Session-level identity first, mirroring spawn (bd-vb7s3): idempotent
 		// (reuses a previously registered coordinator identity) and best-effort,
@@ -1027,7 +1180,7 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 			newPanes[i].Command = command
 			newPanes[i].Variant = variant
 		}
-		return output.PrintJSON(output.AddResponse{
+		response := output.AddResponse{
 			TimestampedResponse: output.NewTimestamped(),
 			Session:             session,
 			AddedClaude:         ccCount,
@@ -1040,10 +1193,16 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 			AddedWindsurf:       windsurfCount,
 			AddedAider:          aiderCount,
 			AddedOpencode:       opencodeCount,
+			AddedOmp:            ompCount,
 			TotalAdded:          totalAgents,
 			NewPanes:            newPanes,
 			AgentMail:           agentMailStatus,
-		})
+			SeatSkips:           seatSkips,
+		}
+		return output.PrintJSON(struct {
+			output.AddResponse
+			Admission *pressure.SpawnAdmission `json:"admission,omitempty"`
+		}{AddResponse: response, Admission: admission})
 	}
 
 	fmt.Printf("✓ Added %d agent(s) (total %d panes now)\n", totalAgents, len(panes)+totalAgents)

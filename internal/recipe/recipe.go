@@ -326,9 +326,16 @@ func normalizeRecipeAgentType(raw string) (string, error) {
 		return string(agentpkg.AgentTypeWindsurf), nil
 	case agentpkg.AgentTypeAider:
 		return string(agentpkg.AgentTypeAider), nil
+	case agentpkg.AgentTypeOpencode:
+		return string(agentpkg.AgentTypeOpencode), nil
+	case agentpkg.AgentTypeOmp:
+		return string(agentpkg.AgentTypeOmp), nil
 	case agentpkg.AgentTypeOllama:
 		return string(agentpkg.AgentTypeOllama), nil
 	default:
+		if kind := agentpkg.AgentType(raw).Canonical(); agentpkg.IsPluginType(kind) {
+			return string(kind), nil
+		}
 		return "", fmt.Errorf("unsupported recipe agent type %q", strings.TrimSpace(raw))
 	}
 }

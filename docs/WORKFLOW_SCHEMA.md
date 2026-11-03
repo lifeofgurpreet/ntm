@@ -157,19 +157,107 @@ How a run works:
    role. Parallel coordination (and `parallel_within_stage`) engages every
    pane of the acting role.
 5. The run ends when the flow reaches a stage with no outgoing transitions,
-   after `--max-transitions` stage changes, or at `--timeout`. `--json`
-   emits a machine-readable result (stages visited, transitions, role→pane
-   mapping).
+   after `--max-transitions` stage changes, at `--timeout`, or when the
+   template's error handling pauses or aborts it (see
+   [Agent Crashes, Errors, and Timeouts](#agent-crashes-errors-and-timeouts)).
+   `--json` emits a machine-readable result (stages visited, transitions,
+   role→pane mapping, agent faults and restarts).
 
 Useful flags: `--fire-manual` fires `manual` triggers automatically,
 `--interval` sets the trigger poll cadence, `--trigger-timeout` bounds
 command triggers, `--project-root` anchors file/command triggers, and
-`--resume` clears a paused checkpoint recorded by the template's
-`error_handling` pause action.
+`--resume` continues the saved stage, including a paused checkpoint recorded
+by the template's `error_handling` pause action. Confirmed prompt deliveries
+are retained, and unfinished deliveries keep their original pane plan.
+
+For TOML orchestration templates, `agent_says` observes output from configured
+workflow participants with the transition's role, added after the current
+stage's saved pane boundary. An empty transition role includes all configured
+participants. Old verdicts in scrollback do not
+complete a new stage or a later visit to the same stage. Review gates count
+distinct eligible panes separately for each outgoing verdict pattern:
+`changes requested` cannot contribute toward an `approved` quorum. Observed
+votes are checkpointed, so a partial review survives a pause or restart even
+after its text scrolls out of the retained response buffer. `--resume` also
+observes responses produced while the runner was stopped without sending
+confirmed prompts again.
+
+A review gate requiring several replies must prompt those reviewers: use
+`parallel_within_stage = true` or stage-to-role routing that selects the full
+reviewer role. A stage named exactly after its role otherwise uses the
+coordinator's round-robin selection for a single pane.
+
+Each capture and prepared dispatch is bound to the original physical pane
+and positive process ID. A missing pane, changed process, failed capture, or
+lost output boundary stops automatic advancement. Evidence captures cover
+200 scrollback lines and at most 512 KiB per pane; unmatched response text is
+retained exactly, up to 64 KiB. The runner pauses if this limit is exceeded
+before the pane's applicable verdicts have been observed, because trimming
+the response could change an anchored pattern's meaning. Recorded votes no
+longer require their response text. A missing overlap after a screen redraw
+or extensive scrollback loss is also reported explicitly. Inspect that stage before choosing
+an intentional `--restart`; the runner never interprets the whole replacement
+screen as a fresh response.
+
+An outgoing prompt must not match its own `agent_says` pattern. For example,
+putting the literal verdict phrase in a description or `--var` can make the
+terminal's prompt echo look like an agent response. Such a prompt is refused
+before transport, including when enrichment introduces the phrase. Use a
+distinct response pattern and keep it out of the outgoing prompt. Older
+checkpoints that lack a boundary for an already-dispatched `agent_says` stage
+are refused on resume rather than reconstructed from historical output.
 
 Note: `ntm spawn -t <template>` uses only the template's agent COUNTS to
 size a new session — it does not run the coordination. Spawn the session
 first, then `ntm workflow run <template>` inside it.
+
+### Agent Crashes, Errors, and Timeouts
+
+A template's `[workflows.error_handling]` table tells `ntm workflow run` what
+to do when an agent fails or a stage stalls:
+
+```toml
+[workflows.error_handling]
+on_agent_crash = "restart_agent"
+on_agent_error = "pause"
+stage_timeout_minutes = 60
+on_timeout = "notify"
+max_retries_per_stage = 2
+```
+
+While a flow runs, every poll checks all of the workflow's agent panes, not
+only the panes the current stage prompted:
+
+- **Agent crash** (`on_agent_crash`): the pane left the session, its process
+  died (`pane_dead`), or its shell has no live child process, meaning the
+  agent CLI exited back to the shell. These are process facts, so a crash is
+  raised on the first poll that sees it. On a remote (SSH) tmux server, pane
+  PIDs cannot be inspected, so only a missing or dead pane counts.
+- **Agent error** (`on_agent_error`): the classification `ntm health` reports:
+  the agent is rate limited, has an authentication error, is waiting on an
+  interactive gate such as a trust or login dialog, or the status detector
+  reports an error state. These come from pane text, so the state must last
+  for `[resilience] crash_threshold` consecutive polls (default 3).
+
+A fault is raised once per episode. The same fault is raised again only after
+the pane recovers or is restarted. Each raised fault is recorded in the
+checkpoint's `errors` list and in the `faults` list of the `--json` result
+(pane, role, stage, type, reason, action).
+
+| Action | Effect |
+|--------|--------|
+| `restart_agent` | Restarts the faulted pane with the same engine as `ntm respawn`: respawns the pane, replays its saved launch command, and waits until the agent is ready. The run then binds to the replacement process. If the pane had already received the current stage's prompt, the prompt is sent again, and any verdict the previous process gave in this stage is discarded. Each pane may restart at most `[resilience] max_restarts` times per run (default 3); the next fault aborts the run, so a crash loop cannot restart forever. If a restart does not end with a ready agent, the run stops with reason `restart-failed`. Not valid for `on_timeout`, because a timeout names no agent. |
+| `pause` | Saves a paused checkpoint and stops with reason `paused`. Continue with `--resume` once the agent is healthy. |
+| `abort` | Stops with reason `aborted`. |
+| `notify` | Reports the fault and keeps running. An unset `on_agent_crash` or `on_agent_error` behaves the same way. |
+| `skip_stage` | Leaves the current stage through its first usable outgoing transition. |
+| `retry` | Sends the current stage prompt to its panes again, up to `max_retries_per_stage` times, then aborts. It does not restart a crashed agent. |
+
+`stage_timeout_minutes` starts a timer for each stage. If the stage is still
+current when the timer expires, `on_timeout` runs; it accepts any action
+except `restart_agent`. A `parallel` template without a flow sends its
+prompts once and completes, so its agents are checked once, just before that
+dispatch, and that single check acts only on confirmed crashes.
 
 ### Best Practices
 
@@ -197,6 +285,10 @@ first, then `ntm workflow run <template>` inside it.
 - **Flow does not advance:** check that the trigger type has all required
   fields (for example `idle_minutes` for `all_agents_idle`) and that the
   trigger's role matches the stage role.
+- **Run aborted after agent restarts:** a pane used up its
+  `[resilience] max_restarts` restart budget. Check the `faults` list in the
+  `--json` result (or the checkpoint's `errors`) to find the agent that keeps
+  crashing before you start the workflow again.
 
 ## Root Structure
 
@@ -296,6 +388,114 @@ settings:
   mail_recipient: user         # Agent mail recipient
 ```
 
+Notifications fire only for the events you enable: `notify_on_complete` covers a
+successful finish and `notify_on_error` a failed one. Cancellation does not
+notify. A channel with nothing to send is skipped — `webhook` without
+`webhook_url`, or `mail` without `mail_recipient` — and unrecognized channel
+names are ignored. Delivery is best-effort under a 10s budget: a webhook that
+hangs or errors is not allowed to fail or delay the run.
+
+The `mail` channel sends as `ntm-pipeline`, using the workflow's working
+directory as the Agent Mail project key (the same key `mail_send` steps take
+explicitly as `project_key`).
+
+### Selector Output Limits
+
+Shell branch predicates, external foreach sources, and bead queries retain their
+successful stdout in the run checkpoint so ordinary resume can reuse the result
+without repeating source effects. Configure their capture limits and aggregate
+journal budget under `settings.limits`:
+
+```yaml
+settings:
+  limits:
+    max_command_stdout_bytes: 16777216       # Per source: 16 MiB
+    max_command_stderr_bytes: 4194304        # Per source: 4 MiB
+    max_selector_output_bytes_total: 33554432 # Retained stdout + reservations: 32 MiB
+```
+
+All values are bytes; omitted or nonpositive workflow limits use their defaults.
+Each new selector reserves its full stdout allowance before launch. On proven
+success the charge becomes its actual retained bytes. Unresolved selectors keep
+the original full reservation until their outcome is explicitly recovered or
+their scope is deliberately reset. Existing cached outcomes remain available
+even when a saved journal exceeds the aggregate budget.
+
+Parallel sources wait within their source deadlines while active reservations
+can shrink. If the retained evidence makes admission impossible, a new source is
+refused before launch. Lower the per-source stdout cap for small outputs, or
+increase the aggregate budget when more retained output is expected. The
+aggregate limit does not cap other checkpoint fields, parsed item lists, or
+temporary capture and serialization copies.
+
+For an existing frozen run, a positive
+`ntm pipeline resume <run-id> --max-selector-output-bytes-total <bytes>` override
+changes admission policy for that attempt without changing captured output,
+receipt identity, or the frozen workflow. REST resume requests and
+`pipeline_resume` jobs accept `max_selector_output_bytes_total` with the same
+meaning. Zero uses the frozen workflow's configured limit or its default;
+negative resume overrides are rejected.
+
+### Step Admission and Materialization Limits
+
+Dynamic workflows have two independent node limits, both defaulting to 100,000:
+
+```yaml
+settings:
+  limits:
+    max_step_count_total: 100000
+    max_materialized_step_nodes: 100000
+```
+
+`max_step_count_total` bounds the distinct concrete runtime step IDs admitted
+over the life of a run. Workflow roots reserve IDs before execution; containers
+admit child batches before dispatch. Foreach with a literal round count admits
+the complete eligible expansion together. Expression-driven rounds and legacy
+loops admit each round or iteration before its body starts. A refused batch adds
+no child IDs, results, in-flight entries, or command launch receipts.
+
+Retries and resumed work reuse their existing IDs. Explicit scope resets also
+retain admissions; a fresh run starts a new ledger. Older checkpoints seed the
+ledger from their retained runtime evidence. A journal already above the current
+limit may reuse admitted IDs, but cannot add new ones. Admission records capacity
+only: it never establishes that an effect occurred, that a process terminated,
+or that replay is safe. Unresolved execution receipts retain their normal
+recovery requirements regardless of capacity overrides.
+
+Authored `on_cancel` and `post_pipeline_steps` roots reserve capacity before main
+work starts in a separate finalization allowance of the same size. Their nested
+work shares that allowance. Exhaustion in an earlier cleanup body does not
+consume a later root's reserved slot. Owned process-group termination remains
+part of the executor's cleanup regardless of these authored-step limits.
+
+`max_materialized_step_nodes` bounds the literal workflow definition and active
+copies retained by planners. The executor checks it before constructing its
+dependency graph, cloning eager foreach plans, decoding selected branches, or
+copying parallel bodies. Temporary leases are released when consumers finish.
+Nested planners fail promptly when the remaining capacity is insufficient;
+they do not wait for capacity held by an ancestor. This is a node limit, not a
+byte limit for command output, parsed item values, or the entire checkpoint.
+
+Main-work admission failure stops the attempt even with `on_error: continue`
+or retry policies. A completed native command whose success hook exceeds a
+limit retains its original receipt and output, allowing recovery to finish the
+hook without repeating that command. Ordinary post-pipeline failure policy is
+unchanged; later reserved finalization roots can still run.
+
+To increase capacity for one attempt of a frozen run, use:
+
+```bash
+ntm pipeline resume <run-id> --max-step-count-total 200000 \
+  --max-materialized-step-nodes 200000
+```
+
+REST resume requests and `pipeline_resume` jobs accept `max_step_count_total`
+and `max_materialized_step_nodes` with the same meaning. Positive values change
+only the current attempt, preserving the frozen workflow and receipt identities.
+Zero uses the frozen configuration or default. Negative resume values are
+rejected before checkpoint mutation. Omitted or nonpositive workflow settings
+use the defaults.
+
 ### Error Actions
 
 | Action | Behavior |
@@ -378,10 +578,17 @@ Agent types:
   prompt: Write tests
 ```
 
-Routing strategies:
+Routing strategies (the same router `ntm send --route` uses):
 - `least-loaded` - Choose agent with lowest context usage
 - `first-available` - Choose first idle agent
 - `round-robin` - Rotate through agents
+- `round-robin-available` - Rotate through agents, skipping busy ones
+- `random` - Pick a random available agent
+- `sticky` - Prefer the agent that handled the previous routed step
+- `affinity` - Prefer the agent holding Agent Mail reservations on files the
+  prompt names (falls back to least-loaded when none does)
+
+`explicit` is not a route: name the pane with `pane:` instead.
 
 ## Wait Configuration
 
@@ -401,6 +608,15 @@ Define when a step is considered complete:
 | `idle` | Same as completion |
 | `time` | Wait for timeout duration only |
 | `none` | Fire and forget (don't wait) |
+
+For shell commands, `wait: none` completes the step after launching its owned
+process group. Normal completion of an enclosing parallel group or parallel
+foreach does not stop that command. It can serve downstream steps and
+`post_pipeline` hooks until workflow finalization cancels and joins it.
+Explicit cancellation and fail-fast still cancel the affected process groups.
+Explicit command and enclosing parallel-group deadlines
+remain active after a container returns; deadline expiry is a background failure,
+and unresolved cleanup continues to prevent automatic replay.
 
 ## Error Handling
 
@@ -485,6 +701,24 @@ are rejected so unknown-field validation can stay strict.
 2. The parallel group completes when all sub-steps finish
 3. If any sub-step fails, the group fails (unless `on_error: continue`)
 4. Outputs are accessible via `${steps.<sub_id>.output}`
+
+### Parallel Foreach Scheduling
+
+For `foreach` or `foreach_pane` with `parallel: true`, `max_concurrent` bounds
+worker creation as well as active iteration bodies. The effective width is
+capped by `settings.limits.max_concurrent_foreach` and the number of items in
+that fan-out. Queued items remain in the plan list until a worker slot opens.
+
+Cancellation and `on_error: fail_fast` stop further iteration launches.
+The executor joins active iteration workers before returning from the loop.
+Background command cleanup finishes before the workflow publishes its final
+outcome. Results retain item order even when workers finish out of order;
+filtered items and completed iterations reused on resume retain their own skip
+classifications. Pane assignment, filters, and iteration substitutions are
+resolved before any iteration body starts.
+
+Authored `loop_control: break` remains limited to sequential foreach; parallel
+foreach rejects it because other admitted iterations may already have effects.
 
 ## Conditional Steps
 

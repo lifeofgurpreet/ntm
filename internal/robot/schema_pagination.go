@@ -48,6 +48,7 @@ var SchemaPagination = map[string]SchemaPaginationFlag{
 	"ensemble_modes": {Paginated: true, Reason: "modes array pages via --limit/--offset"},
 
 	// --- Unpaginated by design ---------------------------------------------
+	"account_status":     {Reason: "bounded: one seat entry per configured CAAM profile per provider (handful)"},
 	"accounts_list":      {Reason: "bounded: configured provider accounts (handful)"},
 	"ack":                {Reason: "bounded: per-request acknowledgement results for addressed panes"},
 	"activity":           {Reason: "bounded: one entry per live agent pane"},
@@ -93,7 +94,6 @@ var SchemaPagination = map[string]SchemaPaginationFlag{
 	"inspect_work":     {Reason: "bounded: single work-item detail"},
 	"interrupt":        {Reason: "bounded: per-request interrupt results for addressed panes"},
 	"jfp_export":       {Reason: "bounded: per-request export file list"},
-	"jfp_install":      {Reason: "bounded: per-request install results"},
 	"kill_agent":       {Reason: "bounded: per-request kill results"},
 	"kill_pane":        {Reason: "bounded: per-request kill results"},
 	"logs":             {Reason: "bounded: recent log lines capped by --limit truncation"},
@@ -101,6 +101,7 @@ var SchemaPagination = map[string]SchemaPaginationFlag{
 	"mail_check":       {Reason: "bounded: per-session mail check rows"},
 	"metrics":          {Reason: "bounded: current metric snapshot rows"},
 	"monitor":          {Reason: "bounded: one row per monitored pane"},
+	"ms_search":        {Reason: "bounded: ms returns at most its --limit (default 20) skill matches"},
 	"palette":          {Reason: "bounded: fixed palette command catalog"},
 	"pane_address":     {Reason: "bounded: address forms for one pane"},
 	"plan":             {Reason: "bounded: execution tracks for one plan request"},
@@ -115,7 +116,7 @@ var SchemaPagination = map[string]SchemaPaginationFlag{
 	"safety_simulate":  {Reason: "bounded: per-request simulated command steps"},
 	"schema":           {Reason: "bounded: fixed schema catalog"},
 	"send":             {Reason: "bounded: per-request send results for addressed panes"},
-	"send_receipt":     {Reason: "bounded: delivery receipt for one send"},
+	"send_receipt":     {Reason: "bounded: receipt for one idempotent send or interrupt"},
 	"spawn":            {Reason: "bounded: per-request spawned pane rows"},
 	"support_bundle":   {Reason: "bounded: bundle manifest for one collection run"},
 

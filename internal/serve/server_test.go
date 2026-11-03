@@ -1,6 +1,7 @@
 package serve
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -13,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net"
 	"net/http"
@@ -32,6 +34,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/kernel"
 	"github.com/Dicklesworthstone/ntm/internal/pipeline"
+	"github.com/Dicklesworthstone/ntm/internal/redaction"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 )
@@ -222,7 +225,13 @@ func TestRobotErrorHTTPStatus(t *testing.T) {
 		{code: robot.ErrCodePaneNotFound, want: http.StatusNotFound},
 		{code: robot.ErrCodeNotFound, want: http.StatusNotFound},
 		{code: robot.ErrCodePermissionDenied, want: http.StatusForbidden},
+		{code: robot.ErrCodeDestructiveCommandBlocked, want: http.StatusForbidden},
+		{code: "SENSITIVE_DATA_BLOCKED", want: http.StatusForbidden},
 		{code: robot.ErrCodeResourceBusy, want: http.StatusConflict},
+		{code: robot.ErrCodeStaleWorkCoordination, want: http.StatusConflict},
+		{code: robot.ErrCodeIdempotencyConflict, want: http.StatusConflict},
+		{code: robot.ErrCodeOperationInProgress, want: http.StatusConflict},
+		{code: robot.ErrCodeOperationOutcomeUnknown, want: http.StatusConflict},
 		{code: robot.ErrCodeTimeout, want: http.StatusGatewayTimeout},
 		{code: robot.ErrCodeNotImplemented, want: http.StatusNotImplemented},
 		{code: robot.ErrCodeDependencyMissing, want: http.StatusServiceUnavailable},
@@ -348,6 +357,287 @@ func TestNewWithCustomPort(t *testing.T) {
 	if srv.port != 8080 {
 		t.Errorf("Port = %d, want 8080", srv.port)
 	}
+}
+
+func TestResolveProjectDir(t *testing.T) {
+	project := t.TempDir()
+	want, err := filepath.EvalSymlinks(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(cwd, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{project, relative} {
+		got, err := ResolveProjectDir(path)
+		if err != nil || got != want || !filepath.IsAbs(got) {
+			t.Errorf("ResolveProjectDir(%q) = %q, %v; want %q", path, got, err, want)
+		}
+	}
+	if got, err := ResolveProjectDir(""); err != nil || got != "" {
+		t.Fatalf("empty project must remain unscoped: %q, %v", got, err)
+	}
+	t.Run("symlink", func(t *testing.T) {
+		alias := filepath.Join(t.TempDir(), "project-link")
+		if err := os.Symlink(project, alias); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		if got, err := ResolveProjectDir(alias); err != nil || got != want {
+			t.Fatalf("symlink project = %q, %v; want %q", got, err, want)
+		}
+	})
+}
+
+func TestServerProjectDirRejectsInvalidStartupPaths(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, []byte("not a directory"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{"missing": filepath.Join(t.TempDir(), "missing"), "file": file} {
+		t.Run(name, func(t *testing.T) {
+			cfg := Config{ProjectDir: path}
+			if err := ValidateConfig(cfg); err == nil || !strings.Contains(err.Error(), "project directory") {
+				t.Fatalf("ValidateConfig admitted invalid project %q: %v", path, err)
+			}
+			srv := New(cfg)
+			defer srv.Stop()
+			if err := srv.Start(t.Context()); err == nil || !strings.Contains(err.Error(), "project directory") {
+				t.Fatalf("Start admitted invalid project %q: %v", path, err)
+			}
+		})
+	}
+}
+
+// GH #360: the first mail request must use the configured project without a
+// preceding global PATCH. Keep the real router, mail-client creation, and MCP
+// request; only the external Agent Mail service is a local fixture.
+func TestServerProjectDirScopesMailAtStartup(t *testing.T) {
+	project := t.TempDir()
+	want, err := filepath.EvalSymlinks(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(cwd, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mcp := newMockAgentMailMCPHandler(t, map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError){
+		"ensure_project": func(args map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
+			key, _ := args["human_key"].(string)
+			return agentmail.Project{ID: 1, Slug: "startup-project", HumanKey: key}, nil
+		},
+	})
+	mail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusOK) // Agent Mail liveness probe.
+			return
+		}
+		mcp.ServeHTTP(w, r)
+	}))
+	defer mail.Close()
+	t.Setenv("AGENT_MAIL_URL", mail.URL+"/mcp/")
+	t.Setenv("AGENT_MAIL_TOKEN", "")
+	srv := New(Config{ProjectDir: relative})
+	defer srv.Stop()
+
+	configResponse := httptest.NewRecorder()
+	srv.Router().ServeHTTP(configResponse, httptest.NewRequest(http.MethodGet, "/api/v1/config", nil))
+	var configBody struct {
+		ProjectDir string `json:"project_dir"`
+	}
+	if err := json.Unmarshal(configResponse.Body.Bytes(), &configBody); err != nil {
+		t.Fatal(err)
+	}
+	if configResponse.Code != http.StatusOK || configBody.ProjectDir != want {
+		t.Fatalf("startup configuration = %d %s; want project %q", configResponse.Code, configResponse.Body, want)
+	}
+
+	mailResponse := httptest.NewRecorder()
+	srv.Router().ServeHTTP(mailResponse, httptest.NewRequest(http.MethodGet, "/api/v1/mail/projects", nil))
+	var mailBody struct {
+		Success  bool                `json:"success"`
+		Projects []agentmail.Project `json:"projects"`
+	}
+	if err := json.Unmarshal(mailResponse.Body.Bytes(), &mailBody); err != nil {
+		t.Fatal(err)
+	}
+	if mailResponse.Code != http.StatusOK || !mailBody.Success || len(mailBody.Projects) != 1 || mailBody.Projects[0].HumanKey != want {
+		t.Fatalf("first mail request lost startup scope: %d %s; want project %q", mailResponse.Code, mailResponse.Body, want)
+	}
+	client, err := srv.getMailClient()
+	if err != nil || client == nil || client.ProjectKey() != want {
+		t.Fatalf("mail client did not inherit configured scope: client=%v, error=%v", client, err)
+	}
+
+	unscoped := New(Config{})
+	defer unscoped.Stop()
+	if unscoped.projectDirSnapshot() != "" {
+		t.Fatalf("default server unexpectedly selected a project: %q", unscoped.projectDirSnapshot())
+	}
+}
+
+// patchProjectDir sends PATCH /api/v1/config through the real router with the
+// given raw project_dir JSON value ("" omits the field) and returns the
+// response code and the project_dir the response reports.
+func patchProjectDir(t *testing.T, srv *Server, rawProjectDir string) (int, string) {
+	t.Helper()
+	body := `{"allowed_origins":["http://localhost:7337"]}`
+	if rawProjectDir != "" {
+		body = `{"project_dir":` + rawProjectDir + `}`
+	}
+	rec := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rec, httptest.NewRequest(http.MethodPatch, "/api/v1/config", strings.NewReader(body)))
+	var resp struct {
+		Config struct {
+			ProjectDir string `json:"project_dir"`
+		} `json:"config"`
+	}
+	if rec.Code == http.StatusOK {
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode PATCH response %s: %v", rec.Body, err)
+		}
+	}
+	return rec.Code, resp.Config.ProjectDir
+}
+
+// GH #360: PATCH /api/v1/config ignored an empty project_dir, so once a caller
+// repointed the server-wide project (and with it mail, beads and jobs), only a
+// restart restored the --project-dir value. An explicit "" or null now resets
+// it to the startup project, or to no project when none was given.
+func TestPatchConfigResetsProjectDirToStartupValue(t *testing.T) {
+	canonical := func(dir string) string {
+		t.Helper()
+		resolved, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resolved
+	}
+	startup, other := canonical(t.TempDir()), canonical(t.TempDir())
+	mcp := newMockAgentMailMCPHandler(t, nil)
+	mail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusOK) // Agent Mail liveness probe.
+			return
+		}
+		mcp.ServeHTTP(w, r)
+	}))
+	defer mail.Close()
+	t.Setenv("AGENT_MAIL_URL", mail.URL+"/mcp/")
+	t.Setenv("AGENT_MAIL_TOKEN", "")
+
+	srv := New(Config{ProjectDir: startup})
+	defer srv.Stop()
+
+	// GET reports the reset target next to the current project.
+	getRec := httptest.NewRecorder()
+	srv.Router().ServeHTTP(getRec, httptest.NewRequest(http.MethodGet, "/api/v1/config", nil))
+	var getResp struct {
+		ProjectDir        string `json:"project_dir"`
+		StartupProjectDir string `json:"startup_project_dir"`
+	}
+	if err := json.Unmarshal(getRec.Body.Bytes(), &getResp); err != nil || getRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/config = %d %s (decode err %v)", getRec.Code, getRec.Body, err)
+	}
+	if getResp.ProjectDir != startup || getResp.StartupProjectDir != startup {
+		t.Fatalf("GET /api/v1/config project_dir=%q startup_project_dir=%q, want both %q", getResp.ProjectDir, getResp.StartupProjectDir, startup)
+	}
+
+	for _, reset := range []string{`""`, `null`} {
+		t.Run("reset with "+reset, func(t *testing.T) {
+			otherJSON, err := json.Marshal(other)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if code, got := patchProjectDir(t, srv, string(otherJSON)); code != http.StatusOK || got != other {
+				t.Fatalf("select other project: %d %q", code, got)
+			}
+			// A PATCH that omits project_dir leaves the selection alone.
+			if code, got := patchProjectDir(t, srv, ""); code != http.StatusOK || got != other {
+				t.Fatalf("PATCH without project_dir changed the project: %d %q, want %q", code, got, other)
+			}
+			if client, err := srv.getMailClient(); err != nil || client == nil || client.ProjectKey() != other {
+				t.Fatalf("mail client not scoped to the selected project: client=%v err=%v", client, err)
+			}
+			srv.mu.Lock()
+			srv.mailUnavailableUntil = time.Now().Add(time.Hour)
+			srv.mu.Unlock()
+
+			if code, got := patchProjectDir(t, srv, reset); code != http.StatusOK || got != startup {
+				t.Fatalf("PATCH project_dir=%s = %d %q, want 200 and the startup project %q", reset, code, got, startup)
+			}
+			if got := srv.projectDirSnapshot(); got != startup {
+				t.Fatalf("server project after reset = %q, want %q", got, startup)
+			}
+			// Mail must follow the reset like any other project change: no
+			// cached client or unavailability verdict for the previous project.
+			if client, err := srv.getMailClient(); err != nil || client == nil || client.ProjectKey() != startup {
+				t.Fatalf("mail client after reset: client=%v err=%v, want project %q", client, err, startup)
+			}
+		})
+	}
+
+	t.Run("non-string value is rejected", func(t *testing.T) {
+		before := srv.projectDirSnapshot()
+		if code, _ := patchProjectDir(t, srv, `42`); code != http.StatusBadRequest {
+			t.Fatalf("PATCH project_dir=42 = %d, want 400", code)
+		}
+		if got := srv.projectDirSnapshot(); got != before {
+			t.Fatalf("rejected PATCH changed the project to %q", got)
+		}
+	})
+
+	t.Run("server started without a project resets to none", func(t *testing.T) {
+		unscoped := New(Config{})
+		defer unscoped.Stop()
+		otherJSON, err := json.Marshal(other)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code, got := patchProjectDir(t, unscoped, string(otherJSON)); code != http.StatusOK || got != other {
+			t.Fatalf("select other project: %d %q", code, got)
+		}
+		if code, got := patchProjectDir(t, unscoped, `""`); code != http.StatusOK || got != "" {
+			t.Fatalf("reset of an unscoped server = %d %q, want 200 and no project", code, got)
+		}
+		if got := unscoped.projectDirSnapshot(); got != "" {
+			t.Fatalf("unscoped server still points at %q after reset", got)
+		}
+	})
+
+	t.Run("startup project that no longer exists is not restored", func(t *testing.T) {
+		gone := filepath.Join(canonical(t.TempDir()), "gone")
+		if err := os.Mkdir(gone, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		vanishing := New(Config{ProjectDir: gone})
+		defer vanishing.Stop()
+		otherJSON, err := json.Marshal(other)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code, got := patchProjectDir(t, vanishing, string(otherJSON)); code != http.StatusOK || got != other {
+			t.Fatalf("select other project: %d %q", code, got)
+		}
+		if err := os.Rename(gone, gone+".moved"); err != nil {
+			t.Fatal(err)
+		}
+		if code, _ := patchProjectDir(t, vanishing, `""`); code != http.StatusBadRequest {
+			t.Fatalf("reset to a removed startup project = %d, want 400", code)
+		}
+		if got := vanishing.projectDirSnapshot(); got != other {
+			t.Fatalf("failed reset changed the project to %q, want %q", got, other)
+		}
+	})
 }
 
 func TestValidateConfigDefaults(t *testing.T) {
@@ -1904,9 +2194,9 @@ func TestHandleForceReleaseReservation_DeniedReturnsConflict(t *testing.T) {
 }
 
 // TestHandleForceReleaseReservation_PolicyGate: bd-2y2on — the HTTP surface
-// must honor automation.force_release exactly like the CLI gate. "never" and
-// "approval" (the default) refuse with 403 BEFORE any Agent Mail call; only
-// an explicit "auto" lets the handler proceed.
+// must honor automation.force_release exactly like the CLI gate. "never"
+// refuses outright; "approval" creates a durable review request after
+// inspecting the lease, without calling force-release before approval.
 func TestHandleForceReleaseReservation_PolicyGate(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -1929,6 +2219,9 @@ func TestHandleForceReleaseReservation_PolicyGate(t *testing.T) {
 			// A mail client whose transport fails the test if the handler
 			// ever consults Agent Mail past a refusing gate.
 			mailClient := newMockAgentMailMCPClient(t, map[string]func(map[string]interface{}) (interface{}, *agentmail.JSONRPCError){
+				"list_file_reservations": func(args map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
+					return []agentmail.FileReservation{{ID: 17, AgentName: "BlueLake", PathPattern: "internal/serve/*"}}, nil
+				},
 				"force_release_file_reservation": func(args map[string]interface{}) (interface{}, *agentmail.JSONRPCError) {
 					t.Error("gate bypassed: force_release_file_reservation was called")
 					return agentmail.ForceReleaseResult{Success: true}, nil
@@ -2326,6 +2619,9 @@ func TestHandleGetUpdateCloseClaimBead(t *testing.T) {
 
 	srv, _ := setupTestServer(t)
 	srv.projectDir = t.TempDir()
+	if err := os.Mkdir(filepath.Join(srv.projectDir, ".beads"), 0o700); err != nil {
+		t.Fatalf("create local Beads workspace: %v", err)
+	}
 
 	getReq := httptest.NewRequest(http.MethodGet, "/api/v1/beads/bd-5", nil)
 	getCtx := chi.NewRouteContext()
@@ -2387,6 +2683,103 @@ func TestHandleGetUpdateCloseClaimBead(t *testing.T) {
 	srv.handleClaimBead(claimRec, claimReq)
 	if claimRec.Code != http.StatusOK {
 		t.Fatalf("claim status=%d, want %d", claimRec.Code, http.StatusOK)
+	}
+}
+
+func TestHandleClaimBeadBindsSelectedOrDefaultProject(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("stub br uses sh")
+	}
+	for _, test := range []struct {
+		name     string
+		explicit bool
+		missing  bool
+		canceled bool
+	}{
+		{name: "unscoped server discovers cwd project"},
+		{name: "explicit project ignores foreign cwd and database", explicit: true},
+		{name: "explicit missing tracker cannot use parent", explicit: true, missing: true},
+		{name: "canceled discovery cannot claim", canceled: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			srv, _ := setupTestServer(t)
+			project, foreign := t.TempDir(), t.TempDir()
+			for _, dir := range []string{project, foreign} {
+				if err := os.Mkdir(filepath.Join(dir, ".beads"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			child := filepath.Join(project, "child")
+			if err := os.Mkdir(child, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			srv.projectDir = ""
+			t.Chdir(child)
+			if test.explicit {
+				srv.projectDir = project
+				t.Chdir(foreign)
+			}
+			if test.missing {
+				srv.projectDir = child
+			}
+			t.Setenv("BEADS_DIR", filepath.Join(foreign, ".beads"))
+			t.Setenv("BEADS_DB", filepath.Join(foreign, ".beads", "beads.db"))
+			calls := filepath.Join(t.TempDir(), "claims")
+			t.Setenv("NTM_TEST_CLAIM_SCOPE", calls)
+			bin := t.TempDir()
+			const script = `#!/bin/sh
+printf '%s\n%s\n%s\n' "$PWD" "$BEADS_DIR" "$*" > "$NTM_TEST_CLAIM_SCOPE"
+if [ -n "${BEADS_DB:-}" ]; then
+  echo 'inherited foreign database reached claim' >&2
+  exit 1
+fi
+case "$*" in
+  '--lock-timeout 5000 update bd-scope --claim --actor ScopeActor --json') ;;
+  *) echo 'unexpected claim command' >&2; exit 2 ;;
+esac
+printf '[{"id":"bd-scope","title":"selected project","status":"in_progress"}]\n'
+`
+			if err := os.WriteFile(filepath.Join(bin, "br"), []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/beads/bd-scope/claim", strings.NewReader(`{"assignee":"ScopeActor"}`))
+			route := chi.NewRouteContext()
+			route.URLParams.Add("id", "bd-scope")
+			ctx := context.WithValue(req.Context(), chi.RouteCtxKey, route)
+			if test.canceled {
+				canceled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = canceled
+			}
+			req = req.WithContext(ctx)
+			rec := httptest.NewRecorder()
+			srv.handleClaimBead(rec, req)
+			if test.missing || test.canceled {
+				if rec.Code < http.StatusBadRequest {
+					t.Fatalf("unverified claim succeeded: status=%d body=%s", rec.Code, rec.Body.String())
+				}
+				if _, err := os.Stat(calls); !os.IsNotExist(err) {
+					t.Fatalf("unverified claim reached br: %v", err)
+				}
+				return
+			}
+			if rec.Code != http.StatusOK {
+				t.Fatalf("claim status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			canonical, err := filepath.EvalSymlinks(project)
+			if err != nil {
+				t.Fatal(err)
+			}
+			commands, err := os.ReadFile(calls)
+			want := canonical + "\n" + filepath.Join(canonical, ".beads") + "\n--lock-timeout 5000 update bd-scope --claim --actor ScopeActor --json\n"
+			if err != nil || string(commands) != want {
+				t.Fatalf("claim scope=%q err=%v, want %q", commands, err, want)
+			}
+			if !test.explicit && srv.projectDirSnapshot() != "" {
+				t.Fatalf("request changed unscoped server default to %q", srv.projectDirSnapshot())
+			}
+		})
 	}
 }
 
@@ -2824,6 +3217,337 @@ func TestEventStreamSSE(t *testing.T) {
 	body, _ := io.ReadAll(rec.Body)
 	if len(body) == 0 {
 		t.Error("Expected some output from SSE stream")
+	}
+}
+
+type sseTestRecorder struct {
+	*httptest.ResponseRecorder
+	onFlush func()
+}
+
+func (r *sseTestRecorder) Flush() {
+	r.ResponseRecorder.Flush()
+	if r.onFlush != nil {
+		r.onFlush()
+	}
+}
+
+type sseTestFrame struct {
+	event string
+	data  json.RawMessage
+}
+
+func readSSETestFrames(t *testing.T, body string) []sseTestFrame {
+	t.Helper()
+	var frames []sseTestFrame
+	for _, record := range strings.Split(body, "\n\n") {
+		if record == "" {
+			continue
+		}
+		lines := strings.Split(record, "\n")
+		if len(lines) != 2 || !strings.HasPrefix(lines[0], "event: ") || !strings.HasPrefix(lines[1], "data: ") {
+			t.Fatal("invalid SSE frame boundaries")
+		}
+		data := json.RawMessage(strings.TrimPrefix(lines[1], "data: "))
+		if !json.Valid(data) {
+			t.Fatal("SSE frame contains invalid JSON")
+		}
+		frames = append(frames, sseTestFrame{event: strings.TrimPrefix(lines[0], "event: "), data: data})
+	}
+	return frames
+}
+
+func newRedactionTestAttentionFeed(t *testing.T) *robot.AttentionFeed {
+	t.Helper()
+	feed := robot.NewAttentionFeed(robot.AttentionFeedConfig{JournalSize: 8, RetentionPeriod: time.Hour})
+	previous := robot.GetAttentionFeed()
+	robot.SetAttentionFeed(feed)
+	t.Cleanup(func() {
+		robot.SetAttentionFeed(previous)
+		feed.Stop()
+	})
+	return feed
+}
+
+func TestSSEFrameRedactionModesPreserveExactJSONAndSource(t *testing.T) {
+	provider := "sk-" + strings.Repeat("x", 48)
+	token := strings.Repeat("q", 32)
+	for _, mode := range []redaction.Mode{redaction.ModeOff, redaction.ModeWarn, redaction.ModeRedact, redaction.ModeBlock} {
+		t.Run(string(mode), func(t *testing.T) {
+			s := &Server{redactionCfg: &RedactionConfig{Enabled: true, Config: redaction.Config{Mode: mode}}}
+			payload := map[string]any{
+				"cursor":  json.Number("9007199254740993"),
+				"items":   []any{},
+				"summary": "ordinary context",
+				"details": map[string]any{
+					"api_token": token,
+					"nested":    []any{map[string]any{"message": provider}},
+				},
+			}
+			original, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := httptest.NewRecorder()
+			if err := s.writeSSEEvent(rec, "attention", payload); err != nil {
+				t.Fatalf("writeSSEEvent: %v", err)
+			}
+			frames := readSSETestFrames(t, rec.Body.String())
+			if len(frames) != 1 || frames[0].event != "attention" {
+				t.Fatal("event routing or frame count changed")
+			}
+			var decoded map[string]json.RawMessage
+			if err := json.Unmarshal(frames[0].data, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if string(decoded["cursor"]) != "9007199254740993" || string(decoded["items"]) != "[]" || string(decoded["summary"]) != `"ordinary context"` {
+				t.Fatal("redaction changed exact cursors, empty arrays, or safe context")
+			}
+			if mode == redaction.ModeRedact || mode == redaction.ModeBlock {
+				if strings.Contains(rec.Body.String(), provider) || strings.Contains(rec.Body.String(), token) || !strings.Contains(rec.Body.String(), "[REDACTED:") {
+					t.Fatal("enforcing mode disclosed sensitive SSE data")
+				}
+			} else if !bytes.Equal(frames[0].data, original) {
+				t.Fatal("off/warn mode changed the serialized payload")
+			}
+			after, err := json.Marshal(payload)
+			if err != nil || !bytes.Equal(after, original) {
+				t.Fatal("output redaction mutated its source object")
+			}
+		})
+	}
+}
+
+type ssePrivateMarshalError string
+
+func (value ssePrivateMarshalError) MarshalJSON() ([]byte, error) {
+	return nil, errors.New(string(value))
+}
+
+func TestSSEFrameRefusesUnsafeOutputWithoutPartialWritesOrSecretDiagnostics(t *testing.T) {
+	secret := "sk-" + strings.Repeat("z", 48)
+	for _, tc := range []struct {
+		name    string
+		event   string
+		payload any
+		cfg     redaction.Config
+	}{
+		{name: "sensitive routing label", event: secret, payload: map[string]string{"message": "safe"}},
+		{name: "injected frame boundary", event: "attention\ndata: " + secret, payload: map[string]string{"message": "safe"}},
+		{name: "private marshaler error", event: "attention", payload: ssePrivateMarshalError(secret)},
+		{name: "unsafe structural rewrite", event: "attention", payload: map[string]int{"count": 1234567890}, cfg: redaction.Config{ExtraPatterns: map[redaction.Category][]string{"TEST_CUSTOM": {`1234567890`}}}},
+		{name: "oversized frame", event: "attention", payload: strings.Repeat("a", sseMaxFrameBytes)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			previous := log.Writer()
+			log.SetOutput(&logs)
+			defer log.SetOutput(previous)
+			tc.cfg.Mode = redaction.ModeRedact
+			s := &Server{redactionCfg: &RedactionConfig{Enabled: true, Config: tc.cfg}}
+			rec := httptest.NewRecorder()
+			err := s.writeSSEEvent(rec, tc.event, tc.payload)
+			if err == nil || rec.Body.Len() != 0 {
+				t.Fatal("unsafe event was not refused before any frame bytes were written")
+			}
+			if strings.Contains(err.Error(), secret) || strings.Contains(logs.String(), secret) {
+				t.Fatal("SSE refusal disclosed private source data in diagnostics")
+			}
+		})
+	}
+}
+
+func TestEventStreamSSERedactsMetadataAndRefusesSensitiveRouting(t *testing.T) {
+	secret := "sk-" + strings.Repeat("y", 48)
+	for _, mode := range []redaction.Mode{redaction.ModeRedact, redaction.ModeBlock} {
+		for _, sensitiveType := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/sensitive_type_%t", mode, sensitiveType), func(t *testing.T) {
+				s := New(Config{Redaction: &RedactionConfig{Enabled: true, Config: redaction.Config{Mode: mode}}})
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				rec := &sseTestRecorder{ResponseRecorder: httptest.NewRecorder()}
+				event := events.BaseEvent{Type: "agent.started", Session: secret, Timestamp: time.Now().UTC()}
+				if sensitiveType {
+					event.Type = secret
+				}
+				published := false
+				rec.onFlush = func() {
+					if !published {
+						published = true
+						s.broadcastEvent(event)
+					} else {
+						cancel()
+					}
+				}
+				s.Router().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/events", nil).WithContext(ctx))
+				if ctx.Err() == context.DeadlineExceeded {
+					t.Fatal("stream did not terminate after its last deliverable frame")
+				}
+				frames := readSSETestFrames(t, rec.Body.String())
+				wantFrames := 2
+				if sensitiveType {
+					wantFrames = 1
+				}
+				if len(frames) != wantFrames || frames[0].event != "connected" || strings.Contains(rec.Body.String(), secret) {
+					t.Fatal("legacy SSE disclosed metadata or changed safe frame boundaries")
+				}
+				if !sensitiveType && (frames[1].event != "agent.started" || !strings.Contains(string(frames[1].data), "[REDACTED:")) {
+					t.Fatal("safe event type or redacted session metadata was lost")
+				}
+				if event.Session != secret {
+					t.Fatal("streaming mutated the source event")
+				}
+			})
+		}
+	}
+}
+
+func TestAttentionStreamSSERedactsReplayLiveAndUpdatedPolicy(t *testing.T) {
+	secret := "sk-" + strings.Repeat("v", 48)
+	token := strings.Repeat("p", 32)
+	for _, initialMode := range []redaction.Mode{redaction.ModeRedact, redaction.ModeBlock, redaction.ModeOff} {
+		t.Run(string(initialMode), func(t *testing.T) {
+			feed := newRedactionTestAttentionFeed(t)
+			replay := feed.PublishMailPending("/project", "sender", "receiver", "replay "+secret, 1, "thread")
+			s := New(Config{Redaction: &RedactionConfig{Enabled: true, Config: redaction.Config{Mode: initialMode}}})
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			rec := &sseTestRecorder{ResponseRecorder: httptest.NewRecorder()}
+			published := false
+			rec.onFlush = func() {
+				if !published {
+					published = true
+					if initialMode == redaction.ModeOff {
+						s.mu.Lock()
+						s.redactionCfg = &RedactionConfig{Enabled: true, Config: redaction.Config{Mode: redaction.ModeBlock}}
+						s.mu.Unlock()
+					}
+					feed.Append(robot.AttentionEvent{Category: robot.EventCategoryAlert, Summary: "live " + secret, Details: map[string]any{"api_token": token}})
+				}
+				if strings.Count(rec.Body.String(), "event: attention\n") == 2 {
+					cancel()
+				}
+			}
+			s.Router().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/attention/stream?heartbeat=0", nil).WithContext(ctx))
+			if ctx.Err() == context.DeadlineExceeded {
+				t.Fatal("stream did not deliver replay and queued live events")
+			}
+			frames := readSSETestFrames(t, rec.Body.String())
+			if len(frames) != 3 || frames[0].event != "connected" || frames[1].event != "attention" || frames[2].event != "attention" {
+				t.Fatal("connection/replay/live frame sequence changed")
+			}
+			if strings.Contains(rec.Body.String(), secret) || strings.Contains(rec.Body.String(), token) {
+				t.Fatal("SSE replay or live data escaped the current output policy")
+			}
+			for i, frame := range frames[1:] {
+				var delivered robot.AttentionEvent
+				if err := json.Unmarshal(frame.data, &delivered); err != nil {
+					t.Fatal(err)
+				}
+				if delivered.Cursor != replay.Cursor+int64(i) || !strings.Contains(delivered.Summary, "[REDACTED:") {
+					t.Fatal("stream lost cursor identity or summary protection")
+				}
+			}
+			stored, _, err := feed.Replay(0, 8)
+			if err != nil || len(stored) != 2 || !strings.Contains(stored[0].Summary, secret) || stored[1].Details["api_token"] != token {
+				t.Fatal("per-client redaction changed the shared feed")
+			}
+		})
+	}
+}
+
+func TestAttentionStreamSSEProtectsHeartbeatDiagnostics(t *testing.T) {
+	s, store := setupTestServer(t)
+	newRedactionTestAttentionFeed(t)
+	secret := "sk-" + strings.Repeat("h", 48)
+	now := time.Now().UTC()
+	if err := store.UpsertSourceHealth(&state.SourceHealth{SourceName: "mail", Available: true, Healthy: false, Reason: "service unavailable", LastErrorCode: secret, LastError: secret, LastCheckAt: now, ConsecutiveFailures: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(s.attentionHeartbeatSourceSummary().degradedReasons, " "), secret) {
+		t.Fatal("source-health fixture does not expose the sensitive diagnostic")
+	}
+	s.redactionCfg = &RedactionConfig{Enabled: true, Config: redaction.Config{Mode: redaction.ModeBlock}}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	rec := &sseTestRecorder{ResponseRecorder: httptest.NewRecorder()}
+	rec.onFlush = func() {
+		if strings.Contains(rec.Body.String(), "event: heartbeat\n") {
+			cancel()
+		}
+	}
+	s.Router().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/attention/stream?heartbeat=1", nil).WithContext(ctx))
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Fatal("heartbeat was not delivered")
+	}
+	frames := readSSETestFrames(t, rec.Body.String())
+	if len(frames) != 2 || frames[1].event != "heartbeat" || strings.Contains(rec.Body.String(), secret) {
+		t.Fatal("heartbeat diagnostics disclosed sensitive content")
+	}
+	var heartbeat struct {
+		SourcesDegraded  int      `json:"sources_degraded"`
+		DegradedReasons  []string `json:"degraded_reasons"`
+		SubscriptionLive bool     `json:"subscription_active"`
+	}
+	if err := json.Unmarshal(frames[1].data, &heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	if heartbeat.SourcesDegraded != 1 || !heartbeat.SubscriptionLive || len(heartbeat.DegradedReasons) != 1 || !strings.Contains(heartbeat.DegradedReasons[0], "[REDACTED:") {
+		t.Fatal("heartbeat lost its non-secret health diagnostics")
+	}
+}
+
+func TestAttentionStreamSSETerminatesOnUnsafeLiveFrame(t *testing.T) {
+	feed := newRedactionTestAttentionFeed(t)
+	s := New(Config{Redaction: &RedactionConfig{Enabled: true, Config: redaction.Config{Mode: redaction.ModeRedact}}})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	rec := &sseTestRecorder{ResponseRecorder: httptest.NewRecorder()}
+	published := false
+	rec.onFlush = func() {
+		if !published {
+			published = true
+			feed.Append(robot.AttentionEvent{Summary: "undeliverable", Details: map[string]any{"value": ssePrivateMarshalError("private source failure")}})
+			feed.Append(robot.AttentionEvent{Summary: "must not skip ahead"})
+		}
+	}
+	s.Router().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/attention/stream?heartbeat=0", nil).WithContext(ctx))
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Fatal("unsafe live frame was silently skipped instead of terminating the stream")
+	}
+	frames := readSSETestFrames(t, rec.Body.String())
+	if len(frames) != 1 || frames[0].event != "connected" {
+		t.Fatal("stream advanced past an unsafe event or emitted a partial frame")
+	}
+}
+
+func TestAttentionSSEReplayRefusalPreservesLastDeliveredCursor(t *testing.T) {
+	const exactCursor int64 = 9007199254740993
+	s := &Server{redactionCfg: &RedactionConfig{Enabled: true, Config: redaction.Config{Mode: redaction.ModeBlock}}}
+	secret := "sk-" + strings.Repeat("r", 48)
+	events := []robot.AttentionEvent{
+		{Cursor: exactCursor, Summary: "safe context " + secret},
+		{Cursor: exactCursor + 1, Summary: "undeliverable", Details: map[string]any{"value": ssePrivateMarshalError(secret)}},
+		{Cursor: exactCursor + 2, Summary: "must not skip ahead"},
+	}
+	rec := httptest.NewRecorder()
+	cursor, delivered, err := s.writeAttentionReplay(rec, rec, events, nil, "", nil, exactCursor-1)
+	if err == nil || strings.Contains(err.Error(), secret) || cursor != exactCursor || delivered != 1 {
+		t.Fatal("replay refusal lost the last delivered cursor or leaked error contents")
+	}
+	frames := readSSETestFrames(t, rec.Body.String())
+	if len(frames) != 1 || strings.Contains(rec.Body.String(), secret) {
+		t.Fatal("replay emitted an unsafe or subsequent frame")
+	}
+	var event robot.AttentionEvent
+	if err := json.Unmarshal(frames[0].data, &event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Cursor != exactCursor || !strings.Contains(event.Summary, "safe context") || !strings.Contains(event.Summary, "[REDACTED:") {
+		t.Fatal("replay changed the exact cursor or discarded safe context")
+	}
+	if !strings.Contains(events[0].Summary, secret) || events[1].Details["value"] != ssePrivateMarshalError(secret) {
+		t.Fatal("replay protection mutated source events")
 	}
 }
 
@@ -4627,7 +5351,7 @@ func TestExecPipelineInline_UsesServerProjectDir(t *testing.T) {
 	output := srv.execPipelineInline(context.Background(), &pipeline.Workflow{
 		SchemaVersion: pipeline.SchemaVersion,
 		Name:          "inline-project-dir",
-		Steps:         nil,
+		Steps:         []pipeline.Step{{ID: "noop", Command: "true"}},
 	}, "inline-session", nil, false)
 
 	if !output.Success {
@@ -4714,13 +5438,16 @@ func TestHandleCleanupPipelines_UsesServerProjectDir(t *testing.T) {
 	projectDir := t.TempDir()
 	srv.projectDir = projectDir
 
+	finishedAt := time.Now().Add(-4 * time.Hour)
 	state := &pipeline.ExecutionState{
-		RunID:      "cleanup-project-dir",
-		WorkflowID: "cleanup-workflow",
-		Session:    "cleanup-session",
-		Status:     pipeline.StatusCompleted,
-		StartedAt:  time.Now().Add(-4 * time.Hour),
-		UpdatedAt:  time.Now().Add(-4 * time.Hour),
+		RunID:                    "cleanup-project-dir",
+		WorkflowID:               "cleanup-workflow",
+		Session:                  "cleanup-session",
+		Status:                   pipeline.StatusCompleted,
+		StartedAt:                finishedAt.Add(-time.Minute),
+		FinishedAt:               finishedAt,
+		UpdatedAt:                finishedAt,
+		CommandEvaluationVersion: 2,
 	}
 	if err := pipeline.SaveState(projectDir, state); err != nil {
 		t.Fatalf("save state: %v", err)
@@ -6458,7 +7185,7 @@ func TestWriteAttentionReplay_AdvancesCursorToLastDeliveredEvent(t *testing.T) {
 		{Cursor: 7, Session: "alpha", Summary: "second"},
 	}
 
-	finalCursor, delivered, err := writeAttentionReplay(rec, rec, events, nil, "", nil, 2)
+	finalCursor, delivered, err := (&Server{}).writeAttentionReplay(rec, rec, events, nil, "", nil, 2)
 	if err != nil {
 		t.Fatalf("writeAttentionReplay() error = %v", err)
 	}
@@ -6486,7 +7213,7 @@ func TestWriteAttentionReplay_SuppressesReplayHeartbeatEventsAndPreservesCursor(
 		{Cursor: 7, Session: "alpha", Summary: "real"},
 	}
 
-	finalCursor, delivered, err := writeAttentionReplay(rec, rec, events, nil, "", nil, 10)
+	finalCursor, delivered, err := (&Server{}).writeAttentionReplay(rec, rec, events, nil, "", nil, 10)
 	if err != nil {
 		t.Fatalf("writeAttentionReplay() error = %v", err)
 	}

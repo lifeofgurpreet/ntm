@@ -1,16 +1,20 @@
 package checkpoint
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -24,9 +28,15 @@ var (
 )
 
 var errWorkingDirNotDirectory = errors.New("not a directory")
+var errRestoreLayoutAppearance = errors.New("restored layout appearance could not be applied")
+var stopRestoreSessionMonitor = resilience.StopSessionMonitor
 
 // RestoreOptions configures how a checkpoint is restored.
 type RestoreOptions struct {
+	// TargetSession restores into a different tmux session without renaming the
+	// stored checkpoint. Empty uses its original session. This isolates tmux
+	// state, not files: use CustomDirectory for a separate working tree.
+	TargetSession string
 	// Force kills any existing session with the same name
 	Force bool
 	// SkipGitCheck skips warning about git state mismatch
@@ -39,20 +49,34 @@ type RestoreOptions struct {
 	CustomDirectory string
 	// ScrollbackLines is how many lines of scrollback to inject (0 = all captured)
 	ScrollbackLines int
+	// Config supplies the caller's configured account launcher. Saved commands
+	// and settings remain authoritative. When nil, replay loads configuration
+	// from the recovery directory only if account affinity or isolation needs it.
+	Config *config.Config
 }
 
 // RestoreResult contains details about what was restored.
 type RestoreResult struct {
 	// SessionName is the restored session name
 	SessionName string
+	// SourceSession is the immutable storage namespace of the checkpoint.
+	SourceSession string
 	// PanesRestored is the number of panes created
 	PanesRestored int
-	// ContextInjected indicates if scrollback was sent to agents
+	// ContextInjected indicates that scrollback was sent to at least one agent.
+	// It remains false for a dry run or when no agent has captured scrollback.
 	ContextInjected bool
+	// ContextPanesInjected counts completed deliveries, including on partial failure.
+	ContextPanesInjected int
 	// Warnings contains non-fatal issues encountered
 	Warnings []string
 	// DryRun indicates this was a simulation
 	DryRun bool
+	// Stage identifies the last attempted restoration phase, including on error.
+	Stage string
+	// Interrupted means cancellation stopped further work, not that prior
+	// mutations were undone. A partially restored session is left for inspection.
+	Interrupted bool
 
 	// Assignments contains bead-to-agent assignment state from the checkpoint (bd-32ck).
 	// Empty if no assignments were captured.
@@ -65,6 +89,19 @@ type RestoreResult struct {
 // Restorer handles checkpoint restoration.
 type Restorer struct {
 	storage *Storage
+	// ctx is set only on an operation-local copy, never on a shared Restorer.
+	// This keeps one implementation for the context-aware and convenience APIs.
+	ctx context.Context
+	// sourceSession remains the checkpoint's storage namespace when restoring
+	// into another session. Like ctx, it belongs only to an operation-local copy.
+	sourceSession string
+	// restoredPaneIDs pins each sorted checkpoint pane to the physical pane
+	// created for it. Re-reading pane positions after a pane exits must never
+	// redirect its launch command or context into a different pane.
+	restoredPaneIDs []string
+	// launchPlans follows sortedCheckpointPanes and belongs to this restore
+	// operation. Account checks complete before --force can remove a session.
+	launchPlans []*resilience.AgentLaunchPlan
 }
 
 // NewRestorer creates a new Restorer with default storage.
@@ -81,20 +118,155 @@ func NewRestorerWithStorage(storage *Storage) *Restorer {
 	}
 }
 
-// RestoreFromCheckpoint restores a session from a loaded checkpoint.
-func (r *Restorer) RestoreFromCheckpoint(cp *Checkpoint, opts RestoreOptions) (*RestoreResult, error) {
+// RestoreFromCheckpointContext restores a session from a loaded checkpoint
+// under the caller's cancellation and deadline. Cancellation prevents
+// subsequent mutations; it does not kill agents already restored or roll back
+// the operator-authorized replacement of a session. On a partial failure, the
+// result describes progress and the error remains fatal.
+func (r *Restorer) RestoreFromCheckpointContext(ctx context.Context, cp *Checkpoint, opts RestoreOptions) (*RestoreResult, error) {
+	if ctx == nil {
+		return nil, errors.New("restore context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if cp == nil {
 		return nil, ErrNilCheckpoint
+	}
+	if err := tmux.ValidateSessionName(cp.SessionName); err != nil {
+		return nil, fmt.Errorf("invalid checkpoint source session: %w", err)
+	}
+	if opts.TargetSession != "" {
+		if err := tmux.ValidateSessionName(opts.TargetSession); err != nil {
+			return nil, fmt.Errorf("invalid restore target session: %w", err)
+		}
+	}
+	op := *r
+	op.ctx = ctx
+	op.sourceSession = cp.SessionName
+	op.restoredPaneIDs = nil
+	op.launchPlans = nil
+	if opts.TargetSession != "" && opts.TargetSession != cp.SessionName {
+		// Never rewrite the caller's checkpoint or persist a renamed copy.
+		// Pane IDs and scrollback references still identify the source artifact.
+		copy := *cp
+		copy.SessionName = opts.TargetSession
+		copy.Session.Panes = append([]PaneState(nil), cp.Session.Panes...)
+		prefix := cp.SessionName + "__"
+		for i := range copy.Session.Panes {
+			title := copy.Session.Panes[i].Title
+			if strings.HasPrefix(title, prefix) {
+				copy.Session.Panes[i].Title = opts.TargetSession + "__" + strings.TrimPrefix(title, prefix)
+			}
+		}
+		cp = &copy
+	}
+	workDir := cp.WorkingDir
+	if opts.CustomDirectory != "" {
+		workDir = opts.CustomDirectory
+	}
+	var finishProgress func()
+	op.ctx, finishProgress = beginRestoreProgress(ctx, RestoreProgress{
+		CheckpointID: cp.ID, SourceSession: op.sourceSession, Session: cp.SessionName,
+		WorkingDir: effectiveRestoreDir(workDir), PlannedPanes: len(cp.Session.Panes),
+	}, opts.DryRun)
+	defer finishProgress()
+	return op.restoreFromCheckpoint(cp, opts)
+}
+
+func (r *Restorer) operationContext() context.Context {
+	if r.ctx != nil {
+		return r.ctx
+	}
+	return context.Background()
+}
+
+func waitForRestore(ctx context.Context, delay time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return ctx.Err()
+	}
+}
+
+func (r *Restorer) restoreFromCheckpoint(cp *Checkpoint, opts RestoreOptions) (result *RestoreResult, retErr error) {
+	ctx := r.operationContext()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if cp == nil {
+		return nil, ErrNilCheckpoint
+	}
+	// Validate required identity, panes, and launch commands before --force can
+	// kill an existing session. An empty checkpoint is not a restore.
+	if err := tmux.ValidateSessionName(cp.SessionName); err != nil {
+		return nil, fmt.Errorf("invalid checkpoint session name: %w", err)
+	}
+	if len(cp.Session.Panes) == 0 {
+		return nil, ErrNoAgentsToRestore
+	}
+	if opts.ScrollbackLines < 0 {
+		return nil, errors.New("scrollback lines must be non-negative")
 	}
 	if err := validateCheckpointAutomatedRelaunch(cp); err != nil {
 		return nil, err
 	}
+	for _, pane := range cp.Session.Panes {
+		agentType := tmux.ParsePaneAgentTypeOption(pane.AgentType)
+		if !agentType.IsValid() && agent.IsPluginType(agentType) && pane.LaunchSpec == nil {
+			return nil, fmt.Errorf("checkpoint pane %d plugin %s has no saved launch specification; relaunch it with its configured command", pane.Index, pane.AgentType)
+		}
+		if pane.LaunchSpec != nil {
+			if err := pane.LaunchSpec.ValidateReplay(agentType); err != nil {
+				return nil, fmt.Errorf("checkpoint pane %d launch specification: %w", pane.Index, err)
+			}
+		}
+		if command := restorableAgentCommand(pane); command != "" {
+			if _, err := tmux.SanitizePaneCommand(command); err != nil {
+				return nil, fmt.Errorf("checkpoint pane %d command: %w", pane.Index, err)
+			}
+			if expectedPaneCommand(command) == "" {
+				return nil, fmt.Errorf("checkpoint pane %d has no executable command", pane.Index)
+			}
+		}
+	}
 
-	result := &RestoreResult{
-		SessionName: cp.SessionName,
-		DryRun:      opts.DryRun,
-		Assignments: cp.Assignments,
-		BVSummary:   cp.BVSummary,
+	result = &RestoreResult{
+		SessionName:   cp.SessionName,
+		SourceSession: r.sourceSession,
+		DryRun:        opts.DryRun,
+		Assignments:   cp.Assignments,
+		BVSummary:     cp.BVSummary,
+		Stage:         "validating",
+	}
+	for _, pane := range cp.Session.Panes {
+		if command := restorableAgentCommand(pane); command != "" && pane.LaunchSpec == nil && isBareAgentRuntimeCommand(pane.Command) {
+			result.Warnings = append(result.Warnings, fmt.Sprintf(
+				"checkpoint pane %d captured runtime %q without launch arguments; restoring %q for agent %s",
+				pane.Index, strings.TrimSpace(pane.Command), command, pane.AgentType))
+		}
+	}
+	defer func() {
+		if err := ctx.Err(); err != nil {
+			retErr = errors.Join(retErr, err, context.Cause(ctx))
+			if result != nil {
+				result.Interrupted = true
+			}
+		}
+	}()
+
+	// Validate saved payloads before any replacement, launch, or context
+	// injection. --force authorizes replacement, never ignoring corruption.
+	warnings, err := preflightCheckpointArtifacts(ctx, r.storage, cp, r.sourceSession)
+	result.Warnings = append(result.Warnings, warnings...)
+	if err != nil {
+		return result, err
 	}
 
 	// Surface assignment and BV summary from checkpoint (bd-32ck)
@@ -130,76 +302,136 @@ func (r *Restorer) RestoreFromCheckpoint(cp *Checkpoint, opts RestoreOptions) (*
 			}
 		}
 	}
-	// Check for existing session
-	if tmux.SessionExists(cp.SessionName) {
-		if !opts.Force {
-			return nil, ErrSessionExists
+	// Resolve every saved account/profile requirement before replacing any
+	// session. This phase is read-only: private Claude directories are created
+	// only when the corresponding replacement pane is ready to launch.
+	restoreDir := effectiveRestoreDir(workDir)
+	sortedStates := sortedCheckpointPanes(cp.Session.Panes)
+	r.launchPlans = make([]*resilience.AgentLaunchPlan, len(sortedStates))
+	for i, pane := range sortedStates {
+		if pane.LaunchSpec == nil {
+			continue
 		}
-		if !opts.DryRun {
-			if err := tmux.KillSession(cp.SessionName); err != nil {
-				return nil, fmt.Errorf("killing existing session: %w", err)
-			}
-			// Wait for session to be fully killed
-			time.Sleep(100 * time.Millisecond)
-		} else {
-			result.Warnings = append(result.Warnings,
-				fmt.Sprintf("would kill existing session %q", cp.SessionName))
+		plan, err := resilience.PreflightAgentLaunchSpec(ctx, opts.Config, *pane.LaunchSpec, restoreDir)
+		if err != nil {
+			return result, fmt.Errorf("checkpoint pane %d launch preflight: %w", pane.Index, err)
 		}
+		r.launchPlans[i] = plan
 	}
-
-	// Validate we have panes to restore
-	if len(cp.Session.Panes) == 0 {
-		return nil, ErrNoAgentsToRestore
-	}
-
-	// Check git state if requested
+	// Advisory git inspection is read-only and also precedes replacement.
 	if !opts.SkipGitCheck && cp.Git.Commit != "" && workDir != "" {
 		if warning := r.checkGitState(cp, workDir); warning != "" {
 			result.Warnings = append(result.Warnings, warning)
 		}
 	}
-	restoreDir := effectiveRestoreDir(workDir)
-
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	// Do not mistake an unavailable tmux server/probe error for absence.
+	exists, err := tmux.DefaultClient.SessionExistsContext(ctx, cp.SessionName)
+	if err != nil {
+		if !opts.DryRun || ctx.Err() != nil {
+			return result, fmt.Errorf("checking existing session: %w", err)
+		}
+		result.Warnings = append(result.Warnings, fmt.Sprintf("could not check existing session: %v", err))
+	}
+	if exists {
+		if !opts.Force {
+			return nil, ErrSessionExists
+		}
+		if !opts.DryRun {
+			result.Stage = "stopping_existing_session"
+			if _, err := runRestoreMutation(ctx, RestoreProgress{Stage: "stop_session"}, func() (string, error) {
+				// Join the existing resident's actuation before replacing its
+				// session. A same-name replacement must not inherit an old
+				// monitor racing recovery against the new topology.
+				// Residents are local; a remote target must leave them alone.
+				if tmux.DefaultClient.Remote == "" {
+					if err := stopRestoreSessionMonitor(ctx, cp.SessionName); err != nil {
+						return "", fmt.Errorf("stopping session monitor: %w", err)
+					}
+				}
+				return "", tmux.DefaultClient.RunSilentContext(ctx, "kill-session", "-t", tmux.TargetSession(cp.SessionName))
+			}); err != nil {
+				return result, fmt.Errorf("killing existing session: %w", err)
+			}
+			if err := waitForRestore(ctx, 100*time.Millisecond); err != nil {
+				return result, err
+			}
+		} else {
+			result.Warnings = append(result.Warnings,
+				fmt.Sprintf("would kill existing session %q", cp.SessionName))
+		}
+	}
 	if opts.DryRun {
-		// Simulate what would happen
 		result.PanesRestored = len(cp.Session.Panes)
-		result.ContextInjected = opts.InjectContext
+		result.Stage = "validated"
 		return result, nil
 	}
 
-	// Create the session
+	result.Stage = "creating_session"
 	if err := r.createSession(cp, restoreDir); err != nil {
-		return nil, fmt.Errorf("creating session: %w", err)
+		result.PanesRestored = len(r.restoredPaneIDs)
+		return result, fmt.Errorf("creating session (inspect for partial creation): %w", err)
+	}
+	result.PanesRestored = 1
+	if err := ctx.Err(); err != nil {
+		return result, err
 	}
 
-	// Create additional panes to match checkpoint layout
+	result.Stage = "restoring_layout"
 	panesCreated, err := r.restoreLayout(cp, restoreDir)
+	result.PanesRestored = panesCreated
 	if err != nil {
 		result.Warnings = append(result.Warnings,
 			fmt.Sprintf("layout restoration incomplete: %v", err))
+		// Layout aesthetics are best-effort, but pane creation, identity, and
+		// cancellation failures cannot be reported as a fully restored session.
+		if ctx.Err() != nil || !errors.Is(err, errRestoreLayoutAppearance) {
+			return result, err
+		}
 	}
-	result.PanesRestored = panesCreated
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 
+	result.Stage = "starting_agents"
 	if err := r.restoreAgents(cp, restoreDir); err != nil {
 		result.Warnings = append(result.Warnings,
 			fmt.Sprintf("agent restoration incomplete: %v", err))
+		return result, err
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
 	}
 
-	// Inject context if requested
 	if opts.InjectContext {
-		if err := r.injectContext(cp, opts.ScrollbackLines); err != nil {
+		result.Stage = "injecting_context"
+		injected, err := r.injectContext(cp, opts.ScrollbackLines)
+		result.ContextPanesInjected = injected
+		result.ContextInjected = injected > 0
+		if err != nil {
 			result.Warnings = append(result.Warnings,
 				fmt.Sprintf("context injection failed: %v", err))
-		} else {
-			result.ContextInjected = true
+			return result, err
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 
+	result.Stage = "selecting_active_pane"
 	if err := r.restoreActivePane(cp); err != nil {
 		result.Warnings = append(result.Warnings,
 			fmt.Sprintf("active pane restoration failed: %v", err))
 	}
-
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	if err := reportRestoreProgress(ctx, RestoreProgress{Stage: "completed", Phase: "observed", Outcome: "succeeded"}); err != nil {
+		return result, err
+	}
+	result.Stage = "completed"
 	return result, nil
 }
 
@@ -214,32 +446,37 @@ func validateCheckpointAutomatedRelaunch(cp *Checkpoint) error {
 
 // createSession creates the initial tmux session.
 func (r *Restorer) createSession(cp *Checkpoint, workDir string) error {
-	if err := tmux.CreateSession(cp.SessionName, workDir); err != nil {
+	ctx := r.operationContext()
+	if _, err := runRestoreMutation(ctx, RestoreProgress{Stage: "create_session"}, func() (string, error) {
+		return "", tmux.DefaultClient.CreateSessionContext(ctx, cp.SessionName, workDir)
+	}); err != nil {
 		return err
 	}
-
-	// Wait for session to be ready
-	time.Sleep(100 * time.Millisecond)
+	if err := waitForRestore(ctx, 100*time.Millisecond); err != nil {
+		return err
+	}
 
 	// Restore the first pane's title and durable type before relaunching it.
 	panes := sortedCheckpointPanes(cp.Session.Panes)
 	if len(panes) > 0 {
-		if err := moveInitialWindow(cp.SessionName, panes[0].WindowIndex); err != nil {
+		if err := moveInitialWindow(ctx, cp.SessionName, panes[0].WindowIndex); err != nil {
 			return err
 		}
-		firstPane := panes[0]
-		firstAgentType := tmux.ParsePaneAgentTypeOption(firstPane.AgentType)
-		if firstPane.Title == "" && (firstAgentType == tmux.AgentUnknown || firstAgentType == tmux.AgentUser) {
-			return nil
-		}
-		livePanes, err := tmux.GetPanes(cp.SessionName)
+		livePanes, err := tmux.DefaultClient.GetPanesContext(ctx, cp.SessionName)
 		if err != nil {
 			return fmt.Errorf("getting initial restored pane: %w", err)
 		}
-		if len(livePanes) == 0 {
-			return fmt.Errorf("restored session %q has no initial pane", cp.SessionName)
+		if len(livePanes) != 1 || livePanes[0].ID == "" {
+			return fmt.Errorf("restored session %q must have exactly one identifiable initial pane", cp.SessionName)
 		}
-		if err := setRestoredPaneIdentity(livePanes[0].ID, firstPane.Title, firstPane.AgentType); err != nil {
+		r.restoredPaneIDs = append(r.restoredPaneIDs, livePanes[0].ID)
+		firstPane := panes[0]
+		event := restorePaneProgress("pane_identified", livePanes[0].ID, firstPane)
+		event.Phase, event.Outcome = "observed", "succeeded"
+		if err := reportRestoreProgress(ctx, event); err != nil {
+			return err
+		}
+		if err := setRestoredPaneIdentity(ctx, livePanes[0].ID, firstPane.Title, firstPane.AgentType); err != nil {
 			return fmt.Errorf("setting initial restored pane identity: %w", err)
 		}
 	}
@@ -249,6 +486,7 @@ func (r *Restorer) createSession(cp *Checkpoint, workDir string) error {
 
 // restoreLayout creates additional panes to match the checkpoint layout.
 func (r *Restorer) restoreLayout(cp *Checkpoint, workDir string) (int, error) {
+	ctx := r.operationContext()
 	paneStates := sortedCheckpointPanes(cp.Session.Panes)
 	if len(paneStates) == 0 {
 		return 0, nil
@@ -259,105 +497,146 @@ func (r *Restorer) restoreLayout(cp *Checkpoint, workDir string) (int, error) {
 	lastWindowIndex := paneStates[0].WindowIndex
 
 	for i := 1; i < len(paneStates); i++ {
+		if err := ctx.Err(); err != nil {
+			return panesCreated, err
+		}
 		paneState := paneStates[i]
 		windowTarget := fmt.Sprintf("%s:%d", cp.SessionName, paneState.WindowIndex)
+		splitWindow := paneState.WindowIndex == lastWindowIndex
 
-		var (
-			paneID string
-			err    error
-		)
-
-		if paneState.WindowIndex != lastWindowIndex {
-			paneID, err = tmux.DefaultClient.Run(
-				"new-window",
-				"-P",
-				"-F",
-				"#{pane_id}",
-				"-t",
-				tmux.ExactTarget(windowTarget),
-				"-c",
-				workDir,
-			)
-			lastWindowIndex = paneState.WindowIndex
-		} else {
-			paneID, err = tmux.DefaultClient.Run(
-				"split-window",
-				"-t",
-				tmux.ExactTarget(windowTarget),
-				"-c",
-				workDir,
-				"-P",
-				"-F",
-				"#{pane_id}",
-			)
-		}
+		paneID, err := runRestoreMutation(ctx, restorePaneProgress("create_pane", "", paneState), func() (string, error) {
+			var paneID string
+			var err error
+			if !splitWindow {
+				paneID, err = tmux.DefaultClient.RunContext(ctx,
+					"new-window", "-P", "-F", "#{pane_id}",
+					"-t", tmux.ExactTarget(windowTarget), "-c", workDir,
+				)
+				lastWindowIndex = paneState.WindowIndex
+			} else {
+				paneID, err = tmux.DefaultClient.RunContext(ctx,
+					"split-window", "-t", tmux.ExactTarget(windowTarget), "-c", workDir,
+					"-P", "-F", "#{pane_id}",
+				)
+			}
+			paneID = strings.TrimSpace(paneID)
+			if err != nil {
+				return paneID, err
+			}
+			if paneID == "" {
+				return "", fmt.Errorf("creating pane %d returned no pane ID", i)
+			}
+			// Retain the successful creation even if its after-checkpoint fails.
+			r.restoredPaneIDs = append(r.restoredPaneIDs, paneID)
+			panesCreated++
+			return paneID, nil
+		})
 		if err != nil {
 			return panesCreated, fmt.Errorf("creating pane %d: %w", i, err)
 		}
 
-		if err := setRestoredPaneIdentity(paneID, paneState.Title, paneState.AgentType); err != nil {
-			return panesCreated, fmt.Errorf("setting pane %d identity: %w", i, err)
+		if err := setRestoredPaneIdentity(ctx, paneID, paneState.Title, paneState.AgentType); err != nil {
+			return panesCreated, fmt.Errorf("setting pane %d identity (pane was created): %w", i, err)
+		}
+		if splitWindow {
+			// Balance only the window being constructed so successive splits
+			// do not keep halving an already tiny active pane. Keep the physical
+			// pane binding/count above even if balancing or its journal fails.
+			// Captured per-window geometry is applied after all panes exist.
+			if _, err := runRestoreMutation(ctx, restorePaneProgress("balance_layout", paneID, paneState), func() (string, error) {
+				return paneID, tmux.DefaultClient.RunSilentContext(ctx, "select-layout", "-t", tmux.ExactTarget(windowTarget), "tiled")
+			}); err != nil {
+				return panesCreated, fmt.Errorf("balancing window after creating pane %d: %w", i, err)
+			}
 		}
 
-		panesCreated++
-
-		// Small delay between pane creations for stability
-		time.Sleep(50 * time.Millisecond)
+		if err := waitForRestore(ctx, 50*time.Millisecond); err != nil {
+			return panesCreated, err
+		}
 	}
 
 	// Apply captured layouts after panes exist.
 	if len(cp.Session.WindowLayouts) > 0 {
 		if err := r.applyWindowLayouts(cp.SessionName, cp.Session.WindowLayouts); err != nil {
-			// Non-fatal - layout is a best-effort feature
-			return panesCreated, fmt.Errorf("applying window layouts: %w", err)
+			return panesCreated, fmt.Errorf("%w: applying window layouts: %w", errRestoreLayoutAppearance, err)
 		}
 	} else if cp.Session.Layout != "" {
 		if !canRestoreLegacySessionLayout(cp.Session) {
-			return panesCreated, fmt.Errorf("skipping legacy single layout for multi-window checkpoint; per-window layouts are missing")
+			return panesCreated, fmt.Errorf("%w: skipping legacy single layout for multi-window checkpoint; per-window layouts are missing", errRestoreLayoutAppearance)
 		}
 		if err := r.applyLayout(cp.SessionName, cp.Session.Layout); err != nil {
-			// Non-fatal - layout is a best-effort feature
-			return panesCreated, fmt.Errorf("applying layout: %w", err)
+			return panesCreated, fmt.Errorf("%w: applying layout: %w", errRestoreLayoutAppearance, err)
 		}
 	}
 
-	return panesCreated, nil
+	return panesCreated, ctx.Err()
 }
 
-func setRestoredPaneIdentity(paneID, title, rawAgentType string) error {
+func setRestoredPaneIdentity(ctx context.Context, paneID, title, rawAgentType string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	agentType := tmux.ParsePaneAgentTypeOption(rawAgentType)
 	if agentType == tmux.AgentUnknown || agentType == tmux.AgentUser {
 		if title == "" {
 			return nil
 		}
-		return tmux.SetPaneTitle(paneID, title)
+		return tmux.DefaultClient.RunSilentContext(ctx, "select-pane", "-t", tmux.ExactTarget(paneID), "-T", title)
 	}
-	return tmux.SetPaneAgentIdentity(paneID, title, agentType)
+	return tmux.DefaultClient.SetPaneAgentIdentityContext(ctx, paneID, title, agentType)
 }
 
 func (r *Restorer) restoreAgents(cp *Checkpoint, workDir string) error {
-	panes, err := tmux.GetPanes(cp.SessionName)
+	ctx := r.operationContext()
+	panes, err := tmux.DefaultClient.GetPanesContext(ctx, cp.SessionName)
 	if err != nil {
 		return fmt.Errorf("getting panes: %w", err)
 	}
 
 	sortedStates := sortedCheckpointPanes(cp.Session.Panes)
-	sortedPanes := sortedTmuxPanes(panes)
+	livePanes := make(map[string]tmux.Pane, len(panes))
+	for _, pane := range panes {
+		livePanes[pane.ID] = pane
+	}
 	attempted := 0
 	launched := 0
 
 	for i, paneState := range sortedStates {
-		if i >= len(sortedPanes) {
-			break
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if i >= len(r.restoredPaneIDs) {
+			return fmt.Errorf("restored session has %d recorded panes, expected %d", len(r.restoredPaneIDs), len(sortedStates))
+		}
+		paneID := r.restoredPaneIDs[i]
+		if _, ok := livePanes[paneID]; !ok {
+			return fmt.Errorf("restored pane %s disappeared before agent launch", paneID)
 		}
 
 		agentCmd := restorableAgentCommand(paneState)
 		if agentCmd == "" {
 			continue
 		}
+		if paneState.LaunchSpec != nil {
+			if i >= len(r.launchPlans) || r.launchPlans[i] == nil {
+				return fmt.Errorf("checkpoint pane %d launch specification was not preflighted", paneState.Index)
+			}
+			// Window-local pane indices may repeat. The sorted position gives
+			// each replacement an independent credential directory.
+			agentCmd, err = r.launchPlans[i].Prepare(ctx, workDir, cp.SessionName, i+1)
+			if err != nil {
+				return fmt.Errorf("preparing restored pane %s launch: %w", paneID, err)
+			}
+			if err := tmux.SetPaneLaunchSpecContext(ctx, paneID, *paneState.LaunchSpec); err != nil {
+				return fmt.Errorf("recording restored pane %s launch specification: %w", paneID, err)
+			}
+		}
 
 		attempted++
-		if err := relaunchRestoredPane(sortedPanes[i].ID, workDir, agentCmd); err != nil {
+		if err := relaunchRestoredPane(ctx, cp.SessionName, paneID, workDir, agentCmd); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			slog.Warn("checkpoint restore: failed to relaunch pane command",
 				"session", cp.SessionName,
 				"pane_index", paneState.Index,
@@ -376,67 +655,49 @@ func (r *Restorer) restoreAgents(cp *Checkpoint, workDir string) error {
 	if launched != attempted {
 		return fmt.Errorf("launched %d of %d agent panes", launched, attempted)
 	}
-	return nil
+	return ctx.Err()
 }
 
-func relaunchRestoredPane(paneID, workDir, agentCmd string) error {
+func relaunchRestoredPane(ctx context.Context, sessionName, paneID, workDir, agentCmd string) error {
 	safeCommand, err := tmux.SanitizePaneCommand(agentCmd)
 	if err != nil {
 		return err
 	}
 
-	expected := expectedPaneCommand(agentCmd)
-	if expected == "" {
+	if expectedPaneCommand(agentCmd) == "" {
 		return fmt.Errorf("determine expected pane command for %q", agentCmd)
 	}
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			time.Sleep(200 * time.Millisecond)
-		}
-
-		// Respawn the pane directly into the target command instead of typing into
-		// a shell prompt. This avoids lost-input races while panes are still initializing.
-		if err := tmux.DefaultClient.RunSilent("respawn-pane", "-k", "-c", workDir, "-t", tmux.ExactTarget(paneID), safeCommand); err != nil {
-			lastErr = err
-			continue
-		}
-		if err := waitForPaneCommand(paneID, expected, 2*time.Second); err == nil {
-			return nil
-		} else {
-			lastErr = err
-		}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-
-	if lastErr != nil {
-		return lastErr
+	// Launch once. A wrapper may exec into a different executable, and an
+	// observation failure is not evidence that the process failed to start.
+	// Retrying respawn-pane -k would kill that potentially healthy agent.
+	if _, err := runRestoreMutation(ctx, RestoreProgress{Stage: "launch_agent", PaneID: paneID}, func() (string, error) {
+		return "", tmux.DefaultClient.RunSilentContext(ctx, "respawn-pane", "-k", "-c", workDir, "-t", tmux.ExactTarget(paneID), safeCommand)
+	}); err != nil {
+		return fmt.Errorf("launching pane %s (inspect before retrying): %w", paneID, err)
 	}
-	return fmt.Errorf("pane %s did not start %q", paneID, expected)
-}
-
-func waitForPaneCommand(paneID, expected string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		current, err := currentPaneCommand(paneID)
-		if err == nil && current == expected {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			if err != nil {
-				return err
-			}
-			return fmt.Errorf("pane %s current command = %q, want %q", paneID, current, expected)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func currentPaneCommand(paneID string) (string, error) {
-	output, err := tmux.DefaultClient.Run("display-message", "-p", "-t", tmux.ExactTarget(paneID), "#{pane_current_command}")
+	// Share spawn's stable process observation instead of requiring the
+	// foreground executable to have the same name as its launch wrapper.
+	pane, err := tmux.WaitForPaneProcessStartContext(ctx, sessionName, paneID)
 	if err != nil {
-		return "", fmt.Errorf("getting pane current command: %w", err)
+		return fmt.Errorf("observing restored pane %s (pane was preserved): %w", paneID, err)
 	}
-	return strings.TrimSpace(output), nil
+	if pane.Dead {
+		return fmt.Errorf("restored pane %s exited during startup; pane was preserved", paneID)
+	}
+	if err := reportRestoreProgress(ctx, RestoreProgress{Stage: "agent_started", Phase: "observed", Outcome: "succeeded", PaneID: paneID}); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+func restorePaneProgress(stage, paneID string, pane PaneState) RestoreProgress {
+	return RestoreProgress{
+		Stage: stage, PaneID: paneID, SourcePaneID: pane.ID,
+		WindowIndex: pane.WindowIndex, PaneIndex: pane.Index, AgentType: pane.AgentType,
+	}
 }
 
 func expectedPaneCommand(agentCmd string) string {
@@ -586,12 +847,12 @@ func trimMatchingQuotes(token string) string {
 	return token
 }
 
-func moveInitialWindow(sessionName string, targetWindowIndex int) error {
+func moveInitialWindow(ctx context.Context, sessionName string, targetWindowIndex int) error {
 	if targetWindowIndex < 0 {
 		return nil
 	}
 
-	currentWindowIndex, err := tmux.GetFirstWindow(sessionName)
+	currentWindowIndex, err := tmux.DefaultClient.GetFirstWindowContext(ctx, sessionName)
 	if err != nil {
 		return fmt.Errorf("getting initial window index: %w", err)
 	}
@@ -601,35 +862,37 @@ func moveInitialWindow(sessionName string, targetWindowIndex int) error {
 
 	source := fmt.Sprintf("%s:%d", sessionName, currentWindowIndex)
 	target := fmt.Sprintf("%s:%d", sessionName, targetWindowIndex)
-	if err := tmux.DefaultClient.RunSilent("move-window", "-s", tmux.ExactTarget(source), "-t", tmux.ExactTarget(target)); err != nil {
+	if err := tmux.DefaultClient.RunSilentContext(ctx, "move-window", "-s", tmux.ExactTarget(source), "-t", tmux.ExactTarget(target)); err != nil {
 		return fmt.Errorf("moving initial window from %s to %s: %w", source, target, err)
 	}
 	return nil
 }
 
 func (r *Restorer) restoreActivePane(cp *Checkpoint) error {
+	ctx := r.operationContext()
 	if cp.Session.ActivePaneIndex < 0 || cp.Session.ActivePaneIndex >= len(cp.Session.Panes) {
 		return nil
 	}
 
-	panes, err := tmux.GetPanes(cp.SessionName)
+	panes, err := tmux.DefaultClient.GetPanesContext(ctx, cp.SessionName)
 	if err != nil {
 		return fmt.Errorf("getting panes: %w", err)
 	}
-	targetPane, ok := restoredPaneForCheckpointIndex(cp, panes, cp.Session.ActivePaneIndex)
+	targetPane, ok := r.restoredPaneForCheckpointIndex(cp, panes, cp.Session.ActivePaneIndex)
 	if !ok {
 		return nil
 	}
-	return tmux.DefaultClient.RunSilent("select-pane", "-t", tmux.ExactTarget(targetPane.ID))
+	return tmux.DefaultClient.RunSilentContext(ctx, "select-pane", "-t", tmux.ExactTarget(targetPane.ID))
 }
 
 // applyLayout applies a tmux layout string to a session.
 func (r *Restorer) applyLayout(sessionName, layout string) error {
+	ctx := r.operationContext()
 	if layout == "" {
 		layout = "tiled"
 	}
 
-	output, err := tmux.DefaultClient.Run("list-windows", "-t", tmux.TargetSession(sessionName), "-F", "#{window_index}")
+	output, err := tmux.DefaultClient.RunContext(ctx, "list-windows", "-t", tmux.TargetSession(sessionName), "-F", "#{window_index}")
 	if err != nil {
 		return err
 	}
@@ -639,50 +902,52 @@ func (r *Restorer) applyLayout(sessionName, layout string) error {
 			continue
 		}
 		target := fmt.Sprintf("%s:%s", sessionName, win)
-		if err := tmux.DefaultClient.RunSilent("select-layout", "-t", tmux.ExactTarget(target), layout); err != nil {
+		if err := tmux.DefaultClient.RunSilentContext(ctx, "select-layout", "-t", tmux.ExactTarget(target), layout); err != nil {
 			return err
 		}
 	}
 
-	return nil
+	return ctx.Err()
 }
 
 func (r *Restorer) applyWindowLayouts(sessionName string, windowLayouts []WindowLayoutState) error {
+	ctx := r.operationContext()
 	for _, windowLayout := range cloneWindowLayouts(windowLayouts) {
 		layout := strings.TrimSpace(windowLayout.Layout)
 		if layout == "" {
 			layout = "tiled"
 		}
 		target := fmt.Sprintf("%s:%d", sessionName, windowLayout.WindowIndex)
-		if err := tmux.DefaultClient.RunSilent("select-layout", "-t", tmux.ExactTarget(target), layout); err != nil {
+		if err := tmux.DefaultClient.RunSilentContext(ctx, "select-layout", "-t", tmux.ExactTarget(target), layout); err != nil {
 			return err
 		}
 	}
-	return nil
+	return ctx.Err()
 }
 
 // injectContext sends scrollback content to restored agents.
-func (r *Restorer) injectContext(cp *Checkpoint, maxLines int) error {
-	panes, err := tmux.GetPanes(cp.SessionName)
-	if err != nil {
-		return fmt.Errorf("getting panes: %w", err)
-	}
-
-	var lastErr error
+func (r *Restorer) injectContext(cp *Checkpoint, maxLines int) (int, error) {
+	ctx := r.operationContext()
+	injected := 0
+	var injectionErrors []error
 	for i, paneState := range cp.Session.Panes {
-		if paneState.ScrollbackFile == "" {
-			continue
+		if err := ctx.Err(); err != nil {
+			return injected, errors.Join(append(injectionErrors, err)...)
 		}
-
-		targetPane, ok := restoredPaneForCheckpointIndex(cp, panes, i)
-		if !ok {
+		// A user/unknown pane is restored as a shell. Its transcript is an
+		// artifact to inspect, never input to submit to that shell.
+		if paneState.ScrollbackFile == "" || restorableAgentCommand(paneState) == "" {
 			continue
 		}
 
 		// Load scrollback content
-		content, err := r.loadPaneScrollbackForPane(cp.SessionName, cp.ID, paneState)
+		sourceSession := r.sourceSession
+		if sourceSession == "" {
+			sourceSession = cp.SessionName
+		}
+		content, err := r.loadPaneScrollbackForPane(sourceSession, cp.ID, paneState)
 		if err != nil {
-			lastErr = err
+			injectionErrors = append(injectionErrors, fmt.Errorf("checkpoint pane %d scrollback: %w", paneState.Index, err))
 			continue
 		}
 
@@ -691,14 +956,49 @@ func (r *Restorer) injectContext(cp *Checkpoint, maxLines int) error {
 			content = truncateToLines(content, maxLines)
 		}
 
-		// Send as context message
+		// Send as context message. The caller's context also reaches tmux's
+		// buffer upload, paste, and submit delays, not just the outer loop.
 		contextMsg := formatContextInjection(content, cp.CreatedAt)
-		if err := tmux.SendBuffer(targetPane.ID, contextMsg, true); err != nil {
-			lastErr = err
+		restoredIndex := restoredPaneIndexForCheckpointIndex(cp.Session.Panes, i)
+		if restoredIndex < 0 || restoredIndex >= len(r.restoredPaneIDs) {
+			injectionErrors = append(injectionErrors, fmt.Errorf("no restored target for checkpoint pane %d", paneState.Index))
+			continue
+		}
+		paneID := r.restoredPaneIDs[restoredIndex]
+		_, err = runRestoreMutation(ctx, restorePaneProgress("inject_context", paneID, paneState), func() (string, error) {
+			// A running process may still be booting, busy, or blocked by a
+			// modal. Wait after the journal flush, without typing into its UI.
+			if err := waitForRestoreContextReady(ctx, cp.SessionName, paneID, tmux.ParsePaneAgentTypeOption(paneState.AgentType)); err != nil {
+				return "", err
+			}
+			// Revalidate AFTER the before-checkpoint: that write can block, and
+			// another process could have replaced or retagged the target meanwhile.
+			panes, err := tmux.DefaultClient.GetPanesContext(ctx, cp.SessionName)
+			if err != nil {
+				return "", fmt.Errorf("checking context target: %w", err)
+			}
+			targetPane, ok := r.restoredPaneForCheckpointIndex(cp, panes, i)
+			if !ok {
+				return "", fmt.Errorf("no restored target for checkpoint pane %d", paneState.Index)
+			}
+			if targetPane.Type.Canonical() != agent.AgentType(paneState.AgentType).Canonical() ||
+				targetPane.Dead || targetPane.Service != "" || strings.TrimSpace(targetPane.Command) == "" ||
+				tmux.PaneCommandIsStarting(targetPane.Command) || targetPane.IdleShell() {
+				return "", fmt.Errorf("restored pane %s is no longer a running %s agent; context was not sent", targetPane.ID, paneState.AgentType)
+			}
+			if err := tmux.DefaultClient.SendBufferContext(ctx, targetPane.ID, contextMsg, true); err != nil {
+				return "", fmt.Errorf("sending context to pane %s: %w", targetPane.ID, err)
+			}
+			injected++
+			return targetPane.ID, nil
+		})
+		if err != nil {
+			injectionErrors = append(injectionErrors, err)
+			continue
 		}
 	}
 
-	return lastErr
+	return injected, errors.Join(append(injectionErrors, ctx.Err())...)
 }
 
 func (r *Restorer) loadPaneScrollbackForPane(sessionName, checkpointID string, pane PaneState) (string, error) {
@@ -707,8 +1007,15 @@ func (r *Restorer) loadPaneScrollbackForPane(sessionName, checkpointID string, p
 
 // checkGitState compares current git state with checkpoint and returns a warning if different.
 func (r *Restorer) checkGitState(cp *Checkpoint, workDir string) string {
+	git := func(args ...string) (string, error) {
+		ctx, cancel := context.WithTimeout(r.operationContext(), 10*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "git", args...)
+		cmd.Dir = workDir
+		return runGitCommand(cmd, ctx, args...)
+	}
 	// Check if current branch matches
-	branch, err := gitCommand(workDir, "rev-parse", "--abbrev-ref", "HEAD")
+	branch, err := git("rev-parse", "--abbrev-ref", "HEAD")
 	if err != nil {
 		return "could not determine current git branch"
 	}
@@ -720,7 +1027,7 @@ func (r *Restorer) checkGitState(cp *Checkpoint, workDir string) string {
 	}
 
 	// Check if commit matches
-	commit, err := gitCommand(workDir, "rev-parse", "HEAD")
+	commit, err := git("rev-parse", "HEAD")
 	if err != nil {
 		return ""
 	}
@@ -900,29 +1207,21 @@ func sortedCheckpointPanes(panes []PaneState) []PaneState {
 	return sorted
 }
 
-func sortedTmuxPanes(panes []tmux.Pane) []tmux.Pane {
-	sorted := make([]tmux.Pane, len(panes))
-	copy(sorted, panes)
-	sort.Slice(sorted, func(i, j int) bool {
-		if sorted[i].WindowIndex != sorted[j].WindowIndex {
-			return sorted[i].WindowIndex < sorted[j].WindowIndex
-		}
-		return sorted[i].Index < sorted[j].Index
-	})
-	return sorted
-}
-
-func restoredPaneForCheckpointIndex(cp *Checkpoint, panes []tmux.Pane, checkpointIndex int) (tmux.Pane, bool) {
+func (r *Restorer) restoredPaneForCheckpointIndex(cp *Checkpoint, panes []tmux.Pane, checkpointIndex int) (tmux.Pane, bool) {
 	if checkpointIndex < 0 || checkpointIndex >= len(cp.Session.Panes) {
 		return tmux.Pane{}, false
 	}
 
-	sortedPanes := sortedTmuxPanes(panes)
 	restoredIndex := restoredPaneIndexForCheckpointIndex(cp.Session.Panes, checkpointIndex)
-	if restoredIndex < 0 || restoredIndex >= len(sortedPanes) {
+	if restoredIndex < 0 || restoredIndex >= len(r.restoredPaneIDs) {
 		return tmux.Pane{}, false
 	}
-	return sortedPanes[restoredIndex], true
+	for _, pane := range panes {
+		if pane.ID == r.restoredPaneIDs[restoredIndex] {
+			return pane, true
+		}
+	}
+	return tmux.Pane{}, false
 }
 
 func restoredPaneIndexForCheckpointIndex(checkpointPanes []PaneState, checkpointIndex int) int {
@@ -951,12 +1250,15 @@ func sameCheckpointPane(a, b PaneState) bool {
 }
 
 func restorableAgentCommand(pane PaneState) string {
-	agentType := agent.AgentType(pane.AgentType).Canonical()
-	if !agentType.IsValid() || agentType == agent.AgentTypeUser || agentType == agent.AgentTypeUnknown {
+	agentType := tmux.ParsePaneAgentTypeOption(pane.AgentType)
+	if agentType == agent.AgentTypeUser || agentType == agent.AgentTypeUnknown {
 		return ""
 	}
+	if pane.LaunchSpec != nil {
+		return pane.LaunchSpec.Command
+	}
 	command := strings.TrimSpace(pane.Command)
-	if command != "" && !looksLikeShellCommand(command) {
+	if command != "" && !looksLikeShellCommand(command) && !isBareAgentRuntimeCommand(command) {
 		return command
 	}
 
@@ -974,8 +1276,12 @@ func restorableAgentCommand(pane PaneState) string {
 		// Relaunch with the official autonomous approval flag so the restored
 		// pane does not block on tool approvals (GH#251 phase 2).
 		return "grok --always-approve"
+	case agent.AgentTypeOmp:
+		// Relaunch with omp's skip-approval flag so the restored pane does
+		// not block on tool approvals; omp picks its own default model.
+		return "omp --auto-approve"
 	case agent.AgentTypeCursor:
-		return "cursor"
+		return "cursor-agent"
 	case agent.AgentTypeWindsurf:
 		return "windsurf"
 	case agent.AgentTypeAider:
@@ -987,6 +1293,25 @@ func restorableAgentCommand(pane PaneState) string {
 	default:
 		return ""
 	}
+}
+
+// Checkpoints populated from tmux retain pane_current_command, which names
+// only the foreground executable. A bare interpreter is missing the script
+// that made it an agent; launching it alone can open a language REPL. Explicit
+// argv is different evidence and must remain intact for custom launchers.
+func isBareAgentRuntimeCommand(command string) bool {
+	token, remaining := nextShellToken(strings.TrimSpace(command))
+	if token == "" || strings.TrimSpace(remaining) != "" {
+		return false
+	}
+	name := strings.ToLower(filepath.Base(trimMatchingQuotes(token)))
+	switch name {
+	case "node", "nodejs", "bun", "deno", "npx", "npm", "python", "python2", "python3", "ruby", "perl", "uv", "uvx":
+		return true
+	}
+	// Python processes can report their full installed minor version.
+	version, python := strings.CutPrefix(name, "python")
+	return python && version != "" && strings.Trim(version, "0123456789.") == ""
 }
 
 func looksLikeShellCommand(command string) bool {

@@ -245,6 +245,7 @@ role=<ROLE> model=<MODEL> domain=<DOMAIN>
 	e.state = &ExecutionState{
 		RunID:      "run-pane-template",
 		WorkflowID: "workflow",
+		Session:    cfg.Session,
 		Variables:  map[string]interface{}{},
 		Steps:      map[string]StepResult{},
 	}
@@ -303,8 +304,16 @@ func (c *countingPaneMetadataClient) PasteKeys(string, string, bool) error {
 	return nil
 }
 
+func (c *countingPaneMetadataClient) PrepareDelivery(ctx context.Context, _ tmux.Pane, _ string) error {
+	return ctx.Err()
+}
+
 func (c *countingPaneMetadataClient) CapturePaneOutput(string, int) (string, error) {
 	return "", nil
+}
+
+func (c *countingPaneMetadataClient) VerifySubmission(context.Context, string, string, string, int) error {
+	return nil
 }
 
 func writeFile(t *testing.T, path, content string) {
@@ -512,9 +521,15 @@ type erroringTmuxClient struct {
 	err error
 }
 
-func (e *erroringTmuxClient) GetPanes(string) ([]tmux.Pane, error)          { return nil, e.err }
+func (e *erroringTmuxClient) GetPanes(string) ([]tmux.Pane, error) { return nil, e.err }
+func (e *erroringTmuxClient) PrepareDelivery(context.Context, tmux.Pane, string) error {
+	return e.err
+}
 func (e *erroringTmuxClient) PasteKeys(string, string, bool) error          { return nil }
 func (e *erroringTmuxClient) CapturePaneOutput(string, int) (string, error) { return "", nil }
+func (e *erroringTmuxClient) VerifySubmission(context.Context, string, string, string, int) error {
+	return nil
+}
 
 // TestLoadPaneMetadataCache_RosterFallbackOnSessionError covers bd-ujk04:
 // a tmux/session lookup failure (resumed-offline session, missing tmux

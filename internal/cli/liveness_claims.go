@@ -1,25 +1,45 @@
+//go:build !liveness_audit
+
 package cli
 
 import (
+	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/encryption"
 	"github.com/Dicklesworthstone/ntm/internal/hooks"
+	"github.com/Dicklesworthstone/ntm/internal/policy"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
 )
 
 // WS0-G2 config-key liveness claims for keys consumed by internal/cli
 // (bd-g2-claims-backlog-o787y). Each claim references the real function on
 // the read path; see internal/config/liveness.go for the contract.
-// Pre-existing per-call-site claims (memory.send_*, cass.context.*,
-// retry.agent_mail.*) stay in their own files.
+//
+// Every claim lives in a liveness_claims*.go file: the dead-code gate builds
+// with -tags liveness_audit, which drops these files, so a reader that is
+// reachable only through its claim is reported dead (bd-ir0li).
 func init() {
 	// Agent Mail client + daemon wiring (mail.go, spawn.go, monitor.go).
 	config.RegisterReader("agent_mail.enabled", newAgentMailClient)
 	config.RegisterReader("agent_mail.url", newAgentMailClient)
 	config.RegisterReader("agent_mail.token", newAgentMailClient)
-	config.RegisterReader("agent_mail.auto_register", agentMailRegistrationEnabled)
+	// agent_mail.auto_register / pane_badges / pane_badge_format are claimed
+	// by internal/spawnidentity, which owns their read path for every launch
+	// surface.
 	config.RegisterReader("agent_mail.supervisor_enabled", shouldSuperviseAgentMailDaemon)
+
+	// Compaction recovery: the session monitor owns the prompt (monitor.go,
+	// bd-xa7ry); the dashboard only displays detected compactions.
+	for _, key := range []string{
+		"context_rotation.recovery.enabled",
+		"context_rotation.recovery.cooldown_seconds",
+		"context_rotation.recovery.max_recoveries_per_pane",
+		"context_rotation.recovery.prompt",
+		"context_rotation.recovery.include_bead_context",
+	} {
+		config.RegisterReader(key, monitorCompactionRecovery)
+	}
 
 	// Account rotation flows (rotate.go, coordinator.go).
 	config.RegisterReader("rotation.auto_open_browser", rotateAllLimited)
@@ -61,12 +81,12 @@ func init() {
 		"recovery.include_agent_mail",
 		"recovery.include_cm_memories",
 		"recovery.max_recovery_tokens",
+		"recovery.max_cm_rules",
+		"recovery.max_cm_snippets",
 	} {
 		config.RegisterReader(key, buildRecoveryContext)
 	}
 	config.RegisterReader("recovery.auto_inject_on_spawn", spawnSessionLogicContextWithOutput)
-	config.RegisterReader("recovery.max_cm_rules", getMemoryContext)
-	config.RegisterReader("recovery.max_cm_snippets", getMemoryContext)
 
 	// Coordinator runtime config bridge (coordinator.go).
 	for _, key := range []string{
@@ -205,6 +225,7 @@ func init() {
 		"agents.windsurf",
 		"agents.aider",
 		"agents.oc",
+		"agents.omp",
 	} {
 		config.RegisterReader(key, spawnAgentCommandTemplate)
 	}
@@ -219,25 +240,36 @@ func init() {
 		"prompts.gmi_default_file",
 		"prompts.agy_default",
 		"prompts.agy_default_file",
+		"prompts.omp_default",
+		"prompts.omp_default_file",
 	} {
 		config.RegisterReader(key, resolveSpawnPanePrompt)
 	}
 
-	// Integrations wired at spawn/send/serve time.
+	// Integrations wired at spawn/send/serve time. The Claude launch hooks
+	// (policy, dcg, rch) are built by policy.ClaudeAgentLaunchSettings for
+	// every Claude launch path.
 	config.RegisterReader("integrations.dcg.enabled", maybeBlockSendWithDCG)
-	config.RegisterReader("integrations.dcg.binary_path", spawnSessionLogicContextWithOutput)
-	config.RegisterReader("integrations.dcg.custom_blocklist", spawnSessionLogicContextWithOutput)
-	config.RegisterReader("integrations.dcg.custom_whitelist", spawnSessionLogicContextWithOutput)
-	config.RegisterReader("integrations.process_triage.enabled", runServe)
-	config.RegisterReader("integrations.rch.enabled", spawnSessionLogicContextWithOutput)
-	config.RegisterReader("integrations.rch.binary_path", spawnSessionLogicContextWithOutput)
-	config.RegisterReader("integrations.rch.intercept_patterns", spawnSessionLogicContextWithOutput)
+	config.RegisterReader("integrations.dcg.binary_path", policy.ClaudeAgentLaunchSettings)
+	config.RegisterReader("integrations.dcg.custom_blocklist", policy.ClaudeAgentLaunchSettings)
+	config.RegisterReader("integrations.dcg.custom_whitelist", policy.ClaudeAgentLaunchSettings)
+	config.RegisterReader("integrations.process_triage.enabled", startServeProcessTriage)
+	config.RegisterReader("integrations.rch.enabled", policy.ClaudeAgentLaunchSettings)
+	config.RegisterReader("integrations.rch.binary_path", policy.ClaudeAgentLaunchSettings)
+	config.RegisterReader("integrations.rch.intercept_patterns", policy.ClaudeAgentLaunchSettings)
+	config.RegisterReader("safety.claude_policy_hook", policy.ClaudeAgentLaunchSettings)
 	// bv subprocess timeout: root.go PersistentPreRunE installs it into
 	// internal/bv via ConfigureCommandTimeout (GH#253).
 	config.RegisterReader("integrations.bv.timeout_seconds", bv.ConfigureCommandTimeout)
 
 	// Swarm launch stagger (swarm.go).
 	config.RegisterReader("swarm.stagger_delay_ms", runSwarm)
+
+	// [spawn] prompt-stagger defaults, applied beneath the flags of both
+	// `ntm spawn` (spawn.go) and `--robot-spawn` (root.go
+	// applyRobotSpawnPromptFlags) by the shared resolver.
+	config.RegisterReader("spawn.stagger_mode", resolveSpawnStaggerDefaults)
+	config.RegisterReader("spawn.stagger_delay", resolveSpawnStaggerDefaults)
 
 	// Swarm global-auth clobber escape hatch (swarm.go): the config value
 	// seeds the --force-global-auth-clobber flag default (bd-6otuk fixed the
@@ -260,4 +292,37 @@ func init() {
 	config.RegisterReader("ensemble.budget.total", applyRobotEnsembleConfigDefaults)
 	config.RegisterReader("ensemble.budget.per_agent", applyRobotEnsembleConfigDefaults)
 	config.RegisterReader("ensemble.cache.enabled", applyRobotEnsembleConfigDefaults)
+
+	// CAAM seat selection for unpinned spawn/add panes (caam_seat.go,
+	// spawn.go, add.go). ntm#319.
+	config.RegisterReader("integrations.caam.seat_selection", caamSeatSelectionEnabled)
+
+	// [retry.agent_mail] (bd-ws6-config-truth-ienmd.1). The reader is
+	// agentmail.ApplyRetryPolicy, handed the loaded values by
+	// applyConfiguredPolicies (policy_wiring.go); the claim lives here because
+	// internal/agentmail cannot import internal/config (import cycle via
+	// internal/watcher → agentmail).
+	config.RegisterReader("retry.agent_mail.max_attempts", agentmail.ApplyRetryPolicy)
+	config.RegisterReader("retry.agent_mail.initial_delay_ms", agentmail.ApplyRetryPolicy)
+
+	// Send-scoped [memory] keys (robot_memory.go). They are NOT
+	// recovery-shadowed and stay in [memory]; the recovery-overlapping keys
+	// are aliased into [recovery] by internal/config (recovery_alias.go).
+	// memory.query_timeout_seconds bounds the cm query behind send-time
+	// injection; since the [recovery] alias fold went (ntm#323) this is its
+	// only reader.
+	config.RegisterReader("memory.send_injection", robotSendMemoryOptions)
+	config.RegisterReader("memory.send_max_rules", robotSendMemoryOptions)
+	config.RegisterReader("memory.send_budget_tokens", robotSendMemoryOptions)
+	config.RegisterReader("memory.query_timeout_seconds", robotSendMemoryOptions)
+
+	// Send-scoped [cass.context] keys, read for both send surfaces
+	// (send_cass.go, bd-ws2-wire-or-delete-ykmcz.11).
+	config.RegisterReader("cass.context.enabled", robotSendCASSOptions)
+	config.RegisterReader("cass.context.max_sessions", robotSendCASSOptions)
+	config.RegisterReader("cass.context.lookback_days", robotSendCASSOptions)
+	config.RegisterReader("cass.context.max_tokens", robotSendCASSOptions)
+	config.RegisterReader("cass.context.min_relevance", robotSendCASSOptions)
+	config.RegisterReader("cass.context.skip_if_context_above", robotSendCASSOptions)
+	config.RegisterReader("cass.context.prefer_same_project", robotSendCASSOptions)
 }

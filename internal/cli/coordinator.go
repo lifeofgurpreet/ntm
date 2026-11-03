@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,17 +18,47 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/coordinator"
-	ntmgit "github.com/Dicklesworthstone/ntm/internal/git"
+	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
-	"github.com/Dicklesworthstone/ntm/internal/util"
 )
+
+// coordinatorFallbackName is the legacy hard-coded coordinator sender. It was
+// never a registered Agent Mail identity, so the server rejects mail and
+// claims made under it ("Agent 'NTM-Coordinator' not found in project"). It
+// survives only as the last-resort identity when Agent Mail is unreachable
+// AND no previously registered session identity is persisted — in that state
+// nothing can be delivered anyway, and a recognizable literal beats an empty
+// sender.
+const coordinatorFallbackName = "NTM-Coordinator"
+
+// resolveCoordinatorIdentity returns the Agent Mail identity the coordinator
+// acts as. First choice is the session's server-registered coordinator agent:
+// RegisterSessionAgent registers a server-generated adjective+noun identity at
+// first use, persists it (name + registration token) under the session, and
+// reuses it on every later call — the same identity `ntm spawn` registers.
+// When the server is unreachable, a previously persisted identity is still
+// the right sender; the legacy literal is the final fallback.
+func resolveCoordinatorIdentity(ctx context.Context, client *agentmail.Client, session, projectKey string) string {
+	if client != nil {
+		regCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		// A non-nil info with a non-nil err means the local identity exists
+		// but the server activity refresh failed — the name is still valid.
+		if info, _ := client.RegisterSessionAgent(regCtx, session, projectKey); info != nil && strings.TrimSpace(info.AgentName) != "" {
+			return info.AgentName
+		}
+	}
+	if saved, err := agentmail.LoadSessionAgent(session, projectKey); err == nil && saved != nil && strings.TrimSpace(saved.AgentName) != "" {
+		return saved.AgentName
+	}
+	return coordinatorFallbackName
+}
 
 var (
 	coordinatorSessionExists  = tmux.SessionExists
 	coordinatorGetPanes       = tmux.GetPanes
-	coordinatorGetAllPanes    = tmux.GetAllPanesContext
 	coordinatorPaneCurrentDir = func(paneID string) (string, error) {
 		return tmux.DefaultClient.Run("display-message", "-p", "-t", tmux.ExactTarget(paneID), "#{pane_current_path}")
 	}
@@ -44,6 +75,11 @@ The coordinator monitors agents, detects file conflicts, sends periodic
 digests, and can automatically assign work to idle agents based on bv
 triage recommendations.
 
+Every session started by 'ntm spawn' runs the coordinator inside its session
+monitor. It always renews the file reservations of in-progress assignments and
+releases them when the assigned bead closes; the optional features below act
+only once enabled.
+
 Examples:
   ntm coordinator status myproject        # Show coordinator status
   ntm coordinator digest myproject        # Generate and display digest
@@ -57,7 +93,6 @@ Examples:
 	}
 
 	cmd.AddCommand(newCoordinatorStatusCmd())
-	cmd.AddCommand(newCoordinatorBootstrapCmd())
 	cmd.AddCommand(newCoordinatorDigestCmd())
 	cmd.AddCommand(newCoordinatorConflictsCmd())
 	cmd.AddCommand(newCoordinatorAssignCmd())
@@ -89,286 +124,6 @@ Examples:
 	return cmd
 }
 
-type coordinatorBootstrapOptions struct {
-	MailProjectKey  string
-	CoordinatorName string
-	TokenFile       string
-	Bindings        []string
-	DryRun          bool
-}
-
-type coordinatorBootstrapResult struct {
-	Success         bool              `json:"success"`
-	DryRun          bool              `json:"dry_run"`
-	Session         string            `json:"session"`
-	ProjectDir      string            `json:"project_dir"`
-	MailProjectKey  string            `json:"mail_project_key"`
-	CoordinatorName string            `json:"coordinator_name"`
-	PaneBindings    map[string]string `json:"pane_bindings"`
-	WouldCreate     bool              `json:"would_create_coordinator,omitempty"`
-	Persisted       bool              `json:"persisted"`
-}
-
-func newCoordinatorBootstrapCmd() *cobra.Command {
-	var opts coordinatorBootstrapOptions
-	cmd := &cobra.Command{
-		Use:   "bootstrap <session>",
-		Short: "Explicitly persist the coordinator sender and live pane identities",
-		Long: `Bootstrap is the only coordinator command allowed to create its Agent Mail
-sender. It requires an explicit canonical mail project key, exact coordinator
-name, and exact live pane-to-agent bindings. Dispatch commands never register
-or invent identities. Use --dry-run to validate without creating or writing.`,
-		Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runCoordinatorBootstrap(cmd, args[0], opts)
-		},
-	}
-	cmd.Flags().StringVar(&opts.MailProjectKey, "mail-project-key", "", "Canonical Agent Mail project key (required)")
-	cmd.Flags().StringVar(&opts.CoordinatorName, "coordinator-name", "", "Exact durable coordinator Agent Mail name (required)")
-	cmd.Flags().StringVar(&opts.TokenFile, "registration-token-file", "", "Absolute mode-0600 file containing an existing coordinator token")
-	cmd.Flags().StringArrayVar(&opts.Bindings, "bind", nil, "Exact live pane binding PANE_ID=AGENT_NAME (repeatable, required)")
-	cmd.Flags().BoolVar(&opts.DryRun, "dry-run", false, "Validate only; do not create an identity or persist state")
-	_ = cmd.MarkFlagRequired("mail-project-key")
-	_ = cmd.MarkFlagRequired("coordinator-name")
-	_ = cmd.MarkFlagRequired("bind")
-	return cmd
-}
-
-func runCoordinatorBootstrap(cmd *cobra.Command, requestedSession string, opts coordinatorBootstrapOptions) error {
-	if err := tmux.EnsureInstalled(); err != nil {
-		return err
-	}
-	resolved, err := ResolveSession(requestedSession, cmd.OutOrStdout())
-	if err != nil {
-		return err
-	}
-	if resolved.Session == "" {
-		return errors.New("session is required")
-	}
-	session := resolved.Session
-	projectDir, err := resolveCoordinatorProjectKey(cmd.Context(), session, resolved.Inferred)
-	if err != nil {
-		return err
-	}
-	mailProjectKey := filepath.Clean(strings.TrimSpace(opts.MailProjectKey))
-	if !filepath.IsAbs(mailProjectKey) {
-		return markCLIInvalidInput(fmt.Errorf("--mail-project-key must be an absolute canonical key"))
-	}
-	coordinatorName := strings.TrimSpace(opts.CoordinatorName)
-	if coordinatorName == "" {
-		return markCLIInvalidInput(fmt.Errorf("--coordinator-name is required"))
-	}
-
-	panes, err := coordinatorGetPanes(session)
-	if err != nil {
-		return fmt.Errorf("getting coordinator panes: %w", err)
-	}
-	panes, err = coordinatorBootstrapPanes(cmd.Context(), panes, opts.Bindings)
-	if err != nil {
-		return fmt.Errorf("getting explicitly bound coordinator panes: %w", err)
-	}
-	bindings, publicBindings, err := validateCoordinatorBootstrapBindings(cmd.Context(), projectDir, panes, opts.Bindings)
-	if err != nil {
-		return markCLIInvalidInput(err)
-	}
-
-	client := newAgentMailClient(mailProjectKey)
-	roster, err := client.ListAgents(cmd.Context(), mailProjectKey)
-	if err != nil {
-		return fmt.Errorf("listing Agent Mail roster for %s: %w", mailProjectKey, err)
-	}
-	rosterByName := make(map[string]agentmail.Agent, len(roster))
-	for _, agent := range roster {
-		rosterByName[agent.Name] = agent
-	}
-	for paneID, binding := range bindings {
-		if _, ok := rosterByName[binding.AgentName]; !ok {
-			return fmt.Errorf("pane %s identity %q is absent from Agent Mail project %s; bootstrap never mints pane identities", paneID, binding.AgentName, mailProjectKey)
-		}
-	}
-
-	existing, err := agentmail.LoadCoordinatorSessionState(session, projectDir)
-	if err != nil {
-		return err
-	}
-	registrationToken := ""
-	if existing != nil {
-		if existing.MailProjectKey != mailProjectKey || existing.Coordinator.AgentName != coordinatorName {
-			return fmt.Errorf("persisted coordinator identity is %s in %s; refusing to replace it with %s in %s", existing.Coordinator.AgentName, existing.MailProjectKey, coordinatorName, mailProjectKey)
-		}
-		registrationToken = existing.Coordinator.RegistrationToken
-	}
-	if opts.TokenFile != "" {
-		importedToken, tokenErr := readCoordinatorRegistrationToken(opts.TokenFile)
-		if tokenErr != nil {
-			return tokenErr
-		}
-		if registrationToken != "" && registrationToken != importedToken {
-			return fmt.Errorf("token file does not match the persisted coordinator token")
-		}
-		registrationToken = importedToken
-	}
-	_, coordinatorExists := rosterByName[coordinatorName]
-	wouldCreate := !coordinatorExists && existing == nil && registrationToken == ""
-	if coordinatorExists && registrationToken == "" {
-		return fmt.Errorf("coordinator name %q already exists but no registration token was supplied; refusing to mint a duplicate", coordinatorName)
-	}
-	if !coordinatorExists && registrationToken != "" {
-		return fmt.Errorf("registration token supplied for absent coordinator %q", coordinatorName)
-	}
-
-	result := coordinatorBootstrapResult{
-		Success: true, DryRun: opts.DryRun, Session: session, ProjectDir: projectDir,
-		MailProjectKey: mailProjectKey, CoordinatorName: coordinatorName,
-		PaneBindings: publicBindings, WouldCreate: wouldCreate,
-	}
-	if opts.DryRun {
-		return json.NewEncoder(cmd.OutOrStdout()).Encode(result)
-	}
-
-	client.SetRegistrationToken(mailProjectKey, coordinatorName, registrationToken)
-	registered, err := client.RegisterAgent(cmd.Context(), agentmail.RegisterAgentOptions{
-		ProjectKey: mailProjectKey, Program: "ntm", Model: "coordinator", Name: coordinatorName,
-		TaskDescription: fmt.Sprintf("NTM session coordinator for %s", session),
-	})
-	if err != nil {
-		return fmt.Errorf("registering exact coordinator identity %q: %w", coordinatorName, err)
-	}
-	if registered.Name != coordinatorName {
-		return fmt.Errorf("Agent Mail returned coordinator %q, want exact name %q", registered.Name, coordinatorName)
-	}
-	if registered.Program != "" && registered.Program != "ntm" || registered.Model != "" && registered.Model != "coordinator" {
-		return fmt.Errorf("Agent Mail coordinator identity has program=%q model=%q, want ntm/coordinator", registered.Program, registered.Model)
-	}
-	if registered.RegistrationToken != "" {
-		registrationToken = registered.RegistrationToken
-	}
-	if registrationToken == "" {
-		return fmt.Errorf("Agent Mail did not return a coordinator registration token")
-	}
-
-	state := &agentmail.CoordinatorSessionState{
-		Version: 1, SessionName: session, ProjectDir: projectDir, MailProjectKey: mailProjectKey,
-		Coordinator: agentmail.CoordinatorIdentity{
-			AgentName: coordinatorName, RegistrationToken: registrationToken, Program: "ntm", Model: "coordinator",
-		},
-		PaneBindings: bindings,
-	}
-	if existing != nil {
-		state.CreatedAt = existing.CreatedAt
-	}
-	if err := agentmail.SaveCoordinatorSessionState(state); err != nil {
-		return err
-	}
-	result.Persisted = true
-	return json.NewEncoder(cmd.OutOrStdout()).Encode(result)
-}
-
-// coordinatorBootstrapPanes expands the primary session topology only when an
-// explicit binding names a pane outside it. Pane IDs are tmux-server-global;
-// the later PID and project checks remain the authorization boundary.
-func coordinatorBootstrapPanes(ctx context.Context, primary []tmux.Pane, specs []string) ([]tmux.Pane, error) {
-	live := make(map[string]struct{}, len(primary))
-	for _, pane := range primary {
-		live[pane.ID] = struct{}{}
-	}
-	needsAll := false
-	for _, spec := range specs {
-		paneID, _, ok := strings.Cut(spec, "=")
-		if ok {
-			if _, present := live[strings.TrimSpace(paneID)]; !present {
-				needsAll = true
-				break
-			}
-		}
-	}
-	if !needsAll {
-		return primary, nil
-	}
-	bySession, err := coordinatorGetAllPanes(ctx)
-	if err != nil {
-		return nil, err
-	}
-	result := append([]tmux.Pane(nil), primary...)
-	for _, panes := range bySession {
-		for _, pane := range panes {
-			if _, exists := live[pane.ID]; exists {
-				continue
-			}
-			live[pane.ID] = struct{}{}
-			result = append(result, pane)
-		}
-	}
-	return result, nil
-}
-
-func validateCoordinatorBootstrapBindings(ctx context.Context, projectDir string, panes []tmux.Pane, specs []string) (map[string]agentmail.CoordinatorPaneBinding, map[string]string, error) {
-	live := make(map[string]tmux.Pane, len(panes))
-	for _, pane := range panes {
-		live[pane.ID] = pane
-	}
-	bindings := make(map[string]agentmail.CoordinatorPaneBinding, len(specs))
-	public := make(map[string]string, len(specs))
-	seenNames := make(map[string]string, len(specs))
-	for _, spec := range specs {
-		paneID, agentName, ok := strings.Cut(spec, "=")
-		paneID, agentName = strings.TrimSpace(paneID), strings.TrimSpace(agentName)
-		if !ok || paneID == "" || agentName == "" {
-			return nil, nil, fmt.Errorf("invalid --bind %q; want PANE_ID=AGENT_NAME", spec)
-		}
-		pane, ok := live[paneID]
-		if !ok || pane.PID <= 0 {
-			return nil, nil, fmt.Errorf("bound pane %s is not live with a stable pid", paneID)
-		}
-		if previous, duplicate := seenNames[agentName]; duplicate && previous != paneID {
-			return nil, nil, fmt.Errorf("agent %q is bound to both %s and %s", agentName, previous, paneID)
-		}
-		paneDir, err := coordinatorPaneCurrentDir(paneID)
-		if err != nil {
-			return nil, nil, fmt.Errorf("reading project for pane %s: %w", paneID, err)
-		}
-		matches, err := coordinatorProjectDirsMatch(ctx, projectDir, paneDir)
-		if err != nil {
-			return nil, nil, err
-		}
-		if !matches {
-			return nil, nil, fmt.Errorf("pane %s is in cross-project directory %q; refusing binding", paneID, strings.TrimSpace(paneDir))
-		}
-		bindings[paneID] = agentmail.CoordinatorPaneBinding{
-			AgentName: agentName, PanePID: pane.PID, ProjectDir: filepath.Clean(projectDir), ImportedAt: time.Now().UTC(),
-		}
-		public[paneID] = agentName
-		seenNames[agentName] = paneID
-	}
-	if len(bindings) == 0 {
-		return nil, nil, fmt.Errorf("at least one --bind is required")
-	}
-	return bindings, public, nil
-}
-
-func readCoordinatorRegistrationToken(path string) (string, error) {
-	path = strings.TrimSpace(path)
-	if !filepath.IsAbs(path) {
-		return "", markCLIInvalidInput(fmt.Errorf("--registration-token-file must be absolute"))
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return "", fmt.Errorf("reading coordinator token file: %w", err)
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
-		return "", fmt.Errorf("coordinator token file must be a mode-0600 regular file")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("reading coordinator token file: %w", err)
-	}
-	token := strings.TrimSpace(string(data))
-	if token == "" {
-		return "", fmt.Errorf("coordinator token file is empty")
-	}
-	return token, nil
-}
-
 func runCoordinatorStatus(cmd *cobra.Command, args []string) error {
 	var session string
 	if len(args) > 0 {
@@ -398,47 +153,98 @@ func runCoordinatorStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	coordConfig := loadCoordinatorRuntimeConfig()
-	runtimeConfig := coordConfig
-	runtimeConfig.AutoAssign = false
-	runtimeConfig.SendDigests = false
-	// Status is a read-only surface: never let its brief coordinator run
-	// enqueue context rotations (bd-rpmg8).
-	runtimeConfig.RotationUsageThreshold = 0
-
-	// Create coordinator to get status without enabling configured side effects.
-	coord, _, err := loadBootstrappedCoordinator(session, projectKey)
-	if err != nil {
-		return err
-	}
-	coord.WithConfig(runtimeConfig)
+	// Inspection reads the saved identity without registering or refreshing
+	// it on the server, and never starts the coordinator's maintenance loops.
+	mailClient := newAgentMailClient(projectKey)
+	coordName := resolveCoordinatorIdentity(cmd.Context(), nil, session, projectKey)
+	coord := coordinator.New(session, projectKey, mailClient, coordName).WithConfig(coordConfig)
 
 	// Get agent states
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
 	defer cancel()
 
-	// Start coordinator briefly to get current state
-	if err := coord.Start(ctx); err != nil {
-		return fmt.Errorf("starting coordinator: %w", err)
+	if err := coord.Observe(ctx); err != nil {
+		return fmt.Errorf("observing coordinator: %w", err)
 	}
-	defer coord.Stop()
 
 	agents := coord.GetAgents()
 	idleAgents := coord.GetIdleAgents()
+	runtime := readCoordinatorRuntime(session)
 
 	if jsonOutput {
-		return outputCoordinatorStatusJSON(session, agents, idleAgents, coordConfig)
+		return outputCoordinatorStatusJSON(session, agents, idleAgents, coordConfig, runtime)
 	}
 
-	return renderCoordinatorStatus(session, agents, idleAgents, coordConfig)
+	return renderCoordinatorStatus(session, agents, idleAgents, coordConfig, runtime)
 }
 
-func outputCoordinatorStatusJSON(session string, agents map[string]*coordinator.AgentState, idleAgents []*coordinator.AgentState, coordCfg coordinator.CoordinatorConfig) error {
+// coordinatorRuntimeView reports where, if anywhere, the session's
+// coordinator is running. Only a live session monitor publishes one.
+type coordinatorRuntimeView struct {
+	Host              string     `json:"host"`
+	State             string     `json:"state"`
+	Summary           string     `json:"summary"`
+	PID               int        `json:"pid,omitempty"`
+	Mode              string     `json:"mode,omitempty"`
+	Features          []string   `json:"features"`
+	ConfigPath        string     `json:"config_path,omitempty"`
+	Healthy           bool       `json:"healthy"`
+	StateSince        *time.Time `json:"state_since,omitempty"`
+	HeartbeatAt       *time.Time `json:"heartbeat_at,omitempty"`
+	LastMaintenanceAt *time.Time `json:"last_maintenance_at,omitempty"`
+	MaintenanceError  string     `json:"maintenance_error,omitempty"`
+	Error             string     `json:"error,omitempty"`
+}
+
+const (
+	coordinatorRuntimeHostNone   = "none"
+	coordinatorRuntimeNotRunning = "not_running"
+)
+
+func readCoordinatorRuntime(session string) coordinatorRuntimeView {
+	status, err := resilience.ReadSessionCoordinatorStatus(session)
+	if err != nil || !status.Alive {
+		return coordinatorRuntimeView{
+			Host: coordinatorRuntimeHostNone, State: coordinatorRuntimeNotRunning, Features: []string{},
+			Summary: fmt.Sprintf("not running: no live session monitor hosts it; 'ntm coordinator run %s' coordinates it in the foreground", session),
+		}
+	}
+	features := status.Features
+	if features == nil {
+		features = []string{}
+	}
+	stateSince, heartbeatAt := status.StateSince, status.HeartbeatAt
+	view := coordinatorRuntimeView{
+		Host: status.Host, State: status.State, PID: status.PID, Mode: status.Mode, Features: features,
+		ConfigPath: status.ConfigPath, Healthy: status.Healthy, StateSince: &stateSince, HeartbeatAt: &heartbeatAt,
+		LastMaintenanceAt: status.LastMaintenanceAt, MaintenanceError: status.MaintenanceError, Error: status.Error,
+	}
+	switch status.State {
+	case resilience.SessionCoordinatorRunning:
+		if status.Mode == monitorCoordinatorModeMaintenance {
+			view.Summary = fmt.Sprintf("running inside the session monitor (pid %d): maintaining assignment leases; no optional features enabled", status.PID)
+		} else {
+			view.Summary = fmt.Sprintf("running inside the session monitor (pid %d) with %s", status.PID, strings.Join(features, ", "))
+		}
+	case resilience.SessionCoordinatorYielded:
+		view.Summary = fmt.Sprintf("paused inside the session monitor (pid %d) while a foreground 'ntm coordinator run' or 'ntm assign --watch' coordinates the session", status.PID)
+	default:
+		view.Summary = fmt.Sprintf("%s inside the session monitor (pid %d)", status.State, status.PID)
+	}
+	if !status.Healthy {
+		view.Summary += " (status heartbeat is stale)"
+	}
+	return view
+}
+
+func outputCoordinatorStatusJSON(session string, agents map[string]*coordinator.AgentState, idleAgents []*coordinator.AgentState, coordCfg coordinator.CoordinatorConfig, runtime coordinatorRuntimeView) error {
 	result := map[string]interface{}{
 		"session":     session,
 		"timestamp":   time.Now().Format(time.RFC3339),
 		"agent_count": len(agents),
 		"idle_count":  len(idleAgents),
 		"agents":      agents,
+		"runtime":     runtime,
 		// Mirror every CoordinatorConfig field the user can set in
 		// ~/.config/ntm/config.toml so `coordinator status --json` can be
 		// used to confirm whether a TOML override actually took effect at
@@ -460,7 +266,7 @@ func outputCoordinatorStatusJSON(session string, agents map[string]*coordinator.
 	return json.NewEncoder(os.Stdout).Encode(result)
 }
 
-func renderCoordinatorStatus(session string, agents map[string]*coordinator.AgentState, idleAgents []*coordinator.AgentState, coordCfg coordinator.CoordinatorConfig) error {
+func renderCoordinatorStatus(session string, agents map[string]*coordinator.AgentState, idleAgents []*coordinator.AgentState, coordCfg coordinator.CoordinatorConfig, runtime coordinatorRuntimeView) error {
 	t := theme.Current()
 
 	fmt.Printf("\n%s Coordinator Status: %s%s\n\n",
@@ -523,6 +329,23 @@ func renderCoordinatorStatus(session string, agents map[string]*coordinator.Agen
 	fmt.Printf("  Digest interval:     %s\n", coordCfg.DigestInterval)
 	fmt.Printf("  Idle threshold:      %.0fs\n", coordCfg.IdleThreshold)
 	fmt.Printf("  Human agent:         %s\n", coordCfg.HumanAgent)
+	fmt.Println()
+
+	fmt.Printf("  %sRuntime%s\n", "\033[1m", "\033[0m")
+	fmt.Printf("  %s%s%s\n", "\033[2m", strings.Repeat("─", 60), "\033[0m")
+	fmt.Printf("  Coordinator:         %s\n", runtime.Summary)
+	if runtime.ConfigPath != "" {
+		fmt.Printf("  Monitor config:      %s\n", runtime.ConfigPath)
+	}
+	if runtime.LastMaintenanceAt != nil {
+		fmt.Printf("  Last maintenance:    %s\n", runtime.LastMaintenanceAt.Local().Format(time.RFC3339))
+	}
+	if runtime.MaintenanceError != "" {
+		fmt.Printf("  Maintenance:         \033[31m%s\033[0m\n", runtime.MaintenanceError)
+	}
+	if runtime.Error != "" {
+		fmt.Printf("  Error:               \033[31m%s\033[0m\n", runtime.Error)
+	}
 	fmt.Println()
 
 	return nil
@@ -604,25 +427,23 @@ func runCoordinatorDigest(cmd *cobra.Command, args []string, sendMail bool) erro
 		return fmt.Errorf("getting project root failed")
 	}
 
+	mailClient := newAgentMailClient(projectKey)
 	runtimeConfig := loadCoordinatorRuntimeConfig()
-	runtimeConfig.AutoAssign = false
-	runtimeConfig.SendDigests = false
-	// Digest is a read-only surface: never let its brief coordinator run
-	// enqueue context rotations (bd-rpmg8).
-	runtimeConfig.RotationUsageThreshold = 0
-	coord, _, err := loadBootstrappedCoordinator(session, projectKey)
-	if err != nil {
-		return err
+	// Only an explicit --send needs to register a sender. Generating a
+	// digest is observation and must not run assignment maintenance.
+	identityClient := mailClient
+	if !sendMail {
+		identityClient = nil
 	}
-	coord.WithConfig(runtimeConfig)
+	coordName := resolveCoordinatorIdentity(cmd.Context(), identityClient, session, projectKey)
+	coord := coordinator.New(session, projectKey, mailClient, coordName).WithConfig(runtimeConfig)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
 	defer cancel()
 
-	if err := coord.Start(ctx); err != nil {
-		return fmt.Errorf("starting coordinator: %w", err)
+	if err := coord.Observe(ctx); err != nil {
+		return fmt.Errorf("observing coordinator: %w", err)
 	}
-	defer coord.Stop()
 
 	digest := coord.GenerateDigest()
 
@@ -648,34 +469,41 @@ type coordinatorRunOutput struct {
 	Once        bool                           `json:"once"`
 	AutoAssign  bool                           `json:"auto_assign"`
 	Assignments []coordinator.AssignmentResult `json:"assignments"`
-	ErrorCode   string                         `json:"error_code,omitempty"`
-	Error       string                         `json:"error,omitempty"`
+	// MonitorYielded reports that the session monitor was running the
+	// coordinator and paused it for this command.
+	MonitorYielded bool   `json:"monitor_yielded,omitempty"`
+	ErrorCode      string `json:"error_code,omitempty"`
+	Error          string `json:"error,omitempty"`
 }
 
 func newCoordinatorRunCmd() *cobra.Command {
 	var once bool
-	var allowCriticalPressure bool
 	cmd := &cobra.Command{
 		Use:   "run [session]",
-		Short: "Run the session coordinator until interrupted",
-		Long: `Run continuous session observation, configured digest delivery, and
-opt-in automatic assignment. The command exits cleanly on SIGINT or SIGTERM.
+		Short: "Run the session coordinator in the foreground until interrupted",
+		Long: `Run continuous session observation, assignment cleanup and lease renewal,
+configured digest delivery, and opt-in automatic assignment. Disabling new
+automatic assignments still releases finished work and maintains active leases.
+The command exits cleanly on SIGINT or SIGTERM.
 
-Use --once to execute exactly one fresh observation and assignment cycle.`,
+Sessions started by 'ntm spawn' already run this coordinator inside their
+session monitor (see 'ntm coordinator status'). This command takes precedence:
+the monitor pauses its coordinator while this command runs and resumes when it
+exits, so the session is never coordinated twice. Use it to coordinate a
+session without a monitor, or with a different --config.
+
+Use --once to execute exactly one fresh observation and maintenance cycle,
+including new assignments when enabled.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runCoordinatorRun(cmd, args, once, allowCriticalPressure)
+			return runCoordinatorRun(cmd, args, once)
 		},
 	}
 	cmd.Flags().BoolVar(&once, "once", false, "Run exactly one fresh coordinator cycle")
-	cmd.Flags().BoolVar(&allowCriticalPressure, "allow-critical-pressure", false, "Allow one explicit assignment cycle under reported critical host pressure (requires --once)")
 	return cmd
 }
 
-func runCoordinatorRun(cmd *cobra.Command, args []string, once, allowCriticalPressure bool) error {
-	if allowCriticalPressure && !once {
-		return markCLIInvalidInput(errors.New("--allow-critical-pressure requires --once"))
-	}
+func runCoordinatorRun(cmd *cobra.Command, args []string, once bool) error {
 	var session string
 	if len(args) > 0 {
 		session = args[0]
@@ -702,20 +530,38 @@ func runCoordinatorRun(cmd *cobra.Command, args []string, once, allowCriticalPre
 	if err := configureAuthoritativeAssignmentPolicy(projectKey); err != nil {
 		return err
 	}
+	// A session monitor hosting the coordinator stops it before this command
+	// coordinates, and cannot restart it until the claim is released.
+	claim, err := resilience.ClaimSessionCoordinator(cmd.Context(), session)
+	if err != nil {
+		return fmt.Errorf("claim session coordination: %w", err)
+	}
+	defer claim.Release()
+	if claim.Preempted && !jsonOutput {
+		fmt.Fprintf(cmd.ErrOrStderr(), "Paused the session monitor's coordinator for %s; it resumes when this command exits.\n", session)
+	}
 
 	runtimeConfig, ntmConfig := loadCoordinatorRuntimeConfigWithNTM()
-	runtimeConfig.AllowCriticalPressure = allowCriticalPressure
-	coord, _, err := loadBootstrappedCoordinator(session, projectKey)
-	if err != nil {
-		return err
+	mailClient := newAgentMailClient(projectKey)
+	coordName := resolveCoordinatorIdentity(cmd.Context(), mailClient, session, projectKey)
+	coord := coordinator.New(session, projectKey, mailClient, coordName).
+		WithConfig(runtimeConfig).
+		WithNTMConfig(ntmConfig).
+		WithPromptContext(resolvePromptContextOptions(false, false, false, ntmConfig))
+	// The coordinator's actuation records (rotation enqueued, mail nudges,
+	// account failover) must land in the durable attention feed that other
+	// processes read, not this process's in-memory default (bd-viwo4).
+	if closeAttention, err := openDurableAttentionFeed(); err != nil {
+		slog.Default().Debug("durable attention feed unavailable", "session", session, "error", err)
+	} else {
+		defer closeAttention()
 	}
-	coord.WithConfig(runtimeConfig).WithNTMConfig(ntmConfig)
 	if once {
 		assignments, cycleErr := coord.RunCycle(cmd.Context())
 		runErr := coordinatorRunFailure(assignments, cycleErr)
 		output := coordinatorRunOutput{
 			Success: runErr == nil, Session: session, Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
-			Once: true, AutoAssign: runtimeConfig.AutoAssign, Assignments: assignments,
+			Once: true, AutoAssign: runtimeConfig.AutoAssign, Assignments: assignments, MonitorYielded: claim.Preempted,
 		}
 		if runErr != nil {
 			output.ErrorCode = "ASSIGNMENT_FAILED"
@@ -751,6 +597,7 @@ func runCoordinatorRun(cmd *cobra.Command, args []string, once, allowCriticalPre
 		output := coordinatorRunOutput{
 			Success: true, Session: session, Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
 			Once: false, AutoAssign: runtimeConfig.AutoAssign, Assignments: []coordinator.AssignmentResult{},
+			MonitorYielded: claim.Preempted,
 		}
 		if err := json.NewEncoder(cmd.OutOrStdout()).Encode(output); err != nil {
 			return err
@@ -768,7 +615,7 @@ func coordinatorRunFailure(assignments []coordinator.AssignmentResult, cycleErr 
 	}
 	failed := 0
 	for _, result := range assignments {
-		if !result.Success && !result.Deferred {
+		if !result.Success {
 			failed++
 		}
 	}
@@ -776,21 +623,6 @@ func coordinatorRunFailure(assignments []coordinator.AssignmentResult, cycleErr 
 		return fmt.Errorf("%d coordinator assignment attempt(s) failed", failed)
 	}
 	return nil
-}
-
-func loadBootstrappedCoordinator(session, projectDir string) (*coordinator.SessionCoordinator, *agentmail.CoordinatorSessionState, error) {
-	state, err := agentmail.LoadCoordinatorSessionState(session, projectDir)
-	if err != nil {
-		return nil, nil, err
-	}
-	if state == nil {
-		return nil, nil, fmt.Errorf("coordinator is not bootstrapped for session %q and project %q; run `ntm coordinator bootstrap %s --mail-project-key <canonical-key> --coordinator-name <name> --bind <pane-id>=<agent-name>`", session, projectDir, session)
-	}
-	client := newAgentMailClient(state.MailProjectKey)
-	client.SetRegistrationToken(state.MailProjectKey, state.Coordinator.AgentName, state.Coordinator.RegistrationToken)
-	coord := coordinator.New(session, projectDir, client, state.Coordinator.AgentName).
-		WithAgentMailScope(state.MailProjectKey, state.Coordinator.AgentName, state.PaneBindings)
-	return coord, state, nil
 }
 
 func resolveCoordinatorProjectKey(ctx context.Context, session string, inferred bool) (string, error) {
@@ -805,24 +637,6 @@ func resolveCoordinatorProjectKey(ctx context.Context, session string, inferred 
 		}
 		if len(panes) == 0 {
 			return "", fmt.Errorf("resolve live coordinator project for %s: session has no panes", session)
-		}
-		// A session may intentionally contain an unrelated utility pane. When
-		// the configured session checkout is live in at least one pane, use it
-		// as the coordinator target and let bootstrap bindings select the exact
-		// in-project panes. Never let an unrelated pane redefine the project.
-		if cfg != nil {
-			configured := filepath.Clean(cfg.GetProjectDir(session))
-			if util.ProjectDirScore(configured) > 0 {
-				for _, pane := range panes {
-					paneDir, pathErr := coordinatorPaneCurrentDir(pane.ID)
-					if pathErr != nil {
-						continue
-					}
-					if same, _ := coordinatorProjectDirsMatch(ctx, configured, paneDir); same {
-						return configured, nil
-					}
-				}
-			}
 		}
 		projectKey, err := robot.ResolveLiveSessionProject(session, panes, coordinatorPaneCurrentDir)
 		if err != nil {
@@ -849,26 +663,6 @@ func resolveCoordinatorProjectKey(ctx context.Context, session string, inferred 
 	return projectKey, nil
 }
 
-func coordinatorProjectDirsMatch(ctx context.Context, targetDir, candidateDir string) (bool, error) {
-	targetRoot := filepath.Clean(util.ResolveProjectDir(strings.TrimSpace(targetDir)))
-	candidateRoot := filepath.Clean(util.ResolveProjectDir(strings.TrimSpace(candidateDir)))
-	if !filepath.IsAbs(targetRoot) || !filepath.IsAbs(candidateRoot) {
-		return false, nil
-	}
-	if targetRoot == candidateRoot {
-		return true, nil
-	}
-	targetCommon, targetErr := ntmgit.CommonDir(ctx, targetRoot)
-	candidateCommon, candidateErr := ntmgit.CommonDir(ctx, candidateRoot)
-	if targetErr != nil || candidateErr != nil {
-		if err := ctx.Err(); err != nil {
-			return false, err
-		}
-		return false, nil
-	}
-	return targetCommon != "" && targetCommon == candidateCommon, nil
-}
-
 func loadCoordinatorRuntimeConfig() coordinator.CoordinatorConfig {
 	coordConfig, _ := loadCoordinatorRuntimeConfigWithNTM()
 	return coordConfig
@@ -881,22 +675,32 @@ func loadCoordinatorRuntimeConfig() coordinator.CoordinatorConfig {
 // runtime config here; with no [rotation] section both stay at their zero
 // values and the trigger remains fully off.
 func loadCoordinatorRuntimeConfigWithNTM() (coordinator.CoordinatorConfig, *config.Config) {
-	coordConfig := coordinator.DefaultCoordinatorConfig()
-	var ntmConfig *config.Config
-	loaded, err := config.Load(selectedConfigPath())
-	switch {
-	case err != nil:
+	coordConfig, ntmConfig, err := loadCoordinatorRuntimeConfigFrom(selectedConfigPath())
+	if err != nil {
 		// Falling back to defaults silently would also silently drop
 		// persisted flags like [coordinator] conflict_negotiate — say so.
 		fmt.Fprintf(os.Stderr,
 			"Warning: could not load config (%v); coordinator running with DEFAULTS — persisted [coordinator] settings (e.g. conflict_negotiate) are NOT in effect\n", err)
-	case loaded != nil:
-		ntmConfig = loaded
-		coordConfig = coordinatorConfigFromTOML(loaded.Coordinator, coordConfig)
-		coordConfig.RotationUsageThreshold = loaded.Rotation.UsagePercentThreshold
-		coordConfig.RotationAutoConfirm = loaded.Rotation.AutoConfirm
 	}
 	return coordConfig, ntmConfig
+}
+
+// loadCoordinatorRuntimeConfigFrom loads path and maps it onto the runtime
+// coordinator configuration. On error it returns the built-in defaults with
+// the error, so a resident caller can keep its last good settings instead.
+func loadCoordinatorRuntimeConfigFrom(path string) (coordinator.CoordinatorConfig, *config.Config, error) {
+	coordConfig := coordinator.DefaultCoordinatorConfig()
+	loaded, err := config.Load(path)
+	if err != nil {
+		return coordConfig, nil, err
+	}
+	if loaded == nil {
+		return coordConfig, nil, nil
+	}
+	coordConfig = coordinatorConfigFromTOML(loaded.Coordinator, coordConfig)
+	coordConfig.RotationUsageThreshold = loaded.Rotation.UsagePercentThreshold
+	coordConfig.RotationAutoConfirm = loaded.Rotation.AutoConfirm
+	return coordConfig, loaded, nil
 }
 
 func renderDigest(digest coordinator.DigestSummary) error {
@@ -998,17 +802,12 @@ func runCoordinatorConflicts(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("getting project root failed")
 	}
 
-	_, state, err := loadBootstrappedCoordinator(session, projectKey)
-	if err != nil {
-		return err
-	}
-	mailClient := newAgentMailClient(state.MailProjectKey)
-	mailClient.SetRegistrationToken(state.MailProjectKey, state.Coordinator.AgentName, state.Coordinator.RegistrationToken)
+	mailClient := newAgentMailClient(projectKey)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	detector := coordinator.NewConflictDetector(mailClient, state.MailProjectKey)
+	detector := coordinator.NewConflictDetector(mailClient, projectKey)
 	conflicts, err := detector.DetectConflicts(ctx)
 	if err != nil {
 		return fmt.Errorf("detecting conflicts: %w", err)
@@ -1091,6 +890,7 @@ Examples:
 	cmd.Flags().BoolVar(&assignForce, "force", false, "Force assignment even if pane is busy")
 	cmd.Flags().BoolVar(&assignIgnoreDeps, "ignore-deps", false, "Ignore dependency checks for assignment")
 	cmd.Flags().StringVar(&assignPrompt, "prompt", "", "Custom prompt for direct assignment")
+	registerAssignPromptContextFlags(cmd)
 
 	return cmd
 }
@@ -1171,6 +971,9 @@ func runCoordinatorAssign(cmd *cobra.Command, args []string, dryRun bool) error 
 		Force:           assignForce,
 		IgnoreDeps:      assignIgnoreDeps,
 		Prompt:          assignPrompt,
+		WithCASS:        assignWithCASS,
+		NoCASS:          assignNoCASS,
+		WithMemory:      assignWithMemory,
 		policyProject:   filepath.Clean(projectDir),
 	}
 
@@ -1215,8 +1018,11 @@ Available features:
   mail-nudge          - Prompt idle panes when they have unread Agent Mail
 
 The flag is written to the [coordinator] section of the selected config file
-(--config, or the global ~/.config/ntm/config.toml). A running
-'ntm coordinator run' daemon reads config at startup; restart it to apply.
+(--config, or the global ~/.config/ntm/config.toml). Session monitors started
+by 'ntm spawn' host the coordinator and apply the change within 15 seconds; a
+foreground 'ntm coordinator run' reads config at startup, so restart it to
+apply. conflict-notify is the exception: session monitors never run it, only
+'ntm coordinator run' does.
 
 Examples:
   ntm coordinator enable auto-assign
@@ -1249,8 +1055,11 @@ Available features:
   mail-nudge          - Unread Agent Mail prompts for idle panes
 
 The flag is written to the [coordinator] section of the selected config file
-(--config, or the global ~/.config/ntm/config.toml). A running
-'ntm coordinator run' daemon reads config at startup; restart it to apply.
+(--config, or the global ~/.config/ntm/config.toml). Session monitors started
+by 'ntm spawn' host the coordinator and apply the change within 15 seconds; a
+foreground 'ntm coordinator run' reads config at startup, so restart it to
+apply. conflict-notify is the exception: session monitors never run it, only
+'ntm coordinator run' does. Disabling a feature never stops assignment lease maintenance.
 
 Examples:
   ntm coordinator disable auto-assign
@@ -1366,7 +1175,11 @@ func runCoordinatorToggle(cmd *cobra.Command, args []string, enable bool, interv
 		fmt.Printf("  %s = %s\n", kv[0], kv[1])
 	}
 	fmt.Println()
-	fmt.Println("A running `ntm coordinator run` daemon reads config at startup; restart it to apply.")
+	if feature == "conflict-notify" {
+		fmt.Println("Session monitors never run conflict-notify; it runs only under `ntm coordinator run` (restart a running one to apply it).")
+	} else {
+		fmt.Println("Session monitors apply this within 15 seconds; restart a foreground `ntm coordinator run` to apply it there.")
+	}
 
 	return nil
 }

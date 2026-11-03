@@ -415,9 +415,7 @@ func (c *BVClient) buildInsightsFromResponse(resp *InsightsResponse, workDir str
 	insights := &Insights{}
 
 	// Extract cycles
-	for _, cycle := range resp.Cycles {
-		insights.Cycles = append(insights.Cycles, cycle.Nodes)
-	}
+	insights.Cycles = append(insights.Cycles, resp.Cycles...)
 
 	// Extract bottlenecks
 	for _, b := range resp.Bottlenecks {
@@ -445,7 +443,8 @@ func (c *BVClient) buildInsightsFromTriage(triage *TriageResponse) *Insights {
 
 	if triage.Triage.ProjectHealth != nil {
 		// Extract counts from project health
-		if counts, ok := triage.Triage.ProjectHealth.StatusDistribution["total"]; ok {
+		insights.TotalCount = triage.Triage.ProjectHealth.Total
+		if counts, ok := triage.Triage.ProjectHealth.StatusDistribution["total"]; ok && insights.TotalCount == 0 {
 			insights.TotalCount = counts
 		}
 

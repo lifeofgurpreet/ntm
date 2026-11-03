@@ -18,7 +18,7 @@ var (
 
 	// agyModelPattern is the RELAXED model charset for the Antigravity (agy)
 	// provider. Antigravity's model *display* names contain spaces and
-	// parentheses — e.g. "Gemini 3.7 Flash (High)" — which the standard
+	// parentheses — e.g. "Gemini 4 Argon (High)" — which the standard
 	// modelPattern rejects. agy always renders its model through
 	// {{shellQuote .Model}} in the launch template (and, in practice, the value
 	// is hard-pinned by config.AntigravityRequiredModel before it ever reaches a
@@ -53,6 +53,10 @@ const (
 	// the wrong pane title / detection. Launch command resolves through the
 	// `[agents] oc = "..."` config key (or the default `opencode` binary).
 	AgentTypeOpencode AgentType = "oc"
+	// AgentTypeOmp covers Oh My Pi (`omp`) panes: `--omp=N[:model[:effort]]`
+	// on spawn/add/adopt/send, launched through `[agents] omp` or
+	// config.DefaultOmpCommand.
+	AgentTypeOmp AgentType = "omp"
 )
 
 // AgentSpec represents a parsed agent specification with optional model
@@ -113,7 +117,7 @@ func (s *AgentSpecs) Type() string {
 // separator (ntm-mjf7).
 func agentTypeSupportsEffortSuffix(agentType AgentType) bool {
 	switch agentType {
-	case AgentTypeClaude, AgentTypeCodex, AgentTypeGrok:
+	case AgentTypeClaude, AgentTypeCodex, AgentTypeGrok, AgentTypeOmp:
 		return true
 	default:
 		return false
@@ -131,7 +135,7 @@ func ParseAgentSpec(value string) (AgentSpec, error) {
 
 // parseAgentSpec parses a spec string, optionally relaxing the model charset for
 // the Antigravity (agy) provider whose display model names contain spaces and
-// parentheses (e.g. "Gemini 3.7 Flash (High)"). See agyModelPattern for why the
+// parentheses (e.g. "Gemini 4 Argon (High)"). See agyModelPattern for why the
 // widened charset is injection-safe. effortAtSuffix enables the `model@effort`
 // shorthand; callers that know the agent type pass it per
 // agentTypeSupportsEffortSuffix.

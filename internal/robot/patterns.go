@@ -6,6 +6,9 @@ import (
 	"regexp"
 	"sort"
 	"sync"
+
+	"github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/errsig"
 )
 
 // AgentState represents the detected state of an agent.
@@ -99,7 +102,7 @@ func defaultPatterns() []Pattern {
 		// Codex patterns
 		{Name: "codex_prompt", RegexStr: `(?i)codex\s*>?\s*$`, Agent: "codex", State: StateWaiting, Category: CategoryIdle, Priority: 100, Description: "Codex prompt"},
 		{Name: "codex_context_left", RegexStr: `(?i)\b\d{1,3}%\s*context\s*left\b`, Agent: "codex", State: StateWaiting, Category: CategoryIdle, Priority: 96, Description: "Codex context status line"},
-		{Name: "codex_chevron_prompt", RegexStr: `(?m)^\s*›\s*.*$`, Agent: "codex", State: StateWaiting, Category: CategoryIdle, Priority: 92, Description: "Codex chevron prompt"},
+		{Name: "codex_chevron_prompt", RegexStr: `(?m)^\s*[›»]\s*.*$`, Agent: "codex", State: StateWaiting, Category: CategoryIdle, Priority: 92, Description: "Codex chevron prompt (\"»\" at effort ultra, GH#273)"},
 
 		// Codex active-work indicators. These must outrank codex_context_left /
 		// codex_chevron_prompt because codex keeps rendering its status bar and
@@ -150,6 +153,23 @@ func defaultPatterns() []Pattern {
 		{Name: "grok_composer_prompt", RegexStr: `(?m)^\s*│\s*❯`, Agent: "grok", State: StateWaiting, Category: CategoryIdle, Priority: 92, Description: "Grok Build bordered composer line (permanent chrome; outranked by the in-flight patterns above)"},
 		{Name: "grok_welcome_banner", RegexStr: `(?i)grok\s+build\s+\d+\.\d+`, Agent: "grok", State: StateWaiting, Category: CategoryIdle, Priority: 96, Description: "Grok Build welcome banner (fresh spawn readiness)"},
 
+		// Oh My Pi (omp) patterns, derived from live captures of omp v18.2.3
+		// across its nerd/unicode/ascii symbol presets. omp keeps a bordered
+		// composer box pinned to the bottom at all times; while a turn is in
+		// flight the box's top border swaps its status icon for a spinner +
+		// elapsed timer ("╭── ⠧ 1s   Union Alpha" / "+-- \ 5s > [M]"), an
+		// activity line opening with the Esc interrupt hint sits directly
+		// above it ("󱊷 Working…" / "⎋ Working…" / "esc Working…"), and a
+		// mid-turn message waits in a "Steering · N" block. Those outrank
+		// the empty-composer idle chrome the same way the grok patterns do.
+		{Name: "omp_status_timer", RegexStr: `(?m)^\s*(?:╭──|\+--)\s+\S\s+\d+[smh]\b`, Agent: "omp", State: StateThinking, Category: CategoryThinking, Priority: 115, Description: "omp composer top border carrying the in-flight spinner + elapsed timer"},
+		{Name: "omp_esc_hint", RegexStr: `(?m)^\s*(?:󱊷|⎋|esc)\s+\S`, Agent: "omp", State: StateThinking, Category: CategoryThinking, Priority: 115, Description: "omp activity line opening with the Esc interrupt hint (only during an in-flight turn)"},
+		{Name: "omp_steering", RegexStr: `(?m)^\s*Steering\s+·\s+\d+\s*$`, Agent: "omp", State: StateThinking, Category: CategoryThinking, Priority: 115, Description: "omp pending-steering block (a message submitted mid-turn, not yet consumed)"},
+		{Name: "omp_subagents", RegexStr: `(?m)^\s*Subagents\s*\n\s*(?:[├└]─|[|\\+` + "`" + `]-)\s+[•*]\s+\S`, Agent: "omp", State: StateThinking, Category: CategoryThinking, Priority: 115, Description: "omp running-subagents panel (header plus at least one listed subagent) in the HUD above the composer"},
+		{Name: "omp_provider_error", RegexStr: `(?m)^\s*Dismissed when you send your next message\.`, Agent: "omp", State: StateError, Category: CategoryError, Priority: 180, Description: "omp provider error block footer (e.g. 401 Invalid API Key)"},
+		{Name: "omp_interrupted", RegexStr: `(?m)^\s*(?:\S\s+)?F5 to Retry\s*$`, Agent: "omp", State: StateWaiting, Category: CategoryCompletion, Priority: 95, Description: "omp retry hint (F5 re-runs the turn) above the idle composer after an interrupt or failure; nerd preset prefixes a glyph"},
+		{Name: "omp_empty_composer", RegexStr: `(?m)^\s*(?:╰─|\+-)\s*(?:─╯|-\+)\s*$`, Agent: "omp", State: StateWaiting, Category: CategoryIdle, Priority: 92, Description: "omp empty composer bottom border (permanent chrome; outranked by the in-flight patterns above)"},
+
 		// Generic shell prompts (user/fallback)
 		{Name: "shell_dollar", RegexStr: `\$\s*$`, Agent: "*", State: StateWaiting, Category: CategoryIdle, Priority: 20, Description: "Shell dollar prompt"},
 		{Name: "shell_percent", RegexStr: `%\s*$`, Agent: "*", State: StateWaiting, Category: CategoryIdle, Priority: 20, Description: "Shell percent prompt"},
@@ -159,28 +179,44 @@ func defaultPatterns() []Pattern {
 		// ==================
 		// ERROR PATTERNS (something went wrong)
 		// ==================
-		// Rate limits
-		{Name: "rate_limit_text", RegexStr: `(?i)rate\s+limit`, Agent: "*", State: StateError, Category: CategoryError, Priority: 200, Description: "Rate limit text"},
-		{Name: "http_429", RegexStr: `\b429\b`, Agent: "*", State: StateError, Category: CategoryError, Priority: 200, Description: "HTTP 429 status"},
+		// Rate limits.
+		//
+		// Rate-limit evidence must be a banner, not a mention. "Rate limit"
+		// anchored at the start of a line is a provider banner; mid-sentence it
+		// needs an explicit limit verb. A bare "429" is not evidence at all —
+		// it occurs inside hashes and IDs, and treating it as authoritative
+		// walled off healthy agents (ntm#299).
+		{Name: "rate_limit_text", RegexStr: errsig.Anchored(`(?i:rate[\s_-]?limit)`) + `|(?i)\brate[\s_-]?limits?\s+(?:exceeded|reached)\b|(?i)\brate_limit_error\b|(?i)\b(?:hit|hitting|reached)\s+(?:the\s+|a\s+|your\s+)?rate[\s_-]?limit\b`, Agent: "*", State: StateError, Category: CategoryError, Priority: 200, Description: "Rate limit banner (anchored, or with an explicit limit verb)"},
+		{Name: "http_429", RegexStr: errsig.HTTPStatus("429", "too many requests", "rate limit"), Agent: "*", State: StateError, Category: CategoryError, Priority: 200, Description: "HTTP 429 status in a structured position"},
 		{Name: "too_many_requests", RegexStr: `(?i)too\s+many\s+requests`, Agent: "*", State: StateError, Category: CategoryError, Priority: 200, Description: "Too many requests"},
 		{Name: "quota_exceeded", RegexStr: `(?i)quota\s+exceeded`, Agent: "*", State: StateError, Category: CategoryError, Priority: 200, Description: "Quota exceeded"},
 		{Name: "usage_limit_hit", RegexStr: `(?i)(?:hit|reached)\s+your\s+usage\s+limit`, Agent: "*", State: StateError, Category: CategoryError, Priority: 200, Description: "Provider usage-limit banner (hit/reached your usage limit)"},
 		{Name: "usage_limit_reached", RegexStr: `(?i)(?:usage|plan)\s+limits?\s+(?:reached|exceeded)`, Agent: "*", State: StateError, Category: CategoryError, Priority: 200, Description: "Usage/plan limit reached banner"},
 
-		// API errors
-		{Name: "api_error", RegexStr: `(?i)(?:api\s+)?error:\s*\S`, Agent: "*", State: StateError, Category: CategoryError, Priority: 180, Description: "API error"},
-		{Name: "exception", RegexStr: `(?i)exception:\s*\S`, Agent: "*", State: StateError, Category: CategoryError, Priority: 180, Description: "Exception"},
-		{Name: "failed_text", RegexStr: `(?i)\bfailed\b.*(?:to|with|:|$)`, Agent: "*", State: StateError, Category: CategoryError, Priority: 150, Description: "Failed operation"},
+		// API errors. Anchored: a runtime prints "Error: ..." at the start of a
+		// line (possibly behind TUI decoration), whereas prose that merely
+		// discusses an error does not — and prose used to be enough to mark a
+		// healthy agent degraded (ntm#299).
+		{Name: "api_error", RegexStr: errsig.Anchored(`(?i:(?:[\w.-]+\s+)?[\w.-]*error)\s*:\s*\S`), Agent: "*", State: StateError, Category: CategoryError, Priority: 180, Description: "API/runtime error line"},
+		{Name: "exception", RegexStr: errsig.Anchored(`(?i:[\w.]*exception)\s*:\s*\S`), Agent: "*", State: StateError, Category: CategoryError, Priority: 180, Description: "Raised exception line"},
+		{Name: "traceback", RegexStr: errsig.Anchored(`(?i:traceback)\b`), Agent: "*", State: StateError, Category: CategoryError, Priority: 180, Description: "Traceback header"},
+		// failed_text is the pattern that turned a successful handoff sentence
+		// ("it failed naming exactly the seven…") into an active agent error
+		// (ntm#297). It now requires a failure *report*: a line that starts
+		// with "Failed to/with/:", or a short status line that ends in
+		// "failed". Prose that merely contains the word never qualifies.
+		{Name: "failed_text", RegexStr: errsig.Anchored(`(?i:failed)\b(?:\s+to\b|\s+with\b|\s*[:.]|\s*$)|[^\n]{0,60}?\b(?i:failed)[.!]?[ \t]*$`), Agent: "*", State: StateError, Category: CategoryError, Priority: 150, Description: "Failure report line"},
+		{Name: "nonzero_exit", RegexStr: errsig.NonzeroExitPattern, Agent: "*", State: StateError, Category: CategoryError, Priority: 150, Description: "Nonzero process exit"},
 
 		// Crashes
-		{Name: "panic", RegexStr: `(?i)^panic:`, Agent: "*", State: StateError, Category: CategoryError, Priority: 250, Description: "Go panic"},
-		{Name: "sigsegv", RegexStr: `SIGSEGV`, Agent: "*", State: StateError, Category: CategoryError, Priority: 250, Description: "Segmentation fault"},
-		{Name: "sigkill", RegexStr: `(?i)(?:killed|SIGKILL)`, Agent: "*", State: StateError, Category: CategoryError, Priority: 250, Description: "Process killed"},
-		{Name: "process_exited", RegexStr: `(?i)(?:process|agent)\s+(?:exited|terminated|crashed)`, Agent: "*", State: StateError, Category: CategoryError, Priority: 240, Description: "Process exited"},
+		{Name: "panic", RegexStr: errsig.Anchored(`(?i:panic):\s`), Agent: "*", State: StateError, Category: CategoryError, Priority: 250, Description: "Go panic"},
+		{Name: "sigsegv", RegexStr: errsig.FatalSignalPattern, Agent: "*", State: StateError, Category: CategoryError, Priority: 250, Description: "Fatal POSIX signal"},
+		{Name: "sigkill", RegexStr: errsig.Anchored(`(?i:killed)\b`) + `|(?i)\bsignal:\s*killed\b`, Agent: "*", State: StateError, Category: CategoryError, Priority: 250, Description: "Process killed"},
+		{Name: "process_exited", RegexStr: errsig.Anchored(`(?i:(?:process|agent)\s+(?:exited|terminated|crashed))`), Agent: "*", State: StateError, Category: CategoryError, Priority: 240, Description: "Process exited"},
 
 		// Auth
-		{Name: "unauthorized", RegexStr: `(?i)unauthorized`, Agent: "*", State: StateError, Category: CategoryError, Priority: 190, Description: "Unauthorized"},
-		{Name: "invalid_key", RegexStr: `(?i)invalid.*(?:api\s*)?key`, Agent: "*", State: StateError, Category: CategoryError, Priority: 190, Description: "Invalid API key"},
+		{Name: "unauthorized", RegexStr: errsig.Anchored(`(?i:unauthorized)\b`) + `|` + errsig.HTTPStatus("401", "unauthorized"), Agent: "*", State: StateError, Category: CategoryError, Priority: 190, Description: "Unauthorized"},
+		{Name: "invalid_key", RegexStr: `(?i)\binvalid\s+(?:api[\s_-]?)?key\b`, Agent: "*", State: StateError, Category: CategoryError, Priority: 190, Description: "Invalid API key"},
 		{Name: "auth_failed", RegexStr: `(?i)authentication\s+(?:failed|error)`, Agent: "*", State: StateError, Category: CategoryError, Priority: 190, Description: "Authentication failed"},
 
 		// Connection errors
@@ -272,7 +308,7 @@ func (lib *PatternLibrary) Match(content string, agentType string) []PatternMatc
 		}
 	}
 
-	return matches
+	return appendPluginPatternMatches(matches, content, agentType, "")
 }
 
 // MatchFirst returns the first (highest priority) matching pattern.
@@ -320,6 +356,48 @@ func (lib *PatternLibrary) MatchByCategory(content string, agentType string, cat
 		}
 	}
 
+	return appendPluginPatternMatches(matches, content, agentType, category)
+}
+
+// Names and priorities of the matches a registered agent plugin's declared
+// readiness patterns contribute. The priorities mirror the built-in omp
+// patterns: an error outranks in-flight evidence, which outranks idle chrome.
+const (
+	pluginErrorPattern   = "plugin_error"
+	pluginWorkingPattern = "plugin_working"
+	pluginIdlePattern    = "plugin_idle"
+
+	pluginErrorPriority   = 180
+	pluginWorkingPriority = 115
+	pluginIdlePriority    = 92
+)
+
+// appendPluginPatternMatches adds the readiness patterns a registered agent
+// plugin declared (ntm#260) to library matches, so the robot classifier,
+// live-busy and health surfaces read plugin panes the way the agent parser and
+// status detector already do: Working patterns are THINKING (authoritative live
+// work), Error patterns ERROR, and Idle patterns WAITING. Every pattern is
+// matched per line of content; callers keep their own window and freshness
+// rules. A non-empty category restricts the additions. The result stays in
+// descending priority order for MatchFirst.
+func appendPluginPatternMatches(matches []PatternMatch, content, agentType string, category PatternCategory) []PatternMatch {
+	found, ok := agent.MatchPluginReadiness(content, agent.AgentType(agentType))
+	if !ok {
+		return matches
+	}
+	added := false
+	add := func(matched bool, m PatternMatch) {
+		if matched && (category == "" || m.Category == category) {
+			matches = append(matches, m)
+			added = true
+		}
+	}
+	add(found.Error, PatternMatch{Pattern: pluginErrorPattern, State: StateError, Category: CategoryError, Priority: pluginErrorPriority})
+	add(found.Working, PatternMatch{Pattern: pluginWorkingPattern, State: StateThinking, Category: CategoryThinking, Priority: pluginWorkingPriority})
+	add(found.Idle, PatternMatch{Pattern: pluginIdlePattern, State: StateWaiting, Category: CategoryIdle, Priority: pluginIdlePriority})
+	if added {
+		sort.SliceStable(matches, func(i, j int) bool { return matches[i].Priority > matches[j].Priority })
+	}
 	return matches
 }
 
@@ -451,7 +529,7 @@ func isGenericShellIdlePattern(name string) bool {
 
 func isKnownAgentPatternType(agentType string) bool {
 	switch normalizeAgentType(agentType) {
-	case "claude", "codex", "gemini", "antigravity", "grok", "cursor", "windsurf", "aider", "oc", "ollama":
+	case "claude", "codex", "gemini", "antigravity", "grok", "cursor", "windsurf", "aider", "oc", "omp", "ollama":
 		return true
 	default:
 		return false

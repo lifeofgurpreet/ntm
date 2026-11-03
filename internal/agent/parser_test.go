@@ -406,7 +406,7 @@ func TestParser_ParseWithHint_AntigravityLiveFrames(t *testing.T) {
   >
 
   ? for shortcuts
-  Gemini 3.7 Flash (High)`
+  Gemini 4 Argon (High)`
 	idle, err := p.ParseWithHint(idleOutput, AgentTypeAntigravity)
 	if err != nil {
 		t.Fatalf("parse idle Antigravity frame: %v", err)
@@ -419,7 +419,7 @@ func TestParser_ParseWithHint_AntigravityLiveFrames(t *testing.T) {
   >
   ⠹ Analyzing repository
   esc to cancel
-  Gemini 3.7 Flash (High)`
+  Gemini 4 Argon (High)`
 	working, err := p.ParseWithHint(workingOutput, AgentTypeAntigravity)
 	if err != nil {
 		t.Fatalf("parse working Antigravity frame: %v", err)
@@ -1694,6 +1694,46 @@ func TestClaudeCompletionLine_AccentedVerb(t *testing.T) {
 				t.Errorf("claudeIsCompletionLine failed to recognize accented verb")
 			}
 		})
+	}
+}
+
+// Current Claude Code ends a turn with "· done <time>" and "· N shell(s) still
+// running" after the duration; every completion line in a live swarm carried
+// them (2026-10). Unrecognized, a stale spinner above the line kept the pane
+// WORKING and a failed tool call above it read as a terminal error.
+func TestClaudeCompletionLine_DoneAndShellSuffixes(t *testing.T) {
+	for _, line := range []string{
+		"✻ Crunched for 10s · done 11:09 PM · 1 shell still running",
+		"✻ Worked for 42s · done 9:03 AM",
+		"✻ Cogitated for 3m 12s · done 11:40 PM · 2 shells still running",
+		"  ✻ Sautéed for 8s · done 10:58 PM",
+	} {
+		if !claudeIsCompletionLine(line) {
+			t.Errorf("claudeIsCompletionLine(%q) = false, want a turn-ended marker", line)
+		}
+	}
+	for _, line := range []string{
+		"✻ Crunching… (12s · ↓ 1.2k tokens · esc to interrupt)",
+		"✻ Whirlpooling… (ctrl+c to interrupt · 2m 44s · thinking)",
+		"● The suite ran for 10s · done",
+		"  thought for 14s · done",
+	} {
+		if claudeIsCompletionLine(line) {
+			t.Errorf("claudeIsCompletionLine(%q) = true, want no turn-ended marker", line)
+		}
+	}
+
+	stale := "✻ Whirlpooling… (ctrl+c to interrupt · 2m 44s · thinking)\n" +
+		"● Summary of the change.\n" +
+		"✻ Crunched for 10s · done 11:09 PM · 1 shell still running\n────────────\n❯ \n────────────\n"
+	if ClaudeActivelyWorking(stale, 0) {
+		t.Error("a suffixed completion line below a stale spinner must end the turn, not leave the pane WORKING")
+	}
+	toolFailure := "● Bash(pkill -f run_c7.sh; echo cleared)\n" +
+		"  ⎿  Error: Exit code 144\n\n" +
+		"✻ Crunched for 10s · done 11:09 PM · 1 shell still running\n────────────\n❯ \n"
+	if got := DetectClaudeTurnState(toolFailure, 0); got != ClaudeTurnEnded {
+		t.Errorf("DetectClaudeTurnState(failed tool call, then suffixed completion) = %v, want ClaudeTurnEnded", got)
 	}
 }
 

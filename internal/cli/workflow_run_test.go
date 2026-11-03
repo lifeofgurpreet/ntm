@@ -2,6 +2,9 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,8 +12,14 @@ import (
 	"testing"
 	"time"
 
+	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/health"
+	"github.com/Dicklesworthstone/ntm/internal/process"
+	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/workflow"
+	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
 // fakeWorkflowSession scripts pane dispatch/capture for the runner loop.
@@ -38,7 +47,7 @@ func (f *fakeWorkflowSession) ports() workflowRunPorts {
 			}
 			return nil
 		},
-		capture: func(paneID string, _ int) (string, error) {
+		capture: func(_ context.Context, paneID string, _ int) (string, error) {
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			return f.outputs[paneID], nil
@@ -113,6 +122,277 @@ func TestWorkflowRunnerPingPongAlternates(t *testing.T) {
 	}
 }
 
+// A realistic pi capture: transcript above a full-width composer, followed
+// by cwd and usage/model rows. Draft text must never become workflow evidence.
+func piWorkflowCapture(transcript, draft string, working bool) string {
+	rule := strings.Repeat("─", 40)
+	top := rule
+	if working {
+		prefix := "── ⠹ Working "
+		top = prefix + strings.Repeat("─", 40-len([]rune(prefix)))
+	}
+	return transcript + "\n\n" + top + "\n" + draft + "\n" + rule + "\n~/projects/demo (main)\n0.0%/1.0M (auto)  model\n"
+}
+
+func TestWorkflowRunnerPiRepaintAdvancesDurableStages(t *testing.T) {
+	for _, scenario := range []string{"answer in first repaint", "blank then restored history", "echo then repaint", "Markdown echo then repaint", "partial composer with verdict draft"} {
+		t.Run(scenario, func(t *testing.T) {
+			fake := newFakeWorkflowSession()
+			history := map[string]string{"%1": "previous red work\nRED-HANDOFF", "%2": "previous green work\nGREEN-HANDOFF"}
+			pending := make(map[string][]string)
+			for pane, transcript := range history {
+				fake.outputs[pane] = piWorkflowCapture(transcript, "", false)
+			}
+			firstRed := true
+			fake.onDispatch = func(pane, prompt string) {
+				if pane == "%2" && len(pending["%1"]) != 0 {
+					t.Fatal("workflow advanced from blank repaint, prompt echo or restored old verdict")
+				}
+				verdict := "RED-HANDOFF"
+				if pane == "%2" {
+					verdict = "GREEN-HANDOFF"
+				}
+				visible := prompt
+				if scenario == "Markdown echo then repaint" {
+					// Pi applies style-only formatting to these known fixture
+					// tokens. Do not generate the expected echo with its matcher.
+					visible = strings.ReplaceAll(visible, "**changes**", "changes")
+					visible = strings.ReplaceAll(visible, "`tests`", "tests")
+				}
+				transcript := "Pi v1.3.0\n" + visible + "\nReviewed this turn.\n" + verdict
+				frame := piWorkflowCapture(transcript, "unsent draft", false)
+				if pane == "%1" && firstRed {
+					switch scenario {
+					case "blank then restored history":
+						pending[pane] = []string{"", piWorkflowCapture(history[pane], "", false), frame}
+					case "echo then repaint", "Markdown echo then repaint":
+						pending[pane] = []string{piWorkflowCapture(history[pane]+"\n"+visible, "", true), frame}
+					case "partial composer with verdict draft":
+						partial := piWorkflowCapture("Pi v1.3.0\n"+prompt, verdict, false)
+						partial = strings.TrimSuffix(partial, "\n~/projects/demo (main)\n0.0%/1.0M (auto)  model\n")
+						pending[pane] = []string{partial, frame}
+					}
+					firstRed = false
+				}
+				fake.mu.Lock()
+				fake.outputs[pane] = frame
+				fake.mu.Unlock()
+				history[pane] = transcript
+			}
+			ports := fake.ports()
+			originalCapture := ports.capture
+			ports.capture = func(ctx context.Context, pane string, lines int) (string, error) {
+				if frames := pending[pane]; len(frames) > 0 {
+					pending[pane] = frames[1:]
+					return frames[0], nil
+				}
+				return originalCapture(ctx, pane, lines)
+			}
+			agents := []workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}}
+			template := pingPongTemplate()
+			if scenario == "Markdown echo then repaint" {
+				template.Description = "Review **changes** and run `tests`"
+			}
+			runner, err := newWorkflowRunner(template, agents, workflowRunOptions{
+				Session: "pi-repaint", ProjectRoot: t.TempDir(), StateDir: filepath.Join(t.TempDir(), "state"),
+				PanePIDs: map[string]int{"%1": 101, "%2": 202}, PaneTypes: map[string]string{"%1": "pi", "%2": "pi"},
+				MaxTransitions: 2, Interval: time.Millisecond,
+			}, ports)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			result, err := runner.Run(ctx)
+			if err != nil || result.Transitions != 2 || strings.Join(fake.dispatchedPanes(), ",") != "%1,%2,%1" {
+				t.Fatalf("pi repaint failed progression: result=%+v dispatches=%v error=%v", result, fake.dispatchedPanes(), err)
+			}
+			for _, pane := range runner.state.Evidence.Panes {
+				if pane.AgentType != "pi" || len(pane.ScreenHash) != 64 || strings.Contains(pane.Capture, "unsent draft") || strings.Contains(pane.Capture, "0.0%/") {
+					t.Fatalf("checkpoint retained pi chrome or lost its normalization contract: %+v", pane)
+				}
+			}
+		})
+	}
+}
+
+func TestWorkflowRunnerPiIncompleteComposerBlocksInitialDelivery(t *testing.T) {
+	fake := newFakeWorkflowSession()
+	fake.outputs["%1"] = "old history\n" + strings.Repeat("─", 40) + "\nunsent draft"
+	fake.outputs["%2"] = piWorkflowCapture("other history", "", false)
+	runner := mustResumeWorkflowRunner(t, pingPongTemplate(), []workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}},
+		workflowRunOptions{Session: "pi-incomplete", PaneTypes: map[string]string{"%1": "pi", "%2": "pi"}}, fake.ports())
+	result, err := runner.Run(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "incomplete or unsupported composer") || result.Transitions != 0 || len(fake.dispatchedPanes()) != 0 {
+		t.Fatalf("initial partial frame authorized a send: result=%+v sends=%v error=%v", result, fake.dispatchedPanes(), err)
+	}
+}
+
+func TestWorkflowRunnerPiComposerVerdictCannotAdvance(t *testing.T) {
+	fake := newFakeWorkflowSession()
+	fake.outputs["%1"] = piWorkflowCapture("old transcript", "", false)
+	fake.outputs["%2"] = piWorkflowCapture("other history", "", false)
+	fake.onDispatch = func(pane, prompt string) {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		fake.outputs[pane] = piWorkflowCapture("Pi v1.3.0\n"+prompt, "RED-HANDOFF", false)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ports := fake.ports()
+	polls := 0
+	ports.sleep = func(context.Context, time.Duration) {
+		polls++
+		if polls == 3 {
+			cancel()
+		}
+	}
+	runner, err := newWorkflowRunner(pingPongTemplate(), []workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}},
+		workflowRunOptions{Session: "pi-draft", PaneTypes: map[string]string{"%1": "pi", "%2": "pi"}}, ports)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.Run(ctx)
+	if result.Transitions != 0 || len(fake.dispatchedPanes()) != 1 || (err != nil && !errors.Is(err, context.Canceled)) {
+		t.Fatalf("composer draft became workflow evidence: result=%+v error=%v", result, err)
+	}
+}
+
+func TestWorkflowRunnerPiResumeUsesPreparedPromptReceipt(t *testing.T) {
+	template := pingPongTemplate()
+	template.Description = "Review **private source context** and run `tests`"
+	fake := newFakeWorkflowSession()
+	fake.outputs["%1"] = piWorkflowCapture("old red history", "", false)
+	fake.outputs["%2"] = piWorkflowCapture("old green history", "", false)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	prepared := make(map[string]string)
+	firstDispatch := true
+	fake.onDispatch = func(pane, prompt string) {
+		prepared[pane] = prompt
+		if firstDispatch {
+			firstDispatch = false
+			cancel() // Pause after delivery, before the first response frame.
+		}
+	}
+	ports := fake.ports()
+	originalDispatch := ports.dispatch
+	var runner *workflowRunner
+	ports.dispatch = func(ctx context.Context, session, pane, prompt string) error {
+		// Model the production before-dispatch hook after redaction and
+		// enrichment. The template text will not appear on the pi screen.
+		message := "Prepared delivery\n" + strings.ReplaceAll(prompt, "private source context", "[redacted]")
+		if err := runner.pinPiDispatchPrompt(runner.state.CurrentStage, pane, message); err != nil {
+			return err
+		}
+		return originalDispatch(ctx, session, pane, message)
+	}
+	opts := workflowRunOptions{
+		Session: "pi-resume-repaint", ProjectRoot: t.TempDir(), StateDir: t.TempDir(),
+		PanePIDs: map[string]int{"%1": 101, "%2": 202}, PaneTypes: map[string]string{"%1": "pi", "%2": "pi"},
+		Interval: time.Millisecond, MaxTransitions: 1,
+	}
+	agents := []workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}}
+	runner = mustResumeWorkflowRunner(t, template, agents, opts, ports)
+	if result, err := runner.Run(ctx); result.Transitions != 0 || (err != nil && !errors.Is(err, context.Canceled)) {
+		t.Fatalf("could not pause delivered pi turn: result=%+v error=%v", result, err)
+	}
+	saved := mustLoadWorkflowCheckpoint(t, opts)
+	if len(saved.Dispatches) != 1 || saved.Dispatches[0].Status != "delivered" || len(saved.Dispatches[0].PromptEchoHash) != 64 || saved.Dispatches[0].PromptEchoLength == 0 || len(saved.Dispatches[0].PiPromptEchoHash) != 64 || saved.Dispatches[0].PiPromptEchoLength == 0 {
+		t.Fatalf("prepared prompt receipt was not persisted: %+v", saved.Dispatches)
+	}
+	visible := strings.ReplaceAll(prepared["%1"], "**[redacted]**", "[redacted]")
+	visible = strings.ReplaceAll(visible, "`tests`", "tests")
+	normalized := status.NormalizeAgentEcho(visible)
+	if saved.Dispatches[0].PiPromptEchoHash != fmt.Sprintf("%x", sha256.Sum256([]byte(normalized))) || saved.Dispatches[0].PiPromptEchoLength != len(normalized) || saved.Dispatches[0].PiPromptEchoHash == saved.Dispatches[0].PromptEchoHash {
+		t.Fatalf("receipt did not pin the final redacted Markdown echo: %+v", saved.Dispatches[0])
+	}
+	fake.outputs["%1"] = piWorkflowCapture("Pi v1.3.0\n"+visible+"\nReviewed the current turn.\nRED-HANDOFF", "", false)
+	opts.Resume = true
+	runner = mustResumeWorkflowRunner(t, template, agents, opts, ports)
+	resumeCtx, resumeCancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer resumeCancel()
+	result, err := runner.Run(resumeCtx)
+	if err != nil || !result.Resumed || result.Transitions != 1 || strings.Join(fake.dispatchedPanes(), ",") != "%1,%2" {
+		t.Fatalf("resume reconstructed a different prompt or repeated delivery: result=%+v sends=%v error=%v", result, fake.dispatchedPanes(), err)
+	}
+}
+
+func TestWorkflowRunnerPiRejectsReplacementAfterPartialResponse(t *testing.T) {
+	for _, agentType := range []string{"pi", "omp", "cod"} {
+		t.Run(agentType, func(t *testing.T) {
+			fake := newFakeWorkflowSession()
+			capture := func(transcript string) string {
+				if agentType == "pi" {
+					return piWorkflowCapture(transcript, "", false)
+				}
+				return transcript
+			}
+			fake.outputs["%1"], fake.outputs["%2"] = capture("old red history"), capture("old green history")
+			fake.onDispatch = func(pane, prompt string) {
+				fake.mu.Lock()
+				defer fake.mu.Unlock()
+				fake.outputs[pane] = capture("old red history\n" + prompt + "\nPartial inspection, no verdict yet.")
+			}
+			ports := fake.ports()
+			ports.sleep = func(context.Context, time.Duration) {
+				fake.mu.Lock()
+				defer fake.mu.Unlock()
+				fake.outputs["%1"] = capture("unrelated replacement screen\nRED-HANDOFF")
+			}
+			runner, err := newWorkflowRunner(pingPongTemplate(), []workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}},
+				workflowRunOptions{Session: "untrusted-repaint", PaneTypes: map[string]string{"%1": agentType, "%2": agentType}}, ports)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			result, err := runner.Run(ctx)
+			if err == nil || !strings.Contains(err.Error(), "saved output boundary") || result.Transitions != 0 || len(fake.dispatchedPanes()) != 1 {
+				t.Fatalf("unattributed %s replacement was trusted: result=%+v error=%v", agentType, result, err)
+			}
+		})
+	}
+}
+
+func TestWorkflowRunnerPiWorkingChromeRetainsActivity(t *testing.T) {
+	if err := agentpkg.RegisterPlugin("pi", []string{`^─+$`}, []string{`^─+ .*Working .*─+$`}, nil); err != nil {
+		t.Fatal(err)
+	}
+	template := pingPongTemplate()
+	template.Flow.Transitions[0].Trigger = workflow.Trigger{Type: workflow.TriggerAllAgentsIdle, IdleMinutes: 1}
+	fake := newFakeWorkflowSession()
+	fake.outputs["%1"] = piWorkflowCapture("old history", "", false)
+	fake.outputs["%2"] = piWorkflowCapture("other history", "", false)
+	fake.onDispatch = func(pane, prompt string) {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		fake.outputs[pane] = piWorkflowCapture(prompt, "", true)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ports := fake.ports()
+	now := time.Now()
+	ports.now = func() time.Time { return now }
+	polls := 0
+	ports.sleep = func(context.Context, time.Duration) {
+		now = now.Add(2 * time.Minute)
+		polls++
+		if polls == 3 {
+			cancel()
+		}
+	}
+	runner, err := newWorkflowRunner(template, []workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}},
+		workflowRunOptions{Session: "pi-working", PaneTypes: map[string]string{"%1": "pi", "%2": "pi"}}, ports)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.Run(ctx)
+	if result.Transitions != 0 || (err != nil && !errors.Is(err, context.Canceled)) {
+		t.Fatalf("stripping a working composer made pi idle: result=%+v error=%v", result, err)
+	}
+}
+
 // A flowless parallel workflow dispatches every role once and completes.
 func TestWorkflowRunnerParallelDispatchesAll(t *testing.T) {
 	tmpl := &workflow.WorkflowTemplate{
@@ -174,7 +454,7 @@ func TestWorkflowRunnerReviewGateRequiresAllApprovals(t *testing.T) {
 	agents := []workflow.CoordinatorAgent{{ID: "%1", Role: "author"}, {ID: "%2", Role: "reviewer"}, {ID: "%3", Role: "reviewer"}}
 	ports := fake.ports()
 	baseCapture := ports.capture
-	ports.capture = func(paneID string, lines int) (string, error) {
+	ports.capture = func(ctx context.Context, paneID string, lines int) (string, error) {
 		pollMu.Lock()
 		polls++
 		// Second reviewer approves only well after the first (poll 12+ is
@@ -185,7 +465,7 @@ func TestWorkflowRunnerReviewGateRequiresAllApprovals(t *testing.T) {
 		} else {
 			pollMu.Unlock()
 		}
-		return baseCapture(paneID, lines)
+		return baseCapture(ctx, paneID, lines)
 	}
 	runner, err := newWorkflowRunner(reviewGateTemplate("all"), agents,
 		workflowRunOptions{Session: "s", MaxTransitions: 5, Interval: 2 * time.Millisecond, FireManual: true}, ports)
@@ -244,7 +524,7 @@ func TestWorkflowRunnerReviewGateNonReviewerRoleNonTerminalTarget(t *testing.T) 
 	agents := []workflow.CoordinatorAgent{{ID: "%1", Role: "author"}, {ID: "%2", Role: "qa"}, {ID: "%3", Role: "qa"}}
 	ports := fake.ports()
 	baseCapture := ports.capture
-	ports.capture = func(paneID string, lines int) (string, error) {
+	ports.capture = func(ctx context.Context, paneID string, lines int) (string, error) {
 		pollMu.Lock()
 		polls++
 		late := polls > 12
@@ -252,7 +532,7 @@ func TestWorkflowRunnerReviewGateNonReviewerRoleNonTerminalTarget(t *testing.T) 
 		if late {
 			fake.say("%3", "QA-SHIP") // second qa approves several rounds later
 		}
-		return baseCapture(paneID, lines)
+		return baseCapture(ctx, paneID, lines)
 	}
 	runner, err := newWorkflowRunner(tmpl, agents,
 		workflowRunOptions{Session: "s", MaxTransitions: 5, Interval: 2 * time.Millisecond, FireManual: true}, ports)
@@ -272,8 +552,10 @@ func TestWorkflowRunnerReviewGateNonReviewerRoleNonTerminalTarget(t *testing.T) 
 	}
 }
 
-// recordTransition runs on the main loop while the TimeoutMonitor goroutine's
-// Pause action writes the same WorkflowState; both must synchronize on r.mu.
+// recordTransitionLocked runs on the main loop (under dispatchMu, via
+// advanceObservation) while the TimeoutMonitor goroutine's Pause action
+// writes the same WorkflowState; both must synchronize on r.mu. Pause does
+// not take dispatchMu, so holding it here does not serialize the two writers.
 // Run with -race: this test exists to catch the unlocked r.state access.
 func TestWorkflowRunnerPauseAndRecordTransitionAreRaceFree(t *testing.T) {
 	fake := newFakeWorkflowSession()
@@ -294,7 +576,9 @@ func TestWorkflowRunnerPauseAndRecordTransitionAreRaceFree(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 25; i++ {
-			runner.recordTransition("green")
+			runner.dispatchMu.Lock()
+			runner.recordTransitionLocked("green")
+			runner.dispatchMu.Unlock()
 		}
 	}()
 	go func() {
@@ -540,5 +824,1060 @@ func TestAssignWorkflowPanes(t *testing.T) {
 	}
 	if _, err := assignWorkflowPanes(tmpl, panes[:2]); err == nil || !strings.Contains(err.Error(), "needs 2 agent pane(s)") {
 		t.Fatalf("insufficient panes must error, got %v", err)
+	}
+}
+
+func TestWorkflowRunnerIgnoresVerdictsBeforeStageAndOnReentry(t *testing.T) {
+	for _, reenter := range []bool{false, true} {
+		t.Run(map[bool]string{false: "initial history", true: "second round"}[reenter], func(t *testing.T) {
+			fake := newFakeWorkflowSession()
+			fake.say("%1", "RED-HANDOFF")
+			fake.say("%2", "GREEN-HANDOFF")
+			redTurns := 0
+			if reenter {
+				fake.onDispatch = func(pane, _ string) {
+					if pane == "%1" {
+						redTurns++
+						if redTurns == 1 {
+							fake.say(pane, "RED-HANDOFF")
+						}
+					} else {
+						fake.say(pane, "GREEN-HANDOFF")
+					}
+				}
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ports := fake.ports()
+			polls := 0
+			ports.sleep = func(context.Context, time.Duration) {
+				polls++
+				if polls == 5 {
+					cancel()
+				}
+			}
+			runner, err := newWorkflowRunner(pingPongTemplate(), []workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}},
+				workflowRunOptions{Session: "s", MaxTransitions: 6}, ports)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := runner.Run(ctx)
+			wantTransitions, wantSends := 0, 1
+			if reenter {
+				wantTransitions, wantSends = 2, 3
+			}
+			if !errors.Is(err, context.Canceled) || result.Transitions != wantTransitions || len(fake.dispatchedPanes()) != wantSends {
+				t.Fatalf("stale verdict advanced workflow: result=%+v err=%v sends=%v", result, err, fake.dispatchedPanes())
+			}
+		})
+	}
+}
+
+func TestWorkflowRunnerKeepsDifferentReviewVerdictsSeparate(t *testing.T) {
+	template := reviewGateTemplate("all")
+	template.Flow.Initial = "review"
+	template.Flow.Transitions = []workflow.Transition{
+		{From: "review", To: "revise", Trigger: workflow.Trigger{Type: workflow.TriggerAgentSays, Pattern: "REVISE-VERDICT", Role: "reviewer"}},
+		{From: "review", To: "complete", Trigger: workflow.Trigger{Type: workflow.TriggerAgentSays, Pattern: "SHIP-VERDICT", Role: "reviewer"}},
+	}
+	fake := newFakeWorkflowSession()
+	fake.onDispatch = func(pane, _ string) {
+		if pane == "%2" {
+			fake.say(pane, "REVISE-VERDICT")
+		} else if pane == "%3" {
+			fake.say(pane, "SHIP-VERDICT")
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ports := fake.ports()
+	polls := 0
+	ports.sleep = func(context.Context, time.Duration) {
+		polls++
+		if polls == 3 {
+			cancel()
+		}
+	}
+	runner, err := newWorkflowRunner(template, []workflow.CoordinatorAgent{{ID: "%1", Role: "author"}, {ID: "%2", Role: "reviewer"}, {ID: "%3", Role: "reviewer"}},
+		workflowRunOptions{Session: "s", StateDir: t.TempDir()}, ports)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.Run(ctx)
+	if !errors.Is(err, context.Canceled) || result.Completed || result.Transitions != 0 {
+		t.Fatalf("mixed verdicts satisfied a quorum: %+v %v", result, err)
+	}
+	state, err := runner.store.Load("s")
+	if err != nil || state.Evidence == nil || len(state.Evidence.Matches[0]) != 1 || len(state.Evidence.Matches[1]) != 1 {
+		t.Fatalf("independent verdict receipts = %+v, %v", state, err)
+	}
+}
+
+func TestWorkflowRunnerRefusesItsOwnVerdictPrompt(t *testing.T) {
+	fake := newFakeWorkflowSession()
+	runner, err := newWorkflowRunner(pingPongTemplate(), []workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}},
+		workflowRunOptions{Session: "s", Vars: map[string]string{"instructions": "Reply RED-HANDOFF after finishing"}}, fake.ports())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "prompt itself matches") || result.Success || len(fake.dispatchedPanes()) != 0 {
+		t.Fatalf("ambiguous prompt was delivered: %+v %v sends=%v", result, err, fake.dispatchedPanes())
+	}
+}
+
+func TestWorkflowRunnerPreservesReceiptsWhenOutputEvidenceFails(t *testing.T) {
+	for _, lostBoundary := range []bool{false, true} {
+		t.Run(map[bool]string{false: "capture failure", true: "screen replacement"}[lostBoundary], func(t *testing.T) {
+			fake := newFakeWorkflowSession()
+			fake.say("%1", "original unique screen")
+			ports := fake.ports()
+			capture := ports.capture
+			ports.capture = func(ctx context.Context, pane string, lines int) (string, error) {
+				if pane == "%1" && len(fake.dispatchedPanes()) > 0 {
+					if lostBoundary {
+						return "unrelated screen contains RED-HANDOFF", nil
+					}
+					return "", errors.New("recorded tmux capture failure")
+				}
+				return capture(ctx, pane, lines)
+			}
+			ports.sleep = func(context.Context, time.Duration) {}
+			runner, err := newWorkflowRunner(pingPongTemplate(), []workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}},
+				workflowRunOptions{Session: "s", StateDir: t.TempDir()}, ports)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := runner.Run(context.Background())
+			if err == nil || result.Reason != "observation-failed" || result.Transitions != 0 || len(fake.dispatchedPanes()) != 1 {
+				t.Fatalf("untrusted capture advanced: %+v %v", result, err)
+			}
+			state, loadErr := runner.store.Load("s")
+			if loadErr != nil || !state.Paused || state.Dispatches[0].Status != "delivered" || state.Evidence == nil || len(state.Evidence.Matches) != 0 {
+				t.Fatalf("failure lost original evidence or receipt: %+v, %v", state, loadErr)
+			}
+		})
+	}
+}
+
+func TestWorkflowObservationCannotApproveRetriedRound(t *testing.T) {
+	fake := newFakeWorkflowSession()
+	fake.onDispatch = func(pane, _ string) {
+		if len(fake.dispatchedPanes()) == 1 {
+			fake.say(pane, "RED-HANDOFF")
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ports := fake.ports()
+	ports.sleep = func(context.Context, time.Duration) { cancel() }
+	runner, err := newWorkflowRunner(pingPongTemplate(), []workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}},
+		workflowRunOptions{Session: "s"}, ports)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	// Restart only the in-memory watcher at the persisted stage to inject the
+	// race deterministically; no prompt is repeated by observation itself.
+	if err := runner.coordinator.Start(&workflow.TriggerContext{Context: context.Background()}); err != nil {
+		t.Fatal(err)
+	}
+	defer runner.coordinator.Stop()
+	observed, err := runner.observe(context.Background())
+	if err != nil || !observed.context.TransitionEvidence[0] {
+		t.Fatalf("first round evidence = %+v, %v", observed, err)
+	}
+	if err := (workflowRunActions{r: runner}).RetryStage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fired, _, stale, err := runner.advanceObservation(context.Background(), observed); err != nil || fired || !stale {
+		t.Fatalf("old round observation applied after retry: fired=%v stale=%v err=%v", fired, stale, err)
+	}
+	if runner.coordinator.CurrentStage() != "red" || len(runner.state.Evidence.Matches) != 0 || len(fake.dispatchedPanes()) != 2 {
+		t.Fatalf("retry reused old verdict: %+v sends=%v", runner.state, fake.dispatchedPanes())
+	}
+}
+
+func TestWorkflowRunnerDoesNotManufactureAnchorsByTrimmingEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		pattern string
+		prefix  string
+	}{
+		{name: "multiline partial line", pattern: `(?m)^APPROVED`, prefix: "NOT "},
+		{name: "string partial line", pattern: `\AAPPROVED`, prefix: "NOT "},
+		{name: "string complete line", pattern: `\AAPPROVED`, prefix: "preamble\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			template := pingPongTemplate()
+			template.Flow.Transitions[0].Trigger.Pattern = tc.pattern
+			fake := newFakeWorkflowSession()
+			fake.onDispatch = func(pane, _ string) {
+				// The exact response cannot match, but a 64 KiB suffix would
+				// begin with APPROVED and invent a new regexp string/line start.
+				fake.mu.Lock()
+				fake.outputs[pane] = tc.prefix + "APPROVED" + strings.Repeat("x", workflowEvidenceMaxBytes-len("APPROVED"))
+				fake.mu.Unlock()
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ports := fake.ports()
+			polls := 0
+			ports.sleep = func(context.Context, time.Duration) {
+				polls++
+				if polls == 3 {
+					cancel()
+				}
+			}
+			opts := workflowRunOptions{
+				Session: "s", StateDir: t.TempDir(), PanePIDs: map[string]int{"%1": 1001, "%2": 1002},
+			}
+			agents := []workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}}
+			runner, err := newWorkflowRunner(template, agents, opts, ports)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := runner.Run(ctx)
+			if err == nil || !strings.Contains(err.Error(), "response evidence exceeds") || result.Reason != "observation-failed" || result.Transitions != 0 {
+				t.Fatalf("unbounded response acquired a false anchor: %+v, %v", result, err)
+			}
+			state, err := runner.store.Load(opts.Session)
+			if err != nil || !state.Paused || len(state.Evidence.Matches) != 0 || len(state.Evidence.Panes["%1"].Fresh) > workflowEvidenceMaxBytes || len(state.Dispatches) != 1 || state.Dispatches[0].Status != "delivered" {
+				t.Fatalf("evidence-limit pause lost the bounded checkpoint or receipt: %+v, %v", state, err)
+			}
+			// The saved boundary is unchanged on failure: resume cannot turn
+			// the same oversized response into a fresh suffix or resend a prompt.
+			opts.Resume = true
+			resumed, err := newWorkflowRunner(template, agents, opts, ports)
+			if err != nil {
+				t.Fatal(err)
+			}
+			polls = 0
+			result, err = resumed.Run(ctx)
+			if err == nil || !strings.Contains(err.Error(), "response evidence exceeds") || result.Transitions != 0 || len(fake.dispatchedPanes()) != 1 {
+				t.Fatalf("resume trusted truncated evidence or repeated delivery: %+v, %v, sends=%v", result, err, fake.dispatchedPanes())
+			}
+		})
+	}
+}
+
+// fakeWorkflowAgents scripts agent health and restarts for supervision
+// tests. It mirrors production identity: a restart replaces the pane's live
+// shell PID, and the validate port fails unless the runner rebinds to it.
+type fakeWorkflowAgents struct {
+	mu        sync.Mutex
+	live      map[string]int                // pane -> live shell PID
+	faults    map[string]workflowAgentFault // current fault per pane
+	restarts  []string
+	checks    int
+	nextPID   int
+	onCheck   func(check int) // runs before each health observation
+	onRestart func(pane string)
+}
+
+func newFakeWorkflowAgents(live map[string]int) *fakeWorkflowAgents {
+	return &fakeWorkflowAgents{live: live, faults: make(map[string]workflowAgentFault), nextPID: 5000}
+}
+
+func crashFault(reason string) *workflowAgentFault {
+	return &workflowAgentFault{Kind: workflow.ErrorAgentCrash, Reason: reason, Confirmed: true}
+}
+
+func (f *fakeWorkflowAgents) set(pane string, fault *workflowAgentFault) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if fault == nil {
+		delete(f.faults, pane)
+		return
+	}
+	f.faults[pane] = *fault
+}
+
+func (f *fakeWorkflowAgents) restarted() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.restarts...)
+}
+
+func (f *fakeWorkflowAgents) healthChecks() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.checks
+}
+
+// wire installs the fault, restart and identity ports. runner is read
+// lazily: identity validation compares the runner's pane binding with the
+// live PIDs, exactly like validateWorkflowPaneLifetimes.
+func (f *fakeWorkflowAgents) wire(ports *workflowRunPorts, runner **workflowRunner) {
+	ports.faults = func(_ context.Context, expected map[string]int) (map[string]workflowAgentFault, error) {
+		f.mu.Lock()
+		f.checks++
+		check, hook := f.checks, f.onCheck
+		f.mu.Unlock()
+		if hook != nil {
+			hook(check)
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		out := make(map[string]workflowAgentFault)
+		for pane, pid := range expected {
+			if fault, ok := f.faults[pane]; ok && pid == f.live[pane] {
+				out[pane] = fault
+			}
+		}
+		return out, nil
+	}
+	ports.restart = func(_ context.Context, _, pane string) (int, error) {
+		f.mu.Lock()
+		f.restarts = append(f.restarts, pane)
+		f.nextPID++
+		pid := f.nextPID
+		f.live[pane] = pid
+		delete(f.faults, pane) // The relaunched agent starts healthy.
+		hook := f.onRestart
+		f.mu.Unlock()
+		if hook != nil {
+			hook(pane)
+		}
+		return pid, nil
+	}
+	ports.validate = func(context.Context) error {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		for pane, pid := range (*runner).opts.PanePIDs {
+			if f.live[pane] != pid {
+				return fmt.Errorf("pane %s changed process lifetime", pane)
+			}
+		}
+		return nil
+	}
+}
+
+func pingPongPIDs() map[string]int { return map[string]int{"%1": 1001, "%2": 1002} }
+
+// A crashed agent pane runs on_agent_crash=restart_agent: the agent is
+// relaunched, the run rebinds to the replacement process and its fresh
+// screen, the stage prompt is re-sent, and the relaunched agent's verdict
+// advances the workflow. The fault is reported and checkpointed.
+func TestWorkflowRunnerRestartsCrashedAgentAndResendsStage(t *testing.T) {
+	template := pingPongTemplate()
+	template.ErrorHandling = &workflow.ErrorConfig{OnAgentCrash: workflow.ErrorActionRestartAgent}
+	fake := newFakeWorkflowSession()
+	agents := newFakeWorkflowAgents(pingPongPIDs())
+	redTurns := 0
+	fake.onDispatch = func(pane, _ string) {
+		switch pane {
+		case "%1":
+			redTurns++
+			if redTurns == 1 {
+				// The agent dies mid-turn; only its shell is left.
+				fake.say("%1", "$ ")
+				agents.set("%1", crashFault("agent process exited; the pane is back at its shell"))
+				return
+			}
+			fake.say("%1", "RED-HANDOFF")
+		case "%2":
+			fake.say("%2", "GREEN-HANDOFF")
+		}
+	}
+	agents.onRestart = func(pane string) {
+		// respawn-pane -k replaces the screen: the old boundary is gone.
+		fake.mu.Lock()
+		fake.outputs[pane] = "fresh agent ready"
+		fake.mu.Unlock()
+	}
+	var runner *workflowRunner
+	ports := fake.ports()
+	agents.wire(&ports, &runner)
+	opts := workflowRunOptions{
+		Session: "s", StateDir: t.TempDir(), PanePIDs: pingPongPIDs(),
+		MaxAgentRestarts: 3, MaxTransitions: 1, Interval: time.Millisecond,
+	}
+	var err error
+	runner, err = newWorkflowRunner(template, []workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}}, opts, ports)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := runner.Run(ctx)
+	if err != nil || !result.Success || result.Reason != "max-transitions" || result.Transitions != 1 {
+		t.Fatalf("restarted agent did not complete its stage: result=%+v err=%v", result, err)
+	}
+	if got := agents.restarted(); strings.Join(got, ",") != "%1" {
+		t.Fatalf("restarts = %v, want [%%1]", got)
+	}
+	if got := fake.dispatchedPanes(); strings.Join(got, ",") != "%1,%1,%2" {
+		t.Fatalf("dispatches = %v, want the red prompt re-sent once before green", got)
+	}
+	wantFault := WorkflowRunFault{Pane: "%1", Role: "red", Stage: "red", Type: "agent_crash", Reason: "agent process exited; the pane is back at its shell", Action: "restart_agent"}
+	if result.Restarts != 1 || len(result.Faults) != 1 || result.Faults[0] != wantFault {
+		t.Fatalf("fault report = restarts %d faults %+v, want 1 restart and %+v", result.Restarts, result.Faults, wantFault)
+	}
+	state, err := runner.store.Load("s")
+	if err != nil || state == nil {
+		t.Fatalf("load checkpoint: %+v %v", state, err)
+	}
+	if state.PanePIDs["%1"] != 5001 || state.PanePIDs["%2"] != 1002 {
+		t.Fatalf("checkpoint pane binding = %v, want %%1 rebound to the replacement pid 5001", state.PanePIDs)
+	}
+	if len(state.Errors) != 1 || state.Errors[0].Type != workflow.ErrorAgentCrash || state.Errors[0].AgentID != "%1" || state.Errors[0].Stage != "red" {
+		t.Fatalf("checkpoint errors = %+v, want the red pane's crash", state.Errors)
+	}
+}
+
+// An errored agent runs on_agent_error. Text-classified errors are
+// debounced: a one-poll blip on another pane is not raised, a persistent
+// error is raised once, and on_agent_error=pause persists the pause.
+func TestWorkflowRunnerAgentErrorRunsOnAgentErrorPolicy(t *testing.T) {
+	template := pingPongTemplate()
+	template.ErrorHandling = &workflow.ErrorConfig{OnAgentError: workflow.ErrorActionPause}
+	fake := newFakeWorkflowSession()
+	agents := newFakeWorkflowAgents(pingPongPIDs())
+	rateLimited := &workflowAgentFault{Kind: workflow.ErrorAgentError, Reason: "agent is rate limited"}
+	agents.onCheck = func(check int) {
+		switch check {
+		case 1:
+			agents.set("%2", rateLimited) // A single-poll blip.
+		case 2:
+			agents.set("%2", nil)
+		case 3:
+			agents.set("%1", rateLimited) // Persists: raised on its second poll.
+		}
+	}
+	var runner *workflowRunner
+	ports := fake.ports()
+	agents.wire(&ports, &runner)
+	opts := workflowRunOptions{
+		Session: "s", StateDir: t.TempDir(), PanePIDs: pingPongPIDs(),
+		AgentFaultPolls: 2, Interval: time.Millisecond,
+	}
+	var err error
+	runner, err = newWorkflowRunner(template, []workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}}, opts, ports)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := runner.Run(ctx)
+	if err == nil || result.Reason != "paused" || !strings.Contains(err.Error(), "pane %1 (red): agent is rate limited") {
+		t.Fatalf("agent error did not pause the run: result=%+v err=%v", result, err)
+	}
+	if checks := agents.healthChecks(); checks != 4 {
+		t.Fatalf("health checks = %d, want the error raised on the 4th poll (2-poll debounce)", checks)
+	}
+	if len(result.Faults) != 1 || result.Faults[0].Pane != "%1" || result.Faults[0].Type != "agent_error" || result.Faults[0].Action != "pause" {
+		t.Fatalf("faults = %+v, want only the persistent red error with action pause", result.Faults)
+	}
+	if got := agents.restarted(); len(got) != 0 {
+		t.Fatalf("pause policy restarted agents: %v", got)
+	}
+	state, err := runner.store.Load("s")
+	if err != nil || state == nil || !state.Paused || !strings.Contains(state.PauseReason, "agent is rate limited") {
+		t.Fatalf("persisted pause = %+v, %v", state, err)
+	}
+	if len(state.Errors) != 1 || state.Errors[0].Type != workflow.ErrorAgentError || state.Errors[0].AgentID != "%1" {
+		t.Fatalf("checkpoint errors = %+v, want the red pane's error", state.Errors)
+	}
+}
+
+// A crash loop cannot restart forever: restart_agent runs at most
+// MaxAgentRestarts times per pane, and the next crash aborts the run.
+func TestWorkflowRunnerCrashLoopStopsAfterRestartBudget(t *testing.T) {
+	template := pingPongTemplate()
+	template.ErrorHandling = &workflow.ErrorConfig{OnAgentCrash: workflow.ErrorActionRestartAgent}
+	fake := newFakeWorkflowSession()
+	agents := newFakeWorkflowAgents(pingPongPIDs())
+	fake.onDispatch = func(pane, _ string) {
+		if pane == "%1" { // Every relaunch dies on its first prompt.
+			agents.set("%1", crashFault("agent process exited"))
+		}
+	}
+	var runner *workflowRunner
+	ports := fake.ports()
+	agents.wire(&ports, &runner)
+	opts := workflowRunOptions{
+		Session: "s", StateDir: t.TempDir(), PanePIDs: pingPongPIDs(),
+		MaxAgentRestarts: 2, Interval: time.Millisecond,
+	}
+	var err error
+	runner, err = newWorkflowRunner(template, []workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}}, opts, ports)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := runner.Run(ctx)
+	if err == nil || result.Reason != "aborted" || !strings.Contains(err.Error(), "exhausted its restart budget (2 restart(s))") {
+		t.Fatalf("crash loop was not stopped by the restart budget: result=%+v err=%v", result, err)
+	}
+	if got := agents.restarted(); strings.Join(got, ",") != "%1,%1" {
+		t.Fatalf("restarts = %v, want exactly two", got)
+	}
+	if got := fake.dispatchedPanes(); strings.Join(got, ",") != "%1,%1,%1" {
+		t.Fatalf("dispatches = %v, want the initial prompt plus one re-send per restart", got)
+	}
+	if result.Restarts != 2 || len(result.Faults) != 3 {
+		t.Fatalf("fault report = restarts %d faults %+v, want 2 restarts and 3 crashes", result.Restarts, result.Faults)
+	}
+}
+
+// Without an error_handling policy a fault is still surfaced (notify), and
+// it is raised once per episode rather than on every poll: a pane that
+// recovers and crashes again is a new episode.
+func TestWorkflowRunnerAgentFaultWithoutPolicyNotifiesOncePerEpisode(t *testing.T) {
+	fake := newFakeWorkflowSession()
+	agents := newFakeWorkflowAgents(pingPongPIDs())
+	agents.onCheck = func(check int) {
+		switch check {
+		case 1, 5:
+			agents.set("%2", crashFault("pane process exited (pane is dead)"))
+		case 4:
+			agents.set("%2", nil)
+		}
+	}
+	var runner *workflowRunner
+	ports := fake.ports()
+	agents.wire(&ports, &runner)
+	var noticesMu sync.Mutex
+	var notices []string
+	ports.notify = func(format string, args ...any) {
+		noticesMu.Lock()
+		defer noticesMu.Unlock()
+		notices = append(notices, fmt.Sprintf(format, args...))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	polls := 0
+	ports.sleep = func(context.Context, time.Duration) {
+		polls++
+		if polls == 7 {
+			cancel()
+		}
+	}
+	var err error
+	runner, err = newWorkflowRunner(pingPongTemplate(), []workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}},
+		workflowRunOptions{Session: "s", PanePIDs: pingPongPIDs()}, ports)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.Run(ctx)
+	if !errors.Is(err, context.Canceled) || result.Reason != "canceled" {
+		t.Fatalf("notify policy changed the run outcome: result=%+v err=%v", result, err)
+	}
+	noticesMu.Lock()
+	raised := 0
+	for _, notice := range notices {
+		if strings.Contains(notice, "workflow error: workflow agent_crash at red: pane %2 (green)") {
+			raised++
+		}
+	}
+	noticesMu.Unlock()
+	if raised != 2 || len(result.Faults) != 2 || result.Faults[0].Action != "notify" {
+		t.Fatalf("notifications = %d, faults = %+v; want one per crash episode with action notify", raised, result.Faults)
+	}
+	if got := agents.restarted(); len(got) != 0 {
+		t.Fatalf("notify policy restarted agents: %v", got)
+	}
+}
+
+// A flowless parallel template has no poll loop: its agents are checked once
+// before the single dispatch, so a crashed agent is relaunched first.
+func TestWorkflowRunnerParallelRestartsCrashedAgentBeforeDispatch(t *testing.T) {
+	tmpl := &workflow.WorkflowTemplate{
+		Name: "par-restart",
+		Agents: []workflow.WorkflowAgent{
+			{Profile: "x", Role: "approach-a"}, {Profile: "x", Role: "approach-b"}, {Profile: "x", Role: "approach-c"},
+		},
+		Coordination:  workflow.CoordParallel,
+		ErrorHandling: &workflow.ErrorConfig{OnAgentCrash: workflow.ErrorActionRestartAgent},
+	}
+	pids := map[string]int{"%1": 1001, "%2": 1002, "%3": 1003}
+	fake := newFakeWorkflowSession()
+	agents := newFakeWorkflowAgents(map[string]int{"%1": 1001, "%2": 1002, "%3": 1003})
+	agents.set("%2", crashFault("agent process exited; the pane is back at its shell"))
+	var runner *workflowRunner
+	ports := fake.ports()
+	agents.wire(&ports, &runner)
+	var err error
+	runner, err = newWorkflowRunner(tmpl, []workflow.CoordinatorAgent{{ID: "%1", Role: "approach-a"}, {ID: "%2", Role: "approach-b"}, {ID: "%3", Role: "approach-c"}},
+		workflowRunOptions{Session: "s", StateDir: t.TempDir(), PanePIDs: pids, MaxAgentRestarts: 1}, ports)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.Run(context.Background())
+	if err != nil || !result.Completed || result.Restarts != 1 {
+		t.Fatalf("result=%+v err=%v, want a completed run after one restart", result, err)
+	}
+	if got := agents.restarted(); strings.Join(got, ",") != "%2" {
+		t.Fatalf("restarts = %v, want [%%2]", got)
+	}
+	if got := fake.dispatchedPanes(); strings.Join(got, ",") != "%1,%2,%3" {
+		t.Fatalf("dispatches = %v, want every pane prompted once after the restart", got)
+	}
+	state, err := runner.store.Load("s")
+	if err != nil || state == nil || state.PanePIDs["%2"] != 5001 || state.Dispatches[1].Status != "delivered" {
+		t.Fatalf("checkpoint = %+v, %v; want %%2 rebound and delivered", state, err)
+	}
+}
+
+// The built-in specialist-team template's error policy is honored as
+// written: on_agent_crash=restart_agent relaunches a crashed builder (idle in
+// the design stage, so no prompt is re-sent to it) and on_agent_error=pause
+// pauses the run when the QA agent errors.
+func TestWorkflowRunnerBuiltinSpecialistTeamErrorPolicy(t *testing.T) {
+	template, err := resolveWorkflowForRun("specialist-team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	panes := []tmux.Pane{
+		{ID: "%0", Index: 0, Type: tmux.AgentUser},
+		{ID: "%1", Index: 1, Type: tmux.AgentClaude}, {ID: "%2", Index: 2, Type: tmux.AgentClaude},
+		{ID: "%3", Index: 3, Type: tmux.AgentClaude}, {ID: "%4", Index: 4, Type: tmux.AgentClaude},
+	}
+	assigned, err := assignWorkflowPanes(template, panes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pids := map[string]int{"%1": 1001, "%2": 1002, "%3": 1003, "%4": 1004}
+	fake := newFakeWorkflowSession()
+	agents := newFakeWorkflowAgents(map[string]int{"%1": 1001, "%2": 1002, "%3": 1003, "%4": 1004})
+	agents.onCheck = func(check int) {
+		switch check {
+		case 1:
+			agents.set("%3", crashFault("agent process exited; the pane is back at its shell"))
+		case 3:
+			agents.set("%4", &workflowAgentFault{Kind: workflow.ErrorAgentError, Reason: "agent is rate limited"})
+		}
+	}
+	var runner *workflowRunner
+	ports := fake.ports()
+	agents.wire(&ports, &runner)
+	opts := workflowRunOptions{
+		Session: "s", StateDir: t.TempDir(), PanePIDs: pids, Vars: map[string]string{"project": "billing"},
+		MaxAgentRestarts: 3, AgentFaultPolls: 1, Interval: time.Millisecond,
+	}
+	runner, err = newWorkflowRunner(template, assigned, opts, ports)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := runner.Run(ctx)
+	if err == nil || result.Reason != "paused" {
+		t.Fatalf("qa error did not pause specialist-team: result=%+v err=%v", result, err)
+	}
+	if got := agents.restarted(); strings.Join(got, ",") != "%3" {
+		t.Fatalf("restarts = %v, want the crashed builder %%3", got)
+	}
+	if got := fake.dispatchedPanes(); strings.Join(got, ",") != "%1" {
+		t.Fatalf("dispatches = %v, want only the design prompt (the idle builder gets none)", got)
+	}
+	if len(result.Faults) != 2 ||
+		result.Faults[0].Pane != "%3" || result.Faults[0].Role != "build" || result.Faults[0].Action != "restart_agent" ||
+		result.Faults[1].Pane != "%4" || result.Faults[1].Role != "qa" || result.Faults[1].Action != "pause" {
+		t.Fatalf("faults = %+v, want builder crash (restart_agent) then qa error (pause)", result.Faults)
+	}
+}
+
+func TestClassifyWorkflowAgentHealth(t *testing.T) {
+	alive := func(int) bool { return true }
+	exited := func(int) bool { return false }
+	fresh := status.FreshnessFresh
+	for _, tc := range []struct {
+		name    string
+		row     health.AgentHealth
+		local   bool
+		alive   func(int) bool
+		want    workflowAgentFault
+		faulted bool
+	}{
+		{name: "working agent", row: health.AgentHealth{ShellPID: 10, ObservationFreshness: fresh, ObservedState: status.StateWorking}, local: true, alive: alive},
+		{
+			name: "agent exited to its shell", row: health.AgentHealth{ShellPID: 10, ObservationFreshness: fresh, ObservedState: status.StateIdle}, local: true, alive: exited,
+			want: workflowAgentFault{Kind: workflow.ErrorAgentCrash, Reason: "agent process exited; the pane is back at its shell", Confirmed: true}, faulted: true,
+		},
+		{
+			name: "remote pids are identifiers, not processes", local: false, alive: exited,
+			row: health.AgentHealth{ShellPID: 10, ObservationFreshness: fresh, ProcessStatus: health.ProcessExited, Status: health.StatusError},
+		},
+		{
+			name: "rate limited", local: true, alive: alive,
+			row:  health.AgentHealth{ShellPID: 10, ObservationFreshness: fresh, RateLimited: true, Issues: []health.Issue{{Type: "rate_limit", Message: "Rate limit detected"}}},
+			want: workflowAgentFault{Kind: workflow.ErrorAgentError, Reason: "agent is rate limited"}, faulted: true,
+		},
+		{
+			name: "blocked on an interactive gate", local: true, alive: alive,
+			row:  health.AgentHealth{ShellPID: 10, ObservationFreshness: fresh, Issues: []health.Issue{{Type: "interactive_gate", Message: "Blocked on interactive gate screen"}}},
+			want: workflowAgentFault{Kind: workflow.ErrorAgentError, Reason: "Blocked on interactive gate screen"}, faulted: true,
+		},
+		{
+			name: "authentication failure", local: true, alive: alive,
+			row:  health.AgentHealth{ShellPID: 10, ObservationFreshness: fresh, Issues: []health.Issue{{Type: "auth_error", Message: "Authentication error"}}},
+			want: workflowAgentFault{Kind: workflow.ErrorAgentError, Reason: "Authentication error"}, faulted: true,
+		},
+		{
+			name: "status detector error state", local: true, alive: alive,
+			row:  health.AgentHealth{ShellPID: 10, ObservationFreshness: fresh, ObservedState: status.StateError, Issues: []health.Issue{{Type: "network_error", Message: "Network error"}}},
+			want: workflowAgentFault{Kind: workflow.ErrorAgentError, Reason: "agent is in an error state: Network error"}, faulted: true,
+		},
+		{
+			name: "crash text under a live agent is not a crash", local: true, alive: alive,
+			row: health.AgentHealth{ShellPID: 10, ObservationFreshness: fresh, ObservedState: status.StateIdle, Issues: []health.Issue{{Type: "crash", Message: "Agent crashed"}}},
+		},
+		{
+			name: "stale observation is not trusted", local: true, alive: alive,
+			row: health.AgentHealth{ShellPID: 10, ObservationFreshness: status.FreshnessStale, RateLimited: true, ObservedState: status.StateError},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, faulted := classifyWorkflowAgentHealth(tc.row, tc.local, tc.alive)
+			if faulted != tc.faulted || got != tc.want {
+				t.Fatalf("classify = (%+v, %v), want (%+v, %v)", got, faulted, tc.want, tc.faulted)
+			}
+		})
+	}
+}
+
+func TestWorkflowRestartOutcomeAcceptsOnlyVerifiedRelaunch(t *testing.T) {
+	ready := func() *robot.RestartPaneOutput {
+		return &robot.RestartPaneOutput{
+			RobotResponse:       robot.NewRobotResponse(true),
+			Restarted:           []string{"2"},
+			PaneShellPIDs:       map[string]robot.RestartPanePIDs{"2": {Before: 100, After: 200}},
+			AgentRelaunchStatus: map[string]robot.RestartAgentRelaunchStatus{"2": robot.RestartAgentRelaunchReady},
+		}
+	}
+	if pid, err := workflowRestartOutcome(ready()); err != nil || pid != 200 {
+		t.Fatalf("ready relaunch = (%d, %v), want replacement pid 200", pid, err)
+	}
+	notReady := ready()
+	notReady.Success = false
+	notReady.AgentRelaunchStatus["2"] = robot.RestartAgentRelaunchNotReady
+	notReady.Failed = []robot.RestartError{{Pane: "2", Reason: "agent not ready within 15s after relaunch"}}
+	soft := ready()
+	soft.PaneShellPIDs["2"] = robot.RestartPanePIDs{Before: 100, After: 100}
+	for name, tc := range map[string]struct {
+		out  *robot.RestartPaneOutput
+		want string
+	}{
+		"agent not ready":   {out: notReady, want: "2: agent not ready"},
+		"soft restart":      {out: soft, want: "no pane was respawned with a ready agent"},
+		"no target matched": {out: &robot.RestartPaneOutput{RobotResponse: robot.NewRobotResponse(true)}, want: "no pane was respawned"},
+		"no result":         {out: nil, want: "no result"},
+	} {
+		if pid, err := workflowRestartOutcome(tc.out); err == nil || pid != 0 || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: outcome = (%d, %v), want error containing %q", name, pid, err, tc.want)
+		}
+	}
+}
+
+// The production fault port classifies real tmux panes: a live agent child
+// is healthy, the agent exiting back to its shell is a confirmed crash, and
+// a pane that left the session is a confirmed crash.
+func TestWorkflowAgentFaultsDetectsRealPaneCrash(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+	if tmux.DefaultClient.Remote != "" {
+		t.Skip("process liveness needs a local tmux server")
+	}
+	tmpDir := t.TempDir()
+	oldCfg := cfg
+	defer func() { cfg = oldCfg }()
+	cfg = newTmuxIntegrationTestConfig(tmpDir)
+	cfg.Agents.Claude = "sleep 300"
+	sessionName := fmt.Sprintf("ntm-wf-faults-%d", time.Now().UnixNano())
+	if err := os.MkdirAll(filepath.Join(tmpDir, sessionName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := spawnSessionLogicContext(t.Context(), SpawnOptions{
+		Session: sessionName, Agents: []FlatAgent{{Type: AgentTypeClaude, Index: 1}}, CCCount: 1, UserPane: true,
+	}); err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	defer func() { _ = tmux.KillSession(sessionName) }()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	panes, err := tmux.GetPanesContext(ctx, sessionName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var agentPane tmux.Pane
+	for _, pane := range panes {
+		if pane.Type == tmux.AgentClaude {
+			agentPane = pane
+		}
+	}
+	if agentPane.ID == "" || agentPane.PID <= 0 {
+		t.Fatalf("no claude pane in %+v", panes)
+	}
+	expected := map[string]int{agentPane.ID: agentPane.PID}
+	waitFault := func(want workflowAgentFault) {
+		t.Helper()
+		var last map[string]workflowAgentFault
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+			faults, err := workflowAgentFaults(ctx, sessionName, expected)
+			if err != nil {
+				t.Fatal(err)
+			}
+			last = faults
+			if faults[agentPane.ID] == want {
+				return
+			}
+		}
+		t.Fatalf("faults = %+v, want %s: %+v", last, agentPane.ID, want)
+	}
+	for deadline := time.Now().Add(10 * time.Second); !process.HasChildAlive(agentPane.PID); time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("agent process never started under the pane shell")
+		}
+	}
+	faults, err := workflowAgentFaults(ctx, sessionName, expected)
+	if err != nil || faults[agentPane.ID].Kind == workflow.ErrorAgentCrash {
+		t.Fatalf("running agent classified as crashed: %+v, %v", faults, err)
+	}
+	// The agent CLI exits: Ctrl-C returns the pane to its shell.
+	if _, err := tmux.DefaultClient.RunContext(ctx, "send-keys", "-t", tmux.ExactTarget(agentPane.ID), "C-c"); err != nil {
+		t.Fatal(err)
+	}
+	waitFault(workflowAgentFault{Kind: workflow.ErrorAgentCrash, Reason: "agent process exited; the pane is back at its shell", Confirmed: true})
+	// The pane leaves the session.
+	if _, err := tmux.DefaultClient.RunContext(ctx, "kill-pane", "-t", tmux.ExactTarget(agentPane.ID)); err != nil {
+		t.Fatal(err)
+	}
+	waitFault(workflowAgentFault{Kind: workflow.ErrorAgentCrash, Reason: "pane no longer exists", Confirmed: true})
+}
+
+// TestHealthTreatsAgentRootPaneAsRunning is the real-tmux ntm#359 regression
+// guard. A pane can run its agent as the pane's own process instead of under
+// an interactive shell (a boot script's `tmux new-session 'claude --resume'`,
+// respawn-pane with a command). Then #{pane_pid} is the agent itself, with no
+// children between tool calls, and the health check behind `ntm health`, the
+// resilience monitor and workflow fault detection used to report it as an
+// exited agent while it was working.
+func TestHealthTreatsAgentRootPaneAsRunning(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+	if tmux.DefaultClient.Remote != "" {
+		t.Skip("process liveness needs a local tmux server")
+	}
+	tmpDir := t.TempDir()
+	oldCfg := cfg
+	defer func() { cfg = oldCfg }()
+	cfg = newTmuxIntegrationTestConfig(tmpDir)
+	cfg.Agents.Claude = "sleep 300"
+	sessionName := fmt.Sprintf("ntm-health-root-%d", time.Now().UnixNano())
+	if err := os.MkdirAll(filepath.Join(tmpDir, sessionName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := spawnSessionLogicContext(t.Context(), SpawnOptions{
+		Session: sessionName, Agents: []FlatAgent{{Type: AgentTypeClaude, Index: 1}}, CCCount: 1, UserPane: true,
+	}); err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	defer func() { _ = tmux.KillSession(sessionName) }()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	findAgentPane := func() tmux.Pane {
+		t.Helper()
+		panes, err := tmux.GetPanesContext(ctx, sessionName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, pane := range panes {
+			if pane.Type == tmux.AgentClaude {
+				return pane
+			}
+		}
+		t.Fatalf("no claude pane in %+v", panes)
+		return tmux.Pane{}
+	}
+	shellPane := findAgentPane()
+
+	// Replace the pane's shell with the agent itself. respawn-pane keeps the
+	// pane's options, so the pane stays typed as claude.
+	if _, err := tmux.DefaultClient.RunContext(ctx, "respawn-pane", "-k", "-t", tmux.ExactTarget(shellPane.ID), "exec sleep 300"); err != nil {
+		t.Fatal(err)
+	}
+	var agentPane tmux.Pane
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+		agentPane = findAgentPane()
+		if agentPane.PID > 0 && agentPane.PID != shellPane.PID && filepath.Base(strings.TrimSpace(agentPane.Command)) == "sleep" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pane never became its own agent process: before=%+v after=%+v", shellPane, agentPane)
+		}
+	}
+	if process.HasChildAlive(agentPane.PID) {
+		t.Fatalf("pane root %d has a child; the fixture must model an agent with no tool call running", agentPane.PID)
+	}
+
+	report, err := health.CheckSession(ctx, sessionName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var row *health.AgentHealth
+	for i := range report.Agents {
+		if report.Agents[i].PaneID == agentPane.ID {
+			row = &report.Agents[i]
+		}
+	}
+	if row == nil {
+		t.Fatalf("pane %s missing from health report %+v", agentPane.ID, report.Agents)
+	}
+	if row.ProcessStatus != health.ProcessRunning || row.Status == health.StatusError {
+		t.Fatalf("agent-root pane health = process %q status %q issues %+v, want a running agent", row.ProcessStatus, row.Status, row.Issues)
+	}
+	faults, err := workflowAgentFaults(ctx, sessionName, map[string]int{agentPane.ID: agentPane.PID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fault, ok := faults[agentPane.ID]; ok {
+		t.Fatalf("working agent-root pane classified as faulted: %+v", fault)
+	}
+}
+
+func TestPiWorkflowVerdictExcludesEchoWithoutMovingRegexAnchors(t *testing.T) {
+	const prompt = "Inspect **this result** and report."
+	const visible = " Inspect this result\n and report."
+	raw := status.NormalizeAgentEcho(prompt)
+	rendered, _, supported := status.PiPromptEcho(prompt)
+	if !supported {
+		t.Fatal("supported formatted prompt failed")
+	}
+	delivery := workflow.StageDispatch{
+		Pane: "%71", Role: "reviewer", Status: "delivered",
+		PromptEchoHash: fmt.Sprintf("%x", sha256.Sum256([]byte(raw))), PromptEchoLength: len(raw),
+		PiPromptEchoHash: rendered.Hash, PiPromptEchoLength: rendered.Length,
+	}
+	for _, tc := range []struct {
+		name, pattern, output string
+		want                  bool
+	}{
+		{"wrapped echo only", `(?m)^ and report\.$`, visible, false},
+		{"wrapped echo with unrelated answer", `(?m)^ and report\.$`, visible + "\nStill processing.", false},
+		{"wrapped echo then actual matching reply", `(?m)^ and report\.$`, visible + "\nStill processing.\n and report.", true},
+		{"answer after echo", `(?m)^SHIP-VERDICT$`, visible + "\n\nSHIP-VERDICT", true},
+		{"whole string anchor unchanged", `^SHIP-VERDICT`, visible + "\n\nSHIP-VERDICT", false},
+		{"match crossing echo boundary", `(?s)and report\..*SHIP-VERDICT`, visible + "\n\nSHIP-VERDICT", false},
+		{"rendered echo repeated", `SHIP-VERDICT`, visible + "\nEarlier reply\n" + visible + "\nSHIP-VERDICT", false},
+		{"raw and rendered echo", `SHIP-VERDICT`, prompt + "\nEarlier reply\n" + visible + "\nSHIP-VERDICT", false},
+		{"verdict before echo", `SHIP-VERDICT`, "SHIP-VERDICT\n" + visible + "\nStill processing.", false},
+		{"no echo", `SHIP-VERDICT`, "Unrelated transcript\nSHIP-VERDICT", false},
+		{"partial echo", `SHIP-VERDICT`, "Inspect this result\nSHIP-VERDICT", false},
+		{"empty suffix", `.*`, visible + "\n\n ", false},
+		{"raw echo followed by reply", `(?m)^SHIP-VERDICT$`, prompt + "\nSHIP-VERDICT", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fired, err := piWorkflowVerdict(tc.pattern, tc.output, delivery)
+			if err != nil || fired != tc.want {
+				t.Fatalf("verdict = %v, %v; want %v", fired, err, tc.want)
+			}
+		})
+	}
+	if fired, err := piWorkflowVerdict("[", visible+"\nAnswer", delivery); fired || err == nil {
+		t.Fatalf("invalid trigger regex = %v, %v", fired, err)
+	}
+	delivery.PiPromptEchoHash, delivery.PiPromptEchoLength = "", 0
+	if fired, err := piWorkflowVerdict("SHIP-VERDICT", visible+"\nSHIP-VERDICT", delivery); fired || err == nil {
+		t.Fatalf("legacy receipt could authorize a verdict: %v, %v", fired, err)
+	}
+}
+
+func TestWorkflowRunnerPiRefusesRenderedVerdictBeforeDispatch(t *testing.T) {
+	for _, prepared := range []bool{false, true} {
+		name := "initial goal"
+		if prepared {
+			name = "final prepared hook"
+		}
+		t.Run(name, func(t *testing.T) {
+			template := pingPongTemplate()
+			template.Description = "Review the requested change."
+			template.Flow.Transitions[0].Trigger.Pattern = `(?m)^APPROVE$`
+			if !prepared {
+				template.Description = "Review the requested change.\n\n**APPROVE**"
+			}
+			fake := newFakeWorkflowSession()
+			fake.outputs["%1"] = piWorkflowCapture("red history", "", false)
+			fake.outputs["%2"] = piWorkflowCapture("green history", "", false)
+			ports := fake.ports()
+			var runner *workflowRunner
+			if prepared {
+				originalDispatch := ports.dispatch
+				ports.dispatch = func(ctx context.Context, session, pane, prompt string) error {
+					// Mirror the production final preparation hook, before the
+					// transport is allowed to type the enriched prompt.
+					message := prompt + "\n\n**APPROVE**"
+					if err := runner.pinPiDispatchPrompt(runner.state.CurrentStage, pane, message); err != nil {
+						return err
+					}
+					return originalDispatch(ctx, session, pane, message)
+				}
+			}
+			runner = mustResumeWorkflowRunner(t, template,
+				[]workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}},
+				workflowRunOptions{Session: "pi-formatted-verdict", PaneTypes: map[string]string{"%1": "pi", "%2": "pi"}}, ports)
+			result, err := runner.Run(t.Context())
+			if err == nil || !strings.Contains(err.Error(), "rendered pi prompt") || result.Transitions != 0 || len(fake.dispatchedPanes()) != 0 {
+				t.Fatalf("formatted prompt authorized its own verdict: result=%+v sends=%v error=%v", result, fake.dispatchedPanes(), err)
+			}
+		})
+	}
+}
+
+func TestWorkflowRunnerPiUnsupportedPromptDoesNotSend(t *testing.T) {
+	template := pingPongTemplate()
+	template.Description = "Inspect the requested change.\n\n> Preserve quoted requirements."
+	fake := newFakeWorkflowSession()
+	fake.outputs["%1"] = piWorkflowCapture("red history", "", false)
+	fake.outputs["%2"] = piWorkflowCapture("green history", "", false)
+	runner := mustResumeWorkflowRunner(t, template,
+		[]workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}},
+		workflowRunOptions{Session: "pi-unsupported-prompt", PaneTypes: map[string]string{"%1": "pi", "%2": "pi"}}, fake.ports())
+	result, err := runner.Run(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "unsupported display formatting") || result.Transitions != 0 || len(fake.dispatchedPanes()) != 0 {
+		t.Fatalf("unsupported prompt reached pi: result=%+v sends=%v error=%v", result, fake.dispatchedPanes(), err)
+	}
+}
+
+func TestWorkflowRunnerPiLegacyReceiptRefusesResume(t *testing.T) {
+	template := pingPongTemplate()
+	template.Description = "Review **changes** and run `tests`"
+	fake := newFakeWorkflowSession()
+	fake.outputs["%1"] = piWorkflowCapture("red history", "", false)
+	fake.outputs["%2"] = piWorkflowCapture("green history", "", false)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	fake.onDispatch = func(pane, prompt string) {
+		visible := strings.ReplaceAll(prompt, "**changes**", "changes")
+		visible = strings.ReplaceAll(visible, "`tests`", "tests")
+		fake.outputs[pane] = piWorkflowCapture("Pi v1.3.0\n"+visible+"\nReviewed the change.\nRED-HANDOFF", "", false)
+		cancel()
+	}
+	opts := workflowRunOptions{
+		Session: "pi-legacy-receipt", ProjectRoot: t.TempDir(), StateDir: t.TempDir(),
+		PanePIDs: map[string]int{"%1": 101, "%2": 202}, PaneTypes: map[string]string{"%1": "pi", "%2": "pi"},
+		Interval: time.Millisecond, MaxTransitions: 1,
+	}
+	agents := []workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}}
+	runner := mustResumeWorkflowRunner(t, template, agents, opts, fake.ports())
+	if result, err := runner.Run(ctx); result.Transitions != 0 || (err != nil && !errors.Is(err, context.Canceled)) {
+		t.Fatalf("could not pause pi delivery: result=%+v error=%v", result, err)
+	}
+	saved := mustLoadWorkflowCheckpoint(t, opts)
+	if len(saved.Dispatches) != 1 || saved.Dispatches[0].Status != "delivered" || saved.Dispatches[0].PiPromptEchoHash == "" {
+		t.Fatalf("missing initial rendered receipt: %+v", saved.Dispatches)
+	}
+	saved.Dispatches[0].PiPromptEchoHash, saved.Dispatches[0].PiPromptEchoLength = "", 0
+	if err := (&workflow.StateStore{Dir: opts.StateDir}).Save(saved); err != nil {
+		t.Fatal(err)
+	}
+	opts.Resume = true
+	runner = mustResumeWorkflowRunner(t, template, agents, opts, fake.ports())
+	result, err := runner.Run(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "lacks rendered pi prompt evidence") || result.Transitions != 0 || len(fake.dispatchedPanes()) != 1 {
+		t.Fatalf("legacy receipt authorized resume: result=%+v sends=%v error=%v", result, fake.dispatchedPanes(), err)
 	}
 }

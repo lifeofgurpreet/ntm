@@ -4,19 +4,40 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/ntm/internal/config"
+	processutil "github.com/Dicklesworthstone/ntm/internal/process"
+	"github.com/Dicklesworthstone/ntm/internal/shellword"
 )
+
+// waitForCmdline waits until pid shows a command line. Start returns when the
+// exec pipe closes, which is before the kernel fills in the new image's argv, and
+// discovery reading that empty argv would find no agent.
+func waitForCmdline(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(processutil.GetCmdlineContext(t.Context(), pid)) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d never showed a command line", pid)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
 
 func nativeDiscoverer(home string) *Discoverer {
 	discoverer := NewDiscoverer()
 	discoverer.homeDir = func() (string, error) { return home, nil }
 	discoverer.lookPath = func(string) (string, error) { return "", os.ErrNotExist }
-	discoverer.findProcessSession = func(string, string, string, int) *Info { return nil }
+	discoverer.findProcessSession = func(context.Context, string, string, string, int) *Info { return nil }
 	discoverer.findProcessStart = func(int, string) int64 { return 0 }
 	return discoverer
 }
@@ -120,8 +141,8 @@ func TestResumeCommandNative(t *testing.T) {
 		{"claude", "abc-123", true, "claude --resume 'abc-123'"},
 		{"codex", "r1", false, "codex resume 'r1'"},
 		{"gemini", "g9", true, "gemini --resume 'g9'"},
-		{"antigravity", "uuid-9", false, "agy --conversation 'uuid-9' --model 'Gemini 3.7 Flash (High)'"},
-		{"antigravity", "uuid-9", true, "agy --conversation 'uuid-9' --model 'Gemini 3.7 Flash (High)'"},
+		{"antigravity", "uuid-9", false, "agy --conversation 'uuid-9' --model 'Gemini 4 Argon (High)'"},
+		{"antigravity", "uuid-9", true, "agy --conversation 'uuid-9' --model 'Gemini 4 Argon (High)'"},
 		{"claude", "", true, ""},
 		{"unknown", "x", true, ""},
 	}
@@ -153,7 +174,7 @@ func TestResumeCommandCASR(t *testing.T) {
 		{"gemini", "g9", "casr -gmi 'g9'"},
 		// Antigravity has no casr short-flag; even with preferCASR=true and
 		// casr available it must fall through to its native agy command.
-		{"antigravity", "uuid-9", "agy --conversation 'uuid-9' --model 'Gemini 3.7 Flash (High)'"},
+		{"antigravity", "uuid-9", "agy --conversation 'uuid-9' --model 'Gemini 4 Argon (High)'"},
 	}
 	for _, c := range cases {
 		if got := ResumeCommand(c.provider, c.id, true); got != c.want {
@@ -164,6 +185,167 @@ func TestResumeCommandCASR(t *testing.T) {
 	// preferCASR=false must still use native even when casr is available.
 	if got := ResumeCommand("claude", "x", false); got != "claude --resume 'x'" {
 		t.Errorf("native override failed: got %q", got)
+	}
+}
+
+func TestResumeLaunchCommandPreservesSettingsAndReplacesSelector(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name, provider, command, want string
+	}{
+		{"claude settings", "claude", `MODE='literal value' '/opt/agent bin/claude'  --model 'custom/model' --effort high --system-prompt-file '/work/persona.md' --custom='literal;value'`, `MODE='literal value' '/opt/agent bin/claude'  --model 'custom/model' --effort high --system-prompt-file '/work/persona.md' --custom='literal;value' --resume 'new-id'`},
+		{"claude existing", "claude", `claude --resume 'old-id' --model model`, `claude --resume 'new-id' --model model`},
+		{"claude inline", "claude", `claude --model model -r='old-id' --effort high`, `claude --model model --resume 'new-id' --effort high`},
+		{"codex settings", "codex", `MODE=literal /opt/codex -m'custom/model' -c 'model_reasoning_effort="high"' --search --custom='quoted value'`, `MODE=literal /opt/codex resume 'new-id' -m'custom/model' -c 'model_reasoning_effort="high"' --search --custom='quoted value'`},
+		{"codex existing", "codex", `codex --model custom resume 'old-id' --search`, `codex --model custom resume 'new-id' --search`},
+		{"codex existing options before ID", "codex", `codex resume --model custom old-id --search`, `codex resume --model custom 'new-id' --search`},
+		{"gemini persona", "gemini", `GEMINI_SYSTEM_MD='/work/persona.md' gemini --model custom --yolo`, `GEMINI_SYSTEM_MD='/work/persona.md' gemini --model custom --yolo --resume 'new-id'`},
+		{"gemini inline", "gemini", `gemini --resume=old-id --model custom`, `gemini --resume 'new-id' --model custom`},
+		{"antigravity locked", "antigravity", `/opt/agy-locked --model 'Gemini 4 Argon (High)' --dangerously-skip-permissions`, `/opt/agy-locked --model 'Gemini 4 Argon (High)' --dangerously-skip-permissions --conversation 'new-id'`},
+		{"antigravity existing", "antigravity", `agy --conversation=old-id --model 'Gemini 4 Argon (High)'`, `agy --conversation 'new-id' --model 'Gemini 4 Argon (High)'`},
+		{"omp settings", "omp", `omp --auto-approve --model 'provider/custom' --thinking high --append-system-prompt '/work/persona.md'`, `omp --auto-approve --model 'provider/custom' --thinking high --append-system-prompt '/work/persona.md' --resume 'new-id'`},
+		{"omp existing", "omp", `omp --auto-approve --resume=old-id --thinking high`, `omp --auto-approve --resume 'new-id' --thinking high`},
+		{"ntm memory wrapper", "claude", `systemd-run --user --scope -q -p MemoryMax=8192M claude --model custom --effort high`, `systemd-run --user --scope -q -p MemoryMax=8192M claude --model custom --effort high --resume 'new-id'`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ResumeLaunchCommand(tc.provider, "new-id", tc.command, ResumeLaunchOptions{})
+			if err != nil || got != tc.want {
+				t.Fatalf("resume = %q (%v), want %q", got, err, tc.want)
+			}
+			for _, nextID := range []string{"next-id", "last-id"} {
+				got, err = ResumeLaunchCommand(tc.provider, nextID, got, ResumeLaunchOptions{})
+				if err != nil {
+					t.Fatalf("repeated resume: %v", err)
+				}
+				want := strings.Replace(tc.want, "'new-id'", shellQuote(nextID), 1)
+				if got != want {
+					t.Fatalf("repeated resume lost settings or duplicated selector: %q, want %q", got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestResumeLaunchCommandGeneratedTemplates(t *testing.T) {
+	t.Parallel()
+	templates := config.DefaultAgentTemplates()
+	for provider, template := range map[string]string{
+		"claude": templates.Claude, "codex": templates.Codex, "gemini": templates.Gemini,
+		"antigravity": templates.Antigravity, "omp": templates.Omp,
+	} {
+		t.Run(provider, func(t *testing.T) {
+			command, err := config.GenerateAgentCommand(template, config.AgentTemplateVars{Model: "selected/model", ReasoningEffort: "high"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			resumed, err := ResumeLaunchCommand(provider, "saved-id", command, ResumeLaunchOptions{})
+			if err != nil {
+				t.Fatalf("default template cannot resume: %q: %v", command, err)
+			}
+			before, err := shellword.Literal(command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			after, err := shellword.Literal(resumed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var retained []string
+			for i := 0; i < len(after); i++ {
+				if after[i].Value == "--resume" || after[i].Value == "resume" || after[i].Value == "--conversation" {
+					i++
+					continue
+				}
+				retained = append(retained, after[i].Value)
+			}
+			var original []string
+			for _, word := range before {
+				original = append(original, word.Value)
+			}
+			if !reflect.DeepEqual(original, retained) {
+				t.Fatalf("default launch settings changed: before=%q after=%q", original, retained)
+			}
+		})
+	}
+}
+
+func TestResumeLaunchCommandCodexPreparedPersona(t *testing.T) {
+	t.Parallel()
+	path := "/work/persona's context.md"
+	command, err := config.GenerateAgentCommand(config.DefaultAgentTemplates().Codex, config.AgentTemplateVars{Model: "custom", SystemPromptFile: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := strings.Replace(command, "$(/bin/cat ", "$(cat ", 1)
+	legacyResumed, err := ResumeLaunchCommand("codex", "legacy-id", legacy, ResumeLaunchOptions{SystemPromptFile: path})
+	if err != nil || legacyResumed != strings.Replace(command, " codex ", " codex resume 'legacy-id' ", 1) {
+		t.Fatalf("legacy persona reader was not pinned during native resume: %q (%v)", legacyResumed, err)
+	}
+	got, err := ResumeLaunchCommand("codex", "first-id", command, ResumeLaunchOptions{SystemPromptFile: path})
+	if err != nil || got != strings.Replace(command, " codex ", " codex resume 'first-id' ", 1) {
+		t.Fatalf("prepared persona resume lost exact expansion: %q (%v)", got, err)
+	}
+	got, err = ResumeLaunchCommand("codex", "second-id", got, ResumeLaunchOptions{SystemPromptFile: path})
+	if err != nil || !strings.Contains(got, " codex resume 'second-id' ") || strings.Contains(got, "first-id") {
+		t.Fatalf("repeated prepared persona resume: %q (%v)", got, err)
+	}
+	for _, opts := range []ResumeLaunchOptions{{}, {SystemPromptFile: "/other.md"}, {SystemPromptFile: "relative.md"}} {
+		if _, err := ResumeLaunchCommand("codex", "id", command, opts); err == nil {
+			t.Fatalf("unbound persona expansion accepted: %+v", opts)
+		}
+	}
+	for _, opaque := range []string{
+		`CODEX_SYSTEM_PROMPT="$(/bin/cat '/work/persona.md'; touch /tmp/unexpected)" codex --model custom`,
+		`CODEX_SYSTEM_PROMPT="$(/bin/cat '/other.md')" codex --model custom`,
+		`CODEX_SYSTEM_PROMPT="$(cat '/work/persona.md'; touch /tmp/unexpected)" codex --model custom`,
+		`CODEX_SYSTEM_PROMPT="$(cat '/work/persona.md')" codex --model "$MODEL"`,
+		`CODEX_SYSTEM_PROMPT="$(cat '/other.md')" codex --model custom`,
+	} {
+		if _, err := ResumeLaunchCommand("codex", "id", opaque, ResumeLaunchOptions{SystemPromptFile: "/work/persona.md"}); err == nil {
+			t.Fatalf("opaque expansion accepted: %q", opaque)
+		}
+	}
+}
+
+func TestResumeLaunchCommandRejectsAmbiguousOrConflictingModes(t *testing.T) {
+	t.Parallel()
+	cases := map[string][]string{
+		"claude": {
+			`claude --continue`, `claude -c`, `claude --resume old --resume other`, `claude --resume=`,
+			`claude --resume --model custom`, `claude --resume`, `claude --fork-session`, `claude --session-id other`,
+			`claude --model`, `claude --model --effort high`, `claude --custom value`, `claude --custom`,
+			`claude mcp`, `claude --model custom auth login`, `claude 'initial task'`, `claude -- task`,
+			`claude --print`, `claude -p 'task'`, `claude --worktree new`, `wrapper claude`, `sh -c 'claude'`,
+			`claude --model "$MODEL"`, `claude $(cat flags)`, `claude; echo later`, `claude && echo later`,
+			`claude | cat`, `claude > log`, `claude # comment`, `claude --model *`, `claude --model ~/alias`,
+			`'MODE=x' claude`, `BAD-NAME=x claude`, `claude 'unterminated`, "claude \\",
+			`systemd-run --scope -p MemoryMax=8192M claude`, `systemd-run --user --scope -q -p MemoryMax=1GM claude`,
+		},
+		"codex":       {`codex exec`, `codex fork old`, `codex resume`, `codex resume --last`, `codex resume old --all`, `codex resume old resume new`, `codex resume old prompt`, `codex --resume old`, `codex -c`, `codex --model custom review`},
+		"gemini":      {`gemini --prompt-interactive task`, `gemini -p task`, `gemini --resume old -r other`, `gemini --list-sessions`},
+		"antigravity": {`agy --conversation old`, `agy --model pinned --conversation old --conversation other`, `agy --model pinned --prompt-interactive task`},
+		"omp":         {`omp --continue`, `omp -c`, `omp --session other`, `omp --mode json`, `omp --resume old --resume other`},
+	}
+	for provider, commands := range cases {
+		for _, command := range commands {
+			t.Run(provider+"/"+command, func(t *testing.T) {
+				if got, err := ResumeLaunchCommand(provider, "id", command, ResumeLaunchOptions{}); err == nil || got != "" {
+					t.Fatalf("unsafe resume accepted: %q (%v)", got, err)
+				}
+			})
+		}
+	}
+	for _, id := range []string{"", " ", "--last", "id\nnext", "id\x00next"} {
+		if _, err := ResumeLaunchCommand("claude", id, "claude", ResumeLaunchOptions{}); err == nil {
+			t.Fatalf("invalid session ID accepted: %q", id)
+		}
+	}
+	if got, err := ResumeLaunchCommand("claude", "session's name", "claude", ResumeLaunchOptions{}); err != nil || got != `claude --resume 'session'\''s name'` {
+		t.Fatalf("session ID escaping = %q (%v)", got, err)
+	}
+	if _, err := ResumeLaunchCommand("unknown", "id", "unknown", ResumeLaunchOptions{}); err == nil {
+		t.Fatal("unknown provider accepted")
 	}
 }
 
@@ -263,7 +445,7 @@ func TestObserveBindingRecordsProvenanceFreshnessAndKeepsSourcePathPrivate(t *te
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			discoverer := NewDiscoverer()
-			discoverer.findProcessSession = func(string, string, string, int) *Info {
+			discoverer.findProcessSession = func(context.Context, string, string, string, int) *Info {
 				copy := *test.info
 				return &copy
 			}
@@ -291,7 +473,7 @@ func TestObserveBindingDeadlineIsUnavailableAndRetryable(t *testing.T) {
 	discoverer := NewDiscoverer()
 	discoverer.homeDir = func() (string, error) { return t.TempDir(), nil }
 	discoverer.lookPath = func(string) (string, error) { return "/fake/casr", nil }
-	discoverer.findProcessSession = func(string, string, string, int) *Info { return nil }
+	discoverer.findProcessSession = func(context.Context, string, string, string, int) *Info { return nil }
 	discoverer.findProcessStart = func(int, string) int64 { return 0 }
 	runs := 0
 	deadlineCtx := newManualDeadlineContext()
@@ -332,7 +514,7 @@ func TestDiscoverContextCancelledBeforeNativeScanIsRetryable(t *testing.T) {
 	}
 
 	discoverer := NewDiscoverer()
-	discoverer.findProcessSession = func(string, string, string, int) *Info { return nil }
+	discoverer.findProcessSession = func(context.Context, string, string, string, int) *Info { return nil }
 	ctx, cancel := context.WithCancel(context.Background())
 	homeCalls := 0
 	discoverer.homeDir = func() (string, error) {
@@ -459,6 +641,26 @@ func TestDiscoverNonResumableAgent(t *testing.T) {
 	}
 }
 
+func TestDiscoverContextStopsAfterCanceledProcessSearch(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	discoverer := NewDiscoverer()
+	discoverer.findProcessSession = func(got context.Context, _, _, _ string, _ int) *Info {
+		if got != ctx {
+			t.Fatal("process search lost the operation context")
+		}
+		cancel()
+		return nil
+	}
+	discoverer.findProcessStart = func(int, string) int64 {
+		t.Fatal("canceled process search continued into fallback discovery")
+		return 0
+	}
+	if info := discoverer.DiscoverContext(ctx, "cod", "/same/project", 123); info != nil {
+		t.Fatalf("canceled discovery returned %+v", info)
+	}
+}
+
 func TestDiscoverCodex(t *testing.T) {
 	home := t.TempDir()
 	workDir := "/data/projects/codexdemo"
@@ -538,7 +740,7 @@ func TestDiscoverGemini(t *testing.T) {
 func TestDiscoverPrefersPaneProcessSession(t *testing.T) {
 	discoverer := NewDiscoverer()
 	discoverer.homeDir = func() (string, error) { return t.TempDir(), nil }
-	discoverer.findProcessSession = func(agentType, provider, _ string, panePID int) *Info {
+	discoverer.findProcessSession = func(_ context.Context, agentType, provider, _ string, panePID int) *Info {
 		if agentType != "cod" || provider != "codex" || (panePID != 4242 && panePID != 5252) {
 			t.Fatalf("unexpected process lookup: agent=%q provider=%q pid=%d", agentType, provider, panePID)
 		}
@@ -562,7 +764,7 @@ func TestDiscoverPrefersPaneProcessSession(t *testing.T) {
 func TestDiscoverProcessSessionDoesNotRequireHomeOrWorkDir(t *testing.T) {
 	discoverer := NewDiscoverer()
 	discoverer.homeDir = func() (string, error) { return "", os.ErrNotExist }
-	discoverer.findProcessSession = func(agentType, provider, home string, panePID int) *Info {
+	discoverer.findProcessSession = func(_ context.Context, agentType, provider, home string, panePID int) *Info {
 		if agentType != "cod" || provider != "codex" || home != "" || panePID != 4242 {
 			t.Fatalf("unexpected process lookup: agent=%q provider=%q home=%q pid=%d", agentType, provider, home, panePID)
 		}
@@ -660,7 +862,7 @@ func TestDiscoverCASRStructuredResultAndCache(t *testing.T) {
 
 	discoverer := NewDiscoverer()
 	discoverer.homeDir = func() (string, error) { return t.TempDir(), nil }
-	discoverer.findProcessSession = func(string, string, string, int) *Info { return nil }
+	discoverer.findProcessSession = func(context.Context, string, string, string, int) *Info { return nil }
 	discoverer.lookPath = func(name string) (string, error) {
 		if name != "casr" {
 			t.Fatalf("lookPath(%q), want casr", name)
@@ -773,7 +975,7 @@ func TestDiscoverCASRCorrelatesSameWorkspacePanesByProcessStart(t *testing.T) {
 
 	discoverer := NewDiscoverer()
 	discoverer.homeDir = func() (string, error) { return t.TempDir(), nil }
-	discoverer.findProcessSession = func(string, string, string, int) *Info { return nil }
+	discoverer.findProcessSession = func(context.Context, string, string, string, int) *Info { return nil }
 	discoverer.findProcessStart = func(pid int, _ string) int64 {
 		switch pid {
 		case 101:
@@ -1081,5 +1283,831 @@ func TestDiscoverAgyGmiDisambiguation(t *testing.T) {
 	gmiOnlyDiscoverer := nativeDiscoverer(gmiOnlyHome)
 	if info := gmiOnlyDiscoverer.Discover("agy", workDir, 0); info != nil {
 		t.Errorf("agy must not discover a gmi tmp session, got %+v", info)
+	}
+}
+
+// --- Oh My Pi (omp) --------------------------------------------------------
+
+const (
+	ompSessionUUID      = "01a0adc4-823b-70d0-aa1d-80adef4fd1b1"
+	ompSessionFileName  = "2026-09-17T05-08-51-899Z_" + ompSessionUUID + ".jsonl"
+	ompOtherSessionUUID = "01a0adc8-399e-7636-a3d9-8c0beb5249fb"
+)
+
+// writeOmpTranscript writes the head of a real omp v18.2.3 transcript: a
+// space-padded title line precedes the session header carrying cwd.
+func writeOmpTranscript(t *testing.T, dir, name, cwd string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lines := []string{
+		`{"type":"title","v":1,"title":"Reply With the Word Ok","source":"auto","updatedAt":"2026-09-17T05:10:17.723Z","pad":"                "}`,
+		`{"type":"session","version":3,"id":"x","timestamp":"2026-09-17T05:08:51.899Z","cwd":"` + cwd + `","title":"Reply With the Word Ok"}`,
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func clearOmpEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{"PI_CODING_AGENT_SESSION_DIR", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR", "XDG_DATA_HOME"} {
+		t.Setenv(key, "")
+	}
+}
+
+func TestOmpResumeProviderAndCommand(t *testing.T) {
+	for _, in := range []string{"omp", "OMP", "oh-my-pi", "oh_my_pi", " ohmypi "} {
+		if got := ResumeProvider(in); got != "omp" {
+			t.Errorf("ResumeProvider(%q) = %q, want omp", in, got)
+		}
+	}
+	if got := canonicalAgentType("oh-my-pi", "omp"); got != "omp" {
+		t.Errorf("canonicalAgentType = %q, want omp", got)
+	}
+
+	orig := lookPath
+	t.Cleanup(func() { lookPath = orig })
+	for _, casrOnPath := range []bool{false, true} {
+		lookPath = func(string) (string, error) {
+			if casrOnPath {
+				return "/usr/bin/casr", nil
+			}
+			return "", os.ErrNotExist
+		}
+		// casr has no omp provider, so omp always resumes natively.
+		if got := ResumeCommand("omp", ompSessionUUID, true); got != "omp --auto-approve --resume '"+ompSessionUUID+"'" {
+			t.Errorf("ResumeCommand(omp, casr=%v) = %q", casrOnPath, got)
+		}
+	}
+}
+
+func TestOmpProcessArgvAndSessionFiles(t *testing.T) {
+	for _, argv := range [][]string{{"omp"}, {"omp", "--auto-approve"}, {"/home/u/.bun/bin/omp", "--auto-approve"}} {
+		if !argvMatchesProvider("omp", argv) {
+			t.Errorf("argvMatchesProvider(omp, %q) = false", argv)
+		}
+	}
+	for _, argv := range [][]string{{"gcc", "compiler.c"}, {"/usr/lib/libomp.so"}, {"zsh", "-l"}, {"node", "component.js"}} {
+		if argvMatchesProvider("omp", argv) {
+			t.Errorf("argvMatchesProvider(omp, %q) = true; only the exact executable identifies omp", argv)
+		}
+	}
+
+	tests := []struct {
+		argv []string
+		want string
+	}{
+		{[]string{"omp", "--auto-approve", "--resume", "01a0adc4"}, "01a0adc4"},
+		{[]string{"omp", "-r", ompSessionUUID}, ompSessionUUID},
+		{[]string{"omp", "--resume=" + ompSessionUUID}, ompSessionUUID},
+		{[]string{"omp", "--resume", "/home/u/.omp/agent/sessions/--p--/" + ompSessionFileName}, ompSessionUUID},
+		{[]string{"omp", "--resume", "--auto-approve"}, ""}, // interactive picker
+		{[]string{"omp", "--continue"}, ""},
+		{[]string{"rg", "--resume", "x"}, ""},
+	}
+	for _, test := range tests {
+		if got := resumedSessionID("omp", test.argv); got != test.want {
+			t.Errorf("resumedSessionID(omp, %q) = %q, want %q", test.argv, got, test.want)
+		}
+	}
+
+	root := filepath.Join(t.TempDir(), ".omp", "agent", "sessions", "--data-projects-demo--")
+	mainPath := writeOmpTranscript(t, root, ompSessionFileName, "/data/projects/demo")
+	// omp also holds sub-agent transcripts open; they must never bind the pane.
+	subPath := writeOmpTranscript(t, filepath.Join(root, strings.TrimSuffix(ompSessionFileName, ".jsonl")), "ExecFuzz.jsonl", "/data/projects/demo")
+	if isProviderSessionFile("omp", subPath) || !isProviderSessionFile("omp", mainPath) {
+		t.Fatalf("isProviderSessionFile: sub=%v main=%v", isProviderSessionFile("omp", subPath), isProviderSessionFile("omp", mainPath))
+	}
+	info := processNodeSession("omp", "omp", []string{"omp", "--auto-approve", "--no-lsp"}, func() []string {
+		return []string{subPath, mainPath}
+	})
+	if info == nil || info.SessionID != ompSessionUUID || info.SourcePath != mainPath || info.AgentType != "omp" || info.Provider != "omp" {
+		t.Fatalf("omp process discovery = %+v, want %s from %s", info, ompSessionUUID, mainPath)
+	}
+}
+
+func TestOmpSessionRoots(t *testing.T) {
+	env := map[string]string{}
+	getenv := func(key string) string { return env[key] }
+	if got := OmpSessionRoots("/home/u", getenv); !reflect.DeepEqual(got, []string{"/home/u/.omp/agent/sessions"}) {
+		t.Fatalf("default roots = %v", got)
+	}
+	env["PI_CODING_AGENT_SESSION_DIR"] = "/launch/sessions"
+	env["PI_CODING_AGENT_DIR"] = "/agent-home"
+	env["XDG_DATA_HOME"] = "/xdg"
+	env["PI_CONFIG_DIR"] = "/.pi-alt"
+	want := []string{"/launch/sessions", "/agent-home/sessions", "/home/u/.pi-alt/agent/sessions", "/xdg/omp/sessions"}
+	if got := OmpSessionRoots("/home/u", getenv); !reflect.DeepEqual(got, want) {
+		t.Fatalf("override roots = %v, want %v", got, want)
+	}
+	// A named profile ignores PI_CODING_AGENT_DIR, as omp's resolver does;
+	// "default" is the default profile.
+	env["OMP_PROFILE"] = "work"
+	want = []string{"/launch/sessions", "/home/u/.pi-alt/profiles/work/agent/sessions", "/xdg/omp/profiles/work/sessions"}
+	if got := OmpSessionRoots("/home/u", getenv); !reflect.DeepEqual(got, want) {
+		t.Fatalf("profile roots = %v, want %v", got, want)
+	}
+	env["OMP_PROFILE"] = ""
+	env["PI_PROFILE"] = "default"
+	if got := OmpSessionRoots("/home/u", getenv); len(got) != 4 {
+		t.Fatalf("legacy PI_PROFILE=default must select the default profile, got %v", got)
+	}
+}
+
+func TestNewestOmpTranscriptForCwd(t *testing.T) {
+	sessions := t.TempDir()
+	projDir := filepath.Join(sessions, "--data-proj--")
+	older := writeOmpTranscript(t, projDir, "2026-09-16T01-00-00-000Z_"+ompOtherSessionUUID+".jsonl", "/data/proj")
+	newest := writeOmpTranscript(t, projDir, ompSessionFileName, "/data/proj")
+	writeOmpTranscript(t, filepath.Join(sessions, "--data-other--"), "2026-09-17T06-00-00-000Z_01a0adc8-398d-71c7-ad2b-e2959d588253.jsonl", "/data/other")
+	sub := writeOmpTranscript(t, filepath.Join(projDir, strings.TrimSuffix(ompSessionFileName, ".jsonl")), "Explorer.jsonl", "/data/proj")
+
+	past := time.Now().Add(-time.Hour)
+	future := time.Now().Add(time.Minute)
+	for path, at := range map[string]time.Time{older: past, sub: future} {
+		if err := os.Chtimes(path, at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	roots := []string{filepath.Join(sessions, "missing"), sessions}
+	if got, _ := NewestOmpTranscriptForCwd(roots, "/data/proj/", time.Time{}, nil); got != newest {
+		t.Errorf("newest = %q, want main transcript %q (sub-agent files never compete)", got, newest)
+	}
+	claimed := map[string]bool{sessionClaimKey("omp", ompSessionUUID): true}
+	if got, _ := NewestOmpTranscriptForCwd(roots, "/data/proj", time.Time{}, claimed); got != older {
+		t.Errorf("with the newest claimed = %q, want %q", got, older)
+	}
+	// A resumed older session touched after newerThan beats a stale newer name.
+	if err := os.Chtimes(newest, past, past); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(older, future, future); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := NewestOmpTranscriptForCwd(roots, "/data/proj", time.Now(), nil); got != older {
+		t.Errorf("fresh pick = %q, want %q", got, older)
+	}
+	if got, _ := NewestOmpTranscriptForCwd(roots, "/data/nomatch", time.Time{}, nil); got != "" {
+		t.Errorf("unmatched cwd = %q, want none", got)
+	}
+	// Flat PI_CODING_AGENT_SESSION_DIR layout: transcripts directly in the root.
+	flat := t.TempDir()
+	flatPath := writeOmpTranscript(t, flat, ompSessionFileName, "/data/proj")
+	if got, _ := NewestOmpTranscriptForCwd([]string{flat}, "/data/proj", time.Time{}, nil); got != flatPath {
+		t.Errorf("flat store = %q, want %q", got, flatPath)
+	}
+}
+
+func TestDiscoverOmpNativeStore(t *testing.T) {
+	clearOmpEnv(t)
+	home := t.TempDir()
+	dir := filepath.Join(home, ".omp", "agent", "sessions", "--data-projects-demo--")
+	first := writeOmpTranscript(t, dir, ompSessionFileName, "/data/projects/demo")
+	second := writeOmpTranscript(t, dir, "2026-09-17T05-12-55-454Z_"+ompOtherSessionUUID+".jsonl", "/data/projects/demo")
+	older := time.Now().Add(-time.Minute)
+	if err := os.Chtimes(first, older, older); err != nil {
+		t.Fatal(err)
+	}
+
+	discoverer := nativeDiscoverer(home)
+	info := discoverer.Discover("omp", "/data/projects/demo", 0)
+	if info == nil || info.SessionID != ompOtherSessionUUID || info.SourcePath != second || info.Source != DiscoverySourceNativeStore {
+		t.Fatalf("first omp pane = %+v, want %s", info, ompOtherSessionUUID)
+	}
+	// Same-workspace panes are handed distinct unclaimed sessions.
+	next := discoverer.Discover("omp", "/data/projects/demo", 7)
+	if next == nil || next.SessionID != ompSessionUUID {
+		t.Fatalf("second omp pane = %+v, want %s", next, ompSessionUUID)
+	}
+}
+
+// startFakeClaude runs a real process whose argv names it claude, so process
+// tree discovery and /proc start times are exercised for real.
+func startFakeClaude(t *testing.T) int {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("Claude session records are verified against /proc start times")
+	}
+	sleepPath, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("sleep unavailable")
+	}
+	data, err := os.ReadFile(sleepPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claude := filepath.Join(t.TempDir(), "claude")
+	if err := os.WriteFile(claude, data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(claude, "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	return cmd.Process.Pid
+}
+
+func writeClaudeSessionRecord(t *testing.T, home string, pid int, sessionID, cwd, procStart string) {
+	t.Helper()
+	dir := filepath.Join(home, ".claude", "sessions")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	record, _ := json.Marshal(map[string]any{"pid": pid, "sessionId": sessionID, "cwd": cwd, "procStart": procStart, "kind": "interactive"})
+	if err := os.WriteFile(filepath.Join(dir, strconv.Itoa(pid)+".json"), record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// GH #338: Claude panes sharing one directory must each bind to their own
+// session. The process's own session record names it exactly; the newest
+// transcript in the directory belongs to whichever pane wrote last.
+func TestClaudeProcessSessionBindsThroughTheSessionRecord(t *testing.T) {
+	pid := startFakeClaude(t)
+	start, ok := linuxProcessStartTicks(pid)
+	if !ok {
+		t.Fatal("no /proc start time for a live process")
+	}
+	home, cwd := t.TempDir(), "/data/projects/demo"
+	const mine, newer = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+	projDir := filepath.Join(home, ".claude", "projects", encodeClaudeProjectDir(cwd))
+	if err := os.MkdirAll(projDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{mine, newer} {
+		if err := os.WriteFile(filepath.Join(projDir, id+".jsonl"), []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The other pane's transcript is the newer one.
+	later := time.Now().Add(time.Minute)
+	if err := os.Chtimes(filepath.Join(projDir, newer+".jsonl"), later, later); err != nil {
+		t.Fatal(err)
+	}
+	writeClaudeSessionRecord(t, home, pid, mine, cwd, start)
+
+	info := discoverProcessSession(t.Context(), "cc", "claude", home, pid)
+	if info == nil || info.SessionID != mine || info.SourcePath != filepath.Join(projDir, mine+".jsonl") || info.Source != DiscoverySourceProcessTree {
+		t.Fatalf("binding = %+v, want this process's own session %s", info, mine)
+	}
+}
+
+func TestClaudeProcessSessionRejectsRecordsItCannotTrust(t *testing.T) {
+	pid := startFakeClaude(t)
+	start, ok := linuxProcessStartTicks(pid)
+	if !ok {
+		t.Fatal("no /proc start time for a live process")
+	}
+	const id = "11111111-1111-4111-8111-111111111111"
+	for name, write := range map[string]func(home string){
+		// A record left by an earlier process that had this PID.
+		"reused pid": func(home string) { writeClaudeSessionRecord(t, home, pid, id, "/data/projects/demo", start+"0") },
+		"pid mismatch": func(home string) {
+			writeClaudeSessionRecord(t, home, pid, id, "/data/projects/demo", start)
+			record, _ := json.Marshal(map[string]any{"pid": pid + 1, "sessionId": id, "cwd": "/data/projects/demo", "procStart": start})
+			_ = os.WriteFile(filepath.Join(home, ".claude", "sessions", strconv.Itoa(pid)+".json"), record, 0o600)
+		},
+		"unsafe session id": func(home string) {
+			writeClaudeSessionRecord(t, home, pid, "../../etc/passwd", "/data/projects/demo", start)
+		},
+		"no record": func(string) {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			write(home)
+			if info := claudeProcessSession("cc", home, pid); info != nil {
+				t.Fatalf("binding = %+v, want none", info)
+			}
+		})
+	}
+}
+
+// These fixtures retain pi's actual header/message envelope, including a
+// timestamped filename independent of the authoritative session header.
+func writePiTranscript(t *testing.T, dir, name, id, cwd string, created, modified time.Time) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	header, err := json.Marshal(map[string]any{
+		"type": "session", "version": 3, "id": id,
+		"timestamp": created.UTC().Format(time.RFC3339Nano), "cwd": cwd,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := "\n" + `{"type":"model_change","id":"70a0baf2","parentId":null,"timestamp":"2026-10-23T20:00:00.000Z","provider":"anthropic","modelId":"claude-sonnet-4-5"}
+{"type":"thinking_level_change","id":"601affde","parentId":"70a0baf2","timestamp":"2026-10-23T20:00:00.001Z","thinkingLevel":"high"}
+{"type":"message","id":"cf552a72","parentId":"601affde","timestamp":"2026-10-23T20:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"Inspect the project and fix the failing test."}],"timestamp":1792785601000}}
+{"type":"message","id":"f09cab71","parentId":"cf552a72","timestamp":"2026-10-23T20:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"The test now passes."}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","stopReason":"stop","timestamp":1792785604000}}
+`
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, append(header, []byte(body)...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, modified, modified); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func clearPiSessionEnvironment(t *testing.T) {
+	t.Helper()
+	t.Setenv("PI_CODING_AGENT_SESSION_DIR", "")
+	t.Setenv("PI_CODING_AGENT_DIR", "")
+}
+
+func TestPiProviderAndNativeResumeRemainSeparateFromOmp(t *testing.T) {
+	for _, name := range []string{"pi", "PI", "pi-cli", "pi-coding-agent"} {
+		if got := ResumeProvider(name); got != "pi" {
+			t.Errorf("ResumeProvider(%q) = %q", name, got)
+		}
+	}
+	if got := ResumeProvider("oh-my-pi"); got != "omp" {
+		t.Fatalf("Oh My Pi provider changed to %q", got)
+	}
+	if got := ResumeCommand("pi", "custom.session-1", false); got != "pi --session 'custom.session-1'" {
+		t.Fatalf("native pi resume = %q", got)
+	}
+	if got := ResumeCommand("omp", "custom.session-1", false); got != "omp --auto-approve --resume 'custom.session-1'" {
+		t.Fatalf("native omp resume changed = %q", got)
+	}
+}
+
+func TestPiDiscoveryUsesEveryHeaderAndModificationTime(t *testing.T) {
+	clearPiSessionEnvironment(t)
+	home, cwd := t.TempDir(), t.TempDir()
+	store := filepath.Join(home, ".pi", "agent", "sessions", "--encoded-cwd--")
+	now := time.Now().Add(-time.Second)
+	old := now.Add(-24 * time.Hour)
+	want := writePiTranscript(t, store, "2026-01-01T00-00-00-000Z_filename-id.jsonl", "authoritative-id", cwd, old, now)
+	for i := 0; i < 16; i++ {
+		writePiTranscript(t, store, "2026-10-23T20-00-"+strconv.Itoa(i)+"-000Z_new.jsonl",
+			"newer-created-"+strconv.Itoa(i), cwd, old.Add(time.Hour), old.Add(time.Duration(i)*time.Minute))
+	}
+	// A filename-newest transcript from another cwd must not hide this cwd.
+	writePiTranscript(t, store, "2099-01-01T00-00-00-000Z_other.jsonl", "other-cwd", cwd+"-other", now, now.Add(time.Minute))
+	got := nativeDiscoverer(home).Discover("pi", cwd+string(filepath.Separator), 0)
+	if got == nil || got.SessionID != "authoritative-id" || got.SourcePath != want || got.Source != DiscoverySourceNativeStore {
+		t.Fatalf("discover old resumed pi session = %+v; want %q", got, want)
+	}
+	if omp := nativeDiscoverer(home).Discover("omp", cwd, 0); omp != nil {
+		t.Fatalf("pi store was mistaken for omp: %+v", omp)
+	}
+}
+
+func TestPiFlatStoreChecksCwdAndClaimedHeaderIdentity(t *testing.T) {
+	clearPiSessionEnvironment(t)
+	store, cwd := t.TempDir(), t.TempDir()
+	t.Setenv("PI_CODING_AGENT_SESSION_DIR", store)
+	now := time.Now().Add(-time.Second)
+	first := writePiTranscript(t, store, "renamed-first.jsonl", "first-header", cwd, now, now)
+	second := writePiTranscript(t, store, "renamed-second.jsonl", "second-header", cwd, now, now.Add(-time.Second))
+	writePiTranscript(t, store, "zzz-other.jsonl", "other-header", cwd+"-other", now, now.Add(time.Second))
+	claimed := map[string]bool{sessionClaimKey("omp", "first-header"): true}
+	got := newestPiSession(context.Background(), []string{store}, cwd, claimed)
+	if got == nil || got.SourcePath != first {
+		t.Fatalf("other provider claim excluded pi session: %+v", got)
+	}
+	claimed[sessionClaimKey("pi", "first-header")] = true
+	got = newestPiSession(context.Background(), []string{store}, cwd, claimed)
+	if got == nil || got.SourcePath != second {
+		t.Fatalf("claimed header identity not excluded: %+v", got)
+	}
+	if got := newestPiSession(context.Background(), []string{store}, cwd+"/child", nil); got != nil {
+		t.Fatalf("different cwd bound to transcript: %+v", got)
+	}
+	// Explicit stores still work when a home directory cannot be determined.
+	if got := nativeDiscoverer("").Discover("pi", cwd, 0); got == nil || got.SourcePath != first {
+		t.Fatalf("home-less override discovery = %+v", got)
+	}
+}
+
+func TestPiSessionRootsHonorPrecedenceAndRelativeDirectories(t *testing.T) {
+	env := map[string]string{}
+	getenv := func(name string) string { return env[name] }
+	check := func(sessionDir string, want []string) {
+		t.Helper()
+		if got := piSessionRoots("/home/user", "/work/project", getenv, sessionDir); !reflect.DeepEqual(got, want) {
+			t.Fatalf("pi roots = %v, want %v", got, want)
+		}
+	}
+	check("", []string{"/home/user/.pi/agent/sessions"})
+	env["PI_CODING_AGENT_DIR"] = "~/custom-agent"
+	check("", []string{"/home/user/custom-agent/sessions"})
+	env["PI_CODING_AGENT_SESSION_DIR"] = "transcripts"
+	check("", []string{"/work/project/transcripts"})
+	check("~/explicit-sessions", []string{"/home/user/explicit-sessions"})
+	check("~", []string{"/home/user"})
+
+	clearPiSessionEnvironment(t)
+	home, cwd := t.TempDir(), t.TempDir()
+	now := time.Now()
+	writePiTranscript(t, filepath.Join(home, ".pi", "agent", "sessions", "--project--"), "default.jsonl", "default-id", cwd, now, now)
+	t.Setenv("PI_CODING_AGENT_SESSION_DIR", filepath.Join(home, "missing-override"))
+	if got := nativeDiscoverer(home).Discover("pi", cwd, 0); got != nil {
+		t.Fatalf("missing override fell back to unrelated default store: %+v", got)
+	}
+}
+
+func TestPiInvalidHeadersAndNestedSubagentsAreIgnored(t *testing.T) {
+	store, cwd := t.TempDir(), t.TempDir()
+	now := time.Now()
+	valid := writePiTranscript(t, store, "valid.jsonl", "valid-id", cwd, now, now)
+	bad := []string{
+		"",
+		`{"type":"message","id":"looks-like-id","cwd":"/work"}`,
+		`{"type":"session","id":"","cwd":"/work"}`,
+		`{"type":"session","id":"safe-id","cwd":"relative/work"}`,
+		`{"type":"session","id":"../escape","cwd":"/work"}`,
+		`{"type":"session","id":"partial","cwd":`,
+		strings.Repeat(" ", piSessionHeaderLimit+1) + `{"type":"session","id":"oversized","cwd":"/work"}`,
+	}
+	for i, contents := range bad {
+		path := filepath.Join(store, "2026-10-23T20-00-00-000Z_fake-"+strconv.Itoa(i)+".jsonl")
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := readPiSessionHeader(path); ok || isProviderSessionFile("pi", path) {
+			t.Fatalf("malformed header %d accepted from filename", i)
+		}
+	}
+	writePiTranscript(t, filepath.Join(store, "project", "subagents"), "nested.jsonl", "subagent-id", cwd, now, now.Add(time.Hour))
+	if got := newestPiSession(context.Background(), []string{store}, cwd, nil); got == nil || got.SourcePath != valid {
+		t.Fatalf("invalid or nested transcript displaced valid main session: %+v", got)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := newestPiSession(ctx, []string{store}, cwd, nil); got != nil {
+		t.Fatalf("cancelled lookup returned %+v", got)
+	}
+}
+
+func TestPiProcessExecutableAndSelectors(t *testing.T) {
+	for _, argv := range [][]string{
+		{"pi"}, {"/usr/bin/pi", "--approve"}, {"node", "/usr/bin/pi"},
+		{"/usr/bin/node", "/usr/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"},
+		{"node", "/usr/lib/node_modules/@mariozechner/pi-coding-agent/dist/cli.js"},
+		{"node", "/usr/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"},
+		{"node", "/usr/lib/node_modules/@mariozechner/pi-coding-agent/dist/bundle/cli.js"},
+	} {
+		if !argvMatchesProvider("pi", argv) {
+			t.Errorf("real pi executable rejected: %q", argv)
+		}
+	}
+	for _, argv := range [][]string{
+		nil, {"pip", "install"}, {"ping"}, {"rg", "pi", "--session", "x"},
+		{"node", "api.py"}, {"bash", "-c", "pi"}, {"node", "unrelated.js", "pi"},
+	} {
+		if argvMatchesProvider("pi", argv) {
+			t.Errorf("unrelated process classified pi: %q", argv)
+		}
+	}
+	tests := []struct {
+		argv     []string
+		selector string
+		exact    bool
+		valid    bool
+	}{
+		{[]string{"pi", "--session-id", "custom.id"}, "custom.id", true, true},
+		{[]string{"pi", "--session-id=custom.id"}, "custom.id", true, true},
+		{[]string{"node", "/usr/bin/pi", "--session", "abc"}, "abc", false, true},
+		{[]string{"pi", "--session=abc"}, "abc", false, true},
+		{[]string{"pi", "--model", "--session", "prompt"}, "", false, true},
+		{[]string{"pi", "--", "--session", "prompt"}, "", false, true},
+		{[]string{"pi", "--resume"}, "", false, true},
+		{[]string{"pi", "-c"}, "", false, true},
+		{[]string{"pi", "--session"}, "", false, false},
+		{[]string{"pi", "--session", "--model"}, "", false, false},
+		{[]string{"pi", "--session-id", "../escape"}, "", false, false},
+		{[]string{"pi", "--session", "one", "--session-id", "two"}, "", false, false},
+		{[]string{"pi", "--resume", "--session", "one"}, "", false, false},
+		{[]string{"pi", "--session", "one", "--no-session"}, "", false, false},
+		{[]string{"pi", "--extension-option", "--session", "prompt"}, "", false, false},
+	}
+	for _, tc := range tests {
+		got, ok := piProcessSelection(tc.argv)
+		if ok != tc.valid || ok && (got.selector != tc.selector || got.exact != tc.exact) {
+			t.Errorf("piProcessSelection(%q) = %+v, %v", tc.argv, got, ok)
+		}
+	}
+	if got := resumedSessionID("pi", []string{"pi", "--session", "ambiguous-prefix"}); got != "" {
+		t.Fatalf("unresolved prefix persisted as exact identity: %q", got)
+	}
+}
+
+func TestPiSelectorResolutionUsesHeaderAndRejectsAmbiguity(t *testing.T) {
+	store, cwd := t.TempDir(), t.TempDir()
+	now := time.Now()
+	one := writePiTranscript(t, store, "filename-disagrees.jsonl", "prefix-one", cwd, now, now)
+	if got := resumedSessionID("pi", []string{"pi", "--session", one}); got != "prefix-one" {
+		t.Fatalf("explicit path identity = %q; want authoritative header", got)
+	}
+	resolve := func(value string, exact bool) *Info {
+		return resolvePiSelector(context.Background(), []string{store}, "", cwd, piSelection{selector: value, exact: exact})
+	}
+	if got := resolve(one, false); got == nil || got.SessionID != "prefix-one" {
+		t.Fatalf("explicit path lost the matching header identity: %+v", got)
+	}
+	foreign := writePiTranscript(t, store, "foreign.jsonl", "foreign-id", cwd+"-other", now, now)
+	if got := resolve(foreign, false); got != nil {
+		t.Fatalf("explicit path bound another workspace to the pane: %+v", got)
+	}
+	relative, err := filepath.Rel(cwd, one)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resolve(relative, false); got == nil || got.SourcePath != one {
+		t.Fatalf("relative path did not resolve against process cwd: %+v", got)
+	}
+	if got := resolve("prefix", false); got == nil || got.SessionID != "prefix-one" {
+		t.Fatalf("unique prefix did not resolve: %+v", got)
+	}
+	if got := resolve("prefix", true); got != nil {
+		t.Fatalf("exact --session-id used a prefix: %+v", got)
+	}
+	writePiTranscript(t, store, "two.jsonl", "prefix-two", cwd, now, now)
+	if got := resolve("prefix", false); got != nil {
+		t.Fatalf("ambiguous prefix guessed a session: %+v", got)
+	}
+	if got := resolve("prefix-one", false); got == nil || got.SourcePath != one {
+		t.Fatalf("exact ID lost to prefix candidates: %+v", got)
+	}
+	writePiTranscript(t, store, "duplicate.jsonl", "prefix-one", cwd, now, now)
+	if got := resolve("prefix-one", true); got != nil {
+		t.Fatalf("duplicate authoritative ID guessed a transcript: %+v", got)
+	}
+	if got := processNodeSession("pi", "pi", []string{"pi", "--session", "missing"}, func() []string { return []string{one} }); got != nil {
+		t.Fatalf("unresolved explicit selector fell back to open unrelated transcript: %+v", got)
+	}
+}
+
+func TestPiLiveProcessFailureNeverFallsBackToNewestTranscript(t *testing.T) {
+	clearPiSessionEnvironment(t)
+	home, cwd := t.TempDir(), t.TempDir()
+	now := time.Now()
+	writePiTranscript(t, filepath.Join(home, ".pi", "agent", "sessions", "--project--"), "unrelated.jsonl", "unrelated-id", cwd, now, now)
+	d := nativeDiscoverer(home)
+	d.findProcessSession = func(context.Context, string, string, string, int) *Info {
+		return nil // Inaccessible process, missing selected file, or ambiguous ID.
+	}
+	if got := d.Discover("pi", cwd, 123); got != nil {
+		t.Fatalf("failed live binding replaced by newest native transcript: %+v", got)
+	}
+}
+
+func TestPiStartupBindingIsBoundedAndReportsNativeEvidence(t *testing.T) {
+	store, cwd := t.TempDir(), t.TempDir()
+	started := time.Now().Add(-time.Minute).Truncate(time.Millisecond)
+	writePiTranscript(t, store, "older.jsonl", "older-id", cwd, started.Add(-time.Hour), time.Now())
+	want := writePiTranscript(t, store, "started.jsonl", "started-id", cwd, started.Add(time.Second), time.Now())
+	got := piSessionNearProcessStart(context.Background(), []string{store}, cwd, started.UnixMilli())
+	if got == nil || got.SourcePath != want || got.Source != DiscoverySourceNativeStore {
+		t.Fatalf("startup session evidence = %+v", got)
+	}
+	writePiTranscript(t, store, "concurrent.jsonl", "concurrent-id", cwd, started.Add(2*time.Second), time.Now())
+	if got := piSessionNearProcessStart(context.Background(), []string{store}, cwd, started.UnixMilli()); got != nil {
+		t.Fatalf("ambiguous concurrent startup bound to %+v", got)
+	}
+}
+
+func TestPiStartupCorrelationDoesNotBecomeExactProcessBinding(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("native process inspection is supported on Linux and macOS")
+	}
+	sleep, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("sleep is unavailable for the process fixture")
+	}
+	home, cwd, store := t.TempDir(), t.TempDir(), t.TempDir()
+	// A real process with pi's argv shape and initial environment exercises
+	// both public binding surfaces without needing a configured model API.
+	cmd := exec.CommandContext(t.Context(), sleep, "30")
+	cmd.Args[0] = "pi"
+	cmd.Dir = cwd
+	cmd.Env = append(os.Environ(), "HOME="+home, "PI_CODING_AGENT_DIR=", "PI_CODING_AGENT_SESSION_DIR="+store)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	waitForCmdline(t, cmd.Process.Pid)
+	now := time.Now()
+	writePiTranscript(t, store, "recent.jsonl", "recent-id", cwd, now, now)
+	got := NewDiscoverer().DiscoverContext(t.Context(), "pi", cwd, cmd.Process.Pid)
+	if got == nil || got.SessionID != "recent-id" || got.Source != DiscoverySourceNativeStore {
+		t.Fatalf("best-effort startup capture = %+v", got)
+	}
+	if exact := DiscoverProcessSession(t.Context(), "pi", cmd.Process.Pid); exact != nil {
+		t.Fatalf("native startup correlation promoted to exact identity: %+v", exact)
+	}
+}
+
+func TestPiResumePreservesSettingsAndRejectsOtherModes(t *testing.T) {
+	tests := []struct{ launch, want string }{
+		{`PI_SKIP_VERSION_CHECK='1' pi --no-approve --model 'provider/custom' --thinking high --append-system-prompt '/work/persona.md'`,
+			`PI_SKIP_VERSION_CHECK='1' pi --no-approve --model 'provider/custom' --thinking high --append-system-prompt '/work/persona.md' --session 'new-id'`},
+		{`pi --approve --session=old-id --thinking high`, `pi --approve --session 'new-id' --thinking high`},
+		{`pi --session-id old-id --session-dir '/work/my sessions'`, `pi --session 'new-id' --session-dir '/work/my sessions'`},
+		{`pi --session-id=old-id --model custom`, `pi --session 'new-id' --model custom`},
+	}
+	for _, tc := range tests {
+		got, err := ResumeLaunchCommand("pi", "new-id", tc.launch, ResumeLaunchOptions{})
+		if err != nil || got != tc.want {
+			t.Errorf("resume %q = %q, %v; want %q", tc.launch, got, err, tc.want)
+		}
+	}
+	for _, launch := range []string{
+		"pi --resume", "pi -r", "pi --resume old-id", "pi --continue", "pi -c",
+		"pi --fork old-id", "pi --no-session", "pi --print", "pi -p",
+		"pi --mode rpc", "pi --export file.jsonl", "pi --list-models",
+		"pi --session one --session-id two", "pi --session",
+	} {
+		if got, err := ResumeLaunchCommand("pi", "new-id", launch, ResumeLaunchOptions{}); err == nil {
+			t.Errorf("ambiguous/noninteractive launch %q accepted as %q", launch, got)
+		}
+	}
+}
+
+func TestPinPiLaunchSessionPreservesSelectionsAndAllocatesDistinctIdentities(t *testing.T) {
+	for _, command := range []string{
+		"pi --session chosen", "pi --session-id already-pinned", "pi --session-id=already-pinned",
+		"pi --resume", "pi -r", "pi --continue", "pi -c", "pi --no-session", "pi --fork original",
+		"pi --mode rpc", "pi --print", "pi --export session.jsonl", "pi --session",
+		"pi -- initial-message", "pi 'initial message'", "pi --unknown option",
+		"env CUSTOM=value pi", "pi | tee capture.log", "exec pi", "omp --auto-approve",
+		"node /usr/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+	} {
+		if got := PinPiLaunchSession(command); got != command {
+			t.Errorf("launch %q changed to %q", command, got)
+		}
+	}
+	command := `PI_CODING_AGENT_SESSION_DIR='/work/sessions' /usr/bin/pi --no-approve --model 'provider/model' --thinking high --append-system-prompt '/work/persona.md'`
+	seen := make(map[string]bool)
+	for i := 0; i < 2; i++ {
+		pinned := PinPiLaunchSession(command)
+		if !strings.HasPrefix(pinned, command+" --session-id ") {
+			t.Fatalf("launch settings changed: %q", pinned)
+		}
+		words, err := shellword.Literal(pinned)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := words[len(words)-1].Value
+		if !piSessionIDPattern.MatchString(id) || !strings.HasPrefix(id, "ntm-") || seen[id] {
+			t.Fatalf("invalid or repeated per-pane session ID %q", id)
+		}
+		seen[id] = true
+		if replay := PinPiLaunchSession(pinned); replay != pinned {
+			t.Fatalf("replaying a launch replaced its identity: %q", replay)
+		}
+		resumed, err := ResumeLaunchCommand("pi", "/work/existing.jsonl", pinned, ResumeLaunchOptions{})
+		if err != nil || resumed != command+" --session '/work/existing.jsonl'" {
+			t.Fatalf("native resume did not replace the pinned selector: %q, %v", resumed, err)
+		}
+	}
+}
+
+func TestResolvePiResumeSessionValidatesExactBindingAndLaunchStore(t *testing.T) {
+	clearPiSessionEnvironment(t)
+	home, cwd, store := t.TempDir(), t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	now := time.Now()
+	want := writePiTranscript(t, store, "renamed-session.jsonl", "saved-id", cwd, now, now)
+	launch := "PI_CODING_AGENT_SESSION_DIR=" + shellQuote(store) + " pi --no-approve --model 'provider/model' --thinking high"
+	path, err := ResolvePiResumeSession(context.Background(), "saved-id", launch, cwd, "")
+	if err != nil || path != want {
+		t.Fatalf("resolve saved pi binding = %q, %v; want %q", path, err, want)
+	}
+	resume, err := ResumeLaunchCommand("pi", path, launch, ResumeLaunchOptions{})
+	if err != nil || !strings.Contains(resume, "--session "+shellQuote(want)) || strings.Contains(resume, "--approve") {
+		t.Fatalf("resolved launch did not preserve trust/settings: %q, %v", resume, err)
+	}
+	for _, tc := range []struct{ id, command, cwd string }{
+		{"saved", launch, cwd}, // saved bindings are exact, never prefixes
+		{"missing", launch, cwd},
+		{"saved-id", launch, cwd + "-other"},
+		{"saved-id", "pi --session-dir " + shellQuote(filepath.Join(store, "missing")), cwd},
+		{"saved-id", "pi --session " + shellQuote(filepath.Join(store, "missing.jsonl")), cwd + "-other"},
+		{"saved-id", "pi --no-session", cwd},
+		{"saved-id", "pi; echo unsafe", cwd},
+	} {
+		if got, err := ResolvePiResumeSession(context.Background(), tc.id, tc.command, tc.cwd, ""); err == nil {
+			t.Errorf("invalid resume %+v resolved to %q", tc, got)
+		}
+	}
+	// An explicit renamed transcript remains usable without any environment
+	// override, but its authoritative header must match the saved binding.
+	direct := "pi --session " + shellQuote(want)
+	if got, err := ResolvePiResumeSession(context.Background(), "saved-id", direct, cwd, ""); err != nil || got != want {
+		t.Fatalf("direct saved transcript = %q, %v", got, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := ResolvePiResumeSession(ctx, "saved-id", launch, cwd, ""); err != context.Canceled {
+		t.Fatalf("cancelled preflight = %v", err)
+	}
+}
+
+func TestResolvePiResumeSessionDoesNotSubstituteForCapturedTranscript(t *testing.T) {
+	clearPiSessionEnvironment(t)
+	cwd, original, ambient := t.TempDir(), t.TempDir(), t.TempDir()
+	now := time.Now()
+	captured := writePiTranscript(t, original, "renamed.jsonl", "saved-id", cwd, now, now)
+	writePiTranscript(t, ambient, "same-id-different-store.jsonl", "saved-id", cwd, now, now)
+	t.Setenv("PI_CODING_AGENT_SESSION_DIR", ambient)
+	command := "pi --session-id saved-id --model provider/model --thinking high"
+	if got, err := ResolvePiResumeSession(t.Context(), "saved-id", command, cwd, captured); err != nil || got != captured {
+		t.Fatalf("captured transcript was replaced by ambient store: %q, %v", got, err)
+	}
+	wrongID := writePiTranscript(t, original, "wrong-id.jsonl", "different-id", cwd, now, now)
+	wrongCwd := writePiTranscript(t, original, "wrong-cwd.jsonl", "saved-id", t.TempDir(), now, now)
+	for _, path := range []string{filepath.Join(original, "missing.jsonl"), wrongID, wrongCwd, "relative.jsonl"} {
+		if got, err := ResolvePiResumeSession(t.Context(), "saved-id", command, cwd, path); err == nil {
+			t.Errorf("invalid captured reference %q silently resolved to %q", path, got)
+		}
+	}
+	if got, err := ResolvePiResumeSession(t.Context(), "saved-id", "pi; echo unsafe", cwd, captured); err == nil {
+		t.Errorf("captured reference bypassed launch validation: %q", got)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := ResolvePiResumeSession(ctx, "saved-id", command, cwd, captured); err != context.Canceled {
+		t.Fatalf("captured reference ignored cancellation: %v", err)
+	}
+}
+
+func TestPiProcessEnvironmentBinding(t *testing.T) {
+	// The child gets a real initial process environment: /proc/environ does
+	// not necessarily reflect later os.Setenv changes in the parent process.
+	if os.Getenv("NTM_PI_BINDING_TEST_CHILD") == "1" {
+		home, _ := os.UserHomeDir()
+		argv := []string{"pi", "--session", os.Getenv("NTM_PI_BINDING_TEST_SELECTOR")}
+		if dir := os.Getenv("NTM_PI_BINDING_TEST_SESSION_DIR"); dir != "" {
+			argv = append(argv, "--session-dir", dir)
+		}
+		info := discoverPiProcess(context.Background(), "pi", home, os.Getpid(), argv)
+		result := struct {
+			ID, Path, Provider string
+			Source             DiscoverySource
+		}{}
+		if info != nil {
+			result.ID, result.Path, result.Provider, result.Source = info.SessionID, info.SourcePath, info.Provider, info.Source
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("process transcript discovery uses Linux procfs or macOS process inspection")
+	}
+	clearPiSessionEnvironment(t)
+	home, cwd, envStore, argStore := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
+	now := time.Now()
+	envPath := writePiTranscript(t, envStore, "env.jsonl", "selected-id", cwd, now, now)
+	argPath := writePiTranscript(t, argStore, "arg.jsonl", "selected-id", cwd, now, now)
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ selector, sessionDir, want string }{
+		{"selected-id", "", envPath},
+		{"selected-id", argStore, argPath},
+		{"missing-id", "", ""},
+	} {
+		cmd := exec.Command(binary, "-test.run=^TestPiProcessEnvironmentBinding$")
+		cmd.Dir = cwd
+		cmd.Env = append(os.Environ(),
+			"HOME="+home, "PI_CODING_AGENT_SESSION_DIR="+envStore,
+			"NTM_PI_BINDING_TEST_CHILD=1",
+			"NTM_PI_BINDING_TEST_SELECTOR="+tc.selector,
+			"NTM_PI_BINDING_TEST_SESSION_DIR="+tc.sessionDir,
+		)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("pi process environment helper: %v\n%s", err, output)
+		}
+		var got struct {
+			ID, Path, Provider string
+			Source             DiscoverySource
+		}
+		if err := json.NewDecoder(strings.NewReader(string(output))).Decode(&got); err != nil {
+			t.Fatalf("decode helper binding: %v\n%s", err, output)
+		}
+		if got.Path != tc.want || tc.want != "" && (got.ID != "selected-id" || got.Provider != "pi" || got.Source != DiscoverySourceProcessTree) {
+			t.Fatalf("process selection %+v = %+v", tc, got)
+		}
 	}
 }

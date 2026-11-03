@@ -222,7 +222,7 @@ func (c *SessionCoordinator) SendDigest(ctx context.Context) error {
 
 	// Send to human
 	_, err := c.mailClient.SendMessage(ctx, agentmail.SendMessageOptions{
-		ProjectKey:  c.mailProjectKey,
+		ProjectKey:  c.projectKey,
 		SenderName:  c.agentName,
 		To:          []string{c.config.HumanAgent},
 		Subject:     fmt.Sprintf("Session Digest: %s", c.session),

@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -32,6 +33,7 @@ const (
 	ErrPromptDeliveryUnsupported ErrorCode = "prompt_delivery_unsupported"
 	ErrProtocol                  ErrorCode = "protocol_failed"
 	ErrLifecycle                 ErrorCode = "lifecycle_failed"
+	ErrRotationPending           ErrorCode = "rotation_pending"
 	ErrPacing                    ErrorCode = "pacing_failed"
 	ErrDelivery                  ErrorCode = "delivery_failed"
 	ErrAlreadyDispatched         ErrorCode = "already_dispatched"
@@ -88,7 +90,7 @@ type Request struct {
 	Delay                 time.Duration
 	StopOnFailure         bool
 	DryRun                bool
-	// ClearInput performs the per-agent composer clear (Escape ritual + C-u)
+	// ClearInput performs the per-agent composer clear (agent-specific keys)
 	// and verifies emptiness before typing the prompt (ntm-5p0b / AP-16):
 	// codex TUIs concatenate a fresh send onto leftover buffer text after an
 	// interrupt, corrupting both.
@@ -346,30 +348,38 @@ func RefuseDeadAgentPane(pane tmux.Pane) error {
 		pane.Ref().Physical(), pane.Title, pane.Command)
 }
 
+// GuaranteeNoDeliveryActuation marks a delivery failure that provably happened
+// BEFORE any byte of the message was typed into the target. Only such a failure
+// is safe for a caller with a durable idempotency barrier to retry; everything
+// after the first keystroke stays outcome-unknown and fails closed.
+func GuaranteeNoDeliveryActuation(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &guaranteedNoDeliveryActuationError{err: err}
+}
+
+// IsGuaranteedNoDeliveryActuation reports whether err is marked as having
+// happened before any actuation.
+func IsGuaranteedNoDeliveryActuation(err error) bool {
+	var marked *guaranteedNoDeliveryActuationError
+	return errors.As(err, &marked)
+}
+
+type guaranteedNoDeliveryActuationError struct{ err error }
+
+func (e *guaranteedNoDeliveryActuationError) Error() string { return e.err.Error() }
+func (e *guaranteedNoDeliveryActuationError) Unwrap() error { return e.err }
+
 func (TMUXDeliverer) Deliver(ctx context.Context, delivery Delivery) error {
 	if err := contextError(ctx); err != nil {
 		return err
 	}
 	if err := validateTMUXDeliveryProtocol(delivery); err != nil {
-		return err
+		return GuaranteeNoDeliveryActuation(err)
 	}
-	if err := RefuseDeadAgentPane(delivery.Target.Pane); err != nil {
-		return err
-	}
-	target := delivery.Target.Ref.ID
-	if target == "" {
-		target = fmt.Sprintf("%s:%s", delivery.Session, delivery.Target.Ref.Physical())
-	}
-	// Fail closed on panes that cannot accept typed input yet (bd-dp9oy):
-	// a Claude/codex TUI still initializing, or showing a trust dialog or
-	// menu instead of its input box, silently swallows pasted prompts while
-	// the send reports success. The check fails open on capture problems and
-	// unknown agent types, so it can only refuse when the screen positively
-	// shows neither a composer nor working-state chrome.
-	if ready, reason := tmux.ComposerReadyForDelivery(ctx, target, delivery.Target.AgentType, delivery.Target.Pane.Width); !ready {
-		return fmt.Errorf("pane %s not ready for delivery: %s", target, reason)
-	}
-	if err := ClearComposerForDelivery(ctx, target, delivery); err != nil {
+	target, err := PrepareTMUXDelivery(ctx, delivery)
+	if err != nil {
 		return err
 	}
 	switch delivery.Protocol {
@@ -387,6 +397,79 @@ func (TMUXDeliverer) Deliver(ctx context.Context, delivery Delivery) error {
 	}
 }
 
+// PrepareTMUXDelivery checks the shared live-agent and composer gates before
+// any message bytes are sent. Pipelines call this same preflight around their
+// durable send intent while retaining ownership of paste and verification.
+// Every error guarantees no message actuation, so a still-live owner may
+// durably record non-delivery for its own intent; an interrupted owner cannot.
+func PrepareTMUXDelivery(ctx context.Context, delivery Delivery) (string, error) {
+	if err := contextError(ctx); err != nil {
+		return "", GuaranteeNoDeliveryActuation(err)
+	}
+	if err := RefuseDeadAgentPane(delivery.Target.Pane); err != nil {
+		return "", GuaranteeNoDeliveryActuation(err)
+	}
+	if delivery.Target.Pane.RotationToken != "" {
+		return "", GuaranteeNoDeliveryActuation(rotationPendingError(delivery.Target))
+	}
+	target := delivery.Target.Ref.ID
+	if target == "" {
+		target = fmt.Sprintf("%s:%s", delivery.Session, delivery.Target.Ref.Physical())
+	}
+	// A prepared plan may predate the rotation's quarantine. Re-read the
+	// physical pane before composer clearing or any message bytes, and never
+	// treat a failed metadata read as proof that delivery is safe.
+	rotationToken, err := tmux.ReadPaneRotationTokenContext(ctx, target)
+	if err != nil {
+		return "", GuaranteeNoDeliveryActuation(fmt.Errorf("verify pane rotation quarantine: %w", err))
+	}
+	if rotationToken != "" {
+		return "", GuaranteeNoDeliveryActuation(rotationPendingError(delivery.Target))
+	}
+	// An unnumbered trust menu can reuse the composer's cursor (GH#325),
+	// while Antigravity has no composer detector at all. Check the actual
+	// decision frame BEFORE composer clearing or any prompt bytes: text
+	// containing 'n' can otherwise quit Grok straight into the user's shell.
+	// This refusal is retry-safe; explicit dialog answers use a different
+	// surface and do not pass through normal prompt delivery.
+	canonical := delivery.Target.AgentType.Canonical()
+	if canonical.IsValid() && canonical != tmux.AgentUser && canonical != tmux.AgentUnknown {
+		capture, captureErr := tmux.CapturePaneVisibleContext(ctx, target)
+		if err := contextError(ctx); err != nil {
+			return "", GuaranteeNoDeliveryActuation(err)
+		}
+		if captureErr == nil && agent.TrustDialogVisible(capture) {
+			return "", GuaranteeNoDeliveryActuation(fmt.Errorf(
+				"PANE_INTERACTIVE_GATE: pane %s is showing a workspace trust dialog; no prompt or clearing keys were sent; inspect with --robot-dialogs and explicitly answer with --robot-answer-dialog before retrying", target))
+		}
+	}
+	// --clear-input may safely leave Codex transcript browsing with one
+	// Escape; readiness is checked again after that verified recovery.
+	if canonical == tmux.AgentCodex {
+		if err := ClearComposerForDelivery(ctx, target, delivery); err != nil {
+			return "", GuaranteeNoDeliveryActuation(err)
+		}
+	}
+	// Fail closed on panes that cannot accept typed input yet (bd-dp9oy):
+	// a Claude/codex TUI still initializing, or showing a trust dialog or
+	// menu instead of its input box, silently swallows pasted prompts while
+	// the send reports success. The check fails open on capture problems and
+	// unknown agent types, so it can only refuse when the screen positively
+	// shows neither a composer nor working-state chrome.
+	if ready, reason := tmux.ComposerReadyForDelivery(ctx, target, delivery.Target.AgentType, delivery.Target.Pane.Width); !ready {
+		return "", GuaranteeNoDeliveryActuation(fmt.Errorf("pane %s not ready for delivery: %s", target, reason))
+	}
+	if canonical != tmux.AgentCodex {
+		if err := ClearComposerForDelivery(ctx, target, delivery); err != nil {
+			return "", GuaranteeNoDeliveryActuation(err)
+		}
+	}
+	if err := contextError(ctx); err != nil {
+		return "", GuaranteeNoDeliveryActuation(err)
+	}
+	return target, nil
+}
+
 // ClearComposerForDelivery runs the pre-send composer clear when the
 // delivery requests it (ntm-5p0b). A composer that POSITIVELY still holds
 // text after the clear is a distinct hard failure — typing into it would
@@ -401,14 +484,40 @@ func ClearComposerForDelivery(ctx context.Context, target string, delivery Deliv
 	if canonical == tmux.AgentUser || canonical == tmux.AgentUnknown || !canonical.IsValid() {
 		return nil
 	}
-	cleared, verified, err := tmux.ClearComposerContext(ctx, target, delivery.Target.AgentType)
+	result, err := tmux.ClearComposerContext(ctx, target, delivery.Target.AgentType)
 	if err != nil {
 		return fmt.Errorf("COMPOSER_CLEAR_FAILED: pane %s: %w", delivery.Target.Ref.Physical(), err)
 	}
-	if !cleared && verified {
-		return fmt.Errorf("COMPOSER_NOT_CLEARED: pane %s composer still holds text after the clear sequence; inspect with --robot-tail before resending", delivery.Target.Ref.Physical())
+	if !result.Cleared && result.Verified {
+		return fmt.Errorf("COMPOSER_NOT_CLEARED: pane %s %s; inspect with --robot-tail before resending",
+			delivery.Target.Ref.Physical(), composerBlockerDetail(result))
 	}
 	return nil
+}
+
+// composerBlockerDetail renders the typed reason a composer could not be
+// cleared. "Still holds text" was the only thing --clear-input could ever say,
+// which left operators unable to tell ordinary stranded input from queued
+// messages from a pane parked on a modal (ntm#300).
+func composerBlockerDetail(result tmux.ComposerClearResult) string {
+	switch result.Blocker {
+	case tmux.ComposerBlockerModal:
+		if result.Residual != "" {
+			return fmt.Sprintf("is showing %s; no prompt or Enter was sent; return with Escape before retrying", result.Residual)
+		}
+		return "is showing a dialog or picker, not an input box, so the composer was not touched (answering it needs a deliberate keystroke)"
+	case tmux.ComposerBlockerQueued:
+		return fmt.Sprintf("still reports queued messages after %d clear rounds; a new prompt would not be the next thing the agent processes", result.Rounds)
+	default:
+		residual := strings.TrimSpace(result.Residual)
+		if runes := []rune(residual); len(runes) > 120 {
+			residual = string(runes[:120]) + "…"
+		}
+		if residual == "" {
+			return fmt.Sprintf("composer still holds text after %d clear rounds", result.Rounds)
+		}
+		return fmt.Sprintf("composer still holds text after %d clear rounds: %q", result.Rounds, residual)
+	}
 }
 
 // VerifyAgentSubmission closes the gap between "keys were sent" and "the
@@ -441,10 +550,25 @@ func VerifyAgentSubmission(ctx context.Context, target, message string, agentTyp
 	case tmux.AgentGrok:
 		kind = "grok"
 		confirmed, rescued, err = tmux.VerifyGrokSubmissionContext(ctx, target, message, paneWidth)
+	case tmux.AgentOmp:
+		kind = "omp"
+		confirmed, rescued, err = tmux.VerifyOmpSubmissionContext(ctx, target, message, paneWidth)
+	case tmux.AgentOpencode:
+		kind = "opencode"
+		confirmed, rescued, err = tmux.VerifyOpencodeSubmissionContext(ctx, target, message, paneWidth)
 	default:
 		return nil
 	}
 	if err != nil {
+		// A lifecycle fence refusing a rescue key is an authoritative loss of
+		// the target, not an inconclusive screen capture. Preserve the failure
+		// so restart/assignment cannot report delivery to a replacement pane.
+		if errors.Is(err, tmux.ErrPaneIdentityChanged) {
+			return err
+		}
+		if errors.Is(err, tmux.ErrCodexTranscriptBrowsing) {
+			return fmt.Errorf("pane %s: %w", target, err)
+		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -923,6 +1047,9 @@ func PlanTargets(req Request) ([]Target, error) {
 		if !req.IncludeUser && !explicitPolicy && pane.Type.Canonical() == tmux.AgentUser {
 			continue
 		}
+		if pane.RotationToken != "" {
+			return nil, rotationPendingError(targetFromPane(pane, multiWindow))
+		}
 		if _, duplicate := seen[stableKey]; duplicate {
 			continue
 		}
@@ -933,6 +1060,12 @@ func PlanTargets(req Request) ([]Target, error) {
 		return nil, &Error{Code: ErrNoTargets, Err: errors.New("no panes matched the target policy")}
 	}
 	return targets, nil
+}
+
+func rotationPendingError(target Target) error {
+	copy := cloneTarget(target)
+	return &Error{Code: ErrRotationPending, Target: &copy, Err: fmt.Errorf(
+		"pane %s has an unresolved context rotation; resolve the pending rotation before sending new work", target.Ref.ID)}
 }
 
 // ValidatePromptDeliveryTargets rejects agents whose prompt-delivery protocol
@@ -975,7 +1108,8 @@ func canonicalizePanes(input []tmux.Pane) ([]tmux.Pane, error) {
 func samePaneSnapshot(a, b tmux.Pane) bool {
 	if a.ID != b.ID || a.Index != b.Index || a.WindowIndex != b.WindowIndex || a.NTMIndex != b.NTMIndex ||
 		a.Title != b.Title || a.Type != b.Type || a.Variant != b.Variant || a.Command != b.Command ||
-		a.Width != b.Width || a.Height != b.Height || a.Active != b.Active || a.PID != b.PID || len(a.Tags) != len(b.Tags) {
+		a.Width != b.Width || a.Height != b.Height || a.Active != b.Active || a.PID != b.PID ||
+		a.RotationToken != b.RotationToken || len(a.Tags) != len(b.Tags) {
 		return false
 	}
 	for i := range a.Tags {

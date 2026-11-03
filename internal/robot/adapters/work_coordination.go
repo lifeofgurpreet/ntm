@@ -8,13 +8,17 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/handoff"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
+	"github.com/Dicklesworthstone/ntm/internal/reservationpath"
 	"github.com/Dicklesworthstone/ntm/internal/tracker"
+	"github.com/Dicklesworthstone/ntm/internal/worksource"
 )
 
 const (
@@ -36,6 +40,8 @@ type WorkSection struct {
 	Graph      *WorkGraph   `json:"graph,omitempty"`
 	Available  bool         `json:"available"`
 	Reason     string       `json:"reason,omitempty"`
+
+	Verification *WorkVerification `json:"verification,omitempty"`
 }
 
 // WorkItem is a normalized bead record suitable for robot surfaces.
@@ -224,10 +230,15 @@ type WorkCoordinationAdapterConfig struct {
 	ConflictWindow            time.Duration
 	MailBacklogThreshold      int
 	AgentMailClient           *agentmail.Client
+
+	VerificationPolicy WorkVerificationPolicy
 }
 
 // DefaultWorkCoordinationAdapterConfig returns conservative defaults.
 func DefaultWorkCoordinationAdapterConfig(projectDir string) WorkCoordinationAdapterConfig {
+	// Snapshots verify work under the same [assign.work_source] policy that
+	// dispatch applies, so they never advertise work dispatch would refuse.
+	policy := bv.WorkSourcePolicyForProject(projectDir)
 	return WorkCoordinationAdapterConfig{
 		ProjectDir:                projectDir,
 		WorkItemLimit:             defaultWorkItemLimit,
@@ -235,6 +246,10 @@ func DefaultWorkCoordinationAdapterConfig(projectDir string) WorkCoordinationAda
 		ReservationExpiringWithin: defaultReservationExpiringWithin,
 		ConflictWindow:            defaultConflictWindow,
 		MailBacklogThreshold:      defaultMailBacklogThreshold,
+		VerificationPolicy: WorkVerificationPolicy{
+			Source:        worksource.Policy{RequiredRef: policy.RequiredRef, RequireClean: policy.RequireClean},
+			ProgramLabels: policy.ProgramLabels,
+		},
 	}
 }
 
@@ -298,7 +313,7 @@ func (a *WorkCoordinationAdapter) Collect(ctx context.Context) (*SignalBatch, er
 		ctx = context.Background()
 	}
 	now := time.Now()
-	work, workErr := a.collectWork(ctx)
+	work, workErr := a.collectVerifiedWork(ctx)
 	coordination := a.collectCoordination(ctx, now)
 
 	batch := &SignalBatch{
@@ -307,22 +322,40 @@ func (a *WorkCoordinationAdapter) Collect(ctx context.Context) (*SignalBatch, er
 		Work:         work,
 		Coordination: coordination,
 	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		a.lastErr = ctxErr
-		return batch, ctxErr
-	}
+	// Work and coordination degrade independently (#285). A deadline that
+	// expires during Agent Mail enrichment must not discard a Beads work
+	// section that already completed — that turned slow mail history into a
+	// false "queue dry" status. collectWork surfaces its own context errors;
+	// collectCoordination degrades in-section (Available=false + Reason).
 	if workErr != nil {
 		a.lastErr = workErr
 		return batch, workErr
 	}
 
 	if (work == nil || !work.Available) && (coordination == nil || !coordination.Available) {
-		a.lastErr = fmt.Errorf("work/coordination sources unavailable")
+		a.lastErr = sourcesUnavailableError(work, coordination)
 		return batch, a.lastErr
 	}
 
 	a.lastErr = nil
 	return batch, nil
+}
+
+// sourcesUnavailableError names why neither section could be collected. The
+// per-section reasons ("br stats failed: …", "agent mail unavailable") are
+// what an operator needs to act on; a bare "sources unavailable" reached the
+// persisted source-health row and the snapshot as the only diagnostic while
+// the tracker itself was readable (#283, 2026-09-04 report).
+func sourcesUnavailableError(work *WorkSection, coordination *CoordinationSection) error {
+	workReason := "work section missing"
+	if work != nil {
+		workReason = firstNonEmpty(strings.TrimSpace(work.Reason), "work data unavailable")
+	}
+	coordinationReason := "coordination section missing"
+	if coordination != nil {
+		coordinationReason = firstNonEmpty(strings.TrimSpace(coordination.Reason), "coordination data unavailable")
+	}
+	return fmt.Errorf("work/coordination sources unavailable (work: %s; coordination: %s)", workReason, coordinationReason)
 }
 
 // LastError returns the most recent collection failure.
@@ -331,7 +364,10 @@ func (a *WorkCoordinationAdapter) LastError() error {
 }
 
 func (a *WorkCoordinationAdapter) collectWork(ctx context.Context) (*WorkSection, error) {
-	triage, _ := bv.GetTriageContext(ctx, a.config.ProjectDir)
+	triage, triageErr := bv.GetTriageContext(ctx, a.config.ProjectDir)
+	if isStaleWorkSourceError(triageErr) {
+		return rejectWorkSource(nil, triageErr), triageErr
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -360,7 +396,9 @@ func (a *WorkCoordinationAdapter) collectCoordination(ctx context.Context, now t
 		ctx = context.Background()
 	}
 	inputs := CoordinationInputs{
-		FileConflicts:             tracker.DetectConflictsRecent(a.config.ConflictWindow),
+		// Scoped to the configured project, not the process working directory:
+		// this adapter runs wherever the caller happens to be.
+		FileConflicts:             tracker.ConflictsForProject(a.config.ProjectDir, a.config.ConflictWindow),
 		Handoff:                   latestHandoff(a.config.ProjectDir, a.config.SessionName),
 		ThreadStaleAfter:          a.config.ThreadStaleAfter,
 		ReservationExpiringWithin: a.config.ReservationExpiringWithin,
@@ -378,30 +416,94 @@ func (a *WorkCoordinationAdapter) collectCoordination(ctx context.Context, now t
 	if err != nil {
 		inputs.Reason = fmt.Sprintf("list_agents failed: %v", err)
 	} else {
-		inputs.InboxByAgent = make(map[string][]agentmail.InboxMessage)
+		names := make([]string, 0, len(agents))
 		for _, agent := range agents {
 			if agent.Name == "HumanOverseer" {
 				continue
 			}
-			inbox, err := client.FetchInbox(ctx, agentmail.FetchInboxOptions{
-				ProjectKey:    a.config.ProjectDir,
-				AgentName:     agent.Name,
-				Limit:         25,
-				IncludeBodies: true,
-			})
-			if err != nil {
-				continue
-			}
-			inputs.InboxByAgent[agent.Name] = inbox
+			names = append(names, agent.Name)
+		}
+		inboxes, timedOut := a.fetchInboxes(ctx, client, names)
+		inputs.InboxByAgent = inboxes
+		if timedOut {
+			// Partial results stay usable, but the section must say so: mail
+			// counts derived from a cut-short sweep are a floor, not a total.
+			inputs.Reason = fmt.Sprintf("agent mail inbox enrichment timed out after %d of %d inboxes", len(inboxes), len(names))
 		}
 	}
 
-	if reservations, err := client.ListReservations(ctx, a.config.ProjectDir, "", true); err == nil {
+	// Resource-only read: coordination inspection must not issue tool calls,
+	// including legacy list tools, when the reservation resource is down.
+	if reservations, err := client.ReadActiveReservations(ctx, a.config.ProjectDir); err == nil {
 		inputs.Reservations = reservations
 		inputs.ReservationConflicts = deriveReservationConflicts(reservations, now)
 	}
 
 	return NormalizeCoordination(inputs)
+}
+
+// statusInboxFetchConcurrency bounds parallel fetch_inbox calls during status
+// enrichment. Projects accumulate many historical Agent Mail identities; a
+// sequential sweep made status latency grow linearly with that history and
+// routinely blew the shared collection deadline (#285).
+const statusInboxFetchConcurrency = 8
+
+// fetchInboxes reads the given agents' inboxes with bounded concurrency,
+// stopping as soon as ctx expires. It returns whatever completed plus whether
+// the sweep was cut short; per-inbox errors are skipped as before. No fetch
+// outlives the call: the worker pool drains before returning.
+func (a *WorkCoordinationAdapter) fetchInboxes(ctx context.Context, client *agentmail.Client, names []string) (map[string][]agentmail.InboxMessage, bool) {
+	inboxes := make(map[string][]agentmail.InboxMessage, len(names))
+	if len(names) == 0 {
+		return inboxes, false
+	}
+
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		timedOut atomic.Bool
+	)
+	work := make(chan string)
+
+	workers := statusInboxFetchConcurrency
+	if workers > len(names) {
+		workers = len(names)
+	}
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for name := range work {
+				if ctx.Err() != nil {
+					timedOut.Store(true)
+					continue // keep draining so the feeder never blocks
+				}
+				inbox, err := client.FetchInbox(ctx, agentmail.FetchInboxOptions{
+					ProjectKey:    a.config.ProjectDir,
+					AgentName:     name,
+					Limit:         25,
+					IncludeBodies: true,
+				})
+				if err != nil {
+					if ctx.Err() != nil {
+						timedOut.Store(true)
+					}
+					continue
+				}
+				mu.Lock()
+				inboxes[name] = inbox
+				mu.Unlock()
+			}
+		}()
+	}
+
+	for _, name := range names {
+		work <- name
+	}
+	close(work)
+	wg.Wait()
+
+	return inboxes, timedOut.Load()
 }
 
 func (a *WorkCoordinationAdapter) mailClient() *agentmail.Client {
@@ -1001,7 +1103,11 @@ func reservationPatternsConflict(a, b string) bool {
 	if a == b {
 		return true
 	}
-	return matchesPattern(a, b) || matchesPattern(b, a)
+	// Matching one glob against the other's literal spelling misses
+	// intersections such as src/*/main.go and src/service/*.go, and a plain
+	// string glob lets * cross directories. Compare their path languages, as
+	// the coordinator does.
+	return reservationpath.MayOverlap(a, b)
 }
 
 func normalizeConflictPattern(a, b string) string {

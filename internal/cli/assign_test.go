@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -26,10 +28,13 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/completion"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	dispatchsvc "github.com/Dicklesworthstone/ntm/internal/dispatch"
+	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/Dicklesworthstone/ntm/internal/sqliteutil"
 	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/internal/worksource"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
@@ -2005,6 +2010,22 @@ func TestWatchLoopShouldStopUsesFilteredActionableCandidates(t *testing.T) {
 			wantStop: false,
 			wantErr:  true,
 		},
+		{
+			name:     "tracker changed during the read keeps watch running",
+			queryErr: watchSourceChangeError(),
+			wantStop: false,
+			wantErr:  false,
+		},
+		{
+			name:     "raw stale policy violation fails closed",
+			queryErr: &worksource.StaleError{Reason: "checkout does not match the required ref"},
+			wantErr:  true,
+		},
+		{
+			name:     "malformed tracker export fails closed",
+			queryErr: &worksource.StaleError{Reason: "invalid tracker JSONL", Cause: errors.New("invalid JSON record")},
+			wantErr:  true,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			calls := 0
@@ -2037,30 +2058,626 @@ func TestWatchLoopShouldStopUsesFilteredActionableCandidates(t *testing.T) {
 	}
 }
 
-func TestWatchLoopRunStopsOnAutomatedAssignmentSafetyErrors(t *testing.T) {
-	isolateSessionAgentStorage(t)
-	for _, safetyErr := range []error{
-		bv.ErrActionablePlanUnverified,
-		bv.ErrActionableLabelsUnverified,
-		markCLIInvalidInput(errors.New("invalid watch policy")),
+func TestAssignDryRunRejectsExecutionOnlyRoutesBeforeExternalWork(t *testing.T) {
+	previousDryRun, previousPane := assignDryRun, assignPane
+	previousReassign, previousRetry, previousRetryFailed := assignReassign, assignRetry, assignRetryFailed
+	previousClear, previousClearPane, previousClearFailed := assignClear, assignClearPane, assignClearFailed
+	t.Cleanup(func() {
+		assignDryRun, assignPane = previousDryRun, previousPane
+		assignReassign, assignRetry, assignRetryFailed = previousReassign, previousRetry, previousRetryFailed
+		assignClear, assignClearPane, assignClearFailed = previousClear, previousClearPane, previousClearFailed
+	})
+	bin := t.TempDir()
+	calls := filepath.Join(bin, "external-calls")
+	t.Setenv("NTM_TEST_DRY_RUN_CALLS", calls)
+	for _, name := range []string{"tmux", "br", "bv", "git"} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\nprintf '%s %s\\n' \"$0\" \"$*\" >> \"$NTM_TEST_DRY_RUN_CALLS\"\nexit 91\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin)
+	for _, test := range []struct {
+		name                     string
+		pane, reassign, retry    string
+		clear, clearPane         string
+		retryFailed, clearFailed bool
+	}{
+		{name: "pane", pane: "1"},
+		{name: "retry", retry: "ntm-recovery"},
+		{name: "retry-failed", retryFailed: true},
+		{name: "reassign", reassign: "ntm-recovery"},
+		{name: "clear", clear: "ntm-recovery"},
+		{name: "clear-pane", clearPane: "1"},
+		{name: "clear-failed", clearFailed: true},
 	} {
-		t.Run(safetyErr.Error(), func(t *testing.T) {
-			store := assignment.NewStore("watch-safety-failure")
-			loop := NewWatchLoop("watch-safety-failure", store, &AutoReassignOptions{
-				Session: "watch-safety-failure",
-				Quiet:   true,
-			})
-			loop.stopWhenDone = false
-			loop.scanInterval = time.Millisecond
-			loop.scanFn = func(context.Context) error {
-				return fmt.Errorf("unsafe recurring scan: %w", safetyErr)
+		t.Run(test.name, func(t *testing.T) {
+			assignDryRun, assignPane = true, test.pane
+			assignReassign, assignRetry, assignRetryFailed = test.reassign, test.retry, test.retryFailed
+			assignClear, assignClearPane, assignClearFailed = test.clear, test.clearPane, test.clearFailed
+			cmd := &cobra.Command{}
+			cmd.SetContext(t.Context())
+			err := runAssign(cmd, []string{"recovery-preview"})
+			if !errors.Is(err, errCLIInvalidInput) || !strings.Contains(err.Error(), "--dry-run") {
+				t.Fatalf("dry-run --%s error=%v, want invalid input before command routing", test.name, err)
 			}
+			if contents, err := os.ReadFile(calls); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("dry-run --%s reached external work: %q, error=%v", test.name, contents, err)
+			}
+		})
+	}
+}
 
-			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+// Assignment planning and watch completion both read Beads before the guarded
+// claim can repair it. Exercise those callers through real br subprocesses,
+// while proving that the corresponding preview paths never request repair.
+func TestAssignmentPlanningRepairsCorruptionOnlyForExecution(t *testing.T) {
+	previousAssign := getActionableRecommendationsForAssign
+	previousWatch := getActionableRecommendationsForWatch
+	previousIdle := getIdleAgentsForWatchStop
+	t.Cleanup(func() {
+		getActionableRecommendationsForAssign = previousAssign
+		getActionableRecommendationsForWatch = previousWatch
+		getIdleAgentsForWatchStop = previousIdle
+	})
+	read := func(ctx context.Context, dir string, _ int) ([]bv.TriageRecommendation, error) {
+		output, err := bv.RunBdContext(ctx, dir, "ready", "--json")
+		if err != nil {
+			return nil, err
+		}
+		var rows []bv.TriageRecommendation
+		err = json.Unmarshal([]byte(output), &rows)
+		return rows, err
+	}
+	getActionableRecommendationsForAssign = read
+	getActionableRecommendationsForWatch = read
+	getIdleAgentsForWatchStop = func(context.Context, string, string, bool) ([]assignAgentInfo, error) {
+		return nil, nil
+	}
+
+	for _, tc := range []struct {
+		name    string
+		watch   bool
+		execute bool
+	}{
+		{name: "automatic assignment", execute: true},
+		{name: "assignment preview"},
+		{name: "executing watch", watch: true, execute: true},
+		{name: "dry-run watch", watch: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateSessionAgentStorage(t)
+			projectDir, logPath := writeAssignmentRecoveryBR(t, true)
+			var err error
+			if tc.watch {
+				loop := NewWatchLoop("recovery-watch", assignment.NewStore("recovery-watch"), &AutoReassignOptions{
+					Session: "recovery-watch", ProjectDir: projectDir, DryRun: !tc.execute,
+					Quiet: true, policyProject: projectDir,
+				})
+				if loop.scanOpts.Auto != tc.execute {
+					t.Fatalf("watch scan execution=%v, want %v", loop.scanOpts.Auto, tc.execute)
+				}
+				_, err = loop.shouldStop(t.Context())
+			} else {
+				_, err = loadActionableRecommendationsForAssignment(t.Context(), projectDir, tc.execute)
+			}
+			if tc.execute && err != nil {
+				t.Fatalf("executing preflight failed to recover: %v", err)
+			}
+			if !tc.execute && err == nil {
+				t.Fatal("preview hid corruption instead of returning the read failure")
+			}
+			calls, readErr := os.ReadFile(logPath)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			wantReads, wantRepairs := 1, 0
+			if tc.execute {
+				wantReads, wantRepairs = 2, 1
+			}
+			if strings.Count(string(calls), "ready --json\n") != wantReads ||
+				strings.Count(string(calls), "sync --import-only --rebuild --json\n") != wantRepairs ||
+				strings.Count(string(calls), "doctor --repair --json\n") != wantRepairs {
+				t.Fatalf("unexpected preflight calls:\n%s", calls)
+			}
+		})
+	}
+}
+
+func TestAssignmentMutationPreflightRejectsUnverifiedRepair(t *testing.T) {
+	projectDir, logPath := writeAssignmentRecoveryBR(t, false)
+	_, err := readBeadAssignmentDetailsForMutation(t.Context(), projectDir, "ntm-recovery")
+	if err == nil || !strings.Contains(err.Error(), "did not verify the repaired database") {
+		t.Fatalf("preflight error=%v, want failed database verification", err)
+	}
+	calls, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if strings.Count(string(calls), "show ntm-recovery --json\n") != 1 ||
+		strings.Count(string(calls), "doctor --repair --json\n") != 1 {
+		t.Fatalf("unverified repair retried the eligibility read:\n%s", calls)
+	}
+}
+
+func TestAutoReassignmentDryRunDoesNotRepairDependencyRead(t *testing.T) {
+	projectDir, logPath := writeAssignmentRecoveryBR(t, true)
+	result, err := PerformAutoReassignment(t.Context(), "ntm-recovery", &AutoReassignOptions{
+		Session: "dry-dependency-read", ProjectDir: projectDir,
+		DryRun: true, Quiet: true, policyProject: projectDir,
+	})
+	if err != nil {
+		t.Fatalf("dry dependency preflight: %v", err)
+	}
+	if result == nil || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "database disk image is malformed") || len(result.Assignments) != 0 {
+		t.Fatalf("dry dependency read=%+v, want corruption reported without assignments", result)
+	}
+	calls, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(calls); got != "--lock-timeout 5000 show ntm-recovery --json\n" {
+		t.Fatalf("dry dependency read requested extra operations:\n%s", got)
+	}
+}
+
+func writeAssignmentRecoveryBR(t *testing.T, verified bool) (string, string) {
+	t.Helper()
+	projectDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(projectDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const authoritative = "{\"id\":\"ntm-recovery\",\"status\":\"open\"}\n{\"id\":\"ntm-preserved\",\"status\":\"tombstone\"}\n"
+	jsonlPath := filepath.Join(projectDir, ".beads", "issues.jsonl")
+	if err := os.WriteFile(jsonlPath, []byte(authoritative), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Preserve a real indexed tombstone while br's read command simulates
+	// corruption, so the independent before/after preservation checks run.
+	databasePath := filepath.Join(projectDir, ".beads", "beads.db")
+	database, err := sql.Open(sqliteutil.DriverName, sqliteutil.FileDSN(databasePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`CREATE TABLE issues (id TEXT PRIMARY KEY, status TEXT NOT NULL)`,
+		`CREATE INDEX idx_issues_status ON issues(status)`,
+		`CREATE INDEX idx_issues_tombstone ON issues(status) WHERE status = 'tombstone'`,
+		`INSERT INTO issues VALUES ('ntm-recovery', 'open'), ('ntm-preserved', 'tombstone')`,
+	} {
+		if _, err := database.ExecContext(t.Context(), statement); err != nil {
+			database.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	logPath := filepath.Join(binDir, "calls")
+	t.Setenv("NTM_TEST_REPAIR_CALLS", logPath)
+	t.Setenv("NTM_TEST_REPAIRED", filepath.Join(binDir, "repaired"))
+	t.Setenv("NTM_TEST_DATABASE_VERIFIED", fmt.Sprint(verified))
+	doctorJSON, err := json.Marshal(map[string]any{
+		"ok": false, "exit_code": 2, "code": "fix_partial", "repaired": true,
+		"database_verified": verified, "preservation_verified": false, "verified": false,
+		"skipped": 0, "fk_violations_cleaned": 0,
+		"history_preservation_warnings": []string{}, "preserved_history": []any{},
+		"dirty_preservation_warnings": []string{"the tombstone issue IDs could not be read before the rebuild (Database error: database disk image is malformed); preservation of unflushed local state could not be established"},
+		"verified_backups":            []any{map[string]any{"backup": databasePath + ".bak"}},
+		"recovery_failure_marker":     databasePath + ".verification-failed.json", "recovery_failure_marker_error": nil,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NTM_TEST_REPAIR_DOCTOR", string(doctorJSON))
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$NTM_TEST_REPAIR_CALLS"
+case "$*" in
+  '--lock-timeout 5000 ready --json'|'--lock-timeout 5000 show ntm-recovery --json')
+    if [ ! -f "$NTM_TEST_REPAIRED" ]; then
+      printf '%s\n' '{"error":{"code":"DATABASE_ERROR","message":"database disk image is malformed"}}'
+      exit 2
+    fi
+    printf '%s\n' '[]'
+    ;;
+  '--lock-timeout 5000 info --json --no-auto-import --no-auto-flush')
+    printf '{"database_path":"%s/.beads/beads.db","jsonl_path":"%s/.beads/issues.jsonl"}\n' "$PWD" "$PWD"
+    ;;
+  '--lock-timeout 5000 sync --import-only --rebuild --json')
+    printf '%s\n' '{"error":{"code":"SYNC_CONFLICT","message":"Sync conflict: Automatic database recovery refused because unflushed-state preservation could not be established:\n- the tombstone issue IDs could not be read before the rebuild (Database error: database disk image is malformed); preservation of unflushed local state could not be established\nThe database was not replaced. Run br doctor --repair to inspect retained evidence."}}'
+    exit 6
+    ;;
+  '--lock-timeout 5000 doctor --repair --json')
+    if [ "$NTM_TEST_DATABASE_VERIFIED" = true ]; then
+      : > "$NTM_TEST_REPAIRED"
+    fi
+    printf '%s\n' "$NTM_TEST_REPAIR_DOCTOR"
+    exit 2
+    ;;
+  *) exit 64 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "br"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Cleanup(func() {
+		contents, err := os.ReadFile(jsonlPath)
+		if err != nil || string(contents) != authoritative {
+			t.Errorf("authoritative JSONL changed: %q, error=%v", contents, err)
+		}
+	})
+	return projectDir, logPath
+}
+
+func TestWatchLoopRunStopsOnAutomatedAssignmentSafetyErrors(t *testing.T) {
+	isolateSourceChangeWatchTests(t)
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{"unverified actionable plan", bv.ErrActionablePlanUnverified},
+		{"unverified labels", bv.ErrActionableLabelsUnverified},
+		{"invalid policy", markCLIInvalidInput(errors.New("invalid watch policy"))},
+		{"raw stale policy violation", &worksource.StaleError{Reason: "checkout does not match the required ref"}},
+		{"malformed tracker", &worksource.StaleError{Reason: "invalid tracker JSONL", Cause: errors.New("invalid JSON record")}},
+		{"unclassified stale error", bv.ErrStaleWorkCoordination},
+		{"canceled scan", context.Canceled},
+		{"expired scan", context.DeadlineExceeded},
+		{"claim conflict", assignment.ErrClaimConflict},
+		{"already claimed bead", bv.ErrBeadAlreadyClaimed},
+		{"occupied target", assignment.ErrTargetOccupied},
+		{"source change and invalid policy", errors.Join(watchSourceChangeError(), markCLIInvalidInput(errors.New("invalid policy")))},
+		{"source change and cancellation", errors.Join(watchSourceChangeError(), context.Canceled)},
+		{"source change and deadline", errors.Join(watchSourceChangeError(), context.DeadlineExceeded)},
+		{"source change and ownership conflict", errors.Join(watchSourceChangeError(), assignment.ErrClaimConflict)},
+		{"source change and independent verification failure", errors.Join(watchSourceChangeError(), errors.New("cannot verify source policy"))},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				loop := newSourceChangeTestWatchLoop(t)
+				scans := 0
+				loop.scanFn = func(context.Context) error {
+					scans++
+					return fmt.Errorf("unsafe recurring scan: %w", test.err)
+				}
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				result := make(chan error, 1)
+				go func() { result <- loop.Run(ctx) }()
+				synctest.Wait()
+				time.Sleep(loop.scanInterval)
+				synctest.Wait()
+				select {
+				case err := <-result:
+					if !errors.Is(err, test.err) {
+						t.Fatalf("WatchLoop.Run() error = %v, want safety error %v", err, test.err)
+					}
+				default:
+					t.Fatal("watcher kept running after a non-retryable failure")
+				}
+				if scans != 1 || loop.deferredSourceChecks != 0 {
+					t.Fatalf("scans=%d deferred=%d; want one failed scan and no deferral", scans, loop.deferredSourceChecks)
+				}
+			})
+		})
+	}
+}
+
+// Use the actual verification receipt, not the broad STALE_WORK_COORDINATION
+// sentinel: that sentinel also represents policy violations and malformed data.
+func watchSourceChangeError() error {
+	before := worksource.Identity{
+		ProjectDir: "/watch-project", JSONLPath: "/watch-project/.beads/issues.jsonl",
+		JSONLSHA256: "tracker-before", HeadSHA: "checkout-before",
+	}
+	after := before
+	after.JSONLSHA256 = "tracker-after"
+	after.HeadSHA = "checkout-after"
+	return fmt.Errorf("%w: load bv --robot-triage: %w", bv.ErrActionablePlanUnverified, before.Verify(after))
+}
+
+func isolateSourceChangeWatchTests(t *testing.T) {
+	t.Helper()
+	isolateSessionAgentStorage(t)
+	previousInterval := assignWatchInterval
+	// Keep completion polling outside these tests' fake-clock window. Their
+	// empty ledgers and injected scans need no tmux, br, or Agent Mail service.
+	assignWatchInterval = 24 * time.Hour
+	t.Cleanup(func() { assignWatchInterval = previousInterval })
+}
+
+func newSourceChangeTestWatchLoop(t *testing.T) *WatchLoop {
+	t.Helper()
+	const session = "watch-source-change"
+	projectDir := t.TempDir()
+	loop := NewWatchLoop(session, assignment.NewStore(session), &AutoReassignOptions{
+		Session: session, ProjectDir: projectDir, Quiet: true, policyProject: projectDir,
+	})
+	loop.stopWhenDone = false
+	loop.scanInterval = time.Minute
+	return loop
+}
+
+func watchSourceDeferralState(loop *WatchLoop) (int, bool) {
+	loop.mu.Lock()
+	defer loop.mu.Unlock()
+	return loop.deferredSourceChecks, loop.sourceCheckDeferred
+}
+
+func TestWatchLoopRunRetriesAfterWorkSourceChangesDuringScan(t *testing.T) {
+	isolateSourceChangeWatchTests(t)
+	synctest.Test(t, func(t *testing.T) {
+		loop := newSourceChangeTestWatchLoop(t)
+		var scans, dispatched atomic.Int32
+		loop.scanFn = func(context.Context) error {
+			if scans.Add(1) == 1 {
+				return watchSourceChangeError()
+			}
+			dispatched.Add(1) // Simulate dispatch only from a successfully verified scan.
+			return nil
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		result := make(chan error, 1)
+		go func() { result <- loop.Run(ctx) }()
+		synctest.Wait()
+		time.Sleep(loop.scanInterval - time.Nanosecond)
+		synctest.Wait()
+		if scans.Load() != 0 {
+			t.Fatalf("scanned %d times before the configured interval", scans.Load())
+		}
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		deferred, pending := watchSourceDeferralState(loop)
+		if scans.Load() != 1 || dispatched.Load() != 0 || deferred != 1 || !pending {
+			t.Fatalf("stale scan: scans=%d dispatched=%d deferred=%d pending=%v", scans.Load(), dispatched.Load(), deferred, pending)
+		}
+		select {
+		case err := <-result:
+			t.Fatalf("watcher exited after transient source change: %v", err)
+		default:
+		}
+		time.Sleep(loop.scanInterval)
+		synctest.Wait()
+		_, pending = watchSourceDeferralState(loop)
+		if scans.Load() != 2 || dispatched.Load() != 1 || pending {
+			t.Fatalf("recovered scan: scans=%d dispatched=%d pending=%v", scans.Load(), dispatched.Load(), pending)
+		}
+		if !strings.Contains(loop.Summary(), "source verification deferred 1 times") {
+			t.Fatalf("deferral missing from operator summary: %s", loop.Summary())
+		}
+		cancel()
+		synctest.Wait()
+		if err := <-result; !errors.Is(err, context.Canceled) {
+			t.Fatalf("WatchLoop.Run() error = %v, want cancellation after recovery", err)
+		}
+	})
+}
+
+func TestWatchLoopRepeatedSourceChangesRemainCancellable(t *testing.T) {
+	isolateSourceChangeWatchTests(t)
+	synctest.Test(t, func(t *testing.T) {
+		loop := newSourceChangeTestWatchLoop(t)
+		var scans atomic.Int32
+		loop.scanFn = func(context.Context) error {
+			scans.Add(1)
+			return watchSourceChangeError()
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		result := make(chan error, 1)
+		go func() { result <- loop.Run(ctx) }()
+		synctest.Wait()
+		for attempt := int32(1); attempt <= 4; attempt++ {
+			time.Sleep(loop.scanInterval - time.Nanosecond)
+			synctest.Wait()
+			if scans.Load() != attempt-1 {
+				t.Fatalf("retried early: scans=%d, want %d", scans.Load(), attempt-1)
+			}
+			time.Sleep(time.Nanosecond)
+			synctest.Wait()
+			deferred, pending := watchSourceDeferralState(loop)
+			if scans.Load() != attempt || deferred != int(attempt) || !pending {
+				t.Fatalf("attempt %d: scans=%d deferred=%d pending=%v", attempt, scans.Load(), deferred, pending)
+			}
+			select {
+			case err := <-result:
+				t.Fatalf("watcher exited on repeated source changes: %v", err)
+			default:
+			}
+		}
+		cancel()
+		synctest.Wait()
+		if err := <-result; !errors.Is(err, context.Canceled) {
+			t.Fatalf("WatchLoop.Run() error = %v, want cancellation during deferral", err)
+		}
+	})
+}
+
+func TestWatchLoopSlowStaleScanWaitsFullIntervalBeforeRetry(t *testing.T) {
+	isolateSourceChangeWatchTests(t)
+	synctest.Test(t, func(t *testing.T) {
+		loop := newSourceChangeTestWatchLoop(t)
+		releaseScan := make(chan struct{})
+		var scans atomic.Int32
+		loop.scanFn = func(ctx context.Context) error {
+			if scans.Add(1) == 1 {
+				select {
+				case <-releaseScan:
+					return watchSourceChangeError()
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			return nil
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		result := make(chan error, 1)
+		go func() { result <- loop.Run(ctx) }()
+		synctest.Wait()
+		time.Sleep(loop.scanInterval)
+		synctest.Wait()
+		// Fail halfway between ticks after several ticks elapsed in flight.
+		// The next attempt must wait a full interval from that failure.
+		time.Sleep(3*loop.scanInterval + loop.scanInterval/2)
+		synctest.Wait()
+		if scans.Load() != 1 {
+			t.Fatalf("slow scan overlapped %d scan attempts", scans.Load())
+		}
+		close(releaseScan)
+		synctest.Wait()
+		if deferred, _ := watchSourceDeferralState(loop); deferred != 1 {
+			t.Fatalf("slow scan was not deferred: %s", loop.Summary())
+		}
+		time.Sleep(loop.scanInterval - time.Nanosecond)
+		synctest.Wait()
+		if scans.Load() != 1 {
+			t.Fatalf("slow stale scan retried before a full interval: scans=%d", scans.Load())
+		}
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		_, pending := watchSourceDeferralState(loop)
+		if scans.Load() != 2 || pending {
+			t.Fatalf("next scheduled scan did not recover: scans=%d pending=%v", scans.Load(), pending)
+		}
+		cancel()
+		synctest.Wait()
+		if err := <-result; !errors.Is(err, context.Canceled) {
+			t.Fatalf("WatchLoop.Run() error = %v, want cancellation", err)
+		}
+	})
+}
+
+func TestWatchLoopStopWhenDoneSkipsCompletionCheckAfterStaleScan(t *testing.T) {
+	isolateSourceChangeWatchTests(t)
+	previousActionable, previousIdle := getActionableRecommendationsForWatch, getIdleAgentsForWatchStop
+	t.Cleanup(func() {
+		getActionableRecommendationsForWatch, getIdleAgentsForWatchStop = previousActionable, previousIdle
+	})
+	synctest.Test(t, func(t *testing.T) {
+		var checks atomic.Int32
+		getActionableRecommendationsForWatch = func(context.Context, string, int) ([]bv.TriageRecommendation, error) {
+			checks.Add(1)
+			return nil, nil
+		}
+		getIdleAgentsForWatchStop = func(context.Context, string, string, bool) ([]assignAgentInfo, error) {
+			return nil, nil
+		}
+		loop := newSourceChangeTestWatchLoop(t)
+		loop.stopWhenDone = true
+		var scans atomic.Int32
+		loop.scanFn = func(context.Context) error {
+			if scans.Add(1) == 1 {
+				return watchSourceChangeError()
+			}
+			return nil
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		result := make(chan error, 1)
+		go func() { result <- loop.Run(ctx) }()
+		synctest.Wait()
+		time.Sleep(loop.scanInterval)
+		synctest.Wait()
+		if scans.Load() != 1 || checks.Load() != 0 {
+			t.Fatalf("stale scan used a completion probe: scans=%d checks=%d", scans.Load(), checks.Load())
+		}
+		select {
+		case err := <-result:
+			t.Fatalf("stale scan ended --stop-when-done: %v", err)
+		default:
+		}
+		time.Sleep(loop.scanInterval)
+		synctest.Wait()
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("verified empty queue failed to stop: %v", err)
+			}
+		default:
+			t.Fatal("verified empty queue did not stop the watcher")
+		}
+		if scans.Load() != 2 || checks.Load() != 1 {
+			t.Fatalf("scans=%d completion checks=%d, want 2/1", scans.Load(), checks.Load())
+		}
+	})
+}
+
+func TestWatchLoopShouldStopRequiresVerifiedEmptySnapshot(t *testing.T) {
+	isolateSourceChangeWatchTests(t)
+	previousActionable, previousIdle := getActionableRecommendationsForWatch, getIdleAgentsForWatchStop
+	t.Cleanup(func() {
+		getActionableRecommendationsForWatch, getIdleAgentsForWatchStop = previousActionable, previousIdle
+	})
+	checks, idleChecks := 0, 0
+	getActionableRecommendationsForWatch = func(context.Context, string, int) ([]bv.TriageRecommendation, error) {
+		checks++
+		switch checks {
+		case 1:
+			return nil, watchSourceChangeError()
+		case 2:
+			return []bv.TriageRecommendation{{ID: "ready-after-change", Status: "open"}}, nil
+		default:
+			return nil, nil
+		}
+	}
+	getIdleAgentsForWatchStop = func(context.Context, string, string, bool) ([]assignAgentInfo, error) {
+		idleChecks++
+		return nil, nil
+	}
+	loop := newSourceChangeTestWatchLoop(t)
+	for attempt, wantStop := range []bool{false, false, true} {
+		stop, err := loop.shouldStop(t.Context())
+		if err != nil || stop != wantStop {
+			t.Fatalf("completion check %d = %v, %v; want %v, nil", attempt+1, stop, err, wantStop)
+		}
+		if loop.sourceCheckDeferred != (attempt == 0) || loop.deferredSourceChecks != 1 {
+			t.Fatalf("completion check %d lost deferral/recovery evidence: pending=%v deferred=%d", attempt+1, loop.sourceCheckDeferred, loop.deferredSourceChecks)
+		}
+	}
+	if checks != 3 || idleChecks != 1 {
+		t.Fatalf("actionable checks=%d idle checks=%d, want 3/1", checks, idleChecks)
+	}
+}
+
+func TestWatchLoopShouldStopNeverTreatsCancellationAsCompletion(t *testing.T) {
+	isolateSourceChangeWatchTests(t)
+	previousActionable, previousIdle := getActionableRecommendationsForWatch, getIdleAgentsForWatchStop
+	t.Cleanup(func() {
+		getActionableRecommendationsForWatch, getIdleAgentsForWatchStop = previousActionable, previousIdle
+	})
+	for _, phase := range []string{"actionable read cancels", "idle read cancels", "idle read returns cancellation", "idle read returns deadline"} {
+		t.Run(phase, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
-			err := loop.Run(ctx)
-			if !errors.Is(err, safetyErr) {
-				t.Fatalf("WatchLoop.Run() error = %v, want safety error %v", err, safetyErr)
+			getActionableRecommendationsForWatch = func(context.Context, string, int) ([]bv.TriageRecommendation, error) {
+				if phase == "actionable read cancels" {
+					cancel()
+				}
+				return nil, nil
+			}
+			getIdleAgentsForWatchStop = func(context.Context, string, string, bool) ([]assignAgentInfo, error) {
+				switch phase {
+				case "actionable read cancels":
+					t.Error("canceled completion probe continued to idle-agent lookup")
+				case "idle read cancels":
+					cancel()
+				case "idle read returns cancellation":
+					return nil, context.Canceled
+				case "idle read returns deadline":
+					return nil, context.DeadlineExceeded
+				}
+				return nil, nil
+			}
+			wantErr := context.Canceled
+			if phase == "idle read returns deadline" {
+				wantErr = context.DeadlineExceeded
+			}
+			loop := newSourceChangeTestWatchLoop(t)
+			if stop, err := loop.shouldStop(ctx); stop || !errors.Is(err, wantErr) {
+				t.Fatalf("shouldStop() = %v, %v; want false, %v", stop, err, wantErr)
 			}
 		})
 	}
@@ -3722,5 +4339,79 @@ func TestClassifyRetryOutcomeTreatsEverySkipAsFailure(t *testing.T) {
 				t.Fatalf("classifyRetryOutcome() = (%q, %v), want code=%q error=%v", code, err, test.wantCode, test.wantError)
 			}
 		})
+	}
+}
+
+// TestAssignPaneRoles covers role resolution from pane title tags, persona
+// names, and persona tags, and the deliberate non-matching of broad
+// descriptive tags like "review".
+func TestAssignPaneRoles(t *testing.T) {
+	registry := persona.NewRegistry()
+	registry.Add(&persona.Persona{Name: "quill", Tags: []string{"reviewer", "standing-qa-pool"}})
+	registry.Add(&persona.Persona{Name: "reviewer", Tags: []string{"review", "quality", "bugs"}})
+	registry.Add(&persona.Persona{Name: "architect", Tags: []string{"design", "review", "architecture"}})
+
+	tests := []struct {
+		name     string
+		pane     tmux.Pane
+		wantImpl bool
+		wantRev  bool
+	}{
+		{name: "persona tag reviewer", pane: tmux.Pane{Variant: "quill"}, wantRev: true},
+		{name: "builtin persona name reviewer", pane: tmux.Pane{Variant: "reviewer"}, wantRev: true},
+		{name: "architect stays dual-eligible", pane: tmux.Pane{Variant: "architect"}},
+		{name: "model-only pane", pane: tmux.Pane{Variant: "gpt-5@high"}},
+		{name: "title tag implementer", pane: tmux.Pane{Tags: []string{"implementer", "frontend"}}, wantImpl: true},
+		{name: "untagged", pane: tmux.Pane{}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			roles := assignPaneRoles(registry, tc.pane)
+			if roles.implementer != tc.wantImpl || roles.reviewer != tc.wantRev {
+				t.Fatalf("assignPaneRoles(%+v) = %+v, want impl=%v rev=%v", tc.pane, roles, tc.wantImpl, tc.wantRev)
+			}
+		})
+	}
+
+	// Nil registry: only title tags apply.
+	roles := assignPaneRoles(nil, tmux.Pane{Tags: []string{"Reviewer"}})
+	if !roles.reviewer || roles.implementer {
+		t.Fatalf("nil-registry roles = %+v, want reviewer only (case-insensitive)", roles)
+	}
+}
+
+// TestFilterAssignAgentsForTemplate: reviewer-only panes are excluded from
+// impl assignment and implementer-only panes from review assignment, while
+// untagged and dual-role panes stay eligible; non-role templates pass
+// through unchanged.
+func TestFilterAssignAgentsForTemplate(t *testing.T) {
+	registry := persona.NewRegistry()
+	registry.Add(&persona.Persona{Name: "reviewer", Tags: []string{"review"}})
+	registry.Add(&persona.Persona{Name: "implementer", Tags: []string{"implementation"}})
+	registry.Add(&persona.Persona{Name: "hybrid", Tags: []string{"implementer", "reviewer"}})
+
+	agents := []assignAgentInfo{
+		{pane: tmux.Pane{ID: "%1", Variant: "reviewer"}},
+		{pane: tmux.Pane{ID: "%2", Variant: "implementer"}},
+		{pane: tmux.Pane{ID: "%3", Variant: "sonnet@high"}},
+		{pane: tmux.Pane{ID: "%4", Variant: "hybrid"}},
+	}
+	ids := func(list []assignAgentInfo) []string {
+		out := make([]string, 0, len(list))
+		for _, a := range list {
+			out = append(out, a.pane.ID)
+		}
+		return out
+	}
+
+	if got := ids(filterAssignAgentsForTemplate(agents, registry, "impl")); !reflect.DeepEqual(got, []string{"%2", "%3", "%4"}) {
+		t.Fatalf("impl candidates = %v, want [%%2 %%3 %%4]", got)
+	}
+	if got := ids(filterAssignAgentsForTemplate(agents, registry, "review")); !reflect.DeepEqual(got, []string{"%1", "%3", "%4"}) {
+		t.Fatalf("review candidates = %v, want [%%1 %%3 %%4]", got)
+	}
+	if got := ids(filterAssignAgentsForTemplate(agents, registry, "custom")); !reflect.DeepEqual(got, []string{"%1", "%2", "%3", "%4"}) {
+		t.Fatalf("custom candidates = %v, want all", got)
 	}
 }

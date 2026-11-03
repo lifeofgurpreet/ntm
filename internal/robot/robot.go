@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -30,19 +32,21 @@ import (
 	ntmevents "github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/git"
 	"github.com/Dicklesworthstone/ntm/internal/health"
+	"github.com/Dicklesworthstone/ntm/internal/history"
 	"github.com/Dicklesworthstone/ntm/internal/models"
 	"github.com/Dicklesworthstone/ntm/internal/pressure"
 	"github.com/Dicklesworthstone/ntm/internal/recipe"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
+	"github.com/Dicklesworthstone/ntm/internal/reservationpath"
 	"github.com/Dicklesworthstone/ntm/internal/robot/adapters"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	swarmlib "github.com/Dicklesworthstone/ntm/internal/swarm"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
-	"github.com/Dicklesworthstone/ntm/internal/tokens"
 	"github.com/Dicklesworthstone/ntm/internal/tools"
 	"github.com/Dicklesworthstone/ntm/internal/tracker"
 	"github.com/Dicklesworthstone/ntm/internal/util"
+	"github.com/Dicklesworthstone/ntm/internal/worksource"
 )
 
 // CASSStatusOutput represents the output for --robot-cass-status
@@ -88,7 +92,7 @@ func GetCASSStatus() (*CASSStatusOutput, error) {
 
 	if err == nil {
 		output.Healthy = status.Healthy
-		output.Index.Exists = true
+		output.Index.Exists = status.Index.Exists
 		output.Index.Fresh = status.Index.Healthy
 		output.Index.LastIndexedAt = status.LastIndexedAt.UnixMilli()
 		output.Index.CountsSkipped = status.Database.CountsSkipped
@@ -97,11 +101,7 @@ func GetCASSStatus() (*CASSStatusOutput, error) {
 			output.Index.Messages = &status.Messages
 		}
 	} else {
-		output.RobotResponse = NewErrorResponse(
-			err,
-			ErrCodeInternalError,
-			"Check cass index health and configuration",
-		)
+		output.RobotResponse = cassErrorResponse(err, "Check cass index health and configuration")
 	}
 
 	return output, nil
@@ -170,13 +170,9 @@ func GetCASSSearch(opts CASSSearchOptions) (*CASSSearchOutput, error) {
 
 	if err != nil {
 		return &CASSSearchOutput{
-			RobotResponse: NewErrorResponse(
-				err,
-				ErrCodeInternalError,
-				"Check cass index health and query parameters",
-			),
-			Query: opts.Query,
-			Hits:  []CASSSearchHit{},
+			RobotResponse: cassErrorResponse(err, "Check cass index health and query parameters"),
+			Query:         opts.Query,
+			Hits:          []CASSSearchHit{},
 		}, nil
 	}
 
@@ -225,85 +221,60 @@ func PrintCASSSearch(query, agent, workspace, since string, limit int) error {
 // CASSInsightsOutput represents the output for --robot-cass-insights
 type CASSInsightsOutput struct {
 	RobotResponse
-	Period string                   `json:"period"`
-	Agents map[string]interface{}   `json:"agents"`
-	Topics []map[string]interface{} `json:"topics"`
-	Errors []map[string]interface{} `json:"errors"`
+	Period     string                   `json:"period"`
+	Agents     []cass.AggregationBucket `json:"agents"`
+	Workspaces []cass.AggregationBucket `json:"workspaces"`
 }
 
-// GetCASSInsights returns aggregated insights.
+// GetCASSInsights returns which agents and workspaces dominate the indexed
+// sessions since `since` (default 7d), from cass's server-side aggregations.
 // This function returns the data struct directly, enabling CLI/REST parity.
-func GetCASSInsights() (*CASSInsightsOutput, error) {
+func GetCASSInsights(since string) (*CASSInsightsOutput, error) {
+	if since == "" {
+		since = "7d"
+	}
+	output := &CASSInsightsOutput{
+		Period:     since,
+		Agents:     []cass.AggregationBucket{},
+		Workspaces: []cass.AggregationBucket{},
+	}
+
 	client := cass.NewClient()
 	if !client.IsInstalled() {
-		return &CASSInsightsOutput{
-			RobotResponse: NewErrorResponse(
-				fmt.Errorf("cass not installed"),
-				ErrCodeDependencyMissing,
-				"Install cass to enable insights",
-			),
-			Period: "7d",
-			Agents: map[string]interface{}{},
-			Topics: []map[string]interface{}{},
-			Errors: []map[string]interface{}{},
-		}, nil
+		output.RobotResponse = NewErrorResponse(
+			fmt.Errorf("cass not installed"),
+			ErrCodeDependencyMissing,
+			"Install cass to enable insights",
+		)
+		return output, nil
 	}
-	// Get aggregations for the last 7 days by default
 	resp, err := client.Search(context.Background(), cass.SearchOptions{
-		Query: "*",
-		Since: "7d",
-		Limit: 0,
+		Query:     "*",
+		Since:     output.Period,
+		Limit:     0,
+		Aggregate: "agent,workspace",
 	})
-
 	if err != nil {
-		return &CASSInsightsOutput{
-			RobotResponse: NewErrorResponse(
-				err,
-				ErrCodeInternalError,
-				"Check cass index health and configuration",
-			),
-			Period: "7d",
-			Agents: map[string]interface{}{},
-			Topics: []map[string]interface{}{},
-			Errors: []map[string]interface{}{},
-		}, nil
+		output.RobotResponse = cassErrorResponse(err, "Check cass index health and configuration")
+		return output, nil
 	}
 
-	output := &CASSInsightsOutput{
-		RobotResponse: NewRobotResponse(true),
-		Period:        "7d",
-		Agents:        map[string]interface{}{},
-		Topics:        []map[string]interface{}{},
-		Errors:        []map[string]interface{}{},
-	}
-
-	if resp.Aggregations != nil {
-		// Convert agent map to buckets list
-		var agentBuckets []map[string]interface{}
-		for k, v := range resp.Aggregations.Agents {
-			agentBuckets = append(agentBuckets, map[string]interface{}{
-				"key":   k,
-				"count": v,
-			})
+	output.RobotResponse = NewRobotResponse(true)
+	if agg := resp.Aggregations; agg != nil {
+		if agg.Agent != nil {
+			output.Agents = agg.Agent.Buckets
 		}
-		output.Agents["buckets"] = agentBuckets
-
-		// Convert tags/topics
-		for k, v := range resp.Aggregations.Tags {
-			output.Topics = append(output.Topics, map[string]interface{}{
-				"term":  k,
-				"count": v,
-			})
+		if agg.Workspace != nil {
+			output.Workspaces = agg.Workspace.Buckets
 		}
 	}
-
 	return output, nil
 }
 
 // PrintCASSInsights outputs aggregated insights as JSON.
 // This is a thin wrapper around GetCASSInsights() for CLI output.
-func PrintCASSInsights() error {
-	output, err := GetCASSInsights()
+func PrintCASSInsights(since string) error {
+	output, err := GetCASSInsights(since)
 	if err != nil {
 		return err
 	}
@@ -350,11 +321,7 @@ func GetCASSContext(query string) (*CASSContextOutput, error) {
 
 	if err != nil {
 		return &CASSContextOutput{
-			RobotResponse: NewErrorResponse(
-				err,
-				ErrCodeInternalError,
-				"Check cass index health",
-			),
+			RobotResponse:    cassErrorResponse(err, "Check cass index health"),
 			Query:            query,
 			RelevantSessions: []CASSContextSession{},
 		}, nil
@@ -603,13 +570,6 @@ type JFPSuggestOutput struct {
 	Suggestions json.RawMessage `json:"suggestions"`
 }
 
-// JFPInstalledOutput represents the output for --robot-jfp-installed
-type JFPInstalledOutput struct {
-	RobotResponse
-	Count  int             `json:"count"`
-	Skills json.RawMessage `json:"skills"`
-}
-
 // JFPCategoriesOutput represents the output for --robot-jfp-categories
 type JFPCategoriesOutput struct {
 	RobotResponse
@@ -629,14 +589,6 @@ type JFPBundlesOutput struct {
 	RobotResponse
 	Count   int             `json:"count"`
 	Bundles json.RawMessage `json:"bundles"`
-}
-
-// JFPInstallOutput represents the output for --robot-jfp-install
-type JFPInstallOutput struct {
-	RobotResponse
-	IDs     []string        `json:"ids"`
-	Project string          `json:"project,omitempty"`
-	Result  json.RawMessage `json:"result,omitempty"`
 }
 
 // JFPExportOutput represents the output for --robot-jfp-export
@@ -763,14 +715,13 @@ func GetJFPList(opts JFPListOptions) (*JFPListOutput, error) {
 		return output, nil
 	}
 
-	output.Prompts = data
-
-	// Try to count items
-	var items []interface{}
-	if json.Unmarshal(data, &items) == nil {
-		output.Count = len(items)
+	prompts, count, err := jfpListField(data, "prompts")
+	if err != nil {
+		output.RobotResponse = NewErrorResponse(err, "LIST_FAILED", "Check 'jfp list --json' output")
+		return output, nil
 	}
-
+	output.Prompts = prompts
+	output.Count = count
 	return output, nil
 }
 
@@ -829,14 +780,13 @@ func GetJFPSearch(query string) (*JFPSearchOutput, error) {
 		return output, nil
 	}
 
-	output.Results = data
-
-	// Try to count results
-	var items []interface{}
-	if json.Unmarshal(data, &items) == nil {
-		output.Count = len(items)
+	results, count, err := jfpListField(data, "results")
+	if err != nil {
+		output.RobotResponse = NewErrorResponse(err, "SEARCH_FAILED", "Check 'jfp search --json' output")
+		return output, nil
 	}
-
+	output.Results = results
+	output.Count = count
 	return output, nil
 }
 
@@ -952,8 +902,34 @@ func GetJFPSuggest(task string) (*JFPSuggestOutput, error) {
 		return output, nil
 	}
 
-	output.Suggestions = data
+	suggestions, _, err := jfpListField(data, "suggestions")
+	if err != nil {
+		output.RobotResponse = NewErrorResponse(err, "SUGGEST_FAILED", "Check 'jfp suggest --json' output")
+		return output, nil
+	}
+	output.Suggestions = suggestions
 	return output, nil
+}
+
+// jfpListField returns one array field of a jfp JSON object (list, search and
+// suggest wrap their items, e.g. {"prompts":[...],"count":N}) and its length.
+func jfpListField(data json.RawMessage, field string) (json.RawMessage, int, error) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return nil, 0, fmt.Errorf("decode jfp output: %w", err)
+	}
+	var items []json.RawMessage
+	list, ok := envelope[field]
+	if !ok || json.Unmarshal(list, &items) != nil {
+		return nil, 0, fmt.Errorf("jfp output has no %q array", field)
+	}
+	return list, len(items), nil
+}
+
+// jfpMovedResponse reports a jfp command that upstream retired as unavailable
+// rather than as a failure.
+func jfpMovedResponse(err error) RobotResponse {
+	return NewErrorResponse(err, ErrCodeNotImplemented, "Skill management moved from jfp to jsm; use jsm directly")
 }
 
 // PrintJFPSuggest outputs prompt suggestions for a task as JSON.
@@ -964,59 +940,6 @@ func PrintJFPSuggest(task string) error {
 		return err
 	}
 	return encodeTerminalRobotOutput(output, output.RobotResponse, "robot JFP suggest failed")
-}
-
-// GetJFPInstalled returns installed Claude Code skills.
-// This function returns the data struct directly, enabling CLI/REST parity.
-func GetJFPInstalled() (*JFPInstalledOutput, error) {
-	adapter := tools.NewJFPAdapter()
-
-	output := &JFPInstalledOutput{
-		RobotResponse: NewRobotResponse(true),
-	}
-
-	// Check if jfp is installed
-	_, installed := adapter.Detect()
-	if !installed {
-		output.RobotResponse = NewErrorResponse(
-			fmt.Errorf("jfp not installed"),
-			ErrCodeDependencyMissing,
-			"Install jfp with: npm install -g jeffreysprompts",
-		)
-		return output, nil
-	}
-
-	ctx := context.Background()
-	data, err := adapter.Installed(ctx)
-
-	if err != nil {
-		output.RobotResponse = NewErrorResponse(
-			err,
-			"INSTALLED_FAILED",
-			"Check if Claude Code skills directory exists",
-		)
-		return output, nil
-	}
-
-	output.Skills = data
-
-	// Try to count items
-	var items []interface{}
-	if json.Unmarshal(data, &items) == nil {
-		output.Count = len(items)
-	}
-
-	return output, nil
-}
-
-// PrintJFPInstalled outputs installed Claude Code skills as JSON.
-// This is a thin wrapper around GetJFPInstalled() for CLI output.
-func PrintJFPInstalled() error {
-	output, err := GetJFPInstalled()
-	if err != nil {
-		return err
-	}
-	return encodeTerminalRobotOutput(output, output.RobotResponse, "robot JFP installed failed")
 }
 
 // GetJFPCategories returns all categories with counts.
@@ -1201,63 +1124,6 @@ func parseJFPIDs(raw string) []string {
 	return ids
 }
 
-// GetJFPInstall installs one or more prompts by ID.
-// This function returns the data struct directly, enabling CLI/REST parity.
-func GetJFPInstall(rawIDs, project string) (*JFPInstallOutput, error) {
-	adapter := tools.NewJFPAdapter()
-	ids := parseJFPIDs(rawIDs)
-
-	output := &JFPInstallOutput{
-		RobotResponse: NewRobotResponse(true),
-		IDs:           ids,
-		Project:       project,
-	}
-
-	// Check if jfp is installed
-	_, installed := adapter.Detect()
-	if !installed {
-		output.RobotResponse = NewErrorResponse(
-			fmt.Errorf("jfp not installed"),
-			ErrCodeDependencyMissing,
-			"Install jfp with: npm install -g jeffreysprompts",
-		)
-		return output, nil
-	}
-
-	if len(ids) == 0 {
-		output.RobotResponse = NewErrorResponse(
-			fmt.Errorf("prompt ID is required"),
-			ErrCodeInvalidFlag,
-			"Provide prompt IDs, e.g., --robot-jfp-install=prompt-123",
-		)
-		return output, nil
-	}
-
-	ctx := context.Background()
-	data, err := adapter.Install(ctx, ids, project)
-	if err != nil {
-		output.RobotResponse = NewErrorResponse(
-			err,
-			"INSTALL_FAILED",
-			"Check prompt IDs and try again",
-		)
-		return output, nil
-	}
-
-	output.Result = data
-	return output, nil
-}
-
-// PrintJFPInstall outputs install results as JSON.
-// This is a thin wrapper around GetJFPInstall() for CLI output.
-func PrintJFPInstall(rawIDs, project string) error {
-	output, err := GetJFPInstall(rawIDs, project)
-	if err != nil {
-		return err
-	}
-	return encodeTerminalRobotOutput(output, output.RobotResponse, "robot JFP install failed")
-}
-
 // GetJFPExport exports one or more prompts by ID.
 // This function returns the data struct directly, enabling CLI/REST parity.
 func GetJFPExport(rawIDs, format string) (*JFPExportOutput, error) {
@@ -1292,6 +1158,10 @@ func GetJFPExport(rawIDs, format string) (*JFPExportOutput, error) {
 
 	ctx := context.Background()
 	data, err := adapter.Export(ctx, ids, format)
+	if errors.Is(err, tools.ErrJFPCommandMoved) {
+		output.RobotResponse = jfpMovedResponse(err)
+		return output, nil
+	}
 	if err != nil {
 		output.RobotResponse = NewErrorResponse(
 			err,
@@ -1336,12 +1206,12 @@ func GetJFPUpdate() (*JFPUpdateOutput, error) {
 	}
 
 	ctx := context.Background()
-	data, err := adapter.Update(ctx)
+	data, err := adapter.Refresh(ctx)
 	if err != nil {
 		output.RobotResponse = NewErrorResponse(
 			err,
 			"UPDATE_FAILED",
-			"Run 'jfp update' to refresh the registry",
+			"Run 'jfp refresh' to refresh the registry",
 		)
 		return output, nil
 	}
@@ -1367,10 +1237,10 @@ func PrintJFPUpdate() error {
 // MSSearchOutput represents the output for --robot-ms-search
 type MSSearchOutput struct {
 	RobotResponse
-	Query  string          `json:"query"`
-	Count  int             `json:"count"`
-	Skills json.RawMessage `json:"skills"`
-	Source string          `json:"source,omitempty"`
+	Query  string               `json:"query"`
+	Count  int                  `json:"count"`
+	Skills []tools.MSSkillMatch `json:"skills"`
+	Source string               `json:"source,omitempty"`
 }
 
 // MSShowOutput represents the output for --robot-ms-show
@@ -1389,6 +1259,7 @@ func GetMSSearch(query string) (*MSSearchOutput, error) {
 	output := &MSSearchOutput{
 		RobotResponse: NewRobotResponse(true),
 		Query:         query,
+		Skills:        []tools.MSSkillMatch{},
 		Source:        "ms",
 	}
 
@@ -1413,7 +1284,7 @@ func GetMSSearch(query string) (*MSSearchOutput, error) {
 	}
 
 	ctx := context.Background()
-	data, err := adapter.Search(ctx, query)
+	matches, err := adapter.Search(ctx, query)
 	if err != nil {
 		output.RobotResponse = NewErrorResponse(
 			err,
@@ -1423,14 +1294,8 @@ func GetMSSearch(query string) (*MSSearchOutput, error) {
 		return output, nil
 	}
 
-	output.Skills = data
-
-	// Try to count items
-	var items []interface{}
-	if json.Unmarshal(data, &items) == nil {
-		output.Count = len(items)
-	}
-
+	output.Skills = matches
+	output.Count = len(matches)
 	return output, nil
 }
 
@@ -1802,6 +1667,7 @@ type StatusSummary struct {
 	WindsurfCount    int            `json:"windsurf_count"`
 	AiderCount       int            `json:"aider_count"`
 	OpencodeCount    int            `json:"opencode_count"`
+	OmpCount         int            `json:"omp_count"`
 	OllamaCount      int            `json:"ollama_count"`
 	AgentsByState    map[string]int `json:"agents_by_state"`
 	AgentsByType     map[string]int `json:"agents_by_type"`
@@ -1983,7 +1849,6 @@ Use --all to include the user pane (index depends on tmux pane-base-index).
 			"profile-show",
 			"giil-fetch",
 			"jfp-search",
-			"jfp-install",
 			"jfp-export",
 			"jfp-update",
 			"ms-search",
@@ -2033,12 +1898,12 @@ Common Modifiers:
 --robot-limit=N  Explicit pagination alias for robot list outputs
 --robot-offset=N Explicit pagination alias for robot list outputs
 --since=VALUE   Time filter for commands that support it (history, diff, and summary accept duration or RFC3339; snapshot requires RFC3339; mail-check uses YYYY-MM-DD)
---type=TYPE     Agent type filter for commands that support it (claude, codex, antigravity, grok, gemini, cursor, windsurf, aider)
+--type=TYPE     Agent type filter for commands that support it (claude, codex, antigravity, grok, omp, gemini, cursor, windsurf, aider)
 --timeout=VALUE Shared timeout for wait/ack/interrupt and spawn --spawn-wait
 --poll=VALUE    Shared polling interval for wait/ack/send --track
 --strategy=NAME Strategy override for assign, route, and spawn --spawn-assign-work
 --exclude=X,Y   Exclude pane indices for commands that support it
---msg=TEXT      Shared message payload for send, ack echo detection, and interrupt retasks
+--msg=TEXT      Shared message payload for send, ack echo detection, interrupt retasks, and route affinity
 --panes=X,Y     Pane filter (comma-separated indices)
 --all           Include the user pane for commands that support it
 --force         Force commands that support it past their normal safety checks
@@ -2108,6 +1973,7 @@ Tips for AI Agents:
 - Snapshot returns latest_cursor plus replay_window metadata for mechanical resync.
 - Prefer --robot-capabilities for schema discovery over parsing help text.
 - Use --robot-send --verify-render when a bounded before/after pane capture must confirm delivery changed rendered output; inspect render_evidence and require delivered_and_rendered for every target. This confirms rendered delivery, not agent comprehension.
+- Pass --op-id=ID to --robot-send or --robot-interrupt when you may retry after a timeout: an identical retry replays the recorded outcome instead of sending (or interrupting) again, a conflicting reuse fails IDEMPOTENCY_CONFLICT, and --robot-send-receipt=ID reports the outcome.
 - Profiles reduce filter boilerplate: --profile=operator is the default.
 - Attention feed is a sensing/actuation surface, not a planner: it does not assign beads, infer intent, or replace beads, bv, or Agent Mail.
 
@@ -2305,6 +2171,7 @@ func cloneSnapshotOutput(base *SnapshotOutput) *SnapshotOutput {
 		WindsurfCount:    base.Summary.WindsurfCount,
 		AiderCount:       base.Summary.AiderCount,
 		OpencodeCount:    base.Summary.OpencodeCount,
+		OmpCount:         base.Summary.OmpCount,
 		OllamaCount:      base.Summary.OllamaCount,
 		AgentsByState:    make(map[string]int, len(base.Summary.AgentsByState)),
 		AgentsByType:     make(map[string]int, len(base.Summary.AgentsByType)),
@@ -2426,10 +2293,6 @@ func buildProjectionBackedStatus(store *state.Store, cfg *config.Config, opts Pa
 		agentsBySession[sess.Name] = agents
 	}
 
-	workRows, err := store.ListFreshRuntimeWork("", 0)
-	if err != nil {
-		return nil, fmt.Errorf("status work: %w", err)
-	}
 	coordinationRows, err := store.ListFreshRuntimeCoordination("")
 	if err != nil {
 		return nil, fmt.Errorf("status coordination: %w", err)
@@ -2472,15 +2335,17 @@ func buildProjectionBackedStatus(store *state.Store, cfg *config.Config, opts Pa
 		}
 	}
 
-	for _, item := range workRows {
-		switch item.Status {
-		case "in_progress":
-			output.Summary.InProgress++
-		case "open":
-			if item.BlockedByCount == 0 {
-				output.Summary.ReadyWork++
-			}
-		}
+	// Work counts come only from a source-verified observation; unverifiable
+	// work reports none (GH #283). A failing work source is already named in
+	// the source-health rows the refresh records.
+	projectDir, err := resolveNormalizedProjectDir("")
+	if err != nil {
+		return nil, fmt.Errorf("status work: %w", err)
+	}
+	work := verifiedRobotWork(store, projectDir, 0)
+	if work.Available {
+		output.Summary.ReadyWork = work.Summary.Ready
+		output.Summary.InProgress = work.Summary.InProgress
 	}
 
 	for _, item := range coordinationRows {
@@ -2494,7 +2359,7 @@ func buildProjectionBackedStatus(store *state.Store, cfg *config.Config, opts Pa
 		output.DegradedSources = append(output.DegradedSources, output.Sources.Degraded...)
 	}
 
-	statusApplyAlertCounts(output, alerts.GetActiveAlerts(alertConfigForProject(cfg, "")))
+	statusApplyAlertCounts(output, alerts.GetActiveAlerts(AlertConfigForProject(cfg, "")))
 	statusFinalize(output, opts)
 	return output, nil
 }
@@ -2578,7 +2443,7 @@ func buildLiveStatus(projectDir string, cfg *config.Config, opts PaginationOptio
 		output.Summary.MailUrgent = 0
 	}
 	if len(output.AlertCounts) == 0 {
-		statusApplyAlertCounts(output, alerts.GetActiveAlerts(alertConfigForProject(cfg, resolvedProjectDir)))
+		statusApplyAlertCounts(output, alerts.GetActiveAlerts(AlertConfigForProject(cfg, resolvedProjectDir)))
 	}
 
 	statusFinalize(output, opts)
@@ -2708,6 +2573,8 @@ func statusAccumulateAgentSummary(summary *StatusSummary, agentType, agentState 
 		summary.AiderCount++
 	case "oc":
 		summary.OpencodeCount++
+	case "omp":
+		summary.OmpCount++
 	case "ollama":
 		summary.OllamaCount++
 	}
@@ -2983,14 +2850,12 @@ func GetMail(opts MailOptions) (*MailOutput, error) {
 
 	// Ensure project exists
 	if _, err := ensureProjectWithRetry(ctx, client, projectKey); err != nil {
-		output.Warnings = append(output.Warnings, fmt.Sprintf("ensure_project failed: %v", err))
-		return output, nil
+		return mailReadFailed(output, "ensure_project", err), nil
 	}
 
 	agents, err := client.ListProjectAgents(ctx, projectKey)
 	if err != nil {
-		output.Warnings = append(output.Warnings, fmt.Sprintf("list_agents failed: %v", err))
-		return output, nil
+		return mailReadFailed(output, "list_agents", err), nil
 	}
 
 	agentByName := make(map[string]agentmail.Agent, len(agents))
@@ -3091,6 +2956,17 @@ func GetMail(opts MailOptions) (*MailOutput, error) {
 	}
 
 	return output, nil
+}
+
+// mailReadFailed marks output failed when the project's agents could not be
+// read: success with an empty agents array would claim the server has none.
+func mailReadFailed(output *MailOutput, step string, err error) *MailOutput {
+	code, hint := ErrCodeInternalError, "Check the Agent Mail server's health and logs"
+	if agentmail.IsUnauthorized(err) {
+		code, hint = ErrCodePermissionDenied, "Set [agent_mail] token or AGENT_MAIL_TOKEN to the bearer token the Agent Mail server requires"
+	}
+	output.RobotResponse = NewErrorResponse(fmt.Errorf("%s failed: %w", step, err), code, hint)
+	return output
 }
 
 // PrintMail outputs detailed Agent Mail state for AI orchestrators.
@@ -3431,7 +3307,10 @@ func reservationPatternsConflict(a, b string) bool {
 	if a == b {
 		return true
 	}
-	return matchesPattern(a, b) || matchesPattern(b, a)
+	// Matching one glob against the other's literal spelling misses
+	// intersections such as src/*/main.go and src/service/*.go. Compare their
+	// path languages, as the coordinator does.
+	return reservationpath.MayOverlap(a, b)
 }
 
 func normalizeConflictPattern(a, b string) string {
@@ -3749,14 +3628,16 @@ func detectAgentType(title string) string {
 		return "windsurf"
 	case containsShortForm(titleLower, "oc"):
 		return "oc"
+	case containsShortForm(titleLower, "omp"):
+		return "omp"
 	}
 
 	return "unknown"
 }
 
 // DetectAgentType detects the agent type from a pane title.
-// Returns one of: "claude", "codex", "gemini", "cursor", "windsurf",
-// "aider", "oc" (opencode), "ollama", or "unknown".
+// Returns one of: "claude", "codex", "gemini", "antigravity", "grok",
+// "cursor", "windsurf", "aider", "oc" (opencode), "omp", "ollama", or "unknown".
 func DetectAgentType(title string) string {
 	return detectAgentType(title)
 }
@@ -3794,6 +3675,8 @@ func ResolveAgentType(t string) string {
 		return "aider"
 	case agent.AgentTypeOpencode:
 		return "oc"
+	case agent.AgentTypeOmp:
+		return "omp"
 	case agent.AgentTypeOllama:
 		return "ollama"
 	case agent.AgentTypeUser:
@@ -3803,6 +3686,52 @@ func ResolveAgentType(t string) string {
 	default:
 		return strings.ToLower(trimmed)
 	}
+}
+
+// paneLaunchModel returns the model ntm launched a pane with, read from the
+// pane's recorded launch specification, or "" when the pane has no record or
+// was launched without an explicit/configured model. It is authoritative
+// where detectModel only guesses from title substrings: an `--oc=1:MODEL`
+// pane's title matched none of detectModel's patterns, so --robot-context
+// reported model "unknown" for a model the operator had named (GH #333).
+var paneLaunchModel = func(paneID string) string {
+	return paneLaunchModelContext(context.Background(), paneID)
+}
+
+func paneLaunchModelContext(ctx context.Context, paneID string) string {
+	if paneID == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	spec, err := tmux.ReadPaneLaunchSpecContext(ctx, paneID)
+	if err != nil || spec == nil {
+		return ""
+	}
+	return strings.TrimSpace(spec.Model)
+}
+
+// contextPaneModel is the model --robot-context reports for a pane: the
+// recorded launch model when there is one, else detectModel's title guess.
+func contextPaneModel(pane tmux.Pane, agentType string) string {
+	if model := paneLaunchModel(pane.ID); model != "" {
+		return model
+	}
+	return detectModel(agentType, pane.Title)
+}
+
+// contextPaneLimit is the context window --robot-context budgets a pane
+// against. A recorded launch model the model registry does not know (agy's
+// pinned "Gemini 4 Argon (High)", an `opus[1m]` alias, an OpenCode
+// provider/model) would otherwise fall to the registry's generic default
+// rather than the family limit detectModel's guess resolves to: an agy pane
+// dropped from gemini's 1M window to 128K and read as nearly eight times
+// fuller than before the launch model was consulted.
+func contextPaneLimit(model string, pane tmux.Pane, agentType string) int {
+	if models.KnownModel(model) {
+		return getContextLimit(model)
+	}
+	return getContextLimit(detectModel(agentType, pane.Title))
 }
 
 // detectModel attempts to detect the model from agent type and pane title.
@@ -4292,6 +4221,18 @@ func determineState(output, agentType string) string {
 	if detectedError == status.ErrorRateLimit {
 		return "error"
 	}
+	// Oh My Pi's composer-anchored chrome is authoritative in both directions:
+	// in-flight signals mean active whatever the transcript says, and a
+	// dismissable provider-error block framed above the quiet composer is the
+	// current (retryable) error, never idle-after-completion.
+	if normalizedType == "omp" {
+		if agent.OmpActivelyWorking(output, 0) {
+			return "active"
+		}
+		if _, failed := agent.OmpProviderError(output); failed {
+			return "error"
+		}
+	}
 	// A shell prompt in a Claude pane means the agent process exited. Preserve
 	// that guard before considering an older completion marker as idle TUI state.
 	if normalizedType == "claude" &&
@@ -4519,14 +4460,19 @@ func resolveAgentsForSession(panes []tmux.Pane, mailAgents []agentmail.Agent) ma
 	return mapping
 }
 
-func alertConfigForProject(cfg *config.Config, projectDir string) alerts.Config {
+// AlertConfigForProject is the one alert-generator configuration for every
+// surface (robot status/snapshot/alerts, markdown, dashboard): the [alerts]
+// thresholds plus the transcript-backed context usage source that turns
+// alerts.context_warning_threshold into per-pane context warnings.
+func AlertConfigForProject(cfg *config.Config, projectDir string) alerts.Config {
 	resolvedProject := strings.TrimSpace(projectDir)
 	if resolvedProject == "" {
 		resolvedProject = util.ResolveProjectDir("")
 	}
 
+	alertCfg := alerts.DefaultConfig()
 	if cfg != nil {
-		return alerts.ToConfigAlerts(
+		alertCfg = alerts.ToConfigAlerts(
 			cfg.Alerts.Enabled,
 			cfg.Alerts.AgentStuckMinutes,
 			cfg.Alerts.DiskLowThresholdGB,
@@ -4537,9 +4483,8 @@ func alertConfigForProject(cfg *config.Config, projectDir string) alerts.Config 
 			resolvedProject,
 		)
 	}
-
-	alertCfg := alerts.DefaultConfig()
 	alertCfg.ProjectsDir = resolvedProject
+	alertCfg.PaneContextUsage = paneContextUsagePercents
 	return alertCfg
 }
 
@@ -4650,21 +4595,46 @@ type SnapshotSession struct {
 	Name     string          `json:"name"`
 	Attached bool            `json:"attached"`
 	Agents   []SnapshotAgent `json:"agents"`
+	// Services lists the session's tagged non-agent service panes. They are
+	// excluded from every agent count, state summary and health rollup
+	// (ntm#305) and reported here so they stay visible.
+	Services []SnapshotService `json:"services,omitempty"`
+}
+
+// SnapshotService is a long-lived, non-agent service pane — an ACFS-managed
+// `cm` or `cass` process, say — identified by its durable pane-option tag
+// rather than by its title. A service's terminal going quiet is normal and
+// must never be reported as an agent error (ntm#305).
+type SnapshotService struct {
+	Pane    string `json:"pane"`
+	Name    string `json:"name"`
+	Manager string `json:"manager"`
+	Command string `json:"command,omitempty"`
+}
+
+// snapshotServiceFromPane renders a tagged service pane for robot output.
+func snapshotServiceFromPane(pane tmux.Pane) SnapshotService {
+	return SnapshotService{
+		Pane:    fmt.Sprintf("%d.%d", pane.WindowIndex, pane.Index),
+		Name:    pane.Service,
+		Manager: pane.ServiceManager,
+		Command: pane.Command,
+	}
 }
 
 // SnapshotAgent represents an agent in the snapshot
 type SnapshotAgent struct {
-	Pane             string  `json:"pane"`
-	Type             string  `json:"type"`              // claude, codex, antigravity, grok, gemini, or another supported type
-	Variant          string  `json:"variant,omitempty"` // Model alias or persona name
-	TypeConfidence   float64 `json:"type_confidence"`
-	TypeMethod       string  `json:"type_method"`
-	State            string  `json:"state"`
-	LastOutputAgeSec int     `json:"last_output_age_sec"`
-	OutputTailLines  int     `json:"output_tail_lines"`
-	ContextPercent   float64 `json:"context_percent,omitempty"`
-	CurrentBead      *string `json:"current_bead,omitempty"`
-	PendingMail      int     `json:"pending_mail"`
+	Pane             string   `json:"pane"`
+	Type             string   `json:"type"`              // claude, codex, antigravity, grok, gemini, or another supported type
+	Variant          string   `json:"variant,omitempty"` // Model alias or persona name
+	TypeConfidence   float64  `json:"type_confidence"`
+	TypeMethod       string   `json:"type_method"`
+	State            string   `json:"state"`
+	LastOutputAgeSec int      `json:"last_output_age_sec"`
+	OutputTailLines  int      `json:"output_tail_lines"`
+	ContextPercent   *float64 `json:"context_percent,omitempty"`
+	CurrentBead      *string  `json:"current_bead,omitempty"`
+	PendingMail      int      `json:"pending_mail"`
 }
 
 // SnapshotAgentMail represents Agent Mail availability and inbox state.
@@ -4847,9 +4817,17 @@ func GetSnapshotWithOptions(cfg *config.Config, opts PaginationOptions) (*Snapsh
 
 		// Ground-truth transcript usage, unambiguous panes only (memoized
 		// per agent-type+cwd group).
-		paneTranscripts := resolvePaneTranscripts(panes)
+		paneTranscripts := ResolvePaneTranscripts(panes)
 
 		for _, pane := range panes {
+			// A tagged service pane is not an agent: keep it out of the agent
+			// list (and therefore out of every count derived from it) but
+			// report it alongside (ntm#305).
+			if pane.IsServicePane() {
+				snapSession.Services = append(snapSession.Services, snapshotServiceFromPane(pane))
+				continue
+			}
+
 			// Capture output for state detection and enhanced type detection
 			captured := ""
 			capturedErr := error(nil)
@@ -4894,34 +4872,9 @@ func GetSnapshotWithOptions(cfg *config.Config, opts PaginationOptions) (*Snapsh
 				lines := splitLines(status.StripANSI(captured))
 				agent.OutputTailLines = len(lines)
 				agent.State = determineState(captured, agent.Type)
-				if !strings.EqualFold(agent.Type, "user") {
-					if usage := tokens.GetUsageInfo(captured, detectModel(agent.Type, pane.Title)); usage != nil {
-						agent.ContextPercent = usage.UsagePercent
-					}
-					// Prefer ground truth from the agent CLI's own session
-					// transcript when one is unambiguously correlated to this
-					// pane (see resolvePaneTranscripts).
-					if tu, ok := paneTranscripts[pane.ID]; ok {
-						limit := tu.ContextWindow
-						if limit <= 0 {
-							model := tu.Model
-							if model == "" {
-								model = detectModel(agent.Type, pane.Title)
-							}
-							limit = getContextLimit(model)
-						}
-						if limit > 0 {
-							pct := float64(tu.Tokens) / float64(limit) * 100
-							if pct > 100 {
-								// Over-100% means the registry window for
-								// this model is wrong; cap at the safe
-								// rotation-triggering ceiling.
-								pct = 100
-							}
-							agent.ContextPercent = pct
-						}
-					}
-				}
+				measured := Agent{Type: agent.Type}
+				enrichAgentContext(&measured, contextPaneModel(pane, agent.Type), captured, paneTranscripts[pane.ID])
+				agent.ContextPercent = contextPercentForAgent(&measured)
 			}
 
 			snapSession.Agents = append(snapSession.Agents, agent)
@@ -4950,10 +4903,10 @@ func GetSnapshotWithOptions(cfg *config.Config, opts PaginationOptions) (*Snapsh
 	// Include tool inventory and health status
 	toolCtx, toolCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer toolCancel()
-	output.Tools = GetToolsSummary(toolCtx)
+	output.Tools = GetToolsSummary(toolCtx, DisabledTools(cfg))
 
 	// Generate and add detailed alerts using the alerts package
-	alertCfg := alertConfigForProject(cfg, projectKey)
+	alertCfg := AlertConfigForProject(cfg, projectKey)
 	activeAlerts := alerts.GetActiveAlerts(alertCfg)
 
 	if len(activeAlerts) > 0 {
@@ -5000,9 +4953,7 @@ func GetSnapshotWithOptions(cfg *config.Config, opts PaginationOptions) (*Snapsh
 		output.Alerts = append(output.Alerts, fmt.Sprintf("failed to list active incidents: %v", err))
 	}
 	if store := currentProjectionStore(); store != nil {
-		if workRows, err := store.ListFreshRuntimeWork("", 0); err == nil {
-			output.Work = snapshotWorkFromRuntime(workRows, BeadLimit)
-		}
+		output.Work = verifiedRobotWork(store, projectKey, BeadLimit)
 		if rows, err := store.GetAllSourceHealth(); err == nil {
 			applySnapshotSourceHealth(output, rows)
 		}
@@ -5039,9 +4990,7 @@ func buildProjectionBackedSnapshot(
 		return nil, err
 	}
 	output.Sessions = sessions
-	if workRows, err := store.ListFreshRuntimeWork("", 0); err == nil {
-		output.Work = snapshotWorkFromRuntime(workRows, BeadLimit)
-	}
+	output.Work = verifiedRobotWork(store, projectKey, BeadLimit)
 	if rows, err := store.GetAllSourceHealth(); err == nil {
 		applySnapshotSourceHealth(output, rows)
 	}
@@ -5078,17 +5027,13 @@ func buildProjectionBackedSnapshot(
 
 	output.Swarm = buildSwarmSnapshot(cfg, tmuxSessions)
 
-	if beads, err := snapshotBeadsSummaryFromRuntime(store, projectKey, BeadLimit); err == nil {
-		output.BeadsSummary = beads
-	} else if beads := bv.GetBeadsSummary("", BeadLimit); beads != nil {
-		output.BeadsSummary = beads
-	}
+	output.BeadsSummary = beadsSummaryFromWork(output.Work, projectKey, BeadLimit)
 
 	toolCtx, toolCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer toolCancel()
-	output.Tools = GetToolsSummary(toolCtx)
+	output.Tools = GetToolsSummary(toolCtx, DisabledTools(cfg))
 
-	alertCfg := alertConfigForProject(cfg, projectKey)
+	alertCfg := AlertConfigForProject(cfg, projectKey)
 	activeAlerts := alerts.GetActiveAlerts(alertCfg)
 	if len(activeAlerts) > 0 {
 		output.AlertsDetailed = make([]AlertInfo, len(activeAlerts))
@@ -5308,54 +5253,68 @@ func snapshotCoordinationFromRuntime(rows []state.RuntimeCoordination, handoff *
 	return summary
 }
 
-func snapshotWorkFromRuntime(rows []state.RuntimeWork, limit int) *adapters.WorkSection {
-	section := &adapters.WorkSection{
-		Ready:      []adapters.WorkItem{},
-		Blocked:    []adapters.WorkItem{},
-		InProgress: []adapters.WorkItem{},
-		Summary:    &adapters.WorkSummary{},
-		Available:  len(rows) > 0,
-	}
-	if len(rows) == 0 {
-		section.Reason = "runtime projection empty"
-		return section
-	}
+// robotWorkTimeout bounds the verified work read behind a snapshot or status.
+const robotWorkTimeout = 10 * time.Second
 
-	appendCapped := func(items []adapters.WorkItem, item adapters.WorkItem) []adapters.WorkItem {
-		if limit > 0 && len(items) >= limit {
-			return items
+// collectRobotWork is the verified work read behind verifiedRobotWork. It is a
+// seam so tests never read the tracker of the repository they run in.
+var collectRobotWork = adapters.CollectDurableWork
+
+// verifiedRobotWork is the project's work as the robot snapshot and status
+// report it: only a source-verified observation (adapters.CollectDurableWork),
+// never the RuntimeWork rows, which are fresh by age alone, carry no source
+// identity, and so could advertise work the tracker no longer has as ready
+// (GH #283).
+//
+// The projection refresh that precedes every robot command publishes its own
+// verified collection, so this is normally a re-verified read of that
+// observation. If the tracker or checkout has moved on since, one new verified
+// observation is taken: the old one is stale, not wrong to replace. Anything
+// still unverifiable is reported unavailable with its reason and no ready
+// work, never filled in from rows.
+func verifiedRobotWork(store *state.Store, projectDir string, limit int) *adapters.WorkSection {
+	ctx, cancel := context.WithTimeout(context.Background(), robotWorkTimeout)
+	defer cancel()
+
+	var work *adapters.WorkSection
+	err := errors.New("work projection store unavailable")
+	if store != nil {
+		cfg := adapters.DefaultWorkCoordinationAdapterConfig(projectDir)
+		if limit > 0 {
+			cfg.WorkItemLimit = limit
 		}
-		return append(items, item)
-	}
-
-	for _, row := range rows {
-		section.Summary.Total++
-		item := snapshotWorkItemFromRuntime(row)
-		switch row.Status {
-		case "open":
-			section.Summary.Open++
-			if row.BlockedByCount > 0 {
-				section.Summary.Blocked++
-				section.Blocked = appendCapped(section.Blocked, item)
-				continue
-			}
-			section.Summary.Ready++
-			section.Ready = appendCapped(section.Ready, item)
-		case "in_progress":
-			section.Summary.InProgress++
-			section.InProgress = appendCapped(section.InProgress, item)
-		case "closed":
-			section.Summary.Closed++
-		default:
-			section.Summary.Open++
-			if row.BlockedByCount > 0 {
-				section.Summary.Blocked++
-				section.Blocked = appendCapped(section.Blocked, item)
-			}
+		work, err = collectRobotWork(ctx, store, cfg, false)
+		if err != nil && errors.Is(err, worksource.ErrStale) && ctx.Err() == nil {
+			work, err = collectRobotWork(ctx, store, cfg, true)
 		}
 	}
-
-	return section
+	if work == nil {
+		work = &adapters.WorkSection{}
+	}
+	if err != nil {
+		work.Available = false
+		work.Ready = nil
+		if work.Summary != nil {
+			work.Summary.Ready = 0
+		}
+		if work.Reason == "" {
+			work.Reason = err.Error()
+		}
+	}
+	// Critical arrays are always present, empty when there is nothing.
+	if work.Ready == nil {
+		work.Ready = []adapters.WorkItem{}
+	}
+	if work.Blocked == nil {
+		work.Blocked = []adapters.WorkItem{}
+	}
+	if work.InProgress == nil {
+		work.InProgress = []adapters.WorkItem{}
+	}
+	if work.Summary == nil {
+		work.Summary = &adapters.WorkSummary{}
+	}
+	return work
 }
 
 func snapshotWorkItemFromRuntime(row state.RuntimeWork) adapters.WorkItem {
@@ -5489,13 +5448,14 @@ func buildProjectionBackedSnapshotSessions(store *state.Store, tmuxSessions []tm
 		agentsBySession[sess.Name] = agents
 	}
 
-	paneLabels := snapshotPaneLabelMap(tmuxSessions)
+	paneLabels, paneServices := snapshotPaneIndex(tmuxSessions)
 	output := make([]SnapshotSession, 0, len(rows))
 	for _, sess := range rows {
 		item := SnapshotSession{
 			Name:     sess.Name,
 			Attached: sess.Attached,
 			Agents:   make([]SnapshotAgent, 0, len(agentsBySession[sess.Name])),
+			Services: paneServices[sess.Name],
 		}
 		for _, agent := range agentsBySession[sess.Name] {
 			snapshotAgent := snapshotAgentFromRuntime(sess.Name, agent, paneLabels)
@@ -5507,65 +5467,49 @@ func buildProjectionBackedSnapshotSessions(store *state.Store, tmuxSessions []tm
 	return output, nil
 }
 
-func snapshotBeadsSummaryFromRuntime(store *state.Store, projectKey string, limit int) (*bv.BeadsSummary, error) {
-	if store == nil {
-		return nil, fmt.Errorf("snapshot beads summary store unavailable")
-	}
-	if limit < 0 {
-		limit = 0
-	}
-
-	rows, err := store.ListFreshRuntimeWork("", 0)
-	if err != nil {
-		return nil, fmt.Errorf("snapshot beads summary: %w", err)
-	}
-
+// beadsSummaryFromWork renders the snapshot's beads summary from the same
+// verified work section the snapshot reports, so the two can never disagree
+// and neither is derived from unverified RuntimeWork rows (GH #283).
+func beadsSummaryFromWork(work *adapters.WorkSection, projectKey string, limit int) *bv.BeadsSummary {
 	summary := &bv.BeadsSummary{
-		Available:      true,
 		Project:        strings.TrimSpace(projectKey),
 		ReadyPreview:   []bv.BeadPreview{},
 		InProgressList: []bv.BeadInProgress{},
 	}
-	for _, row := range rows {
-		summary.Total++
-		switch row.Status {
-		case "open":
-			summary.Open++
-			if row.BlockedByCount > 0 {
-				summary.Blocked++
-				continue
-			}
-			summary.Ready++
-			if limit == 0 || len(summary.ReadyPreview) < limit {
-				summary.ReadyPreview = append(summary.ReadyPreview, bv.BeadPreview{
-					ID:       row.BeadID,
-					Title:    row.Title,
-					Priority: fmt.Sprintf("P%d", row.Priority),
-				})
-			}
-		case "in_progress":
-			summary.InProgress++
-			if limit == 0 || len(summary.InProgressList) < limit {
-				item := bv.BeadInProgress{
-					ID:       row.BeadID,
-					Title:    row.Title,
-					Assignee: row.Assignee,
-				}
-				if row.ClaimedAt != nil && !row.ClaimedAt.IsZero() {
-					item.UpdatedAt = *row.ClaimedAt
-				}
-				summary.InProgressList = append(summary.InProgressList, item)
-			}
-		case "closed":
-			summary.Closed++
-		default:
-			if row.BlockedByCount > 0 {
-				summary.Blocked++
-			}
+	if work == nil || !work.Available {
+		summary.Reason = "work source unverified"
+		if work != nil && work.Reason != "" {
+			summary.Reason = work.Reason
 		}
+		return summary
 	}
-
-	return summary, nil
+	summary.Available = true
+	if s := work.Summary; s != nil {
+		summary.Total, summary.Open, summary.InProgress = s.Total, s.Open, s.InProgress
+		summary.Blocked, summary.Ready, summary.Closed = s.Blocked, s.Ready, s.Closed
+	}
+	for _, item := range work.Ready {
+		if limit > 0 && len(summary.ReadyPreview) >= limit {
+			break
+		}
+		summary.ReadyPreview = append(summary.ReadyPreview, bv.BeadPreview{
+			ID:       item.ID,
+			Title:    item.Title,
+			Priority: fmt.Sprintf("P%d", item.Priority),
+			Type:     item.Type,
+		})
+	}
+	for _, item := range work.InProgress {
+		if limit > 0 && len(summary.InProgressList) >= limit {
+			break
+		}
+		entry := bv.BeadInProgress{ID: item.ID, Title: item.Title, Assignee: item.Assignee}
+		if updated, err := time.Parse(time.RFC3339, item.UpdatedAt); err == nil {
+			entry.UpdatedAt = updated
+		}
+		summary.InProgressList = append(summary.InProgressList, entry)
+	}
+	return summary
 }
 
 func buildProjectionAgentMailPaneMap(store *state.Store, tmuxSessions []tmux.Session) (map[string]string, error) {
@@ -5603,7 +5547,17 @@ func buildProjectionAgentMailPaneMap(store *state.Store, tmuxSessions []tmux.Ses
 }
 
 func snapshotPaneLabelMap(tmuxSessions []tmux.Session) map[string]string {
+	labels, _ := snapshotPaneIndex(tmuxSessions)
+	return labels
+}
+
+// snapshotPaneIndex walks the live panes of each session once and returns both
+// the pane-label map (session:pane_id -> "W.P") and the session's tagged
+// non-agent service panes (ntm#305), so the projection-backed snapshot can
+// report services without a second tmux enumeration.
+func snapshotPaneIndex(tmuxSessions []tmux.Session) (map[string]string, map[string][]SnapshotService) {
 	labels := make(map[string]string)
+	services := make(map[string][]SnapshotService)
 	for _, sess := range tmuxSessions {
 		panes := append([]tmux.Pane(nil), sess.Panes...)
 		if len(panes) == 0 {
@@ -5614,9 +5568,12 @@ func snapshotPaneLabelMap(tmuxSessions []tmux.Session) map[string]string {
 		for _, pane := range panes {
 			key := fmt.Sprintf("%s:%s", sess.Name, strings.TrimSpace(pane.ID))
 			labels[key] = fmt.Sprintf("%d.%d", pane.WindowIndex, pane.Index)
+			if pane.IsServicePane() {
+				services[sess.Name] = append(services[sess.Name], snapshotServiceFromPane(pane))
+			}
 		}
 	}
-	return labels
+	return labels, services
 }
 
 func snapshotAgentFromRuntime(sessionName string, row state.RuntimeAgent, paneLabels map[string]string) SnapshotAgent {
@@ -5635,6 +5592,7 @@ func snapshotAgentFromRuntime(sessionName string, row state.RuntimeAgent, paneLa
 		State:            strings.TrimSpace(string(row.State)),
 		LastOutputAgeSec: row.LastOutputAgeSec,
 		OutputTailLines:  row.OutputTailLines,
+		ContextPercent:   row.ContextPercent,
 		PendingMail:      row.PendingMail,
 	}
 	if bead := strings.TrimSpace(row.CurrentBead); bead != "" {
@@ -6006,6 +5964,8 @@ func agentTypeString(t tmux.AgentType) string {
 		return "aider"
 	case tmux.AgentOpencode:
 		return "oc"
+	case tmux.AgentOmp:
+		return "omp"
 	case tmux.AgentOllama:
 		return "ollama"
 	case tmux.AgentUser:
@@ -6025,6 +5985,23 @@ func paneAgentType(pane tmux.Pane) string {
 		return resolved
 	}
 	return detectAgentType(pane.Title)
+}
+
+// sendInjectionFormat picks the CASS block format for a send. One prompt goes
+// to every target, so a mixed --cc/--cod send uses the neutral markdown
+// format instead of formatting for whichever pane happens to be first. No
+// targets keeps the configured format.
+func sendInjectionFormat(targetPanes []tmux.Pane) InjectionFormat {
+	if len(targetPanes) == 0 {
+		return ""
+	}
+	agentType := paneAgentType(targetPanes[0])
+	for _, pane := range targetPanes[1:] {
+		if paneAgentType(pane) != agentType {
+			return FormatMarkdown
+		}
+	}
+	return FormatForAgent(agentType)
 }
 
 func stateAgentTypeForPane(pane tmux.Pane, detectedType string) string {
@@ -6070,6 +6047,10 @@ func modelNameForPane(pane tmux.Pane, cfg *config.Config) string {
 			if cfg.Models.DefaultOpencode != "" {
 				return cfg.Models.DefaultOpencode
 			}
+		case tmux.AgentOmp:
+			if cfg.Models.DefaultOmp != "" {
+				return cfg.Models.DefaultOmp
+			}
 		}
 	}
 	// Fall back to compiled-in defaults from config.DefaultModels() so the
@@ -6077,7 +6058,12 @@ func modelNameForPane(pane tmux.Pane, cfg *config.Config) string {
 	defaults := config.DefaultModels()
 	switch agentType {
 	case tmux.AgentClaude:
-		return defaults.DefaultClaude
+		if defaults.DefaultClaude != "" {
+			return defaults.DefaultClaude
+		}
+		// Launch model delegated to Claude Code (ntm#334): estimate context
+		// and cost against the Claude family rather than dropping them.
+		return config.ClaudeEstimationModel
 	case tmux.AgentCodex:
 		return defaults.DefaultCodex
 	case tmux.AgentGemini, tmux.AgentAntigravity:
@@ -6092,6 +6078,9 @@ func modelNameForPane(pane tmux.Pane, cfg *config.Config) string {
 		return "aider"
 	case tmux.AgentOpencode:
 		return "opencode"
+	case tmux.AgentOmp:
+		// Empty by default: omp's own config (modelRoles.default) chooses.
+		return defaults.DefaultOmp
 	case tmux.AgentOllama:
 		return defaults.DefaultOllama
 	default:
@@ -6120,7 +6109,7 @@ type SendOutput struct {
 
 	// Operation is the durable idempotent-operation receipt (#245), present
 	// when the caller supplied an operation ID (--op-id / Idempotency-Key).
-	Operation *SendOperationInfo `json:"operation,omitempty"`
+	Operation *OperationInfo `json:"operation,omitempty"`
 }
 
 // SendRenderEvidence records bounded before/after terminal observations for one
@@ -6223,8 +6212,9 @@ type SendError struct {
 
 // SendOptions configures the PrintSend operation
 type SendOptions struct {
-	Session        string // Target session name
-	Message        string // Message to send
+	Context        context.Context `json:"-"` // Optional caller cancellation; nil uses a background context
+	Session        string          // Target session name
+	Message        string          // Message to send
 	Redaction      redaction.Config
 	All            bool     // Send to all panes (including user)
 	Pane           string   // Singular N, W.P, or %N selector; mutually exclusive with Panes
@@ -6239,18 +6229,11 @@ type SendOptions struct {
 	RequestID      string   // External request identifier for REST parity
 	CorrelationID  string   // Correlation identifier for tracing request/outcome/verification
 	IdempotencyKey string   // Idempotency key when provided by an upstream caller
-	// Admission is an opaque authenticated-control-plane capability. It is the
-	// only provenance accepted for a non-dry-run pane mutation. Actor, origin,
-	// and authorization strings are intentionally not accepted here: a CLI or
-	// other caller could forge those values. Direct robot/CLI dispatch therefore
-	// fails closed unless the HTTP RBAC control plane issued this capability.
-	Admission *AuthenticatedSendAdmission
-	// Deprecated untrusted caller assertions. They remain only so read-only
-	// callers and source compatibility compile; non-dry-run admission ignores
-	// them and never persists them.
-	Actor               string
-	Origin              string
-	TargetAuthorization string
+	// MessageGuard checks the final payload against all resolved physical
+	// targets before operation admission, then each target immediately before
+	// its input. It is request-local policy,
+	// never part of the caller's durable command identity or serialized options.
+	MessageGuard func(context.Context, string, []tmux.Pane) error `json:"-"`
 
 	// CASS injection options
 	WithCASS     bool          // Enable CASS context injection
@@ -6263,15 +6246,65 @@ type SendOptions struct {
 	// carries config-derived defaults (nil means compiled-in defaults).
 	WithMemory   bool
 	MemoryInject *CMInjectConfig
+
+	// HistorySource is the prompt-history source a dispatched send is
+	// recorded under; empty records history.SourceRobot. --robot-replay sets
+	// history.SourceReplay.
+	HistorySource history.Source
+}
+
+// recordRobotSendHistory appends a dispatched robot send to the prompt
+// history that ntm send, the palette and replay already write. Without it,
+// orchestrator sends — most sends in a swarm — were absent from
+// --robot-history and --robot-replay, and --robot-metrics could not count the
+// prompts an agent received. Targets are the canonical pane keys the send
+// resolved; Success follows ntm send's rule (every target delivered), so a
+// partially failed send is kept with its error and is not attributed to any
+// pane as a received prompt.
+//
+// The caller's message is stored, not the CASS/CM-augmented payload: the
+// injected context is derived per send, and replay re-sends what the caller
+// asked for. When this send runs under a redaction mode, the stored prompt is
+// redacted under it (warn and block included, as for every persisted prompt);
+// history.Append then applies the configured history redaction on top.
+func recordRobotSendHistory(opts SendOptions, redactCfg redaction.Config, targetPanes []tmux.Pane, targetKeys []string, output SendOutput, startedAt time.Time) {
+	if len(targetKeys) == 0 {
+		return
+	}
+	prompt := opts.Message
+	if redactCfg.Mode != "" && redactCfg.Mode != redaction.ModeOff {
+		persistCfg := redactCfg
+		persistCfg.Mode = redaction.ModeRedact
+		prompt = redaction.ScanAndRedact(prompt, persistCfg).Output
+	}
+	source := opts.HistorySource
+	if source == "" {
+		source = history.SourceRobot
+	}
+	entry := history.NewEntry(opts.Session, append([]string(nil), targetKeys...), prompt, source)
+	agentTypes := make([]string, 0, len(targetPanes))
+	for _, pane := range targetPanes {
+		agentTypes = append(agentTypes, pane.Type.String())
+	}
+	entry.SetAgentTypes(agentTypes)
+	entry.DurationMs = int(time.Since(startedAt) / time.Millisecond)
+	switch {
+	case len(output.Failed) == 0 && len(output.Successful) == len(targetKeys):
+		entry.SetSuccess()
+	case len(output.Failed) > 0:
+		entry.SetError(fmt.Errorf("%d of %d target(s) failed: %s", len(output.Failed), len(targetKeys), output.Failed[0].Error))
+	default:
+		entry.SetError(fmt.Errorf("%d of %d target(s) delivered", len(output.Successful), len(targetKeys)))
+	}
+	if err := history.Append(entry); err != nil {
+		slog.Debug("robot send: prompt history not recorded", "session", opts.Session, "error", err)
+	}
 }
 
 type actuationTrace struct {
-	RequestID           string
-	CorrelationID       string
-	IdempotencyKey      string
-	Actor               string
-	Origin              string
-	TargetAuthorization string
+	RequestID      string
+	CorrelationID  string
+	IdempotencyKey string
 }
 
 func normalizeActuationTrace(requestID, correlationID, idempotencyKey string) actuationTrace {
@@ -6350,23 +6383,20 @@ func publishSendActuationRequest(trace actuationTrace, opts SendOptions, targets
 		targetWord = "target"
 	}
 	GetAttentionFeed().PublishActuation(ActuationRecord{
-		Session:             opts.Session,
-		Action:              "send",
-		Stage:               ActuationStageRequest,
-		Source:              "robot.send",
-		Method:              "paste_enter",
-		RequestID:           trace.RequestID,
-		CorrelationID:       trace.CorrelationID,
-		IdempotencyKey:      trace.IdempotencyKey,
-		Actor:               trace.Actor,
-		Origin:              trace.Origin,
-		TargetAuthorization: trace.TargetAuthorization,
-		Targets:             targets,
-		MessagePreview:      messagePreview,
-		Summary:             fmt.Sprintf("send requested for %d %s", len(targets), targetWord),
-		ReasonCode:          "actuation_requested",
-		Actionability:       ActionabilityInteresting,
-		Severity:            SeverityInfo,
+		Session:        opts.Session,
+		Action:         "send",
+		Stage:          ActuationStageRequest,
+		Source:         "robot.send",
+		Method:         "paste_enter",
+		RequestID:      trace.RequestID,
+		CorrelationID:  trace.CorrelationID,
+		IdempotencyKey: trace.IdempotencyKey,
+		Targets:        targets,
+		MessagePreview: messagePreview,
+		Summary:        fmt.Sprintf("send requested for %d %s", len(targets), targetWord),
+		ReasonCode:     "actuation_requested",
+		Actionability:  ActionabilityInteresting,
+		Severity:       SeverityInfo,
 	})
 }
 
@@ -6425,29 +6455,26 @@ func publishSendActuationOutcome(trace actuationTrace, opts SendOptions, output 
 	}
 
 	GetAttentionFeed().PublishActuation(ActuationRecord{
-		Session:             opts.Session,
-		Action:              "send",
-		Stage:               ActuationStageOutcome,
-		Source:              "robot.send",
-		Method:              "paste_enter",
-		RequestID:           trace.RequestID,
-		CorrelationID:       trace.CorrelationID,
-		IdempotencyKey:      trace.IdempotencyKey,
-		Actor:               trace.Actor,
-		Origin:              trace.Origin,
-		TargetAuthorization: trace.TargetAuthorization,
-		Targets:             output.Targets,
-		Successful:          output.Successful,
-		Failed:              sendErrorsToDetails(output.Failed),
-		MessagePreview:      output.MessagePreview,
-		Result:              result,
-		ErrorCode:           output.ErrorCode,
-		Error:               output.Error,
-		Blocked:             output.Blocked,
-		Summary:             summary,
-		ReasonCode:          reasonCode,
-		Actionability:       actionability,
-		Severity:            severity,
+		Session:        opts.Session,
+		Action:         "send",
+		Stage:          ActuationStageOutcome,
+		Source:         "robot.send",
+		Method:         "paste_enter",
+		RequestID:      trace.RequestID,
+		CorrelationID:  trace.CorrelationID,
+		IdempotencyKey: trace.IdempotencyKey,
+		Targets:        output.Targets,
+		Successful:     output.Successful,
+		Failed:         sendErrorsToDetails(output.Failed),
+		MessagePreview: output.MessagePreview,
+		Result:         result,
+		ErrorCode:      output.ErrorCode,
+		Error:          output.Error,
+		Blocked:        output.Blocked,
+		Summary:        summary,
+		ReasonCode:     reasonCode,
+		Actionability:  actionability,
+		Severity:       severity,
 	})
 }
 
@@ -6482,6 +6509,17 @@ func publishSendActuationVerification(trace actuationTrace, opts SendAndAckOptio
 		reasonCode = "actuation_verification_timeout"
 		actionability = ActionabilityActionRequired
 		severity = SeverityWarning
+	case len(ackOutput.Failed) > 0 || !ackOutput.Success:
+		verification = "failed"
+		summary = "send verification failed"
+		if len(ackOutput.Failed) > 0 {
+			summary = fmt.Sprintf("send verification failed for %d target(s)", len(ackOutput.Failed))
+		} else if len(ackOutput.Pending) > 0 {
+			summary = fmt.Sprintf("send verification stopped with %d target(s) still pending", len(ackOutput.Pending))
+		}
+		reasonCode = "actuation_verification_failed"
+		actionability = ActionabilityActionRequired
+		severity = SeverityWarning
 	case len(ackOutput.Pending) > 0:
 		verification = "pending"
 		summary = fmt.Sprintf("send verification still pending for %d target(s)", len(ackOutput.Pending))
@@ -6504,11 +6542,10 @@ func publishSendActuationVerification(trace actuationTrace, opts SendAndAckOptio
 		RequestID:      trace.RequestID,
 		CorrelationID:  trace.CorrelationID,
 		IdempotencyKey: trace.IdempotencyKey,
-		Actor:          trace.Actor,
-		Origin:         trace.Origin,
 		Targets:        targets,
 		Confirmations:  ackConfirmationsToDetails(ackOutput.Confirmations),
 		Pending:        ackOutput.Pending,
+		Failed:         ackFailuresToDetails(ackOutput.Failed),
 		Verification:   verification,
 		ErrorCode:      ackOutput.ErrorCode,
 		Error:          ackOutput.Error,
@@ -6519,6 +6556,14 @@ func publishSendActuationVerification(trace actuationTrace, opts SendAndAckOptio
 		Severity:       severity,
 		MessagePreview: sendOutput.MessagePreview,
 	})
+}
+
+func ackFailuresToDetails(failures []AckFailure) []map[string]any {
+	details := make([]map[string]any, 0, len(failures))
+	for _, failure := range failures {
+		details = append(details, map[string]any{"pane": failure.Pane, "error": failure.Reason})
+	}
+	return details
 }
 
 func finalizeTerminalSendAndAckActuation(trace actuationTrace, opts SendAndAckOptions, output *SendAndAckOutput) *SendAndAckOutput {
@@ -6916,6 +6961,21 @@ func newRobotDispatchService(redactCfg redaction.Config, deliverer dispatchsvc.D
 	return service, redactor, err
 }
 
+// A successful preflight is not authority to send into a replacement pane
+// after pacing or an interrupt's readiness wait. Recheck request-local policy
+// on the original physical target and exact prepared bytes at delivery time.
+func guardedRobotMessageDeliverer(guard func(context.Context, string, []tmux.Pane) error) dispatchsvc.Deliverer {
+	if guard == nil {
+		return nil
+	}
+	return dispatchsvc.DelivererFunc(func(ctx context.Context, delivery dispatchsvc.Delivery) error {
+		if err := guard(ctx, delivery.Message, []tmux.Pane{delivery.Target.Pane}); err != nil {
+			return dispatchsvc.GuaranteeNoDeliveryActuation(err)
+		}
+		return (dispatchsvc.TMUXDeliverer{}).Deliver(ctx, delivery)
+	})
+}
+
 func robotDispatchPrepareErrorResponse(err error) RobotResponse {
 	errorCode := ErrCodeInternalError
 	hint := "Inspect the dispatch target and message policy"
@@ -6940,8 +7000,13 @@ func robotPreparedDispatchRequest(allPanes, targetPanes []tmux.Pane, opts SendOp
 	for i, pane := range allPanes {
 		planningPanes[i] = pane
 		planningPanes[i].Tags = append([]string(nil), pane.Tags...)
-		if paneAgentType(pane) == "grok" {
+		switch paneAgentType(pane) {
+		case "grok":
 			planningPanes[i].Type = tmux.AgentGrok
+		case "omp":
+			// A title-only omp pane must still plan the omp composer gate,
+			// Ctrl+C clear, and submission verifier.
+			planningPanes[i].Type = tmux.AgentOmp
 		}
 	}
 	selectors := make([]string, 0, len(targetPanes))
@@ -7007,9 +7072,72 @@ func finalizeRobotSendDispatchStatus(output *SendOutput) {
 	}
 }
 
+// ErrSendCommandBlocked marks a send refused by the destructive-command guard.
+// Guards wrap it with the reason; any other guard error means the check itself
+// failed, and the send is refused fail-closed.
+var ErrSendCommandBlocked = errors.New("blocked by dcg")
+
+// sendCommandGuard vets the exact payload about to reach the selected panes for
+// destructive shell commands. The cli package installs its dcg check here
+// (robot cannot import cli without a cycle) so --robot-send, REST sends and
+// `ntm send` apply one guard rather than leaving the robot path unchecked.
+var sendCommandGuard func(ctx context.Context, message, session string, panes []tmux.Pane) error
+
+// SetSendCommandGuard registers the destructive-command guard GetSend applies
+// before delivery. Passing nil disables it.
+func SetSendCommandGuard(guard func(ctx context.Context, message, session string, panes []tmux.Pane) error) {
+	sendCommandGuard = guard
+}
+
+// checkSendCommandGuard runs the registered destructive-command guard on the
+// exact payload about to reach panes. A nil error allows delivery; otherwise
+// resp is the typed refusal and blocked reports a dcg verdict, as opposed to a
+// check that failed or did not finish (both refuse fail-closed).
+func checkSendCommandGuard(ctx context.Context, message, session string, panes []tmux.Pane) (resp RobotResponse, blocked bool, err error) {
+	if sendCommandGuard == nil {
+		return RobotResponse{}, false, nil
+	}
+	err = sendCommandGuard(ctx, message, session, panes)
+	switch {
+	case err == nil:
+		return RobotResponse{}, false, nil
+	case errors.Is(err, ErrSendCommandBlocked):
+		return NewErrorResponse(err, ErrCodeDestructiveCommandBlocked,
+			"Remove the destructive command from the message, or run it yourself after review"), true, err
+	case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+		return NewErrorResponse(fmt.Errorf("destructive-command check did not finish: %w", err),
+			ErrCodeTimeout, "The message was refused because the dcg check was interrupted; retry"), false, err
+	default:
+		return NewErrorResponse(fmt.Errorf("destructive-command check failed: %w", err),
+			ErrCodeInternalError, "Check the dcg installation; the message was refused fail-closed"), false, err
+	}
+}
+
+// guardSendCommand applies checkSendCommandGuard to a send. On refusal it
+// records the typed error on output and returns false; the caller must not
+// dispatch.
+func guardSendCommand(ctx context.Context, output *SendOutput, message, session string, panes []tmux.Pane, dryRun bool) bool {
+	resp, blocked, err := checkSendCommandGuard(ctx, message, session, panes)
+	if err == nil {
+		return true
+	}
+	output.DryRun = dryRun
+	output.Blocked = blocked
+	output.RobotResponse = resp
+	output.Failed = append(output.Failed, SendError{Pane: "guard", Error: err.Error()})
+	return false
+}
+
 // GetSend sends a message to multiple panes atomically and returns structured results.
 // This function returns the data struct directly, enabling CLI/REST parity.
 func GetSend(opts SendOptions) (*SendOutput, error) {
+	ctx := opts.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	trace := normalizeActuationTrace(opts.RequestID, opts.CorrelationID, opts.IdempotencyKey)
 	redactCfg := normalizeSendRedactionConfig(opts.Redaction)
 	_, initialPreview, initialSummary, initialWarnings, initialBlocked := applySendMessageRedaction(opts.Message, redactCfg)
@@ -7031,33 +7159,6 @@ func GetSend(opts SendOptions) (*SendOutput, error) {
 			Failed:         []SendError{},
 			MessagePreview: initialPreview,
 		}), nil
-	}
-
-	if !opts.DryRun {
-		actor, origin, _, provenanceErr := validateSendReceiptProvenance(opts)
-		if provenanceErr != nil {
-			return finalizeTerminalSendActuation(trace, opts, &SendOutput{
-				RobotResponse:  NewErrorResponse(provenanceErr, ErrCodeReceiptProvenanceRequired, "Use an authenticated control-plane request with target authorization before using an operation ID"),
-				Session:        opts.Session,
-				SentAt:         time.Now().UTC(),
-				Redaction:      initialSummary,
-				Warnings:       initialWarnings,
-				Targets:        []string{},
-				Successful:     []string{},
-				Failed:         []SendError{{Pane: "provenance", Error: provenanceErr.Error()}},
-				MessagePreview: initialPreview,
-			}), nil
-		}
-		trace.Actor = actor
-		trace.Origin = origin
-		// Every authenticated pane mutation has a durable receipt. A client
-		// supplied key retains retry semantics; otherwise allocate an internal
-		// unique key so ordinary HTTP sends remain non-idempotent to callers
-		// while their authorization provenance is still persisted atomically.
-		if trace.IdempotencyKey == "" {
-			trace.IdempotencyKey = "audit-" + audit.NewCorrelationID()
-			opts.IdempotencyKey = trace.IdempotencyKey
-		}
 	}
 
 	if strings.TrimSpace(opts.Session) == "" {
@@ -7137,94 +7238,46 @@ func GetSend(opts SendOptions) (*SendOutput, error) {
 		return finalizeTerminalSendActuation(trace, opts, &output), nil
 	}
 	output.Targets = append(output.Targets, targetKeys...)
-	if !opts.DryRun {
-		_, _, authorizationSeed, provenanceErr := validateSendReceiptProvenance(opts)
-		if provenanceErr != nil {
-			output.RobotResponse = NewErrorResponse(provenanceErr, ErrCodeReceiptProvenanceRequired, "Use an authenticated control-plane request with resolved target authorization")
-			return finalizeTerminalSendActuation(trace, opts, &output), nil
-		}
-		targetAuthorization, authorizationErr := resolvedTargetAuthorization(authorizationSeed, targetPanes)
-		if authorizationErr != nil {
-			output.RobotResponse = NewErrorResponse(authorizationErr, ErrCodeReceiptProvenanceRequired, "Resolve an authorized pane target before dispatch")
-			return finalizeTerminalSendActuation(trace, opts, &output), nil
-		}
-		trace.TargetAuthorization = targetAuthorization
-	}
 	var renderBaselines map[string]sendRenderBaseline
 	if opts.VerifyRender {
 		renderBaselines = captureSendRenderBaselines(targetPanes, targetKeys)
 	}
 
-	// Perform CASS injection if enabled
-	messageToSend := opts.Message
-	if opts.WithCASS {
-		// Use provided configs or defaults
-		queryConfig := DefaultCASSConfig()
-		if opts.CASSConfig != nil {
-			queryConfig = *opts.CASSConfig
-		}
-
-		filterConfig := DefaultFilterConfig()
-		if opts.FilterConfig != nil {
-			filterConfig = *opts.FilterConfig
-		}
-
-		injectConfig := DefaultInjectConfig()
+	// CASS history and CM memory rules (--with-cass / --with-memory, bd-3j6hm)
+	// through the pipeline every assignment surface shares
+	// (prompt_context.go). The retrieval query is the caller's original
+	// message, and CM memory is scoped to the verified project of the live
+	// targets. Degradation is graceful: cass or cm being unavailable records a
+	// skip reason and the send proceeds unmodified.
+	if opts.WithCASS && (opts.CASSConfig == nil || opts.CASSConfig.Enabled) {
+		inject := DefaultInjectConfig()
 		if opts.InjectConfig != nil {
-			injectConfig = *opts.InjectConfig
+			inject = *opts.InjectConfig
 		}
-
-		// If there are target panes, try to determine agent type for
-		// formatting. One prompt goes to every pane, so a mixed --cc/--cod
-		// send uses the neutral markdown format instead of formatting for
-		// whichever pane happens to be first.
-		if len(targetPanes) > 0 {
-			agentType := paneAgentType(targetPanes[0])
-			uniform := true
-			for _, pane := range targetPanes[1:] {
-				if paneAgentType(pane) != agentType {
-					uniform = false
-					break
-				}
+		if inject.CurrentContextPct == 0 || inject.CurrentContextPct < inject.SkipThreshold {
+			used, known, err := ntmctx.MaxPaneContextUsage(ctx, tmux.DefaultClient, targetPanes, inject.SkipThreshold)
+			if err != nil {
+				return nil, fmt.Errorf("send canceled during CASS capacity measurement: %w", err)
 			}
-			if uniform {
-				injectConfig.Format = FormatForAgent(agentType)
-			} else {
-				injectConfig.Format = FormatMarkdown
+			if known {
+				inject.CurrentContextPct = max(inject.CurrentContextPct, used)
 			}
 		}
-
-		// Perform CASS query and injection
-		injectResult, queryResult, filterResult := InjectContextFromQuery(
-			opts.Message,
-			queryConfig,
-			filterConfig,
-			injectConfig,
-		)
-
-		// Record injection metadata
-		output.CASSInjection = NewCASSInjectionInfo(injectResult, queryResult.Query, filterResult.Hits)
-
-		// Use modified message if injection succeeded
-		if injectResult.Success && injectResult.ModifiedPrompt != "" {
-			messageToSend = injectResult.ModifiedPrompt
-		}
+		opts.InjectConfig = &inject
 	}
-
-	// Perform CM memory rule injection if enabled (bd-3j6hm). The retrieval
-	// query is the caller's original message; the block is prepended to the
-	// (possibly CASS-augmented) payload. Degradation is graceful: cm being
-	// unavailable records a skip reason and the send proceeds unmodified.
-	if opts.WithMemory {
-		memCfg := DefaultCMInjectConfig()
-		if opts.MemoryInject != nil {
-			memCfg = *opts.MemoryInject
-		}
-		modified, memInfo := InjectCMRules(context.Background(), opts.Message, messageToSend, memCfg)
-		output.MemoryInjection = memInfo
-		if modified != "" {
-			messageToSend = modified
-		}
+	messageToSend, cassInjection, memoryInjection := injectPromptContext(
+		ctx, opts.Message, opts.Message, sendInjectionFormat(targetPanes),
+		PromptContextOptions{
+			WithCASS: opts.WithCASS, CASSConfig: opts.CASSConfig, FilterConfig: opts.FilterConfig, InjectConfig: opts.InjectConfig,
+			WithMemory: opts.WithMemory, MemoryInject: opts.MemoryInject,
+		},
+		func(cfg CMInjectConfig) (CMInjectConfig, *CMInjectionInfo) {
+			return prepareCMSendContext(ctx, opts.Session, targetPanes, cfg)
+		},
+	)
+	output.CASSInjection, output.MemoryInjection = cassInjection, memoryInjection
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	sendEnter := true
@@ -7258,111 +7311,75 @@ func GetSend(opts SendOptions) (*SendOutput, error) {
 		return finalizeTerminalSendActuation(trace, opts, &output), nil
 	}
 
-	// Durable idempotent operation claim (#245). The claim happens BEFORE
-	// any keystroke is injected and binds the operation ID to the caller's
-	// canonical selector spec plus the digest of the exact payload about to
-	// be delivered (post CASS injection). Identical retries replay the
-	// recorded outcome; conflicting reuse is rejected; a claim abandoned by
-	// a crashed process is taken over after a staleness window; preflight
-	// failures release the claim so the ID stays retryable.
-	var claimedOp *state.SendOperation
-	var claimedStore *state.Store
+	if opts.MessageGuard != nil {
+		finalMessage, _, _, _, blocked := applySendMessageRedaction(messageToSend, redactCfg)
+		if !blocked {
+			if err := opts.MessageGuard(ctx, finalMessage, append([]tmux.Pane(nil), targetPanes...)); err != nil {
+				return nil, fmt.Errorf("message policy check: %w", err)
+			}
+		}
+	}
+
+	// Destructive-command guard on the exact post-injection payload, before an
+	// operation ID is claimed or any keystroke is injected.
+	if !guardSendCommand(ctx, &output, messageToSend, opts.Session, targetPanes, opts.DryRun) {
+		return finalizeTerminalSendActuation(trace, opts, &output), nil
+	}
+
+	// Durable idempotent operation claim (#245; protocol shared with
+	// --robot-interrupt in operation_idempotency.go). The claim happens
+	// BEFORE any keystroke is injected and binds the operation ID to the
+	// caller's canonical selector spec plus input-message digest; the
+	// receipt's payload digest records the exact bytes about to be delivered
+	// (post CASS injection). Identical retries replay the recorded outcome;
+	// conflicting reuse is rejected; only a stale claim with durable proof
+	// that dispatch never started may be taken over. Preflight failures
+	// release the claim so the ID stays retryable.
 	dispatchAttempted := false
+	var owned *durableOperation
 	if trace.IdempotencyKey != "" && !opts.DryRun {
-		store := currentProjectionStore()
-		if store == nil {
-			output.RobotResponse = NewErrorResponse(
-				fmt.Errorf("idempotent send requires the runtime projection store"),
-				ErrCodeNotImplemented,
-				"Re-run without an operation ID, or ensure the runtime state store is available",
-			)
+		claim := claimRobotOperation(operationClaimRequest{
+			Kind:        state.OperationKindSend,
+			OperationID: trace.IdempotencyKey,
+			Session:     opts.Session,
+			BindingHash: sendOperationBindingHash(opts),
+			Payload:     messageToSend,
+			Targets:     output.Targets,
+		})
+		switch claim.Verdict {
+		case operationRefused:
+			output.RobotResponse = claim.Response
+			output.Operation = claim.Info
+			return finalizeTerminalSendActuation(trace, opts, &output), nil
+		case operationReplay:
+			if err := applyReplayedSendOutcome(&output, claim.Record); err != nil {
+				output.RobotResponse = NewErrorResponse(err, ErrCodeInternalError, "Stored send outcome could not be decoded")
+				return finalizeTerminalSendActuation(trace, opts, &output), nil
+			}
+			output.AgentHints = generateSendHints(output)
 			return finalizeTerminalSendActuation(trace, opts, &output), nil
 		}
-		// The binding covers the caller's input command (selector + input
-		// message); PayloadSHA256 records the exact post-transformation
-		// bytes about to be delivered. They differ under CASS injection.
-		payloadSHA, payloadBytes := sendPayloadDigest(messageToSend)
-		claim := &state.SendOperation{
-			OperationID:         trace.IdempotencyKey,
-			SessionName:         opts.Session,
-			Actor:               trace.Actor,
-			Origin:              trace.Origin,
-			TargetAuthorization: trace.TargetAuthorization,
-			BindingHash:         sendOperationBindingHash(opts),
-			PayloadSHA256:       payloadSHA,
-			PayloadBytes:        payloadBytes,
-		}
-		stored, claimed, claimErr := store.ClaimSendOperation(claim)
-		if claimErr != nil {
-			output.RobotResponse = NewErrorResponse(claimErr, ErrCodeInternalError, "Failed to claim send operation")
-			return finalizeTerminalSendActuation(trace, opts, &output), nil
-		}
-		if !claimed {
-			if stored.BindingHash != claim.BindingHash {
-				output.RobotResponse = NewErrorResponse(
-					fmt.Errorf("operation ID '%s' is already bound to a different selector or payload in session '%s'", trace.IdempotencyKey, opts.Session),
-					ErrCodeIdempotencyConflict,
-					"Use a fresh operation ID for a different send, or repeat the original command exactly",
-				)
-				output.Operation = sendOperationInfoFromRecord(stored, false)
-				return finalizeTerminalSendActuation(trace, opts, &output), nil
-			}
-			if stored.Status == state.SendOperationCompleted {
-				if err := applyReplayedOutcome(&output, stored); err != nil {
-					output.RobotResponse = NewErrorResponse(err, ErrCodeInternalError, "Stored send outcome could not be decoded")
-					return finalizeTerminalSendActuation(trace, opts, &output), nil
-				}
-				output.AgentHints = generateSendHints(output)
-				return finalizeTerminalSendActuation(trace, opts, &output), nil
-			}
-			// In progress. If the original claimant crashed before recording
-			// an outcome the row would otherwise stay in_progress forever, so
-			// a sufficiently stale matching claim is taken over and executed
-			// fresh. A recent claim is a live concurrent sender: report
-			// in-progress and let the caller reconcile via the receipt.
-			takenOver, takeoverErr := store.TakeOverStaleSendOperation(
-				claim.OperationID, claim.SessionName, claim.BindingHash,
-				time.Now().UTC().Add(-sendOperationStaleClaimWindow),
-			)
-			if takeoverErr == nil && takenOver {
-				stored, _ = store.GetSendOperation(claim.OperationID, claim.SessionName)
-				if stored == nil {
-					stored = claim
-				}
-			} else {
-				output.RobotResponse = NewErrorResponse(
-					fmt.Errorf("operation '%s' is in progress", trace.IdempotencyKey),
-					ErrCodeOperationInProgress,
-					fmt.Sprintf("Query the durable receipt with --robot-send-receipt=%s before retrying", trace.IdempotencyKey),
-				)
-				info := sendOperationInfoFromRecord(stored, true)
-				info.Admissions = unknownAdmissions(output.Targets)
-				output.Operation = info
-				return finalizeTerminalSendActuation(trace, opts, &output), nil
-			}
-		}
-		claimedOp = stored
-		claimedStore = store
+		owned = claim.Owned
 		defer func() {
 			// After a dispatch attempt the outcome is terminal: record it so
 			// the receipt survives caller timeouts. Before any dispatch
 			// attempt (preflight failure) nothing was typed, so the claim is
 			// released and the operation ID stays retryable.
 			if dispatchAttempted {
-				completeSendOperationRecord(claimedStore, claimedOp, &output)
-			} else {
-				releaseSendOperationClaim(claimedStore, claimedOp, &output)
+				completeSendOperation(owned, &output)
+			} else if warning := owned.release(); warning != "" {
+				output.Warnings = append(output.Warnings, warning)
 			}
 		}()
 	}
 
-	service, finalRedactor, err := newRobotDispatchService(redactCfg, nil, nil)
+	service, finalRedactor, err := newRobotDispatchService(redactCfg, guardedRobotMessageDeliverer(opts.MessageGuard), nil)
 	if err != nil {
 		output.RobotResponse = NewErrorResponse(err, ErrCodeInternalError, "Dispatch service initialization failed")
 		return finalizeTerminalSendActuation(trace, opts, &output), nil
 	}
 	prepared, prepareErr := service.Prepare(
-		context.Background(),
+		ctx,
 		robotPreparedDispatchRequest(panes, targetPanes, opts, messageToSend, sendEnter),
 	)
 	preview, summary, warnings := finalRedactor.outputView()
@@ -7389,7 +7406,7 @@ func GetSend(opts SendOptions) (*SendOutput, error) {
 	}
 
 	if opts.DryRun {
-		result, dispatchErr := service.Dispatch(context.Background(), prepared)
+		result, dispatchErr := service.Dispatch(ctx, prepared)
 		if dispatchErr != nil {
 			output.RobotResponse = NewErrorResponse(dispatchErr, ErrCodeInternalError, "Dispatch dry-run failed")
 			return finalizeTerminalSendActuation(trace, opts, &output), nil
@@ -7400,10 +7417,26 @@ func GetSend(opts SendOptions) (*SendOutput, error) {
 		return &output, nil
 	}
 
+	if owned != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		// The redactor memoizes the exact final message shared by all
+		// prepared targets. Persist its digest after redaction, together
+		// with the ownership-fenced dispatch boundary, before any input.
+		if err := owned.start(finalRedactor.result.Message, output.Targets); err != nil {
+			output.RobotResponse = operationStartErrorResponse(err)
+			return finalizeTerminalSendActuation(trace, opts, &output), nil
+		}
+		output.Operation = operationInfoFromRecord(owned.record, false)
+	}
+
 	publishSendActuationRequest(trace, opts, output.Targets, output.MessagePreview)
 	dispatchAttempted = true
-	result, _ := service.Dispatch(context.Background(), prepared)
+	dispatchStarted := time.Now()
+	result, _ := service.Dispatch(ctx, prepared)
 	applyRobotDispatchResult(&output, result)
+	recordRobotSendHistory(opts, redactCfg, targetPanes, targetKeys, output, dispatchStarted)
 	if opts.VerifyRender {
 		output.RenderEvidence = verifySendRenderEvidence(targetPanes, targetKeys, output.Successful, renderBaselines)
 	}
@@ -7488,18 +7521,40 @@ func captureSendRenderBaselinesWith(panes []tmux.Pane, keys []string, capture fu
 	return baselines
 }
 
+// sendRenderSettle bounds how long --verify-render keeps re-capturing a
+// delivered pane whose screen still matches the pre-send baseline. A TUI such
+// as Claude Code redraws its composer a few milliseconds after the paste
+// lands, so a single capture taken the instant Dispatch returns can miss text
+// that is already in the composer — most visibly on a stage-only send
+// (--enter=false), which returns as soon as the keys are written (GH #332).
+type sendRenderSettle struct {
+	// polls is the maximum number of re-captures after the first capture.
+	polls int
+	// interval is the pause before each re-capture.
+	interval time.Duration
+	sleep    func(time.Duration)
+}
+
+// defaultSendRenderSettle re-captures for up to ~2s. Panes whose render
+// changes stop being polled immediately, so only a pane that genuinely shows
+// no change pays the full window.
+var defaultSendRenderSettle = sendRenderSettle{polls: 20, interval: 100 * time.Millisecond, sleep: time.Sleep}
+
 func verifySendRenderEvidence(panes []tmux.Pane, keys, successful []string, baselines map[string]sendRenderBaseline) []SendRenderEvidence {
 	return verifySendRenderEvidenceWith(panes, keys, successful, baselines, func(pane tmux.Pane) (string, error) {
 		return capturePaneFallback(pane, sendRenderVerificationLines)
-	})
+	}, defaultSendRenderSettle)
 }
 
-func verifySendRenderEvidenceWith(panes []tmux.Pane, keys, successful []string, baselines map[string]sendRenderBaseline, capture func(tmux.Pane) (string, error)) []SendRenderEvidence {
+func verifySendRenderEvidenceWith(panes []tmux.Pane, keys, successful []string, baselines map[string]sendRenderBaseline, capture func(tmux.Pane) (string, error), settle sendRenderSettle) []SendRenderEvidence {
 	successfulSet := make(map[string]struct{}, len(successful))
 	for _, key := range successful {
 		successfulSet[key] = struct{}{}
 	}
 	evidence := make([]SendRenderEvidence, 0, len(keys))
+	// pending holds indexes into evidence (and panes) that are worth
+	// re-capturing: delivered, with a baseline, and not yet changed.
+	var pending []int
 	for i, pane := range panes {
 		if i >= len(keys) {
 			break
@@ -7508,23 +7563,53 @@ func verifySendRenderEvidenceWith(panes []tmux.Pane, keys, successful []string, 
 		baseline := baselines[key]
 		entry := SendRenderEvidence{Pane: key, BaselineAvailable: baseline.err == nil}
 		_, entry.Delivered = successfulSet[key]
-		post, err := capture(pane)
-		if baseline.err != nil {
-			entry.CaptureError = "pre-send capture unavailable: " + baseline.err.Error()
+		observeSendRender(&entry, baseline, pane, capture)
+		if entry.Delivered && entry.BaselineAvailable && !entry.RenderChanged {
+			pending = append(pending, len(evidence))
 		}
-		if err != nil {
-			if entry.CaptureError != "" {
-				entry.CaptureError += "; "
-			}
-			entry.CaptureError += "post-send capture unavailable: " + err.Error()
-		} else {
-			entry.RenderAvailable = true
-			entry.RenderChanged = baseline.err == nil && baseline.output != post
-		}
-		entry.DeliveredAndRendered = entry.Delivered && entry.BaselineAvailable && entry.RenderAvailable && entry.RenderChanged
 		evidence = append(evidence, entry)
 	}
+
+	for poll := 0; poll < settle.polls && len(pending) > 0; poll++ {
+		if settle.sleep != nil && settle.interval > 0 {
+			settle.sleep(settle.interval)
+		}
+		still := pending[:0]
+		for _, idx := range pending {
+			observeSendRender(&evidence[idx], baselines[keys[idx]], panes[idx], capture)
+			if !evidence[idx].RenderChanged {
+				still = append(still, idx)
+			}
+		}
+		pending = still
+	}
+
+	for i := range evidence {
+		entry := &evidence[i]
+		entry.DeliveredAndRendered = entry.Delivered && entry.BaselineAvailable && entry.RenderAvailable && entry.RenderChanged
+	}
 	return evidence
+}
+
+// observeSendRender records one post-send capture of pane into entry,
+// replacing any earlier observation so the evidence reflects the latest look.
+func observeSendRender(entry *SendRenderEvidence, baseline sendRenderBaseline, pane tmux.Pane, capture func(tmux.Pane) (string, error)) {
+	entry.CaptureError = ""
+	entry.RenderAvailable = false
+	entry.RenderChanged = false
+	if baseline.err != nil {
+		entry.CaptureError = "pre-send capture unavailable: " + baseline.err.Error()
+	}
+	post, err := capture(pane)
+	if err != nil {
+		if entry.CaptureError != "" {
+			entry.CaptureError += "; "
+		}
+		entry.CaptureError += "post-send capture unavailable: " + err.Error()
+		return
+	}
+	entry.RenderAvailable = true
+	entry.RenderChanged = baseline.err == nil && baseline.output != post
 }
 
 func sendRenderEvidenceComplete(evidence []SendRenderEvidence) bool {
@@ -7760,7 +7845,7 @@ type Change struct {
 }
 
 // GetSnapshotDelta retrieves state changes since the given timestamp.
-// Uses the internal state tracker ring buffer to return delta changes.
+// Replays the durable attention feed, including event-specific payloads.
 // This function returns the data struct directly, enabling CLI/REST parity.
 func GetSnapshotDelta(since time.Time) (*SnapshotDeltaOutput, error) {
 	output := &SnapshotDeltaOutput{
@@ -7808,6 +7893,16 @@ func GetSnapshotDelta(since time.Time) (*SnapshotDeltaOutput, error) {
 		}
 		if event.ReasonCode != "" {
 			change.Data["reason_code"] = event.ReasonCode
+		}
+		// Preserve the canonical event payload and validated follow-up actions
+		// used by --robot-events. Keep the stored scope above so window.pane
+		// addresses survive even when they are not integer pane indices.
+		replayed := attentionEventFromStored(event)
+		if len(replayed.Details) > 0 {
+			change.Data["details"] = replayed.Details
+		}
+		if len(replayed.NextActions) > 0 {
+			change.Data["next_actions"] = replayed.NextActions
 		}
 		output.Changes = append(output.Changes, change)
 	}
@@ -7858,17 +7953,27 @@ func RefreshNormalizedProjection(ctx context.Context, store *state.Store, projec
 		adapters.DefaultWorkCoordinationAdapterConfig(resolvedProjectDir),
 	))
 
+	// The work (bv/br) and tmux (capture, process) collections are
+	// independent and each takes seconds on a busy host; run them together.
+	var (
+		tmuxSnapshot *NormalizedSnapshot
+		tmuxErr      error
+		tmuxDone     = make(chan struct{})
+	)
+	go func() {
+		defer close(tmuxDone)
+		tmuxSnapshot, tmuxErr = collectNormalizedTmuxProjectionContext(ctx, resolvedProjectDir, normalizedProjectionStaleAfter)
+	}()
 	signals, err := aggregator.Collect(ctx)
+	<-tmuxDone
 	if err != nil {
 		return fmt.Errorf("collect normalized projection: %w", err)
 	}
 	if signals == nil {
 		return nil
 	}
-
-	tmuxSnapshot, err := collectNormalizedTmuxProjectionContext(ctx, resolvedProjectDir, normalizedProjectionStaleAfter)
-	if err != nil {
-		return fmt.Errorf("collect tmux projection: %w", err)
+	if tmuxErr != nil {
+		return fmt.Errorf("collect tmux projection: %w", tmuxErr)
 	}
 
 	if err := persistNormalizedProjection(store, signals, tmuxSnapshot, normalizedProjectionStaleAfter); err != nil {
@@ -7876,6 +7981,17 @@ func RefreshNormalizedProjection(ctx context.Context, store *state.Store, projec
 	}
 
 	publishNormalizedAttentionSignals(GetAttentionFeed(), store, sessionName, signals)
+
+	// The work just collected is source-verified. Publish it as the project's
+	// durable observation so the snapshot and status that follow read it back
+	// (re-verified) instead of collecting again. RuntimeWork rows carry no
+	// source identity and are never served as work (GH #283). Unavailable work
+	// (no tracker here, br failing) is published as a marker and reported by
+	// the readers; it is not a refresh failure.
+	err = adapters.PublishDurableWork(ctx, store, adapters.DefaultWorkCoordinationAdapterConfig(resolvedProjectDir), signals.Work)
+	if err != nil && !errors.Is(err, adapters.ErrWorkSnapshotUnavailable) {
+		return fmt.Errorf("publish durable work: %w", err)
+	}
 	return nil
 }
 
@@ -7955,6 +8071,11 @@ func collectNormalizedTmuxProjectionContext(ctx context.Context, projectDir stri
 	for _, sess := range sessions {
 		panes := allPanes[sess.Name]
 		for _, pane := range panes {
+			// Service panes are dropped from the agent projection below, so
+			// capturing their scrollback would be pure waste (ntm#305).
+			if pane.IsServicePane() {
+				continue
+			}
 			captureJobs = append(captureJobs, normalizedTmuxCaptureJob{
 				paneID:    pane.ID,
 				modelName: modelNameForPane(pane, cfg),
@@ -7974,6 +8095,13 @@ func collectNormalizedTmuxProjectionContext(ctx context.Context, projectDir stri
 
 	for i := range sessions {
 		panes := allPanes[sessions[i].Name]
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		paneTranscripts, err := resolvePaneTranscriptsContext(ctx, panes)
+		if err != nil {
+			return nil, err
+		}
 		// Ensure panes are associated with the session for the adapter
 		sessions[i].Panes = append([]tmux.Pane(nil), panes...)
 
@@ -7982,6 +8110,12 @@ func collectNormalizedTmuxProjectionContext(ctx context.Context, projectDir stri
 		outputTails := make(map[string]string, len(panes))
 
 		for _, pane := range panes {
+			// Tagged service panes never enter the agent projection: they are
+			// not agents, so counting them made a quiet service look like a
+			// failed agent (ntm#305).
+			if pane.IsServicePane() {
+				continue
+			}
 			agent := Agent{
 				Pane:     pane.ID,
 				Window:   pane.WindowIndex,
@@ -8000,7 +8134,17 @@ func collectNormalizedTmuxProjectionContext(ctx context.Context, projectDir stri
 			captured := allCapturedContent[pane.ID]
 			content := captured.content
 			agent.CaptureError = captured.captureErr
-			enrichAgentStatus(&agent, sessions[i].Name, modelNameForPane(pane, cfg), content)
+			modelName := paneLaunchModelContext(ctx, pane.ID)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if modelName == "" {
+				modelName = detectModel(agent.Type, pane.Title)
+			}
+			// Context is enriched once below with attributed evidence, rather
+			// than estimating it here and discarding it during normalization.
+			enrichAgentStatus(&agent, sessions[i].Name, "", content)
+			enrichAgentContext(&agent, modelName, content, paneTranscripts[pane.ID])
 			if content != "" {
 				outputTails[pane.ID] = content
 			}
@@ -8583,6 +8727,12 @@ func buildRuntimeWorkRows(section *adapters.WorkSection, collectedAt, staleAfter
 	}
 	for _, item := range section.Blocked {
 		assign(item, normalizedProjectionWorkStatus)
+		// A blocked bead's blocker IDs come from triage, which may not list
+		// it. It is still blocked: stored as an open row with no blockers, it
+		// would read back as ready (GH #283 field case a).
+		if row := rows[strings.TrimSpace(item.ID)]; row != nil && row.Status == normalizedProjectionWorkStatus && row.BlockedByCount == 0 {
+			row.BlockedByCount = 1
+		}
 	}
 	for _, item := range section.InProgress {
 		assign(item, normalizedProjectionInProgStatus)
@@ -9439,11 +9589,7 @@ func GetGraph() (*GraphOutput, error) {
 		insights, err := bv.GetInsights(wd)
 		if err != nil {
 			output.Error = fmt.Sprintf("failed to get insights: %v", err)
-			output.RobotResponse = NewErrorResponse(
-				err,
-				ErrCodeInternalError,
-				"Check bv graph data and repository state",
-			)
+			output.RobotResponse = bvErrorResponse(err, "Check bv graph data and repository state")
 		} else {
 			output.Insights = insights
 		}
@@ -9834,7 +9980,9 @@ func getBeadNeighbors(dir, issueID, direction string) ([]string, []bdDepTreeNode
 	cleaned := make([]bdDepTreeNode, 0)
 	for _, n := range nodes {
 		n.ID = strings.TrimSpace(n.ID)
-		if n.ID == "" || seen[n.ID] {
+		// br dep tree lists the queried issue itself at depth 0; it is not
+		// its own blocker or dependent.
+		if n.ID == "" || seen[n.ID] || n.Depth == 0 || n.ID == issueID {
 			continue
 		}
 		seen[n.ID] = true
@@ -9868,7 +10016,7 @@ func GetAlertsDetailed(includeResolved bool) (*AlertsOutput, error) {
 	if err != nil {
 		cfg = config.Default()
 	}
-	alertCfg := alertConfigForProject(cfg, wd)
+	alertCfg := AlertConfigForProject(cfg, wd)
 	tracker := alerts.GenerateAndTrack(alertCfg)
 
 	active, resolved := tracker.GetAll()
@@ -10169,8 +10317,10 @@ func buildTerseOutputFromSnapshot(snapshot *SnapshotOutput) *TerseOutput {
 				continue
 			}
 			state.ActiveAgents++
-			totalContextPercent += agent.ContextPercent
-			contextAgentCount++
+			if agent.ContextPercent != nil {
+				totalContextPercent += *agent.ContextPercent
+				contextAgentCount++
+			}
 			switch strings.ToLower(strings.TrimSpace(agent.State)) {
 			case "idle":
 				state.IdleAgents++
@@ -10343,14 +10493,14 @@ type ContextPendingRotationInfo struct {
 	PaneID         string  `json:"pane_id"`
 	ContextPercent float64 `json:"context_percent"`
 	CreatedAt      string  `json:"created_at"`
-	TimeoutAt      string  `json:"timeout_at"`
-	DefaultAction  string  `json:"default_action"`
+	TimeoutAt      string  `json:"timeout_at"` // the request lapses unconfirmed; nothing runs on its own
 	WorkDir        string  `json:"work_dir,omitempty"`
 }
 
 // AgentContextInfo contains context window information for a single agent pane
 type AgentContextInfo struct {
 	Pane            string  `json:"pane"`
+	PaneID          string  `json:"pane_id"`
 	PaneIdx         int     `json:"pane_idx"`
 	AgentType       string  `json:"agent_type"`
 	Model           string  `json:"model"`
@@ -10362,8 +10512,10 @@ type AgentContextInfo struct {
 	Confidence      string  `json:"confidence"`
 	State           string  `json:"state"`
 	// Source discriminates where the primary numbers came from:
-	// "transcript" (ground truth read from the agent CLI's own session
-	// transcript) or "scrollback_estimate" (legacy char-count heuristic).
+	// "status_bar" (the agent's own live context gauge, parsed from the
+	// pane; Oh My Pi), "transcript" (ground truth read from the agent CLI's
+	// own session transcript) or "scrollback_estimate" (legacy char-count
+	// heuristic).
 	Source string `json:"source"`
 	// Transcript* fields are populated only when Source == "transcript".
 	TranscriptTokens    int    `json:"transcript_tokens,omitempty"`
@@ -10457,41 +10609,150 @@ var transcriptUsageForCwd = func(agentType, cwd string) (*ntmctx.TranscriptUsage
 	return ntmctx.LatestAgentTranscriptUsage(agentType, cwd, time.Time{})
 }
 
-// resolvePaneTranscripts correlates panes with their agent CLI's own session
-// transcripts via each pane's working directory, returning usage keyed by
-// pane ID. Correlation is by (agent type, cwd), so when SEVERAL panes of the
-// same agent type share one directory — the normal NTM swarm layout — the
-// newest transcript cannot be attributed to any specific pane; those panes
-// get NO transcript (scrollback estimation stands) rather than all being
-// assigned the same session's numbers. Transcript lookups are memoized per
-// (type, cwd) so a snapshot over many panes costs one filesystem probe per
-// group, not per pane.
-func resolvePaneTranscripts(panes []tmux.Pane) map[string]*ntmctx.TranscriptUsage {
-	type paneKey struct{ agentType, cwd string }
-	groups := make(map[paneKey][]string)
+// transcriptUsageForProcess reads the transcript of the session the agent
+// process under a pane is writing. Overridable for tests.
+var transcriptUsageForProcess = func(agentType string, panePID int) (*ntmctx.TranscriptUsage, bool) {
+	return ntmctx.ProcessTranscriptUsage(context.Background(), agentType, panePID)
+}
+
+// ResolvePaneTranscripts correlates panes with their agent CLI's own session
+// transcripts, returning usage keyed by pane ID.
+//
+// A pane whose agent process names its session (agentsession process-tree
+// binding: Claude Code's per-process session record, a resumed session id)
+// reads that transcript: exact per pane even where several panes of one agent
+// type share a directory, the normal NTM swarm layout. Otherwise correlation
+// falls back to (agent type, cwd) under ntmctx.AttributePaneTranscripts'
+// sole-pane rule, so a pane never shows another pane's numbers (scrollback
+// estimation stands instead).
+func ResolvePaneTranscripts(panes []tmux.Pane) map[string]*ntmctx.TranscriptUsage {
+	return resolvePaneTranscripts(context.Background(), panes, paneCurrentPath, transcriptUsageForProcess, transcriptUsageForCwd)
+}
+
+// resolvePaneTranscriptsContext keeps the projection refresh's deadline on
+// tmux and process discovery, instead of starting independent background work.
+func resolvePaneTranscriptsContext(ctx context.Context, panes []tmux.Pane) (map[string]*ntmctx.TranscriptUsage, error) {
+	currentPath := func(paneID string) (string, bool) {
+		cwd, err := tmux.DefaultClient.RunContext(ctx, "display-message", "-p", "-t", tmux.ExactTarget(paneID), "#{pane_current_path}")
+		cwd = strings.TrimSpace(cwd)
+		return cwd, err == nil && cwd != ""
+	}
+	byProcess := func(agentType string, pid int) (*ntmctx.TranscriptUsage, bool) {
+		return ntmctx.ProcessTranscriptUsage(ctx, agentType, pid)
+	}
+	result := resolvePaneTranscripts(ctx, panes, currentPath, byProcess, transcriptUsageForCwd)
+	return result, ctx.Err()
+}
+
+func resolvePaneTranscripts(ctx context.Context, panes []tmux.Pane,
+	currentPath func(string) (string, bool),
+	byProcess func(string, int) (*ntmctx.TranscriptUsage, bool),
+	byCwd func(string, string) (*ntmctx.TranscriptUsage, bool),
+) map[string]*ntmctx.TranscriptUsage {
+	// Remote tmux PIDs and paths belong to another host. They cannot identify
+	// a local process or transcript; pane-rendered gauges remain usable.
+	if ctx.Err() != nil || tmux.DefaultClient.Remote != "" {
+		return map[string]*ntmctx.TranscriptUsage{}
+	}
+	refs := make([]ntmctx.PaneTranscriptRef, 0, len(panes))
 	for _, pane := range panes {
+		if ctx.Err() != nil {
+			return map[string]*ntmctx.TranscriptUsage{}
+		}
+		if pane.IsServicePane() {
+			continue
+		}
 		agentType := paneAgentType(pane)
 		if agentType == "unknown" || agentType == "user" {
 			continue
 		}
-		cwd, ok := paneCurrentPath(pane.ID)
+		cwd, _ := currentPath(pane.ID)
+		refs = append(refs, ntmctx.PaneTranscriptRef{PaneID: pane.ID, AgentType: agentType, PID: pane.PID, Cwd: cwd})
+	}
+	return ntmctx.AttributePaneTranscripts(refs, nil,
+		func(agentType string, pid int) (*ntmctx.TranscriptUsage, bool) {
+			if ctx.Err() != nil {
+				return nil, false
+			}
+			return byProcess(agentType, pid)
+		},
+		func(agentType, cwd string) (*ntmctx.TranscriptUsage, bool) {
+			if ctx.Err() != nil {
+				return nil, false
+			}
+			return byCwd(agentType, cwd)
+		},
+	)
+}
+
+// transcriptUsagePercent converts a transcript usage reading into a percent
+// of the context window: the window the transcript reports (Codex), else the
+// model registry's window for the transcript's model, or fallbackModel when
+// the transcript names none. limit <= 0 means no window is known and pct is
+// meaningless. Real usage cannot exceed the real window, so an over-100%
+// reading means the registry's window for this (possibly unrecognized) model
+// is wrong: it is capped at 100, the safe direction for rotation, and
+// reported through capped.
+func transcriptUsagePercent(tu *ntmctx.TranscriptUsage, fallbackModel string) (pct float64, limit int, capped bool) {
+	limit = tu.ContextWindow
+	if limit <= 0 {
+		model := tu.Model
+		if model == "" {
+			model = fallbackModel
+		}
+		limit = getContextLimit(model)
+	}
+	if limit <= 0 {
+		return 0, limit, false
+	}
+	pct = float64(tu.Tokens) / float64(limit) * 100
+	if pct > 100 {
+		return 100, limit, true
+	}
+	return pct, limit, false
+}
+
+// transcriptContextReading measures a pane's transcript reading against its
+// context window: the transcript's own model when it names one, else
+// paneModel (the pane's launch or title model, contextPaneModel).
+// --robot-context and --robot-metrics both read a pane through it, so the two
+// never disagree about the same pane.
+func transcriptContextReading(paneModel string, usage *ntmctx.TranscriptUsage) (model string, pct float64, limit int, capped bool) {
+	model = paneModel
+	if usage.Model != "" {
+		model = usage.Model
+	}
+	pct, limit, capped = transcriptUsagePercent(usage, model)
+	return model, pct, limit, capped
+}
+
+// paneContextUsagePercents is the alert generator's context-usage source
+// (alerts.Config.PaneContextUsage): each agent pane's transcript-attributed
+// usage percent, keyed by pane ID. Panes with no attributable transcript or
+// no known window are absent, so they never raise a context warning.
+func paneContextUsagePercents(_ string, panes []tmux.Pane) map[string]float64 {
+	transcripts := ResolvePaneTranscripts(panes)
+	usage := make(map[string]float64, len(transcripts))
+	for _, pane := range panes {
+		tu, ok := transcripts[pane.ID]
 		if !ok {
 			continue
 		}
-		key := paneKey{agentType: agentType, cwd: cwd}
-		groups[key] = append(groups[key], pane.ID)
+		if pct, limit, _ := transcriptUsagePercent(tu, detectModel(paneAgentType(pane), pane.Title)); limit > 0 {
+			usage[pane.ID] = pct
+		}
 	}
+	return usage
+}
 
-	result := make(map[string]*ntmctx.TranscriptUsage)
-	for key, paneIDs := range groups {
-		if len(paneIDs) != 1 {
-			continue // ambiguous attribution: no transcript beats a wrong one
-		}
-		if usage, ok := transcriptUsageForCwd(key.agentType, key.cwd); ok {
-			result[paneIDs[0]] = usage
-		}
+// ompStatusBarUsage reads an omp pane's live context gauge (see
+// ntmctx.OmpStatusBarUsage); every other agent type reports false. The
+// reading always carries a positive ContextWindow.
+func ompStatusBarUsage(agentType, cleanCapture string, capturedAt time.Time) (*ntmctx.TranscriptUsage, bool) {
+	if agent.AgentType(agentType).Canonical() != agent.AgentTypeOmp {
+		return nil, false
 	}
-	return result
+	return ntmctx.OmpStatusBarUsage(cleanCapture, capturedAt)
 }
 
 // GetContext retrieves context window usage information for all agents in a session.
@@ -10534,15 +10795,20 @@ func GetContext(session string, lines int) (*ContextOutput, error) {
 
 	// Ground-truth transcripts, resolved once for the whole pane set
 	// (memoized per agent-type+cwd group; ambiguous groups get none).
-	paneTranscripts := resolvePaneTranscripts(panes)
+	paneTranscripts := ResolvePaneTranscripts(panes)
 
 	for _, pane := range panes {
+		// Tagged service panes are not agents and hold no agent context
+		// (ntm#305).
+		if pane.IsServicePane() {
+			continue
+		}
 		agentType := paneAgentType(pane)
 		if agentType == "unknown" || agentType == "user" {
 			continue // Skip non-agent panes
 		}
 
-		model := detectModel(agentType, pane.Title)
+		model := contextPaneModel(pane, agentType)
 
 		scrollback, _ := tmux.CapturePaneOutput(pane.ID, lines)
 		cleanText := stripANSI(scrollback)
@@ -10553,7 +10819,7 @@ func GetContext(session string, lines int) (*ContextOutput, error) {
 		estTokens := charCount / 4
 		// Add overhead for system prompts and other context (2.5x multiplier)
 		withOverhead := int(float64(estTokens) * 2.5)
-		contextLimit := getContextLimit(model)
+		contextLimit := contextPaneLimit(model, pane, agentType)
 		// A non-positive limit would yield NaN or +Inf, which json.Encode rejects
 		// outright — the whole response would be replaced by an empty stdout and a
 		// nonzero exit. Treat an unusable limit as fully consumed instead, which
@@ -10567,6 +10833,7 @@ func GetContext(session string, lines int) (*ContextOutput, error) {
 
 		agentInfo := AgentContextInfo{
 			Pane:            paneKey,
+			PaneID:          pane.ID,
 			PaneIdx:         pane.Index,
 			AgentType:       agentType,
 			Model:           model,
@@ -10579,10 +10846,22 @@ func GetContext(session string, lines int) (*ContextOutput, error) {
 			Source:          "scrollback_estimate",
 		}
 
-		// Ground truth beats scrollback heuristics: read the agent CLI's own
-		// session transcript (Claude Code / Codex usage records) when one is
-		// unambiguously correlated to this pane via its working directory.
-		if usage, ok := paneTranscripts[pane.ID]; ok {
+		// Ground truth beats scrollback heuristics. omp renders its own
+		// context gauge in the composer border: that reading belongs to this
+		// pane, so it wins even where several omp panes share a directory.
+		// Otherwise read the agent CLI's own session transcript (Claude Code
+		// / Codex / omp usage records) when one is unambiguously correlated
+		// to this pane via its working directory.
+		if gauge, ok := ompStatusBarUsage(agentType, cleanText, output.CapturedAt); ok {
+			agentInfo.Source = "status_bar"
+			agentInfo.EstimatedTokens = gauge.Tokens
+			agentInfo.WithOverhead = gauge.Tokens
+			agentInfo.ContextLimit = gauge.ContextWindow
+			// Multiply before dividing so a whole-percent gauge reads back
+			// exactly ("7", not "7.000000000000001").
+			agentInfo.UsagePercent = float64(gauge.Tokens) * 100 / float64(gauge.ContextWindow)
+			agentInfo.Confidence = "high"
+		} else if usage, ok := paneTranscripts[pane.ID]; ok {
 			agentInfo.Source = "transcript"
 			agentInfo.TranscriptTokens = usage.Tokens
 			agentInfo.TranscriptModel = usage.Model
@@ -10590,25 +10869,15 @@ func GetContext(session string, lines int) (*ContextOutput, error) {
 			agentInfo.TranscriptUpdatedAt = usage.UpdatedAt.UTC().Format(time.RFC3339)
 			agentInfo.EstimatedTokens = usage.Tokens
 			agentInfo.WithOverhead = usage.Tokens // transcript totals need no overhead multiplier
-			if usage.Model != "" {
-				agentInfo.Model = usage.Model
-			}
-			limit := usage.ContextWindow
-			if limit <= 0 {
-				limit = getContextLimit(agentInfo.Model)
-			}
+			readingModel, pct, limit, capped := transcriptContextReading(agentInfo.Model, usage)
+			agentInfo.Model = readingModel
 			agentInfo.ContextLimit = limit
 			agentInfo.UsagePercent = 100.0
 			agentInfo.Confidence = ntmctx.TranscriptConfidence(usage.UpdatedAt, time.Now())
 			if limit > 0 {
-				agentInfo.UsagePercent = float64(usage.Tokens) / float64(limit) * 100
-				if agentInfo.UsagePercent > 100 {
-					// Real usage cannot exceed the real window, so an
-					// over-100% reading means the registry's window for this
-					// (possibly unrecognized) model is wrong. Cap at 100 —
-					// the safe direction for rotation — and drop confidence
-					// so consumers know the limit, not the tokens, is suspect.
-					agentInfo.UsagePercent = 100
+				agentInfo.UsagePercent = pct
+				if capped {
+					// The limit, not the tokens, is suspect: say so.
 					agentInfo.Confidence = "low"
 				}
 			}
@@ -10643,7 +10912,6 @@ func GetContext(session string, lines int) (*ContextOutput, error) {
 			ContextPercent: p.ContextPercent,
 			CreatedAt:      p.CreatedAt.Format(time.RFC3339),
 			TimeoutAt:      p.TimeoutAt.Format(time.RFC3339),
-			DefaultAction:  string(p.DefaultAction),
 			WorkDir:        p.WorkDir,
 		})
 	}
@@ -10907,6 +11175,13 @@ func GetActivity(opts ActivityOptions) (*ActivityOutput, error) {
 			}
 		}
 
+		// Tagged service panes are not agents: a long-lived service whose
+		// terminal has gone quiet must never be reported busy, idle or in
+		// error (ntm#305).
+		if pane.IsServicePane() {
+			continue
+		}
+
 		agentType := paneAgentType(pane)
 
 		// Skip non-agent panes (user, unknown)
@@ -11114,6 +11389,37 @@ func matchesAgentTypeFilter(agentType, filter string) bool {
 	return normalizeAgentType(agentType) == normalizeAgentType(filter)
 }
 
+// normalizedAgentTypeFilter canonicalizes a --type list (aliases resolved,
+// blanks dropped, sorted, deduplicated) for target filtering and for
+// idempotency bindings.
+func normalizedAgentTypeFilter(agentTypes []string) []string {
+	out := make([]string, 0, len(agentTypes))
+	for _, t := range agentTypes {
+		if strings.TrimSpace(t) == "" {
+			continue
+		}
+		out = append(out, normalizeAgentType(t))
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// keepPanesOfAgentTypes narrows panes to those whose agent type (as typeOf
+// classifies it) is in the --type list; an empty list keeps every pane.
+func keepPanesOfAgentTypes(panes []tmux.Pane, agentTypes []string, typeOf func(tmux.Pane) string) []tmux.Pane {
+	wanted := normalizedAgentTypeFilter(agentTypes)
+	if len(wanted) == 0 {
+		return panes
+	}
+	kept := make([]tmux.Pane, 0, len(panes))
+	for _, pane := range panes {
+		if slices.Contains(wanted, normalizeAgentType(typeOf(pane))) {
+			kept = append(kept, pane)
+		}
+	}
+	return kept
+}
+
 // ============================================================================
 // --robot-diff: Compare agent activity and file changes
 // ============================================================================
@@ -11232,6 +11538,10 @@ func GetDiff(opts DiffOptions) (*DiffOutput, error) {
 
 	// Analyze activity windows per pane
 	for _, pane := range panes {
+		// Tagged service panes are not agents (ntm#305).
+		if pane.IsServicePane() {
+			continue
+		}
 		// Capture pane output for state detection
 		captured, _ := tmux.CapturePaneOutput(pane.ID, 100)
 		detection := DetectAgentTypeEnhanced(pane, captured)
@@ -11379,11 +11689,7 @@ func GetTriage(opts TriageOptions) (*TriageOutput, error) {
 	triage, err := bv.GetTriage(wd)
 	if err != nil {
 		output.Error = fmt.Sprintf("failed to get triage: %v", err)
-		output.RobotResponse = NewErrorResponse(
-			err,
-			ErrCodeInternalError,
-			"Check bv triage cache and repository state",
-		)
+		output.RobotResponse = bvErrorResponse(err, "Check bv triage cache and repository state")
 		return output, nil
 	}
 
@@ -11458,10 +11764,36 @@ type FileRelationsOptions struct {
 
 func setBVRobotFailure(response *RobotResponse, message, code string) {
 	hint := "Check bv output and repository state"
-	if code == ErrCodeDependencyMissing {
+	switch {
+	case code == ErrCodeDependencyMissing:
 		hint = "Install bv to enable this analysis"
+	case code == ErrCodeInternalError && bv.IsNotInitialized(errors.New(message)):
+		code, hint = ErrCodeDependencyMissing, beadsInitHint
 	}
 	*response = NewErrorResponse(errors.New(message), code, hint)
+}
+
+// beadsInitHint answers a bv/br analysis run in a project with no beads
+// workspace: nothing is wrong, there is just no tracker to analyze yet.
+const beadsInitHint = "No beads workspace in this project: run 'br init' to start tracking work"
+
+// cassErrorResponse is the failure for a cass call: DEPENDENCY_MISSING naming
+// the index command when cass is installed but has never indexed, else
+// INTERNAL_ERROR.
+func cassErrorResponse(err error, hint string) RobotResponse {
+	if errors.Is(err, cass.ErrNotInitialized) {
+		return NewErrorResponse(err, ErrCodeDependencyMissing, "Run 'cass index --full' once to build the cass index")
+	}
+	return NewErrorResponse(err, ErrCodeInternalError, hint)
+}
+
+// bvErrorResponse is the failure for a bv/br call: DEPENDENCY_MISSING with
+// beadsInitHint when the project has no beads workspace, else INTERNAL_ERROR.
+func bvErrorResponse(err error, hint string) RobotResponse {
+	if bv.IsNotInitialized(err) {
+		return NewErrorResponse(err, ErrCodeDependencyMissing, beadsInitHint)
+	}
+	return NewErrorResponse(err, ErrCodeInternalError, hint)
 }
 
 // ForecastOutput is the JSON output for --robot-forecast
@@ -11633,8 +11965,9 @@ type SearchOutput struct {
 	Error     string             `json:"error,omitempty"`
 }
 
-// GetSearch returns BV semantic vector search results.
-func GetSearch(query string) (*SearchOutput, error) {
+// GetSearch returns BV semantic vector search results, at most limit of
+// them when limit > 0 (bv's own default otherwise).
+func GetSearch(query string, limit int) (*SearchOutput, error) {
 	adapter := tools.NewBVAdapter()
 	_, installed := adapter.Detect()
 
@@ -11651,7 +11984,7 @@ func GetSearch(query string) (*SearchOutput, error) {
 	}
 
 	wd := mustGetwd()
-	raw, err := adapter.GetSearch(context.Background(), wd, query)
+	raw, err := adapter.GetSearchWithOptions(context.Background(), wd, tools.BVSearchOptions{Query: query, Limit: limit})
 	if err != nil {
 		output.Error = fmt.Sprintf("failed to perform search: %v", err)
 		setBVRobotFailure(&output.RobotResponse, output.Error, ErrCodeInternalError)
@@ -11670,8 +12003,8 @@ func GetSearch(query string) (*SearchOutput, error) {
 }
 
 // PrintSearch outputs BV semantic vector search results
-func PrintSearch(query string) error {
-	output, err := GetSearch(query)
+func PrintSearch(query string, limit int) error {
+	output, err := GetSearch(query, limit)
 	if err != nil {
 		return err
 	}

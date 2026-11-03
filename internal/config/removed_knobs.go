@@ -39,11 +39,17 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// RemovedKnob is a config key found in a user's config file that was removed
-// in v1.26.0, together with its disposition sentence.
+// RemovedKnob is a dead config key found in a user's config file, together
+// with its disposition sentence and the removal batch it belongs to.
 type RemovedKnob struct {
 	Key         string // dotted key as written in the config file
 	Disposition string // names the replacement, or states there is none
+	// Tier is the DeadKeyTier* name of the batch that removed this key.
+	// Callers that print when a key stopped loading MUST read the release
+	// text from this batch (DeadKeyTierProvenance) rather than hard-coding
+	// one: `ntm doctor` used to tell every removed key it had failed loading
+	// "since v1.27.0", which is false for any later batch (ntm#323).
+	Tier string
 }
 
 // noEffect is the honest sentence: these keys were parsed, validated, and
@@ -69,6 +75,26 @@ var removedKnobExact = map[string]string{
 
 	"memory.include_anti_patterns": noEffect,
 	"memory.include_history":       noEffect,
+}
+
+// recoveryAliasKnobExact is the memory.*-into-[recovery] alias batch
+// (ntm#323). Unlike every other dead knob these keys DID have an effect: they
+// were folded into their [recovery] counterparts behind a per-key warning
+// that promised removal in v1.27.0 and then shipped, unremoved and still
+// emitted by `ntm config init`, all the way to v1.33.1 — so a brand-new
+// config warned on every invocation while `config migrate` called it clean.
+//
+// Their dispositions therefore name the replacement instead of claiming the
+// key was inert, and `config migrate` can finally strip them.
+//
+// memory.query_timeout_seconds is deliberately absent: it was never purely a
+// recovery alias (internal/cli reads it to bound the cm query behind
+// send-time injection), so it stays live in [memory].
+// Dispositions read as the predicate of "config key X was ...", so they are
+// phrased to complete that sentence.
+var recoveryAliasKnobExact = map[string]string{
+	"memory.include_in_recovery": "superseded by recovery.include_cm_memories",
+	"memory.max_rules":           "superseded by recovery.max_cm_rules",
 }
 
 // removedKnobPrefixes maps removed table prefixes to their dispositions; a
@@ -176,24 +202,32 @@ var deprecatedKnobPrefixes = map[string]string{
 	"tmux.activity_indicators": noEffect,
 }
 
-// classifyDeadKey reports whether a dotted config key is a known dead knob
-// (either removal tier), together with its disposition and tier name
-// ("removed" for the v1.26.0 batch, "deprecated" for the v1.28.0 batch).
-// Shared by the strict-loader classification and `ntm config migrate`.
-func classifyDeadKey(key string) (disposition, tier string, ok bool) {
-	if disp, found := removedKnobExact[key]; found {
-		return disp, DeadKeyTierRemoved, true
-	}
-	if disp, found := matchPrefix(key, removedKnobPrefixes); found {
-		return disp, DeadKeyTierRemoved, true
-	}
-	if disp, found := deprecatedKnobExact[key]; found {
-		return disp, DeadKeyTierDeprecated, true
-	}
-	if disp, found := matchPrefix(key, deprecatedKnobPrefixes); found {
-		return disp, DeadKeyTierDeprecated, true
-	}
-	return "", "", false
+// noReader is the disposition for keys that were parsed, validated, written by
+// `ntm config init` and printed by `config get`, while the code that read them
+// had no caller.
+const noReader = "removed, no replacement — nothing in ntm read this key"
+
+// readerlessKnobExact is the claims-audit batch (bd-syx9t). These keys looked
+// live only because a G2 claim pointed at a reader with no production caller:
+// the [context_rotation] toggles were read solely by Rotator.CheckAndRotate,
+// NeedsRotation and NeedsWarning, and agents.plugins solely by the resilience
+// monitor's ScanAndRegisterAgents (bd-ir0li). Like the recovery-alias batch
+// they error outright instead of warning for a release first: there is
+// nothing to migrate (no value ever had an effect) and `ntm config migrate`
+// deletes them.
+var readerlessKnobExact = map[string]string{
+	"context_rotation.enabled":             noReader + " (the live rotation trigger is [rotation] usage_percent_threshold; 0 turns it off)",
+	"context_rotation.warning_threshold":   noReader,
+	"context_rotation.min_session_age_sec": noReader,
+	"context_rotation.require_confirm":     noReader + " (coordinator rotations always wait for confirmation unless [rotation] auto_confirm is set)",
+	// bd-fka4c: stored on each pending rotation and displayed, but no code ever
+	// ran it when the request lapsed.
+	"context_rotation.default_confirm_action": "removed, no replacement — a lapsed pending rotation never ran it; confirm with `ntm rotate context confirm` or the dashboard, or set [rotation] auto_confirm",
+}
+
+// readerlessKnobPrefixes holds the claims-audit batch's tables.
+var readerlessKnobPrefixes = map[string]string{
+	"agents.plugins": noReader + " (custom agents are plugin files in the agents/ directory of the config dir; see `ntm plugins`)",
 }
 
 // Dead-key tier names shared by the strict loader, doctor, and config migrate.
@@ -202,7 +236,97 @@ const (
 	DeadKeyTierRemoved = "removed"
 	// DeadKeyTierDeprecated is the v1.28.0 batch (bd-6otuk; error since v1.29.0).
 	DeadKeyTierDeprecated = "deprecated"
+	// DeadKeyTierRecoveryAlias is the memory.*-into-[recovery] alias batch,
+	// removed outright rather than run through a warn release: the warning
+	// had already been shipping since v1.26.0 (ntm#323).
+	DeadKeyTierRecoveryAlias = "recovery-alias"
+	// DeadKeyTierReaderless is the claims-audit batch (bd-syx9t): keys whose
+	// only reader had no caller, removed outright.
+	DeadKeyTierReaderless = "readerless"
 )
+
+// deadKeyTier is one removal batch: its key sets and the release provenance
+// its error line cites.
+//
+// Batches are a table rather than a hand-written branch per tier because the
+// release text is the part that goes stale — the memory.* aliases shipped a
+// warning promising removal "in v1.27.0" and were still being written by
+// `ntm config init` at v1.33.1 (ntm#323). A new batch is one entry here, and
+// it cannot borrow another batch's release claim.
+type deadKeyTier struct {
+	name     string
+	exact    map[string]string
+	prefixes map[string]string
+	// provenance completes the error line after the disposition, in
+	// parentheses, naming when the key went away and where to read about it.
+	provenance string
+}
+
+// deadKeyTiers is ordered: earlier batches classify first, so a key that
+// somehow appears in two batches reports under the older one.
+var deadKeyTiers = []deadKeyTier{
+	{
+		name:       DeadKeyTierRemoved,
+		exact:      removedKnobExact,
+		prefixes:   removedKnobPrefixes,
+		provenance: "removed in v1.26.0, a config error since v1.27.0; see the v1.26.0 removed-key migration table in CHANGELOG.md",
+	},
+	{
+		name:       DeadKeyTierDeprecated,
+		exact:      deprecatedKnobExact,
+		prefixes:   deprecatedKnobPrefixes,
+		provenance: "deprecated in v1.28.0, a config error since v1.29.0; see the v1.28.0 dead-knob migration table in CHANGELOG.md",
+	},
+	{
+		name:  DeadKeyTierRecoveryAlias,
+		exact: recoveryAliasKnobExact,
+		// Deliberately cites the issue rather than a release number. The
+		// predecessor of this batch promised removal "in v1.27.0" and then
+		// shipped that promise for seven more releases (ntm#323); naming a
+		// version that has not been cut yet is how that happens. The
+		// CHANGELOG entry carries the release.
+		provenance: "removed with the memory.*/[recovery] split (ntm#323); the [recovery] replacement carries the same value",
+	},
+	{
+		name:     DeadKeyTierReaderless,
+		exact:    readerlessKnobExact,
+		prefixes: readerlessKnobPrefixes,
+		// Cites the bead, not a release, for the reason the recovery-alias
+		// batch gives above.
+		provenance: "removed in the reader-less key sweep (bd-syx9t, bd-fka4c); `ntm config migrate` deletes it",
+	},
+}
+
+// classifyDeadKey reports whether a dotted config key is a known dead knob in
+// any removal batch, together with its disposition and tier name. Shared by
+// the strict-loader classification and `ntm config migrate`.
+func classifyDeadKey(key string) (disposition, tier string, ok bool) {
+	for _, t := range deadKeyTiers {
+		if disp, found := t.exact[key]; found {
+			return disp, t.name, true
+		}
+		if disp, found := matchPrefix(key, t.prefixes); found {
+			return disp, t.name, true
+		}
+	}
+	return "", "", false
+}
+
+// DeadKeyTierProvenance returns the release provenance for a removal batch:
+// when its keys went away and where the migration table lives.
+//
+// It is exported so surfaces outside this package (notably `ntm doctor`) can
+// tell the user when a specific key stopped loading instead of asserting one
+// batch's release numbers over every key they print. An unknown tier yields
+// the empty string; callers must render nothing rather than guess.
+func DeadKeyTierProvenance(tier string) string {
+	for _, t := range deadKeyTiers {
+		if t.name == tier {
+			return t.provenance
+		}
+	}
+	return ""
+}
 
 // DeadKeyLoadError is the strict-loader failure for a config file containing
 // removed (v1.26.0 batch) and/or deprecated (v1.28.0 batch) keys, plus any
@@ -212,9 +336,11 @@ const (
 // fallback (root.go PersistentPreRunE) can collapse the multi-line detail
 // into a single actionable line pointing at `ntm config migrate`.
 type DeadKeyLoadError struct {
-	Removed    []RemovedKnob
-	Deprecated []RemovedKnob
-	Unknown    []string
+	// ByTier holds the dead keys found, grouped by removal batch and keyed
+	// by DeadKeyTier* name. Grouping keeps each batch's error lines citing
+	// its own release provenance instead of borrowing another batch's.
+	ByTier  map[string][]RemovedKnob
+	Unknown []string
 }
 
 func (e *DeadKeyLoadError) Error() string {
@@ -222,15 +348,23 @@ func (e *DeadKeyLoadError) Error() string {
 	if len(e.Unknown) > 0 {
 		msgs = append(msgs, "unknown field(s): "+strings.Join(e.Unknown, ", "))
 	}
-	msgs = append(msgs, removedKnobErrorLines(e.Removed)...)
-	msgs = append(msgs, deprecatedKnobErrorLines(e.Deprecated)...)
+	// Tier order, not map order, so the message is deterministic.
+	for _, t := range deadKeyTiers {
+		for _, knob := range e.ByTier[t.name] {
+			msgs = append(msgs, deadKnobErrorLine(knob, t.provenance))
+		}
+	}
 	return "parsing config: " + strings.Join(msgs, "\n")
 }
 
-// DeadKeyCount is the number of removed + deprecated keys in the failure
+// DeadKeyCount is the number of dead keys in the failure across every batch
 // (unknown fields excluded — those are not migratable no-ops).
 func (e *DeadKeyLoadError) DeadKeyCount() int {
-	return len(e.Removed) + len(e.Deprecated)
+	n := 0
+	for _, knobs := range e.ByTier {
+		n += len(knobs)
+	}
+	return n
 }
 
 // classifyUndecodedKeys partitions the strict loader's undecoded key list
@@ -241,27 +375,15 @@ func (e *DeadKeyLoadError) DeadKeyCount() int {
 // has concrete child keys present, only the children are reported (one line
 // per key the user actually wrote); the bare table header is reported only
 // when it appears alone.
-func classifyUndecodedKeys(fields []string) (removed, deprecated []RemovedKnob, unknown []string) {
+func classifyUndecodedKeys(fields []string) (byTier map[string][]RemovedKnob, unknown []string) {
 	type match struct {
 		disposition string
-		deprecated  bool
+		tier        string
 	}
 	matched := make(map[string]match)
 	for _, key := range fields {
-		if disp, ok := removedKnobExact[key]; ok {
-			matched[key] = match{disposition: disp}
-			continue
-		}
-		if disp, ok := matchPrefix(key, removedKnobPrefixes); ok {
-			matched[key] = match{disposition: disp}
-			continue
-		}
-		if disp, ok := deprecatedKnobExact[key]; ok {
-			matched[key] = match{disposition: disp, deprecated: true}
-			continue
-		}
-		if disp, ok := matchPrefix(key, deprecatedKnobPrefixes); ok {
-			matched[key] = match{disposition: disp, deprecated: true}
+		if disp, tier, ok := classifyDeadKey(key); ok {
+			matched[key] = match{disposition: disp, tier: tier}
 			continue
 		}
 		unknown = append(unknown, key)
@@ -273,18 +395,16 @@ func classifyUndecodedKeys(fields []string) (removed, deprecated []RemovedKnob, 
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+
+	byTier = make(map[string][]RemovedKnob, len(deadKeyTiers))
 	for _, key := range keys {
 		if hasStrictChild(key, keys) {
 			continue
 		}
-		knob := RemovedKnob{Key: key, Disposition: matched[key].disposition}
-		if matched[key].deprecated {
-			deprecated = append(deprecated, knob)
-		} else {
-			removed = append(removed, knob)
-		}
+		m := matched[key]
+		byTier[m.tier] = append(byTier[m.tier], RemovedKnob{Key: key, Disposition: m.disposition, Tier: m.tier})
 	}
-	return removed, deprecated, unknown
+	return byTier, unknown
 }
 
 func matchPrefix(key string, prefixes map[string]string) (string, bool) {
@@ -305,48 +425,16 @@ func hasStrictChild(key string, keys []string) bool {
 	return false
 }
 
-// removedKnobErrorLine renders the strict-loader error line for one removed
-// knob. The key + disposition text is IDENTICAL to the v1.26.0 deprecation
-// warning it replaces (WS6-remove-finalize, bd-ws6-config-truth-ienmd.3) —
-// only the severity changed. The line tells the user exactly what to delete
-// and why, and points at the v1.26.0 migration table for the full list.
-func removedKnobErrorLine(knob RemovedKnob) string {
+// deadKnobErrorLine renders the strict-loader error line for one dead knob.
+// The key + disposition text is IDENTICAL to the deprecation warning the
+// error replaces — only the severity changed — and the provenance clause is
+// the knob's OWN batch, never a neighbouring batch's release numbers. A
+// borrowed release claim is how the memory.* aliases ended up telling users
+// for seven releases that they had been removed in v1.27.0 (ntm#323).
+func deadKnobErrorLine(knob RemovedKnob, provenance string) string {
 	return fmt.Sprintf(
-		"config key %s was %s — delete it from your config file (removed in v1.26.0, a config error since v1.27.0; see the v1.26.0 removed-key migration table in CHANGELOG.md)",
-		knob.Key, knob.Disposition)
-}
-
-// removedKnobErrorLines renders one error line per removed knob, in input
-// order, so a single load failure lists every key the user must delete.
-func removedKnobErrorLines(removed []RemovedKnob) []string {
-	lines := make([]string, 0, len(removed))
-	for _, knob := range removed {
-		lines = append(lines, removedKnobErrorLine(knob))
-	}
-	return lines
-}
-
-// deprecatedKnobErrorLine renders the strict-loader error line for one
-// v1.28.0-batch deprecated knob (bd-6otuk). The key + disposition text is
-// IDENTICAL to the v1.28.0 deprecation warning it replaces — only the
-// severity changed, exactly like the v1.26.0→v1.27.0 flip
-// (bd-ws6-config-truth-ienmd.3). The line tells the user exactly what to
-// delete and why, and points at the v1.28.0 migration table for the full
-// list.
-func deprecatedKnobErrorLine(knob RemovedKnob) string {
-	return fmt.Sprintf(
-		"config key %s was %s — delete it from your config file (deprecated in v1.28.0, a config error since v1.29.0; see the v1.28.0 deprecated-key migration table in CHANGELOG.md)",
-		knob.Key, knob.Disposition)
-}
-
-// deprecatedKnobErrorLines renders one error line per v1.28.0-batch knob, in
-// input order, so a single load failure lists every key the user must delete.
-func deprecatedKnobErrorLines(deprecated []RemovedKnob) []string {
-	lines := make([]string, 0, len(deprecated))
-	for _, knob := range deprecated {
-		lines = append(lines, deprecatedKnobErrorLine(knob))
-	}
-	return lines
+		"config key %s was %s — delete it from your config file (%s)",
+		knob.Key, knob.Disposition, provenance)
 }
 
 // ScanRemovedKnobs reports the removed config knobs present in the config
@@ -355,9 +443,18 @@ func deprecatedKnobErrorLines(deprecated []RemovedKnob) []string {
 // decodes leniently, so it works on exactly the configs the strict loader
 // refuses since v1.27.0. A missing config file yields no knobs; an
 // unparseable file yields an error.
+// ScanRemovedKnobs also reports the recovery-alias batch (ntm#323) and the
+// reader-less batch (bd-syx9t), whose keys are removals in the same sense:
+// doctor lists everything the user must delete, and the per-tier release text
+// lives in the strict-loader error.
 func ScanRemovedKnobs(path string) ([]RemovedKnob, error) {
-	removed, _, err := scanKnobs(path)
-	return removed, err
+	byTier, err := scanKnobs(path)
+	if err != nil {
+		return nil, err
+	}
+	knobs := append([]RemovedKnob(nil), byTier[DeadKeyTierRemoved]...)
+	knobs = append(knobs, byTier[DeadKeyTierRecoveryAlias]...)
+	return append(knobs, byTier[DeadKeyTierReaderless]...), nil
 }
 
 // ScanDeprecatedKnobs reports the v1.28.0-batch deprecated (bd-6otuk) config
@@ -366,26 +463,29 @@ func ScanRemovedKnobs(path string) ([]RemovedKnob, error) {
 // remediation surface, which keeps working on exactly the configs the strict
 // loader refuses since these keys became hard errors in v1.29.0.
 func ScanDeprecatedKnobs(path string) ([]RemovedKnob, error) {
-	_, deprecated, err := scanKnobs(path)
-	return deprecated, err
+	byTier, err := scanKnobs(path)
+	if err != nil {
+		return nil, err
+	}
+	return byTier[DeadKeyTierDeprecated], nil
 }
 
-func scanKnobs(path string) (removed, deprecated []RemovedKnob, err error) {
+func scanKnobs(path string) (map[string][]RemovedKnob, error) {
 	if path == "" {
 		path = DefaultPath()
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil, nil
+			return nil, nil
 		}
-		return nil, nil, err
+		return nil, err
 	}
 	cfg := &Config{}
 	md, err := toml.Decode(string(data), cfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("parsing config: %w", err)
+		return nil, fmt.Errorf("parsing config: %w", err)
 	}
-	removed, deprecated, _ = classifyUndecodedKeys(undecodedConfigFields(md))
-	return removed, deprecated, nil
+	byTier, _ := classifyUndecodedKeys(undecodedConfigFields(md))
+	return byTier, nil
 }

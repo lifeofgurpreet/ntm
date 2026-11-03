@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -80,9 +81,7 @@ func newConflictWireMailServer(t *testing.T, reservationsJSON string) (*agentmai
 
 		switch rpc.Method {
 		case "resources/read":
-			contents, _ := json.Marshal(map[string]any{
-				"contents": []map[string]any{{"text": reservationsJSON}},
-			})
+			contents := conflictWireResourceResponse(t, rpc.Params, reservationsJSON)
 			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":%s}`, idJSON, contents)
 		case "tools/call":
 			var params struct {
@@ -103,6 +102,35 @@ func newConflictWireMailServer(t *testing.T, reservationsJSON string) (*agentmai
 
 	client := agentmail.NewClient(agentmail.WithBaseURL(server.URL))
 	return client, recorder
+}
+
+// Current Agent Mail resource rows may omit project_id; the client's
+// independent project-identity read must receive a project, not the lock list.
+func conflictWireResourceResponse(t *testing.T, paramsJSON json.RawMessage, reservationsJSON string) []byte {
+	t.Helper()
+	var params struct {
+		URI string `json:"uri"`
+	}
+	if err := json.Unmarshal(paramsJSON, &params); err != nil {
+		t.Errorf("decode resource params: %v", err)
+	}
+	text := reservationsJSON
+	if strings.HasPrefix(params.URI, "resource://project/") {
+		key, err := url.PathUnescape(strings.TrimPrefix(params.URI, "resource://project/"))
+		if err != nil {
+			t.Errorf("decode project resource key: %v", err)
+		}
+		project, err := json.Marshal(agentmail.Project{ID: 9, HumanKey: key})
+		if err != nil {
+			t.Errorf("encode project resource: %v", err)
+		}
+		text = string(project)
+	}
+	contents, err := json.Marshal(map[string]any{"contents": []map[string]any{{"text": text}}})
+	if err != nil {
+		t.Errorf("encode resource response: %v", err)
+	}
+	return contents
 }
 
 // conflictingPairReservationsJSON builds the resource payload for a genuine
@@ -139,7 +167,7 @@ func newConflictWireCoordinator(t *testing.T, client *agentmail.Client, cfg Coor
 	t.Helper()
 	origGetPanes := getPanesWithActivity
 	t.Cleanup(func() { getPanesWithActivity = origGetPanes })
-	getPanesWithActivity = func(string) ([]tmux.PaneActivity, error) { return nil, nil }
+	getPanesWithActivity = func(context.Context, string) ([]tmux.PaneActivity, error) { return nil, nil }
 
 	return New("conflict-wire-test", t.TempDir(), client, "TestCoordinator").WithConfig(cfg)
 }
@@ -277,13 +305,15 @@ func TestRunCycle_ConflictFlagsOff_EngineNeverInvoked(t *testing.T) {
 }
 
 // TestRunCycle_ConflictNotifyOnly_NotificationWithoutMutation covers the
-// notify-only mode (the persisted default): both holders are informed of the
-// named conflict, but no release is requested and nothing is mutated.
+// notify-only mode (`ntm coordinator enable conflict-notify`): both holders
+// are informed of the named conflict, but no release is requested and nothing
+// is mutated.
 func TestRunCycle_ConflictNotifyOnly_NotificationWithoutMutation(t *testing.T) {
 	const pattern = "internal/coordinator/monitor.go"
 	client, recorder := newConflictWireMailServer(t, conflictingPairReservationsJSON(pattern))
 
-	cfg := DefaultCoordinatorConfig() // ConflictNotify=true, ConflictNegotiate=false
+	cfg := DefaultCoordinatorConfig() // ConflictNegotiate=false
+	cfg.ConflictNotify = true
 	c := newConflictWireCoordinator(t, client, cfg)
 
 	if _, err := c.RunCycle(context.Background()); err != nil {
@@ -341,7 +371,8 @@ func TestRunCycle_ConflictCooldown_BoundsRepeatedTicks(t *testing.T) {
 // TestRunConflictCycle_BoundedPerTick pins the per-tick work bound with many
 // simultaneous conflicts.
 func TestRunConflictCycle_BoundedPerTick(t *testing.T) {
-	cfg := DefaultCoordinatorConfig() // notify-only
+	cfg := DefaultCoordinatorConfig()
+	cfg.ConflictNotify = true // notify-only
 	c := newConflictWireCoordinator(t, nil, cfg)
 
 	now := time.Now()
@@ -420,9 +451,7 @@ func TestRunConflictCycle_FailedSendRetriesNextTick(t *testing.T) {
 		idJSON, _ := json.Marshal(rpc.ID)
 		switch rpc.Method {
 		case "resources/read":
-			contents, _ := json.Marshal(map[string]any{
-				"contents": []map[string]any{{"text": conflictingPairReservationsJSON(pattern)}},
-			})
+			contents := conflictWireResourceResponse(t, rpc.Params, conflictingPairReservationsJSON(pattern))
 			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":%s}`, idJSON, contents)
 		case "tools/call":
 			var params struct {

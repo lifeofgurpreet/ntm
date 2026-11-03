@@ -1,13 +1,808 @@
 package cli
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/Dicklesworthstone/ntm/internal/redaction"
+	"github.com/Dicklesworthstone/ntm/internal/startup"
 )
+
+type jsonEscapedCredentialFixture struct {
+	name          string
+	content       string
+	lines         []int
+	sourceMatches []string
+	invalidLines  []int
+	hidden        []string
+	allowlist     []string
+	disabled      []redaction.Category
+	visible       string
+}
+
+func jsonEscapedCredentialFixtures() []jsonEscapedCredentialFixture {
+	allowed := "{\"message\":\"PASSWORD=\\\"allowlisted-sensitive-control\\\"\",\"note\":\"public-neighbor\"}\n{\"message\":\"PASSWORD=\\\"unlisted-sensitive-secret\\\"\",\"note\":\"public-neighbor\"}"
+	rawAssignment := "PASSWORD=\\\"allowlisted-sensitive-control\\\""
+	logicalAssignment := "PASSWORD=\"allowlisted-sensitive-control\""
+	return []jsonEscapedCredentialFixture{
+		{
+			name:    "embedded quoted assignment",
+			content: "{\"message\":\"PASSWORD=\\\"embedded-sensitive-head-embedded-sensitive-tail\\\"\",\"note\":\"public-neighbor\"}",
+			lines:   []int{1},
+			hidden:  []string{"embedded-sensitive-head", "embedded-sensitive-tail"},
+		},
+		{
+			name:    "fully encoded key and separator",
+			content: "{\"message\":\"\\u0050\\u0041\\u0053\\u0053\\u0057\\u004f\\u0052\\u0044\\u003dfully-encoded-key-secret\",\"note\":\"public-neighbor\"}",
+			lines:   []int{1},
+			hidden:  []string{"fully-encoded-key-secret"},
+		},
+		{
+			name:    "encoded property with escaped value",
+			content: "{\"pass\\u0077ord\":\"encoded-sensitive-head\\\"encoded-sensitive-tail\",\"note\":\"public-neighbor\"}",
+			lines:   []int{1},
+			hidden:  []string{"encoded-sensitive-head", "encoded-sensitive-tail"},
+		},
+		{
+			name:    "physical JSONL lines",
+			content: "{\"message\":\"harmless first record\",\"note\":\"public-neighbor\"}\n\n{\"message\":\"before\\nPASSWORD=\\\"jsonl-sensitive-first\\\"\\nafter\",\"note\":\"public-neighbor\"}\n{\"pass\\u0077ord\":\"jsonl-sensitive-second\",\"note\":\"public-neighbor\"}\n",
+			lines:   []int{3, 4},
+			hidden:  []string{"jsonl-sensitive-first", "jsonl-sensitive-second"},
+		},
+		{
+			name:      "raw assignment allowlist",
+			content:   allowed,
+			lines:     []int{2},
+			hidden:    []string{"unlisted-sensitive-secret"},
+			allowlist: []string{"^" + regexp.QuoteMeta(rawAssignment) + "$"},
+			visible:   "allowlisted-sensitive-control",
+		},
+		{
+			name:      "logical assignment allowlist",
+			content:   allowed,
+			lines:     []int{2},
+			hidden:    []string{"unlisted-sensitive-secret"},
+			allowlist: []string{"^" + regexp.QuoteMeta(logicalAssignment) + "$"},
+			visible:   "allowlisted-sensitive-control",
+		},
+		{
+			name: "decoded noncredentials",
+			content: "{\"message\":\"password=\\u0061\\u0062\\u0063\\u0064\\u0065\\u0066\\u0067\",\"note\":\"public-neighbor\"}\n" +
+				"{\"message\":\"PWD=\\u002fhome/user/project\",\"note\":\"public-neighbor\"}\n" +
+				"{\"message\":\"OLDPWD=C:\\\\Users\\\\user\\\\project\",\"note\":\"public-neighbor\"}\n" +
+				"{\"message\":\"password=\\u003credacted\\u003e\",\"note\":\"public-neighbor\"}\n" +
+				"{\"password\\u005fhint\":\"public-neighbor-long\",\"token\\u005fcount\":\"public-count-value\",\"note\":\"public-neighbor\"}\n" +
+				"{\"pass\\u0077ord\\u0022\\u003a\\u0022token\":\"public-neighbor-long\",\"note\":\"public-neighbor\"}\n",
+		},
+	}
+}
+
+func jsonMixedRecordCredentialFixtures() []jsonEscapedCredentialFixture {
+	return []jsonEscapedCredentialFixture{
+		{
+			name:          "complete message before truncated tail",
+			content:       "{\"message\":\"PASSWORD=\\\"tail-sensitive-head-tail-sensitive-tail\\\"\",\"note\":\"public-neighbor\"}\n{\"message\":",
+			lines:         []int{1},
+			sourceMatches: []string{"PASSWORD=\\\"tail-sensitive-head-tail-sensitive-tail\\\""},
+			invalidLines:  []int{2},
+			hidden:        []string{"tail-sensitive-head", "tail-sensitive-tail"},
+		},
+		{
+			name:          "encoded key before truncated tail",
+			content:       "{\"pass\\u0077ord\":\"key-tail-sensitive-head\\\"key-tail-sensitive-tail\",\"note\":\"public-neighbor\"}\n{\"message\":",
+			lines:         []int{1},
+			sourceMatches: []string{"\"pass\\u0077ord\":\"key-tail-sensitive-head\\\"key-tail-sensitive-tail\""},
+			invalidLines:  []int{2},
+			hidden:        []string{"key-tail-sensitive-head", "key-tail-sensitive-tail"},
+		},
+		{
+			name: "valid records around invalid lines",
+			content: "INFO public-prefix\n" +
+				"{\"message\":\"PASSWORD=\\\"before-gap-sensitive-head-before-gap-sensitive-tail\\\"\",\"note\":\"public-neighbor\"}\n" +
+				"{\"message\":broken\n" +
+				"{\"pass\\u0077ord\":\"after-gap-sensitive-head\\\"after-gap-sensitive-tail\",\"note\":\"public-neighbor\"}\n",
+			lines: []int{2, 4},
+			sourceMatches: []string{
+				"PASSWORD=\\\"before-gap-sensitive-head-before-gap-sensitive-tail\\\"",
+				"\"pass\\u0077ord\":\"after-gap-sensitive-head\\\"after-gap-sensitive-tail\"",
+			},
+			invalidLines: []int{1, 3},
+			hidden:       []string{"before-gap-sensitive-head", "before-gap-sensitive-tail", "after-gap-sensitive-head", "after-gap-sensitive-tail"},
+		},
+		{
+			name: "raw assignments in mixed records",
+			content: "PASSWORD=plain-sensitive-head-plain-sensitive-tail\n" +
+				"{\"message\":\"PASSWORD=\\\"valid-sensitive-head-valid-sensitive-tail\\\"\",\"note\":\"public-neighbor\"}\n" +
+				"{\"broken\": PASSWORD=malformed-sensitive-head-malformed-sensitive-tail\n" +
+				"{\"pass\\u0077ord\":\"last-sensitive-head\\\"last-sensitive-tail\",\"note\":\"public-neighbor\"}\n",
+			lines: []int{1, 2, 3, 4},
+			sourceMatches: []string{
+				"PASSWORD=plain-sensitive-head-plain-sensitive-tail",
+				"PASSWORD=\\\"valid-sensitive-head-valid-sensitive-tail\\\"",
+				"PASSWORD=malformed-sensitive-head-malformed-sensitive-tail",
+				"\"pass\\u0077ord\":\"last-sensitive-head\\\"last-sensitive-tail\"",
+			},
+			invalidLines: []int{1, 3},
+			hidden:       []string{"plain-sensitive-head", "plain-sensitive-tail", "valid-sensitive-head", "valid-sensitive-tail", "malformed-sensitive-head", "malformed-sensitive-tail", "last-sensitive-head", "last-sensitive-tail"},
+		},
+		{
+			name: "decoded noncredentials in mixed records",
+			content: "INFO public-neighbor\n" +
+				"{\"message\":\"password=\\u0061\\u0062\\u0063\\u0064\\u0065\\u0066\\u0067\",\"note\":\"public-neighbor\"}\n" +
+				"{\"message\":truncated\n" +
+				"{\"message\":\"PWD=\\u002fhome/user/project\",\"note\":\"public-neighbor\"}\n" +
+				"{\"message\":\"password=\\u003credacted\\u003e\",\"note\":\"public-neighbor\"}\n" +
+				"{\"message\":\"OLDPWD=C:\\\\Users\\\\user\\\\project\",\"note\":\"public-neighbor\"}\n",
+			invalidLines: []int{1, 3},
+		},
+	}
+}
+
+func jsonPartialRecordCredentialFixtures() []jsonEscapedCredentialFixture {
+	const prefix = "{\"note\":\"public-neighbor\","
+	const partialField = "\"password\":\"partial-sensitive-head-partial-sensitive-tail"
+	const pendingMessage = "PASSWORD=\\\"message-partial-head-message-partial-tail\\u12"
+	const logicalMessagePrefix = "PASSWORD=\"message-partial-head-message-partial-tail"
+	const allowedField = "\"password\":\"allowlisted-sensitive-partial\\u12"
+	const rawShortAssignment = "PASSWORD=\\u0061\\u0062\\u0063\\u0064\\u0065\\u0066\\u0067\""
+	return []jsonEscapedCredentialFixture{
+		{
+			name:          "partial password value",
+			content:       prefix + partialField,
+			lines:         []int{1},
+			sourceMatches: []string{partialField},
+			invalidLines:  []int{1},
+			hidden:        []string{"partial-sensitive-head", "partial-sensitive-tail"},
+		},
+		{
+			name:          "complete encoded message without closing brace",
+			content:       prefix + "\"message\":\"PASSWORD=\\\"missing-brace-sensitive-head-missing-brace-sensitive-tail\\\"\"",
+			lines:         []int{1},
+			sourceMatches: []string{"PASSWORD=\\\"missing-brace-sensitive-head-missing-brace-sensitive-tail\\\""},
+			invalidLines:  []int{1},
+			hidden:        []string{"missing-brace-sensitive-head", "missing-brace-sensitive-tail"},
+		},
+		{
+			name: "partial Unicode credential keys",
+			content: prefix + "\"pass\\u0077ord\":\"closed-key-sensitive-head-closed-key-sensitive-tail\"\n" +
+				prefix + "\"pass\\u0077ord\":\"open-key-sensitive-head\\\"open-key-sensitive-tail\\u12",
+			lines: []int{1, 2},
+			sourceMatches: []string{
+				"\"pass\\u0077ord\":\"closed-key-sensitive-head-closed-key-sensitive-tail\"",
+				"\"pass\\u0077ord\":\"open-key-sensitive-head\\\"open-key-sensitive-tail\\u12",
+			},
+			invalidLines: []int{1, 2},
+			hidden:       []string{"closed-key-sensitive-head", "closed-key-sensitive-tail", "open-key-sensitive-head", "open-key-sensitive-tail", "\\u12"},
+		},
+		{
+			name:          "partial quoted message with pending escape",
+			content:       prefix + "\"message\":\"" + pendingMessage,
+			lines:         []int{1},
+			sourceMatches: []string{pendingMessage},
+			invalidLines:  []int{1},
+			hidden:        []string{"message-partial-head", "message-partial-tail", "\\u12"},
+		},
+		{
+			name:          "pending escape cannot use logical prefix allowlist",
+			content:       prefix + "\"message\":\"" + pendingMessage,
+			lines:         []int{1},
+			sourceMatches: []string{pendingMessage},
+			invalidLines:  []int{1},
+			hidden:        []string{"message-partial-head", "message-partial-tail", "\\u12"},
+			allowlist:     []string{"^" + regexp.QuoteMeta(logicalMessagePrefix) + "$"},
+		},
+		{
+			name: "partial JSONL records preserve physical bounds",
+			content: prefix + "\"password\":\"before-next-sensitive-head\\\"before-next-sensitive-tail\n" +
+				prefix + "\"message\":\"PASSWORD=\\\"complete-middle-sensitive\\\"\"}\n" +
+				prefix + "\"pass\\u0077ord\":\"at-eof-sensitive-head\\\"at-eof-sensitive-tail",
+			lines: []int{1, 2, 3},
+			sourceMatches: []string{
+				"\"password\":\"before-next-sensitive-head\\\"before-next-sensitive-tail",
+				"PASSWORD=\\\"complete-middle-sensitive\\\"",
+				"\"pass\\u0077ord\":\"at-eof-sensitive-head\\\"at-eof-sensitive-tail",
+			},
+			invalidLines: []int{1, 3},
+			hidden:       []string{"before-next-sensitive-head", "before-next-sensitive-tail", "complete-middle-sensitive", "at-eof-sensitive-head", "at-eof-sensitive-tail"},
+		},
+		{
+			name:          "partial message preserves raw multiline assignment",
+			content:       prefix + "\"message\":\"PASSWORD\n=synthetic-never-valid-multiline\npublic-trailer\n",
+			lines:         []int{1},
+			sourceMatches: []string{"PASSWORD\n=synthetic-never-valid-multiline"},
+			invalidLines:  []int{1, 2, 3},
+			hidden:        []string{"synthetic-never-valid-multiline", "never-valid-multiline"},
+			visible:       "public-trailer",
+		},
+		{
+			name: "seven decoded characters with pending escapes",
+			content: prefix + "\"password\":\"abcdefg\\u12\n" +
+				prefix + "\"message\":\"PASSWORD=\\\"abcdefg\\",
+			invalidLines: []int{1, 2},
+		},
+		{
+			name: "partial records preserve noncredential suppression",
+			content: prefix + "\"password\":\"\\u003credacted\\u003e\n" +
+				prefix + "\"pwd\":\"\\u002fhome/agent/project\n" +
+				prefix + "\"message\":\"PASSWORD=\\u0061\\u0062\\u0063\\u0064\\u0065\\u0066\\u0067\"\n" +
+				prefix + "\"message\":\"OLDPWD=C:\\\\Users\\\\agent\\\\project\"\n" +
+				prefix + "\"pass\\u0077ord_hint\":\"public-hint-long",
+			invalidLines: []int{1, 2, 3, 4, 5},
+		},
+		{
+			name:          "invalid syntax retains raw assignment matching",
+			content:       prefix + "\"message\":\"" + rawShortAssignment + ",\"broken\":!}",
+			lines:         []int{1},
+			sourceMatches: []string{rawShortAssignment},
+			invalidLines:  []int{1},
+			hidden:        []string{"\\u0061", "\\u0067"},
+		},
+		{
+			name:         "whole raw partial field allowlist",
+			content:      prefix + allowedField,
+			invalidLines: []int{1},
+			allowlist:    []string{"^" + regexp.QuoteMeta(allowedField) + "$"},
+			visible:      "allowlisted-sensitive-partial",
+		},
+		{
+			name: "partial password category disabled",
+			content: prefix + "\"pass\\u0077ord\":\"disabled-sensitive-partial\\u12\n" +
+				prefix + "\"message\":\"PASSWORD=\\\"disabled-message-sensitive-tail\\u12",
+			invalidLines: []int{1, 2},
+			disabled:     []redaction.Category{redaction.CategoryPassword},
+		},
+	}
+}
+
+func TestScrub_DecodedJSONCredentials(t *testing.T) {
+	fixtures := append(jsonEscapedCredentialFixtures(), jsonMixedRecordCredentialFixtures()...)
+	fixtures = append(fixtures, jsonPartialRecordCredentialFixtures()...)
+	for _, tc := range fixtures {
+		t.Run(tc.name, func(t *testing.T) {
+			for i, line := range strings.Split(tc.content, "\n") {
+				if strings.TrimSpace(line) == "" {
+					continue
+				}
+				wantValid := true
+				for _, invalidLine := range tc.invalidLines {
+					if invalidLine == i+1 {
+						wantValid = false
+					}
+				}
+				if json.Valid([]byte(line)) != wantValid {
+					t.Fatalf("fixture line %d validity differs from expected %t", i+1, wantValid)
+				}
+			}
+			path := filepath.Join(t.TempDir(), "artifact.jsonl")
+			if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			res := runScrub([]string{path}, nil, redaction.Config{Allowlist: tc.allowlist, DisabledCategories: tc.disabled})
+			if res.FilesScanned != 1 || len(res.Warnings) != 0 {
+				t.Fatalf("files=%d warnings=%v, want one file without warnings", res.FilesScanned, res.Warnings)
+			}
+			if len(res.Findings) != len(tc.lines) {
+				t.Fatalf("findings=%d, want %d", len(res.Findings), len(tc.lines))
+			}
+			for i, finding := range res.Findings {
+				if finding.Category != redaction.CategoryPassword || finding.Line != tc.lines[i] {
+					t.Errorf("finding %d category=%s line=%d, want PASSWORD on physical line %d", i, finding.Category, finding.Line, tc.lines[i])
+				}
+				if len(tc.sourceMatches) > 0 {
+					wantStart := strings.Index(tc.content, tc.sourceMatches[i])
+					wantEnd := wantStart + len(tc.sourceMatches[i])
+					if wantStart < 0 {
+						t.Fatalf("expected source match %d is absent from fixture", i)
+					}
+					wantColumn := wantStart - strings.LastIndex(tc.content[:wantStart], "\n")
+					if finding.Start != wantStart || finding.End != wantEnd || finding.Column != wantColumn {
+						t.Errorf("finding %d source span=%d:%d column=%d, want %d:%d column=%d", i, finding.Start, finding.End, finding.Column, wantStart, wantEnd, wantColumn)
+					}
+				}
+				for _, fragment := range tc.hidden {
+					if strings.Contains(finding.Preview, fragment) {
+						t.Errorf("finding %d preview exposed a secret fragment", i)
+					}
+				}
+			}
+			encoded, err := json.Marshal(res)
+			if err != nil {
+				t.Fatal(err)
+			}
+			textOutput, err := captureStdout(t, func() error {
+				printScrubText(res)
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, output := range []string{string(encoded), textOutput} {
+				for _, fragment := range tc.hidden {
+					if strings.Contains(output, fragment) {
+						t.Error("scrub output exposed a secret fragment")
+					}
+				}
+				if len(tc.lines) > 0 && !strings.Contains(output, "public-neighbor") {
+					t.Error("scrub previews removed the neighboring public field")
+				}
+			}
+		})
+	}
+}
+
+type credentialOutputFixture struct {
+	name          string
+	content       string
+	categories    []redaction.Category
+	lines         []int
+	sourceMatches []string
+	hidden        []string
+	allowlist     []string
+	disabled      []redaction.Category
+	visible       string
+}
+
+func jsonCredentialOverlapFixtures() []credentialOutputFixture {
+	provider := "gh" + "p_" + strings.Repeat("q", 40)
+	escaped := "gh" + "p_" + strings.Repeat("q", 31) + "\\u0071SECRETL8"
+	composite := "{\"password\":\"left-sensitive " + provider + " right-sensitive\",\"note\":\"public-neighbor\"}"
+	exact := "{\"password\":\"" + provider + "\",\"note\":\"public-neighbor\"}"
+	embedded := "{\"message\":\"PASSWORD=\\\"left-sensitive:" + provider + ":right-sensitive\\\"\",\"note\":\"public-neighbor\"}"
+	return []credentialOutputFixture{
+		{
+			name:       "escaped provider suffix",
+			content:    "{\"token\":\"" + escaped + "\",\"note\":\"public-neighbor\"}",
+			categories: []redaction.Category{redaction.CategoryGitHubToken, redaction.CategoryGenericSecret},
+			hidden:     []string{strings.Repeat("q", 31), "SECRETL8"},
+		},
+		{
+			name:       "password around provider",
+			content:    composite,
+			categories: []redaction.Category{redaction.CategoryPassword, redaction.CategoryGitHubToken, redaction.CategoryPassword},
+			hidden:     []string{"left-sensitive", "right-sensitive", provider},
+		},
+		{
+			name:       "allowlisted provider inside password",
+			content:    composite,
+			categories: []redaction.Category{redaction.CategoryPassword, redaction.CategoryPassword},
+			hidden:     []string{"left-sensitive", "right-sensitive"},
+			allowlist:  []string{"^" + regexp.QuoteMeta(provider) + "$"},
+			visible:    provider,
+		},
+		{
+			name:       "exact provider value",
+			content:    exact,
+			categories: []redaction.Category{redaction.CategoryGitHubToken},
+			hidden:     []string{provider},
+		},
+		{
+			name:      "allowlisted exact provider value",
+			content:   exact,
+			allowlist: []string{"^" + regexp.QuoteMeta(provider) + "$"},
+			visible:   provider,
+		},
+		{
+			name:       "embedded password around provider",
+			content:    embedded,
+			categories: []redaction.Category{redaction.CategoryPassword, redaction.CategoryGitHubToken, redaction.CategoryPassword},
+			hidden:     []string{"left-sensitive", "right-sensitive", provider},
+		},
+		{
+			name:       "embedded password allowlists only provider",
+			content:    embedded,
+			categories: []redaction.Category{redaction.CategoryPassword, redaction.CategoryPassword},
+			hidden:     []string{"left-sensitive", "right-sensitive"},
+			allowlist:  []string{"^" + regexp.QuoteMeta(provider) + "$"},
+			visible:    provider,
+		},
+		{
+			name:          "unquoted logged password around provider",
+			content:       "{\"message\":\"PASSWORD=left-sensitive:" + provider + ":right-sensitive\",\"note\":\"public-neighbor\"}",
+			categories:    []redaction.Category{redaction.CategoryPassword, redaction.CategoryGitHubToken, redaction.CategoryPassword},
+			lines:         []int{1, 1, 1},
+			sourceMatches: []string{"left-sensitive:", provider, ":right-sensitive"},
+			hidden:        []string{"left-sensitive", "right-sensitive", provider},
+		},
+		{
+			name:          "bearer token around provider",
+			content:       "{\"message\":\"Bearer left-sensitive." + provider + ".right-sensitive\",\"note\":\"public-neighbor\"}",
+			categories:    []redaction.Category{redaction.CategoryBearerToken, redaction.CategoryGitHubToken, redaction.CategoryBearerToken},
+			lines:         []int{1, 1, 1},
+			sourceMatches: []string{"left-sensitive.", provider, ".right-sensitive"},
+			hidden:        []string{"left-sensitive", "right-sensitive", provider},
+		},
+	}
+}
+
+func privateKeyCredentialFixtures() []credentialOutputFixture {
+	head := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("synthetic-pem-head", 3)))
+	tail := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("synthetic-pem-tail", 3)))
+	block := func(kind, body string) string {
+		return "-----BEGIN " + kind + "-----\n" + body + "\n-----END " + kind + "-----"
+	}
+	encode := func(value string) string {
+		data, _ := json.Marshal(value)
+		return string(data[1 : len(data)-1])
+	}
+	record := func(key, value string) string {
+		data, _ := json.Marshal(value)
+		return "{\"" + key + "\":" + string(data) + ",\"note\":\"public-neighbor\"}"
+	}
+	pem := block("PRIVATE KEY", head+"\n"+tail)
+	encrypted := block("ENCRYPTED PRIVATE KEY", head+"\n"+tail)
+	rsa := block("RSA PRIVATE KEY", head+"\n"+tail)
+	encodedPEM := encode(pem)
+	google := "AIza" + strings.Repeat("Q", 35)
+	providerPEM := block("PRIVATE KEY", head+"\n"+google+"A\n"+tail)
+	encodedProviderPEM := encode(providerPEM)
+	providerOffset := strings.Index(encodedProviderPEM, google)
+	providerPrefix := encodedProviderPEM[:providerOffset]
+	providerSuffix := encodedProviderPEM[providerOffset+len(google):]
+	hiddenBody := []string{head, tail, head[:20], tail[len(tail)-20:]}
+	return []credentialOutputFixture{
+		{
+			name:          "raw complete PEM body",
+			content:       "public-neighbor\n" + pem + "\npublic-trailer\n",
+			categories:    []redaction.Category{redaction.CategoryPrivateKey},
+			lines:         []int{2},
+			sourceMatches: []string{pem},
+			hidden:        hiddenBody,
+		},
+		{
+			name:          "JSON complete PEM body",
+			content:       record("private_key", pem),
+			categories:    []redaction.Category{redaction.CategoryPrivateKey},
+			lines:         []int{1},
+			sourceMatches: []string{encodedPEM},
+			hidden:        hiddenBody,
+		},
+		{
+			name:          "partial message preserves raw complete PEM body",
+			content:       "{\"note\":\"public-neighbor\",\"message\":\"" + pem + "\npublic-trailer\n",
+			categories:    []redaction.Category{redaction.CategoryPrivateKey},
+			lines:         []int{1},
+			sourceMatches: []string{pem},
+			hidden:        hiddenBody,
+			visible:       "public-trailer",
+		},
+		{
+			name:          "JSONL complete PEM bodies",
+			content:       "{\"note\":\"public-neighbor\"}\n\n" + record("private_key", rsa) + "\n" + record("private_key", encrypted) + "\n",
+			categories:    []redaction.Category{redaction.CategoryPrivateKey, redaction.CategoryPrivateKey},
+			lines:         []int{3, 4},
+			sourceMatches: []string{encode(rsa), encode(encrypted)},
+			hidden:        hiddenBody,
+		},
+		{
+			name:          "raw encrypted PEM body",
+			content:       "public-neighbor\n" + encrypted + "\npublic-trailer\n",
+			categories:    []redaction.Category{redaction.CategoryPrivateKey},
+			lines:         []int{2},
+			sourceMatches: []string{encrypted},
+			hidden:        hiddenBody,
+		},
+		{
+			name:          "PEM with password category disabled",
+			content:       record("password", pem),
+			categories:    []redaction.Category{redaction.CategoryPrivateKey},
+			lines:         []int{1},
+			sourceMatches: []string{encodedPEM},
+			hidden:        hiddenBody,
+			disabled:      []redaction.Category{redaction.CategoryPassword},
+		},
+		{
+			name:      "raw full PEM allowlist",
+			content:   record("private_key", pem),
+			allowlist: []string{"^" + regexp.QuoteMeta(encodedPEM) + "$"},
+			visible:   head,
+		},
+		{
+			name:      "logical full PEM allowlist",
+			content:   record("private_key", pem),
+			allowlist: []string{"^" + regexp.QuoteMeta(pem) + "$"},
+			visible:   head,
+		},
+		{
+			name:          "header allowlist does not expose PEM body",
+			content:       record("private_key", pem),
+			categories:    []redaction.Category{redaction.CategoryPrivateKey},
+			lines:         []int{1},
+			sourceMatches: []string{encodedPEM},
+			hidden:        hiddenBody,
+			allowlist:     []string{"^" + regexp.QuoteMeta("-----BEGIN "+"PRIVATE KEY-----") + "$"},
+		},
+		{
+			name:          "PEM body around provider",
+			content:       record("private_key", providerPEM),
+			categories:    []redaction.Category{redaction.CategoryPrivateKey, redaction.CategoryGoogleAPIKey, redaction.CategoryPrivateKey},
+			lines:         []int{1, 1, 1},
+			sourceMatches: []string{providerPrefix, google, providerSuffix},
+			hidden:        append(append([]string{}, hiddenBody...), google),
+		},
+		{
+			name:          "PEM body allowlists only provider",
+			content:       record("private_key", providerPEM),
+			categories:    []redaction.Category{redaction.CategoryPrivateKey, redaction.CategoryPrivateKey},
+			lines:         []int{1, 1},
+			sourceMatches: []string{providerPrefix, providerSuffix},
+			hidden:        hiddenBody,
+			allowlist:     []string{"^" + regexp.QuoteMeta(google) + "$"},
+			visible:       google,
+		},
+	}
+}
+
+func TestScrub_ProviderOverlapPreviews(t *testing.T) {
+	fixtures := jsonCredentialOverlapFixtures()
+	for _, tc := range fixtures {
+		if !json.Valid([]byte(tc.content)) {
+			t.Fatalf("%s fixture must be valid JSON", tc.name)
+		}
+	}
+	testScrubCredentialOutputs(t, fixtures)
+}
+
+func TestScrub_PrivateKeyBodies(t *testing.T) {
+	testScrubCredentialOutputs(t, privateKeyCredentialFixtures())
+}
+
+func testScrubCredentialOutputs(t *testing.T, fixtures []credentialOutputFixture) {
+	t.Helper()
+	for _, tc := range fixtures {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "artifact.log")
+			if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			res := runScrub([]string{path}, nil, redaction.Config{Allowlist: tc.allowlist, DisabledCategories: tc.disabled})
+			if res.FilesScanned != 1 || len(res.Warnings) != 0 {
+				t.Fatalf("files=%d warnings=%v, want one file without warnings", res.FilesScanned, res.Warnings)
+			}
+			if len(res.Findings) != len(tc.categories) {
+				t.Fatalf("findings=%d, want %d", len(res.Findings), len(tc.categories))
+			}
+			for i, finding := range res.Findings {
+				if finding.Category != tc.categories[i] {
+					t.Errorf("finding %d category=%s, want %s", i, finding.Category, tc.categories[i])
+				}
+				if len(tc.lines) > 0 && finding.Line != tc.lines[i] {
+					t.Errorf("finding %d line=%d, want physical line %d", i, finding.Line, tc.lines[i])
+				}
+				if len(tc.sourceMatches) > 0 {
+					wantStart := strings.Index(tc.content, tc.sourceMatches[i])
+					wantEnd := wantStart + len(tc.sourceMatches[i])
+					if wantStart < 0 {
+						t.Fatalf("expected source match %d is absent from fixture", i)
+					}
+					wantColumn := wantStart - strings.LastIndex(tc.content[:wantStart], "\n")
+					if finding.Start != wantStart || finding.End != wantEnd || finding.Column != wantColumn {
+						t.Errorf("finding %d source span=%d:%d column=%d, want %d:%d column=%d", i, finding.Start, finding.End, finding.Column, wantStart, wantEnd, wantColumn)
+					}
+				}
+				for _, fragment := range tc.hidden {
+					if strings.Contains(finding.Preview, fragment) {
+						t.Errorf("finding %d preview exposed a secret fragment", i)
+					}
+				}
+			}
+			encoded, err := json.Marshal(res)
+			if err != nil {
+				t.Fatal(err)
+			}
+			textOutput, err := captureStdout(t, func() error {
+				printScrubText(res)
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, output := range []string{string(encoded), textOutput} {
+				for _, fragment := range tc.hidden {
+					if strings.Contains(output, fragment) {
+						t.Error("scrub output exposed a secret fragment")
+					}
+				}
+				if len(tc.categories) > 0 && !strings.Contains(output, "public-neighbor") {
+					t.Error("scrub previews removed the neighboring public field")
+				}
+			}
+		})
+	}
+}
+
+func TestScrub_QuotedCredentialsAndSafePreviews(t *testing.T) {
+	left := strings.Repeat("left-sensitive-fragment-", 8)
+	right := strings.Repeat("right-sensitive-fragment-", 8)
+	cases := []struct {
+		name      string
+		content   string
+		lines     []int
+		hidden    []string
+		allowlist []string
+	}{
+		{
+			name:    "JSON",
+			content: "{\"password\":\"synthetic-never-valid-json-value\",\"note\":\"public-neighbor\"}",
+			lines:   []int{1},
+			hidden:  []string{"synthetic-never-valid-json-value"},
+		},
+		{
+			name:    "JSONL escaped strings",
+			content: "{\"password\":\"jsonl-first-sensitive\"}\n{\"passwd\":\"head-sensitive\\\"quote-sensitive\\\\slash-sensitive with spaces\",\"note\":\"public-neighbor\"}\n",
+			lines:   []int{1, 2},
+			hidden:  []string{"jsonl-first-sensitive", "head-sensitive", "quote-sensitive", "slash-sensitive", "with spaces"},
+		},
+		{
+			name:    "ordinary assignments",
+			content: "PASSWORD=synthetic-never-valid-control-value\npasswd=second-control-value\n",
+			lines:   []int{1, 2},
+			hidden:  []string{"synthetic-never-valid-control-value", "second-control-value"},
+		},
+		{
+			name:    "adjacent long values",
+			content: "{\"password\":\"" + left + "\",\"passwd\":\"" + right + "\",\"note\":\"public-neighbor\"}",
+			lines:   []int{1, 1},
+			hidden:  []string{"left-sensitive-fragment", "right-sensitive-fragment"},
+		},
+		{
+			name:      "allowlisted JSON neighbor",
+			content:   "{\"password\":\"allowlisted-never-valid\"}\n{\"password\":\"blocked-never-valid\"}\n",
+			lines:     []int{2},
+			hidden:    []string{"blocked-never-valid"},
+			allowlist: []string{"allowlisted-never-valid"},
+		},
+		{
+			name:    "placeholders and noncredential fields",
+			content: "{\"password\":\"<redacted>\",\"pwd\":\"/home/user/worktree\",\"password_hint\":\"public-hint-value\",\"token_count\":\"1234567890123456\",\"note\":\"public-neighbor\"}",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "artifact.log")
+			if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			scanCfg := redaction.DefaultConfig()
+			scanCfg.Allowlist = tc.allowlist
+			res := runScrub([]string{path}, nil, scanCfg)
+			if res.FilesScanned != 1 || len(res.Warnings) != 0 {
+				t.Fatalf("files=%d warnings=%v, want one file without warnings", res.FilesScanned, res.Warnings)
+			}
+			if len(res.Findings) != len(tc.lines) {
+				t.Fatalf("findings=%d, want %d", len(res.Findings), len(tc.lines))
+			}
+			for i, finding := range res.Findings {
+				if finding.Category != redaction.CategoryPassword || finding.Line != tc.lines[i] {
+					t.Errorf("finding %d category=%s line=%d, want PASSWORD on line %d", i, finding.Category, finding.Line, tc.lines[i])
+				}
+				if finding.Start < 0 || finding.End <= finding.Start || finding.End > len(tc.content) || finding.Column < 1 {
+					t.Errorf("invalid finding offsets: %+v", finding)
+				}
+				if !strings.Contains(finding.Preview, "[REDACTED:PASSWORD:") {
+					t.Errorf("finding %d preview lacks a password placeholder", i)
+				}
+				for _, fragment := range tc.hidden {
+					if strings.Contains(finding.Preview, fragment) {
+						t.Errorf("finding %d preview exposed a secret fragment", i)
+					}
+				}
+			}
+			encoded, err := json.Marshal(res)
+			if err != nil {
+				t.Fatal(err)
+			}
+			textOutput, err := captureStdout(t, func() error {
+				printScrubText(res)
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, output := range []string{string(encoded), textOutput} {
+				for _, fragment := range tc.hidden {
+					if strings.Contains(output, fragment) {
+						t.Error("scrub output exposed a secret fragment")
+					}
+				}
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != tc.content {
+				t.Error("read-only scrub modified the source artifact")
+			}
+		})
+	}
+}
+
+func TestRedactionAllowlistEnvironmentCommands(t *testing.T) {
+	const fixture = "ANTHROPIC_API_KEY=ecs2a-bogus-not-a-real-key\nCLAUDE_CODE_OAUTH_TOKEN=fixture-never-log-this\npassword=unlisted-fixture-secret\n"
+	const allowlist = "^ANTHROPIC_API_KEY=ecs2a-bogus-not-a-real-key$,^TOKEN=fixture-never-log-this$"
+	for _, command := range []string{"scrub", "preview"} {
+		for _, source := range []string{"none", "TOML", "environment", "empty override"} {
+			t.Run(command+"/"+source, func(t *testing.T) {
+				resetFlags()
+				t.Cleanup(resetFlags)
+				startup.ResetConfig()
+				t.Cleanup(startup.ResetConfig)
+				dir := t.TempDir()
+				t.Chdir(dir)
+				t.Setenv("HOME", dir)
+				t.Setenv("XDG_CONFIG_HOME", dir)
+				t.Setenv("NTM_CONFIG", "")
+				t.Setenv("NTM_REDACTION_ALLOWLIST", "")
+				if err := os.Unsetenv("NTM_REDACTION_ALLOWLIST"); err != nil {
+					t.Fatal(err)
+				}
+				artifact := filepath.Join(dir, "fixtures.txt")
+				if err := os.WriteFile(artifact, []byte(fixture), 0600); err != nil {
+					t.Fatal(err)
+				}
+				configPath := filepath.Join(dir, "scrub.toml")
+				settings := "[redaction]\nmode = 'redact'\n"
+				wantFindings := 3
+				switch source {
+				case "TOML", "empty override":
+					settings += "allowlist = ['^ANTHROPIC_API_KEY=ecs2a-bogus-not-a-real-key$', '^TOKEN=fixture-never-log-this$']\n"
+					wantFindings = 1
+					if source == "empty override" {
+						t.Setenv("NTM_REDACTION_ALLOWLIST", "")
+						wantFindings = 3
+					}
+				case "environment":
+					t.Setenv("NTM_REDACTION_ALLOWLIST", allowlist)
+					wantFindings = 1
+				}
+				if err := os.WriteFile(configPath, []byte(settings), 0600); err != nil {
+					t.Fatal(err)
+				}
+				oldCfg, oldCfgFile := cfg, cfgFile
+				cfg = nil
+				t.Cleanup(func() { cfg, cfgFile = oldCfg, oldCfgFile })
+				// Each case models a fresh process, including fresh command-local
+				// slice flags and the production configuration-loading hook.
+				commandRoot := &cobra.Command{Use: "ntm", PersistentPreRunE: rootCmd.PersistentPreRunE}
+				commandRoot.PersistentFlags().StringVar(&cfgFile, "config", "", "config file")
+				commandRoot.PersistentFlags().BoolVar(&jsonOutput, "json", false, "JSON output")
+				commandRoot.AddCommand(newScrubCmd(), newRedactCmd())
+				args := []string{"--config", configPath}
+				if command == "scrub" {
+					args = append(args, "scrub", "--path", artifact, "--format", "json")
+				} else {
+					args = append(args, "redact", "preview", "--file", artifact, "--json")
+				}
+				out, err := captureStdout(t, func() error {
+					commandRoot.SetArgs(args)
+					return commandRoot.Execute()
+				})
+				if err != nil {
+					t.Fatalf("command failed: %v\n%s", err, out)
+				}
+				var response struct {
+					Findings []json.RawMessage `json:"findings"`
+				}
+				if err := json.Unmarshal([]byte(out), &response); err != nil {
+					t.Fatalf("decode response: %v\n%s", err, out)
+				}
+				if len(response.Findings) != wantFindings {
+					t.Errorf("findings = %d, want %d\n%s", len(response.Findings), wantFindings, out)
+				}
+				if strings.Contains(out, "unlisted-fixture-secret") {
+					t.Fatal("environment allowlist exposed an unrelated secret")
+				}
+			})
+		}
+	}
+}
 
 func TestScrub_CommandJSONOutputIsRedacted(t *testing.T) {
 	resetFlags()
@@ -143,5 +938,72 @@ func TestResolveScrubRootsUsesSelectedConfigDir(t *testing.T) {
 	}
 	if roots[0] != customDir {
 		t.Fatalf("scrub root = %q, want %q", roots[0], customDir)
+	}
+}
+
+func TestScrubPreviewZeroWidthPatternsDoNotExposeCredentials(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		pattern  string
+		fragment string
+	}{
+		{
+			name:     "same start as assignment",
+			input:    "password=unmistakablesensitivevalue",
+			pattern:  `^`,
+			fragment: "unmistakablesensitivevalue",
+		},
+		{
+			name:     "inside long JSON value",
+			input:    `{"password":"` + strings.Repeat("clippedsecret", 12) + `"}`,
+			pattern:  `\b`,
+			fragment: "clippedsecret",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := redaction.Scan(tt.input, redaction.Config{
+				ExtraPatterns: map[redaction.Category][]string{
+					"CUSTOM_ANCHOR": {tt.pattern},
+				},
+			})
+			passwords, anchors := 0, 0
+			for _, finding := range findings {
+				if finding.Category == redaction.CategoryPassword {
+					passwords++
+				}
+				if finding.Start == finding.End {
+					anchors++
+				}
+			}
+			if passwords != 1 || anchors == 0 {
+				t.Fatalf("password findings=%d, zero-width findings=%d; want one password and at least one anchor", passwords, anchors)
+			}
+			for i, finding := range findings {
+				preview := scrubPreview(tt.input, finding, findings)
+				if strings.Contains(preview, tt.fragment) {
+					t.Errorf("preview %d exposed a secret around a zero-width custom finding", i)
+				}
+			}
+		})
+	}
+}
+
+func TestScrubPreviewClippedProviderToken(t *testing.T) {
+	token := "gh" + "p_" + strings.Repeat("q", 90)
+	password := strings.Repeat("rightsecret", 8)
+	input := `{"token":"` + token + `","password":"` + password + `"}`
+	findings := redaction.Scan(input, redaction.Config{})
+	if len(findings) != 2 || findings[0].Category != redaction.CategoryGitHubToken || findings[1].Category != redaction.CategoryPassword {
+		t.Fatalf("expected a GitHub token and a password, got %d findings", len(findings))
+	}
+	for i, finding := range findings {
+		preview := scrubPreview(input, finding, findings)
+		for _, fragment := range []string{strings.Repeat("q", 12), "rightsecret"} {
+			if strings.Contains(preview, fragment) {
+				t.Errorf("preview %d exposed part of a neighboring credential crossing its context boundary", i)
+			}
+		}
 	}
 }

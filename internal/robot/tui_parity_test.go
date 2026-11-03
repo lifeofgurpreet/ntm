@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -15,7 +17,10 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/alerts"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	ntmctx "github.com/Dicklesworthstone/ntm/internal/context"
+	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/history"
+	"github.com/Dicklesworthstone/ntm/internal/redaction"
 	"github.com/Dicklesworthstone/ntm/internal/robot/adapters"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -880,6 +885,348 @@ func TestPrintMetricsWithPeriod(t *testing.T) {
 			}
 		})
 	}
+}
+
+// metricsTestSession is a real tmux session with two agent panes (cc and cod)
+// running cat, plus the user pane CreateSession made.
+type metricsTestSession struct {
+	name   string
+	claude tmux.Pane
+	codex  tmux.Pane
+}
+
+func newMetricsTestSession(t *testing.T) metricsTestSession {
+	t.Helper()
+	testutil.RequireTmuxThrottled(t)
+	dir := t.TempDir()
+	name := fmt.Sprintf("ntm-metrics-%d", time.Now().UnixNano())
+	if err := tmux.CreateSession(name, dir); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.KillSession(name) })
+	for i, title := range []string{name + "__cc_1", name + "__cod_2"} {
+		paneID, err := tmux.DefaultClient.Run("split-window", "-d", "-t", name, "-c", dir, "-P", "-F", "#{pane_id}", "cat")
+		if err != nil {
+			t.Fatalf("create agent pane %d: %v", i+1, err)
+		}
+		if err := tmux.SetPaneTitle(strings.TrimSpace(paneID), title); err != nil {
+			t.Fatalf("title agent pane %d: %v", i+1, err)
+		}
+	}
+	panes, err := tmux.GetPanes(name)
+	if err != nil {
+		t.Fatalf("get panes: %v", err)
+	}
+	session := metricsTestSession{name: name}
+	for _, pane := range panes {
+		switch pane.Title {
+		case name + "__cc_1":
+			session.claude = pane
+		case name + "__cod_2":
+			session.codex = pane
+		}
+	}
+	if session.claude.ID == "" || session.codex.ID == "" || session.claude.PID <= 0 {
+		t.Fatalf("agent panes not found or without a PID: %+v", panes)
+	}
+	return session
+}
+
+// seedMetricsTestLifecycle writes the session monitor's records into the
+// analytics event log under home, as the monitor's events.Emit does.
+func seedMetricsTestLifecycle(t *testing.T, home string, records ...events.Event) {
+	t.Helper()
+	path := filepath.Join(home, ".config", "ntm", "analytics", "events.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var buf strings.Builder
+	for _, record := range records {
+		line, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	if err := os.WriteFile(path, []byte(buf.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func lifecycleRecord(eventType events.EventType, session, paneID string, at time.Time) events.Event {
+	return events.Event{
+		Timestamp: at,
+		Type:      eventType,
+		Session:   session,
+		Data:      events.ToMap(events.AgentLifecycleData{PaneID: paneID, AgentType: "cc"}),
+	}
+}
+
+func appendMetricsTestPrompt(t *testing.T, session string, targets []string, success bool, at time.Time) {
+	t.Helper()
+	entry := history.NewEntry(session, targets, "work on the next bead", history.SourceRobot)
+	entry.Timestamp = at
+	if success {
+		entry.SetSuccess()
+	} else {
+		entry.SetError(errors.New("1 of 1 target(s) failed"))
+	}
+	if err := history.Append(entry); err != nil {
+		t.Fatalf("append history: %v", err)
+	}
+}
+
+func runRobotMetrics(t *testing.T, opts MetricsOptions) MetricsOutput {
+	t.Helper()
+	stdout, err := captureStdout(t, func() error { return PrintMetrics(opts) })
+	var out MetricsOutput
+	if decodeErr := json.Unmarshal([]byte(stdout), &out); decodeErr != nil {
+		t.Fatalf("decode --robot-metrics output: %v (print err %v)\n%s", decodeErr, err, stdout)
+	}
+	return out
+}
+
+func parseMetricsDuration(t *testing.T, label, value string) time.Duration {
+	t.Helper()
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		t.Fatalf("%s = %q, not a duration: %v", label, value, err)
+	}
+	return d
+}
+
+// --robot-metrics reported every activity field as 0 for every session. It now
+// reads each field from the source ntm already keeps — the prompt history,
+// the session monitor's crash/restart records, the agents' own transcripts,
+// tmux's session creation time and the pane shell's start time — and the
+// period bounds the event counts.
+func TestRobotMetricsMeasuresAgentsFromCanonicalSources(t *testing.T) {
+	dataHome := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", dataHome)
+	t.Setenv("HOME", home)
+
+	sess := newMetricsTestSession(t)
+	realNow := time.Now()
+	// Measure three hours into the session's life, so a one-hour period
+	// splits events that all happened after the session was created.
+	prevNow := metricsNow
+	metricsNow = func() time.Time { return realNow.Add(3 * time.Hour) }
+	t.Cleanup(func() { metricsNow = prevNow })
+
+	// The claude pane's own transcript reports 150k of a 200k window; the
+	// codex pane has none attributable.
+	prevProcess, prevCwd, prevPath := transcriptUsageForProcess, transcriptUsageForCwd, paneCurrentPath
+	t.Cleanup(func() {
+		transcriptUsageForProcess, transcriptUsageForCwd, paneCurrentPath = prevProcess, prevCwd, prevPath
+	})
+	paneCurrentPath = func(string) (string, bool) { return "", false }
+	transcriptUsageForProcess = func(_ string, pid int) (*ntmctx.TranscriptUsage, bool) {
+		if pid == sess.claude.PID {
+			return &ntmctx.TranscriptUsage{Tokens: 150000, ContextWindow: 200000, Model: "claude-opus-4"}, true
+		}
+		return nil, false
+	}
+	transcriptUsageForCwd = func(string, string) (*ntmctx.TranscriptUsage, bool) { return nil, false }
+
+	claudeKey := tmux.PaneTargetKey(sess.claude, false)
+	codexKey := tmux.PaneTargetKey(sess.codex, false)
+	// Prompt history: canonical keys and a pane ID both resolve.
+	appendMetricsTestPrompt(t, sess.name, []string{claudeKey}, true, realNow.Add(time.Hour))                      // 24h only
+	appendMetricsTestPrompt(t, sess.name, []string{sess.claude.ID, codexKey}, true, realNow.Add(150*time.Minute)) // both periods
+	appendMetricsTestPrompt(t, sess.name, []string{codexKey}, false, realNow.Add(160*time.Minute))                // failed: never counted
+	appendMetricsTestPrompt(t, sess.name, []string{claudeKey}, true, realNow.Add(-time.Hour))                     // before the session existed
+	appendMetricsTestPrompt(t, "some-other-session", []string{claudeKey}, true, realNow.Add(170*time.Minute))     // another session
+
+	// Session monitor records.
+	seedMetricsTestLifecycle(t, home,
+		lifecycleRecord(events.EventAgentCrash, sess.name, sess.claude.ID, realNow.Add(time.Hour)),
+		lifecycleRecord(events.EventAgentRestart, sess.name, sess.claude.ID, realNow.Add(61*time.Minute)),
+		lifecycleRecord(events.EventAgentCrash, sess.name, sess.claude.ID, realNow.Add(150*time.Minute)),
+		lifecycleRecord(events.EventAgentRestart, sess.name, sess.claude.ID, realNow.Add(151*time.Minute)),
+		lifecycleRecord(events.EventAgentCrash, sess.name, sess.codex.ID, realNow.Add(165*time.Minute)),
+		lifecycleRecord(events.EventAgentCrash, sess.name, sess.claude.ID, realNow.Add(-time.Hour)),               // before the session existed
+		lifecycleRecord(events.EventAgentRestart, "some-other-session", sess.claude.ID, realNow.Add(2*time.Hour)), // another session
+	)
+
+	// Before any session monitor has run, crash and restart counts have no
+	// recorder: they are declared, not reported as zero activity.
+	unmonitored := runRobotMetrics(t, MetricsOptions{Session: sess.name, Period: "24h"})
+	if !unmonitored.Success {
+		t.Fatalf("metrics failed: %+v", unmonitored.RobotResponse)
+	}
+	for _, want := range []string{"agent_stats[].error_count", "agent_stats[].restart_count"} {
+		if !containsField(unmonitored.Unmeasured, want) {
+			t.Errorf("without a session monitor %s must be declared unmeasured; unmeasured=%v", want, unmonitored.Unmeasured)
+		}
+	}
+
+	statusPath := filepath.Join(dataHome, "ntm", "manifests", "monitors", sess.name+"-monitor.status.json")
+	if err := os.MkdirAll(filepath.Dir(statusPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	status := fmt.Sprintf(`{"session":%q,"generation":"g1","pid":0,"state":"stopped"}`, sess.name)
+	if err := os.WriteFile(statusPath, []byte(status), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	day := runRobotMetrics(t, MetricsOptions{Session: sess.name, Period: "24h"})
+	if !day.Success {
+		t.Fatalf("metrics failed: %+v", day.RobotResponse)
+	}
+	if got, want := sortedStrings(day.Unmeasured), []string{"agent_stats[].avg_response_time_sec", "token_usage.total_cost_usd"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("unmeasured = %v, want only the sourceless fields %v", got, want)
+	}
+
+	claude, ok := day.AgentStats[sess.claude.Title]
+	if !ok {
+		t.Fatalf("no stats for %s: %+v", sess.claude.Title, day.AgentStats)
+	}
+	codex := day.AgentStats[sess.codex.Title]
+	if claude.Type != "claude" || codex.Type != "codex" || claude.Pane != claudeKey || codex.Pane != codexKey {
+		t.Errorf("agent identity: claude=%+v codex=%+v", claude, codex)
+	}
+	if claude.PromptsReceived != 2 || codex.PromptsReceived != 1 || day.SessionStats.TotalPrompts != 2 {
+		t.Errorf("24h prompts: claude=%d codex=%d total=%d, want 2/1/2",
+			claude.PromptsReceived, codex.PromptsReceived, day.SessionStats.TotalPrompts)
+	}
+	if claude.ErrorCount != 2 || claude.RestartCount != 2 || codex.ErrorCount != 1 || codex.RestartCount != 0 {
+		t.Errorf("24h lifecycle: claude errors=%d restarts=%d, codex errors=%d restarts=%d; want 2/2/1/0",
+			claude.ErrorCount, claude.RestartCount, codex.ErrorCount, codex.RestartCount)
+	}
+
+	// Readings.
+	if claude.TokensUsed != 150000 || day.TokenUsage.TotalTokens != 150000 ||
+		day.TokenUsage.ByAgent[sess.claude.Title] != 150000 || day.TokenUsage.ByModel["claude-opus-4"] != 150000 {
+		t.Errorf("tokens: agent=%d total=%d by_agent=%v by_model=%v", claude.TokensUsed,
+			day.TokenUsage.TotalTokens, day.TokenUsage.ByAgent, day.TokenUsage.ByModel)
+	}
+	if pct, ok := day.TokenUsage.ContextCurrent[sess.claude.Title]; !ok || pct != 75 {
+		t.Errorf("claude context percent = %d (present %v), want 75", pct, ok)
+	}
+	if _, ok := day.TokenUsage.ContextCurrent[sess.codex.Title]; ok {
+		t.Error("codex has no transcript reading, so it must be absent from context_current_percent, not 0")
+	}
+	if !reflect.DeepEqual(codex.Unmeasured, []string{"tokens_used"}) || len(claude.Unmeasured) != 0 {
+		t.Errorf("per-agent unmeasured: claude=%v codex=%v", claude.Unmeasured, codex.Unmeasured)
+	}
+	sessionAge := parseMetricsDuration(t, "session_duration", day.SessionStats.SessionDuration)
+	uptime := parseMetricsDuration(t, "claude uptime", claude.Uptime)
+	for label, d := range map[string]time.Duration{"session_duration": sessionAge, "claude uptime": uptime} {
+		if d < 3*time.Hour || d > 3*time.Hour+time.Minute {
+			t.Errorf("%s = %s, want ~3h (measured three hours after the session began)", label, d)
+		}
+	}
+
+	// One hour: only the later events count; readings do not change.
+	hour := runRobotMetrics(t, MetricsOptions{Session: sess.name, Period: "1h"})
+	claude, codex = hour.AgentStats[sess.claude.Title], hour.AgentStats[sess.codex.Title]
+	if claude.PromptsReceived != 1 || codex.PromptsReceived != 1 || hour.SessionStats.TotalPrompts != 1 {
+		t.Errorf("1h prompts: claude=%d codex=%d total=%d, want 1/1/1",
+			claude.PromptsReceived, codex.PromptsReceived, hour.SessionStats.TotalPrompts)
+	}
+	if claude.ErrorCount != 1 || claude.RestartCount != 1 || codex.ErrorCount != 1 {
+		t.Errorf("1h lifecycle: claude errors=%d restarts=%d, codex errors=%d; want 1/1/1",
+			claude.ErrorCount, claude.RestartCount, codex.ErrorCount)
+	}
+	if claude.TokensUsed != 150000 || hour.TokenUsage.ContextCurrent[sess.claude.Title] != 75 {
+		t.Errorf("readings must not be period-filtered: tokens=%d pct=%d", claude.TokensUsed, hour.TokenUsage.ContextCurrent[sess.claude.Title])
+	}
+
+	// All time still stops at the session's creation.
+	all := runRobotMetrics(t, MetricsOptions{Session: sess.name, Period: "all"})
+	claude = all.AgentStats[sess.claude.Title]
+	if claude.PromptsReceived != 2 || claude.ErrorCount != 2 || all.SessionStats.TotalPrompts != 2 {
+		t.Errorf("all-time: prompts=%d errors=%d total=%d, want 2/2/2 (a previous same-named session's records excluded)",
+			claude.PromptsReceived, claude.ErrorCount, all.SessionStats.TotalPrompts)
+	}
+}
+
+// A period that is not a duration is a flag error, not a silently echoed
+// label over unfiltered numbers.
+func TestRobotMetricsRejectsInvalidPeriod(t *testing.T) {
+	out := runRobotMetrics(t, MetricsOptions{Period: "fortnight"})
+	if out.Success || out.ErrorCode != ErrCodeInvalidFlag {
+		t.Fatalf("invalid period: success=%v code=%q, want INVALID_FLAG", out.Success, out.ErrorCode)
+	}
+	if out.Period != "fortnight" || out.AgentStats == nil || out.TokenUsage.ByAgent == nil {
+		t.Fatalf("error envelope must keep the period and non-null maps: %+v", out)
+	}
+}
+
+// Orchestrator sends reach the prompt history, so --robot-metrics counts the
+// prompts an agent received through --robot-send.
+func TestRobotSendIsCountedByRobotMetrics(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	sess := newMetricsTestSession(t)
+
+	sent, err := GetSend(SendOptions{Session: sess.name, Message: "status report please", Pane: sess.claude.ID})
+	if err != nil {
+		t.Fatalf("GetSend: %v", err)
+	}
+	if !sent.Success {
+		t.Fatalf("send failed: %+v", sent)
+	}
+
+	entries, err := history.ReadForSession(sess.name)
+	if err != nil {
+		t.Fatalf("read history: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("history entries = %d, want the one robot send: %+v", len(entries), entries)
+	}
+	entry := entries[0]
+	if entry.Source != history.SourceRobot || !entry.Success || entry.Prompt != "status report please" ||
+		!reflect.DeepEqual(entry.Targets, sent.Targets) || !reflect.DeepEqual(entry.AgentTypes, []string{"cc"}) {
+		t.Fatalf("history entry = %+v (send targets %v)", entry, sent.Targets)
+	}
+
+	out := runRobotMetrics(t, MetricsOptions{Session: sess.name, Period: "1h"})
+	if got := out.AgentStats[sess.claude.Title].PromptsReceived; got != 1 {
+		t.Errorf("claude prompts_received = %d, want 1", got)
+	}
+	if got := out.AgentStats[sess.codex.Title].PromptsReceived; got != 0 {
+		t.Errorf("codex prompts_received = %d, want 0", got)
+	}
+	if out.SessionStats.TotalPrompts != 1 {
+		t.Errorf("total_prompts = %d, want 1", out.SessionStats.TotalPrompts)
+	}
+}
+
+// A robot send under a redaction mode never persists the secret it redacted.
+func TestRobotSendHistoryRedactsUnderSendRedaction(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	sess := newMetricsTestSession(t)
+
+	secret := "ghp_" + strings.Repeat("a1B2c3D4e5", 4)
+	sent, err := GetSend(SendOptions{
+		Session:   sess.name,
+		Message:   "use token " + secret,
+		Pane:      sess.claude.ID,
+		Redaction: redaction.Config{Mode: redaction.ModeWarn},
+	})
+	if err != nil {
+		t.Fatalf("GetSend: %v", err)
+	}
+	if !sent.Success {
+		t.Fatalf("send failed: %+v", sent)
+	}
+	entries, err := history.ReadForSession(sess.name)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("history = %+v, %v; want one entry", entries, err)
+	}
+	if strings.Contains(entries[0].Prompt, secret) {
+		t.Fatalf("history persisted the secret: %q", entries[0].Prompt)
+	}
+}
+
+func sortedStrings(in []string) []string {
+	out := append([]string(nil), in...)
+	sort.Strings(out)
+	return out
 }
 
 // =============================================================================
@@ -2404,11 +2751,16 @@ func TestBeadClaimOutputStructure(t *testing.T) {
 }
 
 func TestGetBeadClaimUsesAtomicActorAndIsIdempotent(t *testing.T) {
+	project := t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(project)
 	calls := 0
 	deps := &BeadClaimDependencies{
 		ClaimBead: func(_ context.Context, dir, beadID, actor string) (bv.BeadClaimResult, error) {
 			calls++
-			if dir != "" || beadID != "ntm-atomic" || actor != "BlueLake" {
+			if dir != project || beadID != "ntm-atomic" || actor != "BlueLake" {
 				t.Fatalf("claim args dir=%q bead=%q actor=%q", dir, beadID, actor)
 			}
 			return bv.BeadClaimResult{ID: beadID, Title: "Atomic claim", Actor: actor, Status: "in_progress"}, nil
@@ -2426,6 +2778,117 @@ func TestGetBeadClaimUsesAtomicActorAndIsIdempotent(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("claim calls=%d, want 2 idempotent atomic attempts", calls)
+	}
+}
+
+func TestGetBeadClaimBindsDiscoveredProjectBeforeAtomicCommand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires POSIX shell fixture")
+	}
+	parent := t.TempDir()
+	project := filepath.Join(parent, "selected")
+	child := filepath.Join(project, "src", "nested")
+	missingTracker := filepath.Join(parent, "selected-without-tracker")
+	binDir := filepath.Join(parent, "bin")
+	for _, dir := range []string{
+		filepath.Join(parent, ".beads"),
+		filepath.Join(project, ".beads"),
+		filepath.Join(project, ".ntm"),
+		child,
+		filepath.Join(missingTracker, ".ntm"),
+		binDir,
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, dir := range []string{project, missingTracker} {
+		if err := os.WriteFile(filepath.Join(dir, ".ntm", "config.toml"), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	canonicalProject, err := filepath.EvalSymlinks(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(parent, "claims.log")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$NTM_TEST_BEAD_CLAIM_LOG"
+if [ "$PWD" != "$NTM_TEST_BEAD_CLAIM_PROJECT" ]; then
+  printf 'wrong project: %s\n' "$PWD" >&2
+  exit 21
+fi
+if [ "$BEADS_DIR" != "$NTM_TEST_BEAD_CLAIM_PROJECT/.beads" ]; then
+  printf 'wrong Beads directory: %s\n' "$BEADS_DIR" >&2
+  exit 22
+fi
+if [ -n "${BEADS_DB+x}${BD_DB+x}${BD_DATABASE+x}${BEADS_JSONL+x}${BEADS_CACHE_DIR+x}" ]; then
+  printf 'foreign tracker override inherited\n' >&2
+  exit 23
+fi
+if [ "$*" != '--lock-timeout 5000 update ntm-atomic --claim --actor BlueLake --json' ]; then
+  printf 'unexpected claim command: %s\n' "$*" >&2
+  exit 24
+fi
+if [ "$NTM_TEST_BEAD_CLAIM_NO_DB" = 1 ]; then
+  printf 'no beads database found; use '\''br --no-db'\''\n' >&2
+  exit 1
+fi
+printf '%s\n' '[{"id":"ntm-atomic","title":"Atomic claim","status":"in_progress"}]'
+`
+	if err := os.WriteFile(filepath.Join(binDir, "br"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("NTM_TEST_BEAD_CLAIM_LOG", logPath)
+	t.Setenv("NTM_TEST_BEAD_CLAIM_PROJECT", canonicalProject)
+	for _, key := range []string{"BEADS_DIR", "BEADS_DB", "BD_DB", "BD_DATABASE", "BEADS_JSONL", "BEADS_CACHE_DIR"} {
+		t.Setenv(key, filepath.Join(parent, "foreign", key))
+	}
+
+	for _, tc := range []struct {
+		name        string
+		cwd         string
+		noDB        bool
+		wantSuccess bool
+		wantCalls   int
+	}{
+		{name: "project root", cwd: project, wantSuccess: true, wantCalls: 1},
+		{name: "project child", cwd: child, wantSuccess: true, wantCalls: 2},
+		{name: "selected project cannot use parent tracker", cwd: missingTracker, wantCalls: 2},
+		{name: "missing database does not fall back to no-db", cwd: project, noDB: true, wantCalls: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(tc.cwd)
+			if tc.noDB {
+				t.Setenv("NTM_TEST_BEAD_CLAIM_NO_DB", "1")
+			} else {
+				t.Setenv("NTM_TEST_BEAD_CLAIM_NO_DB", "0")
+			}
+			output, err := GetBeadClaim(BeadClaimOptions{BeadID: "ntm-atomic", Assignee: "BlueLake"})
+			if err != nil {
+				t.Fatalf("GetBeadClaim: %v", err)
+			}
+			if output.Success != tc.wantSuccess || output.Claimed != tc.wantSuccess || output.Actor != "BlueLake" {
+				t.Fatalf("output=%+v, want success=%v", output, tc.wantSuccess)
+			}
+			if tc.wantSuccess && (output.Title != "Atomic claim" || output.NewStatus != "in_progress") {
+				t.Fatalf("successful claim output=%+v", output)
+			}
+			if !tc.wantSuccess && output.ErrorCode != ErrCodeInternalError {
+				t.Fatalf("failed claim output=%+v", output)
+			}
+			if tc.noDB && !strings.Contains(output.Error, "no beads database found") {
+				t.Fatalf("missing-database error not preserved: %+v", output)
+			}
+			calls, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Count(string(calls), "\n"); got != tc.wantCalls {
+				t.Fatalf("claim calls=%d, want %d: %s", got, tc.wantCalls, calls)
+			}
+		})
 	}
 }
 
@@ -2712,30 +3175,5 @@ func TestGetPaletteXFEnabledKnob(t *testing.T) {
 	}
 	if hasXFSearch(out) {
 		t.Fatal("xf.enabled=false must not inject the xf-search palette entry")
-	}
-}
-
-func TestIsBeadsNotInitializedError(t *testing.T) {
-	tests := []struct {
-		msg  string
-		want bool
-	}{
-		{"br list --json: exit status 1: no .beads directory found", true},
-		{"beads workspace not initialized", true},
-		{"br list: {\"error\":{\"code\":\"NOT_INITIALIZED\",\"message\":\"...\"}}", true},
-		{"No beads database found in this project", true},
-		{"exit status 1: run 'br init' to create a workspace", true},
-		{"br list --json: exit status 1: database disk image is malformed", false},
-		{"exec: \"br\": executable file not found in $PATH", false},
-		{"", false},
-	}
-	for _, tt := range tests {
-		var err error
-		if tt.msg != "" {
-			err = errors.New(tt.msg)
-		}
-		if got := isBeadsNotInitializedError(err); got != tt.want {
-			t.Errorf("isBeadsNotInitializedError(%q) = %v, want %v", tt.msg, got, tt.want)
-		}
 	}
 }

@@ -271,3 +271,166 @@ func TestRustContractCompatibility(t *testing.T) {
 		}
 	}
 }
+
+// The current mcp-agent-mail reference implementation stores a structured
+// PaneIdentityRecord JSON object in the canonical identity file (its GH#252
+// binding-liveness work); older writers stored a bare name. Resolving must
+// decode the structured form to its "name" field — returning the raw blob
+// made an entire JSON object the Beads assignee and Agent Mail actor for the
+// pane (PR #275 finding 5).
+func TestResolveIdentity_StructuredPaneBindingDecodesToName(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv("HOME", tmp)
+
+	projectKey := "/structured/binding"
+	paneID := "%25"
+	path := CanonicalIdentityPath(projectKey, paneID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir identity dir: %v", err)
+	}
+	record := `{"name":"BlueLake","session_name":"proj","pane_id":"%25","pane_pid":4242,` +
+		`"socket_path":"/tmp/tmux-1000/default","written_at":"2026-08-30T00:00:00Z"}`
+	if err := os.WriteFile(path, []byte(record+"\n"), 0o600); err != nil {
+		t.Fatalf("write structured identity: %v", err)
+	}
+
+	name, foundPath := ResolveIdentity(projectKey, paneID)
+	if name != "BlueLake" {
+		t.Fatalf("ResolveIdentity name = %q, want BlueLake (a raw JSON blob must never be an identity)", name)
+	}
+	if foundPath != path {
+		t.Fatalf("ResolveIdentity path = %q, want %q", foundPath, path)
+	}
+}
+
+// Malformed or name-less JSON must fail closed: falling through to "use the
+// raw contents" would resurrect the JSON-blob-as-assignee bug for exactly the
+// files most likely to be corrupt.
+func TestResolveIdentity_MalformedOrNamelessJSONFailsClosed(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{"truncated object", `{"name":"Blue`},
+		{"object without name", `{"pane_id":"%25"}`},
+		{"object with empty name", `{"name":"   "}`},
+		{"array", `["BlueLake"]`},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("XDG_CONFIG_HOME", tmp)
+			t.Setenv("HOME", tmp)
+
+			projectKey := fmt.Sprintf("/malformed/binding/%d", i)
+			paneID := "%26"
+			path := CanonicalIdentityPath(projectKey, paneID)
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatalf("mkdir identity dir: %v", err)
+			}
+			if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+				t.Fatalf("write identity: %v", err)
+			}
+			if name, foundPath := ResolveIdentity(projectKey, paneID); name != "" || foundPath != "" {
+				t.Fatalf("ResolveIdentity = (%q, %q), want no identity for %s", name, foundPath, tc.name)
+			}
+		})
+	}
+}
+
+// Plain-text legacy identities must keep resolving exactly as before.
+func TestResolveIdentity_PlainTextStillResolves(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv("HOME", tmp)
+
+	projectKey := "/plain/legacy"
+	paneID := "%27"
+	path := CanonicalIdentityPath(projectKey, paneID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir identity dir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("SnowyOwl\n"), 0o600); err != nil {
+		t.Fatalf("write identity: %v", err)
+	}
+	if name, _ := ResolveIdentity(projectKey, paneID); name != "SnowyOwl" {
+		t.Fatalf("ResolveIdentity = %q, want SnowyOwl", name)
+	}
+}
+
+// TestBareTmuxPaneID: only %N addresses pass; composite labels, bare digits,
+// and junk are refused — those are ntm-side provenance, not addresses the
+// server's pane-binding contract accepts.
+func TestBareTmuxPaneID(t *testing.T) {
+	accepted := map[string]string{"%0": "%0", "%42": "%42", "  %7 ": "%7"}
+	for in, want := range accepted {
+		if got, ok := BareTmuxPaneID(in); !ok || got != want {
+			t.Errorf("BareTmuxPaneID(%q) = %q,%v want %q,true", in, got, ok, want)
+		}
+	}
+	for _, in := range []string{"", "%", "42", "main:0:2", "%1a", "%1\r\nEvil: x"} {
+		if got, ok := BareTmuxPaneID(in); ok {
+			t.Errorf("BareTmuxPaneID(%q) = %q,true want refusal", in, got)
+		}
+	}
+}
+
+// TestPaneIdentityReceiptReadAndMirror: the server's structured generation
+// receipt round-trips byte-for-byte into another project namespace, and both
+// namespaces resolve to the same agent name.
+func TestPaneIdentityReceiptReadAndMirror(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv("HOME", tmp)
+
+	raw := `{"name":"BlueLake","session_name":"proj","pane_id":"%42","pane_pid":4242,` +
+		`"socket_path":"/tmp/tmux-1000/default","written_at":"2026-08-31T00:00:00Z"}`
+	path := CanonicalIdentityPath("/source/project", "%42")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	receipt, name, ok := ReadPaneIdentityReceipt("/source/project", "%42")
+	if !ok || name != "BlueLake" || string(receipt) != raw {
+		t.Fatalf("ReadPaneIdentityReceipt = %q,%q,%v", receipt, name, ok)
+	}
+	if _, err := MirrorPaneIdentityReceipt("/worktree/project", "%42", receipt); err != nil {
+		t.Fatalf("mirror: %v", err)
+	}
+	mirrored, err := os.ReadFile(CanonicalIdentityPath("/worktree/project", "%42"))
+	if err != nil || string(mirrored) != raw {
+		t.Fatalf("mirrored receipt = %q err=%v, want byte-identical copy", mirrored, err)
+	}
+	if got, _ := ResolveIdentity("/worktree/project", "%42"); got != "BlueLake" {
+		t.Fatalf("mirrored namespace resolves to %q, want BlueLake", got)
+	}
+}
+
+// TestPaneIdentityReceiptRejectsPlainAndMalformed: a legacy plain-name file or
+// malformed JSON is not a generation receipt.
+func TestPaneIdentityReceiptRejectsPlainAndMalformed(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv("HOME", tmp)
+
+	for name, content := range map[string]string{
+		"plain":    "BlueLake\n",
+		"broken":   "{not json",
+		"nameless": `{"pane_id":"%42"}`,
+	} {
+		path := CanonicalIdentityPath("/p-"+name, "%42")
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, ok := ReadPaneIdentityReceipt("/p-"+name, "%42"); ok {
+			t.Errorf("%s content was accepted as a generation receipt", name)
+		}
+	}
+}

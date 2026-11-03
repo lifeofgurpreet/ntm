@@ -76,8 +76,8 @@ func TestDefaultCoordinatorConfig(t *testing.T) {
 	if cfg.IdleThreshold != 30.0 {
 		t.Errorf("expected IdleThreshold 30.0, got %f", cfg.IdleThreshold)
 	}
-	if !cfg.ConflictNotify {
-		t.Error("expected ConflictNotify to be true by default")
+	if cfg.ConflictNotify {
+		t.Error("expected ConflictNotify to be false by default: every session monitor hosts a coordinator")
 	}
 	if cfg.ConflictNegotiate {
 		t.Error("expected ConflictNegotiate to be false by default")
@@ -208,7 +208,7 @@ func TestUpdateAgentStates_CaptureFailureMarksCurrentUnavailableAndRetainsLastKn
 	})
 
 	lastActivity := time.Now().Add(-1 * time.Minute).UTC()
-	getPanesWithActivity = func(session string) ([]tmux.PaneActivity, error) {
+	getPanesWithActivity = func(_ context.Context, session string) ([]tmux.PaneActivity, error) {
 		return []tmux.PaneActivity{
 			{
 				Pane: tmux.Pane{
@@ -276,7 +276,7 @@ func TestUpdateAgentStates_TopologyFailureInvalidatesCurrentWithoutRefreshingLas
 		captureForHealthCheckWithCtx = origCaptureForHealthCheckWithCtx
 	})
 
-	getPanesWithActivity = func(string) ([]tmux.PaneActivity, error) {
+	getPanesWithActivity = func(context.Context, string) ([]tmux.PaneActivity, error) {
 		return nil, errors.New("topology failed")
 	}
 	captureForHealthCheckWithCtx = func(context.Context, string) (string, error) {
@@ -333,7 +333,7 @@ func TestUpdateAgentStates_UsesFreshObservationForDispatchSafety(t *testing.T) {
 	})
 
 	lastActivity := time.Now().Add(-time.Minute).UTC()
-	getPanesWithActivity = func(string) ([]tmux.PaneActivity, error) {
+	getPanesWithActivity = func(context.Context, string) ([]tmux.PaneActivity, error) {
 		return []tmux.PaneActivity{
 			{Pane: tmux.Pane{ID: "%2", Index: 2, Title: "test-session__cc_2", Type: tmux.AgentClaude}, LastActivity: lastActivity},
 			{Pane: tmux.Pane{ID: "%1", Index: 1, Title: "test-session__cc_1", Type: tmux.AgentClaude}, LastActivity: lastActivity},
@@ -384,7 +384,7 @@ func TestUpdateAgentStatesLoadsPersistedAgentMailIdentity(t *testing.T) {
 		captureForHealthCheckWithCtx = originalCapture
 	})
 	lastActivity := time.Now().Add(-time.Minute).UTC()
-	getPanesWithActivity = func(string) ([]tmux.PaneActivity, error) {
+	getPanesWithActivity = func(context.Context, string) ([]tmux.PaneActivity, error) {
 		return []tmux.PaneActivity{{
 			Pane:         tmux.Pane{ID: paneID, Index: 1, Title: paneTitle, Type: tmux.AgentCodex},
 			LastActivity: lastActivity,
@@ -404,104 +404,6 @@ func TestUpdateAgentStatesLoadsPersistedAgentMailIdentity(t *testing.T) {
 	}
 	if idle := c.GetIdleAgents(); len(idle) != 1 || idle[0].AgentMailName != "BlueLake" {
 		t.Fatalf("idle identity projection = %+v", idle)
-	}
-}
-
-func TestAuthoritativeCoordinatorBindingsSkipUnboundCrossProjectAndRecycledPanes(t *testing.T) {
-	projectDir := t.TempDir()
-	otherDir := t.TempDir()
-	originalGetPanes := getPanesWithActivity
-	originalCapture := captureForHealthCheckWithCtx
-	originalCurrentDir := coordinatorPaneCurrentDir
-	t.Cleanup(func() {
-		getPanesWithActivity = originalGetPanes
-		captureForHealthCheckWithCtx = originalCapture
-		coordinatorPaneCurrentDir = originalCurrentDir
-	})
-	getPanesWithActivity = func(string) ([]tmux.PaneActivity, error) {
-		return []tmux.PaneActivity{
-			{Pane: tmux.Pane{ID: "%44", Index: 1, PID: 4400, Title: "train", Type: tmux.AgentCodex}},
-			{Pane: tmux.Pane{ID: "%45", Index: 2, PID: 4500, Title: "unbound", Type: tmux.AgentCodex}},
-			{Pane: tmux.Pane{ID: "%66", Index: 3, PID: 6600, Title: "lms", Type: tmux.AgentCodex}},
-			{Pane: tmux.Pane{ID: "%129", Index: 4, PID: 9999, Title: "recycled", Type: tmux.AgentCodex}},
-		}, nil
-	}
-	captureForHealthCheckWithCtx = func(context.Context, string) (string, error) {
-		return "completed\n────────────\n› \n────────────", nil
-	}
-	coordinatorPaneCurrentDir = func(_ context.Context, paneID string) (string, error) {
-		if paneID == "%66" {
-			return otherDir, nil
-		}
-		return projectDir, nil
-	}
-	bindings := map[string]agentmail.CoordinatorPaneBinding{
-		"%44":  {AgentName: "AzureCreek", PanePID: 4400, ProjectDir: projectDir},
-		"%66":  {AgentName: "CrossProject", PanePID: 6600, ProjectDir: projectDir},
-		"%129": {AgentName: "CoralFox", PanePID: 12900, ProjectDir: projectDir},
-	}
-	c := New("bbi-infrastructure", projectDir, nil, "SilverHarbor").
-		WithAgentMailScope("/repos/github.com/biji-biji-initiative/bbi-infrastructure", "SilverHarbor", bindings)
-	c.monitor = NewAgentMonitor(c.session, nil, c.projectKey)
-	if err := c.updateAgentStatesContext(context.Background()); err != nil {
-		t.Fatalf("updateAgentStatesContext: %v", err)
-	}
-	agents := c.GetAgents()
-	if len(agents) != 1 || agents["%44"] == nil || agents["%44"].AgentMailName != "AzureCreek" {
-		t.Fatalf("authoritative agents = %+v, want only %%44/AzureCreek", agents)
-	}
-}
-
-func TestAuthoritativeCoordinatorBindingsObserveDetachedSameProjectSession(t *testing.T) {
-	projectDir := t.TempDir()
-	originalGetPanes := getPanesWithActivity
-	originalGetAllPanes := getAllPanesContext
-	originalCapture := captureForHealthCheckWithCtx
-	originalCurrentDir := coordinatorPaneCurrentDir
-	t.Cleanup(func() {
-		getPanesWithActivity = originalGetPanes
-		getAllPanesContext = originalGetAllPanes
-		captureForHealthCheckWithCtx = originalCapture
-		coordinatorPaneCurrentDir = originalCurrentDir
-	})
-	getPanesWithActivity = func(session string) ([]tmux.PaneActivity, error) {
-		switch session {
-		case "bbi-infrastructure":
-			return []tmux.PaneActivity{{Pane: tmux.Pane{ID: "%44", Index: 1, PID: 4400, Type: tmux.AgentCodex}}}, nil
-		case "bbi-infrastructure--lms-argo-wedge":
-			return []tmux.PaneActivity{
-				{Pane: tmux.Pane{ID: "%155", Index: 1, PID: 15500, Type: tmux.AgentCodex}},
-				{Pane: tmux.Pane{ID: "%156", Index: 2, PID: 15600, Type: tmux.AgentCodex}},
-			}, nil
-		default:
-			return nil, fmt.Errorf("unexpected session %q", session)
-		}
-	}
-	getAllPanesContext = func(context.Context) (map[string][]tmux.Pane, error) {
-		return map[string][]tmux.Pane{
-			"bbi-infrastructure":                 {{ID: "%44", PID: 4400}},
-			"bbi-infrastructure--lms-argo-wedge": {{ID: "%155", PID: 15500}, {ID: "%156", PID: 15600}},
-		}, nil
-	}
-	captureForHealthCheckWithCtx = func(context.Context, string) (string, error) {
-		return "completed\n────────────\n› \n────────────", nil
-	}
-	coordinatorPaneCurrentDir = func(context.Context, string) (string, error) { return projectDir, nil }
-
-	bindings := map[string]agentmail.CoordinatorPaneBinding{
-		"%44":  {AgentName: "AzureCreek", PanePID: 4400, ProjectDir: projectDir},
-		"%155": {AgentName: "YellowOx", PanePID: 15500, ProjectDir: projectDir},
-		"%156": {AgentName: "NobleAnchor", PanePID: 15600, ProjectDir: projectDir},
-	}
-	c := New("bbi-infrastructure", projectDir, nil, "IvoryAnchor").
-		WithAgentMailScope("/repos/github.com/biji-biji-initiative/bbi-infrastructure", "IvoryAnchor", bindings)
-	c.monitor = NewAgentMonitor(c.session, nil, c.projectKey)
-	if err := c.updateAgentStatesContext(context.Background()); err != nil {
-		t.Fatalf("updateAgentStatesContext: %v", err)
-	}
-	agents := c.GetAgents()
-	if len(agents) != 3 || agents["%44"].AgentMailName != "AzureCreek" || agents["%155"].AgentMailName != "YellowOx" || agents["%156"].AgentMailName != "NobleAnchor" {
-		t.Fatalf("authoritative multi-session agents = %+v", agents)
 	}
 }
 
@@ -570,7 +472,7 @@ func TestEmitEvent_PublishesToEventsBus(t *testing.T) {
 func TestStartStop(t *testing.T) {
 	originalGetPanes := getPanesWithActivity
 	t.Cleanup(func() { getPanesWithActivity = originalGetPanes })
-	getPanesWithActivity = func(string) ([]tmux.PaneActivity, error) { return nil, nil }
+	getPanesWithActivity = func(context.Context, string) ([]tmux.PaneActivity, error) { return nil, nil }
 
 	c := New("test-session", "/tmp/test", nil, "TestAgent")
 	c.config.PollInterval = 100 * time.Millisecond
@@ -593,6 +495,7 @@ func TestStartStop(t *testing.T) {
 }
 
 func TestAutoAssignCycleRunsAfterFreshMonitorUpdate(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	c := New("test-session", "/tmp/test", nil, "TestAgent")
 	c.config.PollInterval = MinPollInterval
 	c.config.AutoAssign = true
@@ -605,7 +508,7 @@ func TestAutoAssignCycleRunsAfterFreshMonitorUpdate(t *testing.T) {
 
 	var mu sync.Mutex
 	monitorCalls := 0
-	getPanesWithActivity = func(string) ([]tmux.PaneActivity, error) {
+	getPanesWithActivity = func(context.Context, string) ([]tmux.PaneActivity, error) {
 		mu.Lock()
 		monitorCalls++
 		mu.Unlock()
@@ -643,7 +546,7 @@ func TestAutoAssignCycleRunsAfterFreshMonitorUpdate(t *testing.T) {
 func TestStart_DoubleStartRejected(t *testing.T) {
 	originalGetPanes := getPanesWithActivity
 	t.Cleanup(func() { getPanesWithActivity = originalGetPanes })
-	getPanesWithActivity = func(string) ([]tmux.PaneActivity, error) { return nil, nil }
+	getPanesWithActivity = func(context.Context, string) ([]tmux.PaneActivity, error) { return nil, nil }
 
 	c := New("test-session", "/tmp/test", nil, "TestAgent")
 	c.config.PollInterval = 100 * time.Millisecond
@@ -664,7 +567,7 @@ func TestStart_DoubleStartRejected(t *testing.T) {
 func TestRunCyclePropagatesTopologyObservationFailure(t *testing.T) {
 	originalGetPanes := getPanesWithActivity
 	t.Cleanup(func() { getPanesWithActivity = originalGetPanes })
-	getPanesWithActivity = func(string) ([]tmux.PaneActivity, error) {
+	getPanesWithActivity = func(context.Context, string) ([]tmux.PaneActivity, error) {
 		return nil, errors.New("topology unavailable")
 	}
 
@@ -679,10 +582,44 @@ func TestRunCyclePropagatesTopologyObservationFailure(t *testing.T) {
 	}
 }
 
+func TestMaintainAssignmentsCancelsCanonicalTopologyObservation(t *testing.T) {
+	originalGetPanes := getPanesWithActivity
+	t.Cleanup(func() { getPanesWithActivity = originalGetPanes })
+	started := make(chan struct{})
+	getPanesWithActivity = func(ctx context.Context, session string) ([]tmux.PaneActivity, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	c := New("maintenance-cancellation", t.TempDir(), nil, "Coordinator")
+	c.workItemStatusFn = func(context.Context, string) (string, error) {
+		t.Error("canceled observation continued into assignment maintenance")
+		return "closed", nil
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.MaintainAssignments(ctx) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("canonical topology observation did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("maintenance cancellation error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("maintenance failed to cancel the canonical topology observation")
+	}
+}
+
 func TestStartObservationFailureCanBeRetried(t *testing.T) {
 	originalGetPanes := getPanesWithActivity
 	t.Cleanup(func() { getPanesWithActivity = originalGetPanes })
-	getPanesWithActivity = func(string) ([]tmux.PaneActivity, error) {
+	getPanesWithActivity = func(context.Context, string) ([]tmux.PaneActivity, error) {
 		return nil, errors.New("initial topology unavailable")
 	}
 
@@ -691,7 +628,7 @@ func TestStartObservationFailureCanBeRetried(t *testing.T) {
 		t.Fatalf("first Start() error = %v, want initial observation failure", err)
 	}
 
-	getPanesWithActivity = func(string) ([]tmux.PaneActivity, error) { return nil, nil }
+	getPanesWithActivity = func(context.Context, string) ([]tmux.PaneActivity, error) { return nil, nil }
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	if err := c.Start(ctx); err != nil {
@@ -714,7 +651,7 @@ func TestStop_WaitsForInFlightMonitorCycle(t *testing.T) {
 	blocked := make(chan struct{})
 	release := make(chan struct{})
 
-	getPanesWithActivity = func(session string) ([]tmux.PaneActivity, error) {
+	getPanesWithActivity = func(_ context.Context, session string) ([]tmux.PaneActivity, error) {
 		calls++
 		if calls == 1 {
 			return nil, nil
@@ -772,7 +709,7 @@ func TestStop_WaitsForConcurrentStartInitialization(t *testing.T) {
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 
-	getPanesWithActivity = func(session string) ([]tmux.PaneActivity, error) {
+	getPanesWithActivity = func(_ context.Context, session string) ([]tmux.PaneActivity, error) {
 		close(blocked)
 		<-release
 		return nil, nil

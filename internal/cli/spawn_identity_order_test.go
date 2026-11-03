@@ -6,9 +6,10 @@ package cli
 // could read a previous occupant's name or find none. The text output path
 // also called registerSpawnedAgents twice.
 //
-// The fix introduces spawnIdentityCoordinator: identities are prepared and
-// published per-pane immediately before the launch keystrokes, and the three
-// late batch registration call sites were removed.
+// The fix introduced the spawn identity coordinator (now
+// internal/spawnidentity, shared with robot and REST spawn): identities are
+// prepared and published per-pane immediately before the launch keystrokes,
+// and the three late batch registration call sites were removed.
 
 import (
 	"context"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/spawnidentity"
 )
 
 // --- Structural ordering tests -------------------------------------------
@@ -54,7 +56,7 @@ func spawnFuncDecl(t *testing.T, funcName string) (*token.FileSet, *ast.FuncDecl
 }
 
 // TestSpawnPublishesIdentityBeforeLaunch asserts that inside the spawn
-// lifecycle every identity preparation call (prepareAgent) textually precedes
+// lifecycle every identity preparation call (PrepareAgent) textually precedes
 // the first agent launch call (tmux.SendKeysContext), and that no late batch
 // registration call remains.
 func TestSpawnPublishesIdentityBeforeLaunch(t *testing.T) {
@@ -72,7 +74,7 @@ func TestSpawnPublishesIdentityBeforeLaunch(t *testing.T) {
 			if fun.Sel.Name == "SendKeysContext" && firstSendKeys == token.NoPos {
 				firstSendKeys = call.Pos()
 			}
-			if fun.Sel.Name == "prepareAgent" {
+			if fun.Sel.Name == "PrepareAgent" {
 				prepareCall = call.Pos()
 			}
 		case *ast.Ident:
@@ -87,13 +89,13 @@ func TestSpawnPublishesIdentityBeforeLaunch(t *testing.T) {
 		t.Errorf("spawnSessionLogicContextWithOutput calls registerSpawnedAgents %d time(s), want 0 (identities must be published pre-launch, and the duplicate text-mode registration must stay removed)", registerCalls)
 	}
 	if prepareCall == token.NoPos {
-		t.Fatal("spawnSessionLogicContextWithOutput must call identityCoordinator.prepareAgent")
+		t.Fatal("spawnSessionLogicContextWithOutput must call identityCoordinator.PrepareAgent")
 	}
 	if firstSendKeys == token.NoPos {
 		t.Fatal("spawnSessionLogicContextWithOutput must call tmux.SendKeysContext")
 	}
 	if fset.Position(prepareCall).Offset >= fset.Position(firstSendKeys).Offset {
-		t.Errorf("prepareAgent (%v) must precede the first tmux.SendKeysContext (%v): agents may not launch before their pane identity is published",
+		t.Errorf("PrepareAgent (%v) must precede the first tmux.SendKeysContext (%v): agents may not launch before their pane identity is published",
 			fset.Position(prepareCall), fset.Position(firstSendKeys))
 	}
 }
@@ -177,7 +179,7 @@ func isolateIdentityDirs(t *testing.T) {
 }
 
 // TestSpawnIdentityCoordinator_PublishesIdentityAtPrepareTime is the core
-// #255 property: after prepareAgent returns (which spawn now calls BEFORE
+// #255 property: after PrepareAgent returns (which spawn now calls BEFORE
 // sending the launch keystrokes), the pane's canonical identity file and the
 // session registry mapping already contain the assigned name — the identity
 // a booting agent resolves equals the one reported in AgentMap.
@@ -197,22 +199,22 @@ func TestSpawnIdentityCoordinator_PublishesIdentityAtPrepareTime(t *testing.T) {
 	paneID := "%7"
 
 	// Seed a stale identity from a previous pane occupant: the exact hazard
-	// from #255. prepareAgent must overwrite it before launch.
+	// from #255. PrepareAgent must overwrite it before launch.
 	if _, err := agentmail.WriteIdentity(projectKey, paneID, "StaleOldTenant"); err != nil {
 		t.Fatalf("seed stale identity: %v", err)
 	}
 
-	coordinator := newSpawnIdentityCoordinator(projectKey, session)
-	coordinator.prepareAgent(context.Background(), spawnedAgentInfo{
-		paneIndex: 1,
-		paneID:    paneID,
-		paneTitle: session + "__cc_1",
-		agentType: "cc",
-		model:     "opus",
+	coordinator := newSpawnIdentityCoordinator(projectKey, session, false)
+	coordinator.PrepareAgent(context.Background(), spawnidentity.Agent{
+		PaneIndex: 1,
+		PaneID:    paneID,
+		PaneTitle: session + "__cc_1",
+		AgentType: "cc",
+		Model:     "opus",
 	})
 
 	// The status a booting agent would act on.
-	status := coordinator.finalStatus()
+	status := coordinator.Status()
 	if status == nil || !status.Available || !status.ProjectRegistered {
 		t.Fatalf("status = %+v, want available and project registered", status)
 	}
@@ -241,84 +243,15 @@ func TestSpawnIdentityCoordinator_PublishesIdentityAtPrepareTime(t *testing.T) {
 	// The server must have been asked to create exactly one identity.
 	creates := 0
 	for _, tool := range calledTools() {
+		if tool == "health_check" {
+			t.Fatal("spawn identity registration must not be gated on the slower diagnostic health_check; ensure_project is the availability probe")
+		}
 		if tool == "create_agent_identity" || tool == "register_agent" {
 			creates++
 		}
 	}
 	if creates != 1 {
 		t.Fatalf("identity creations = %d, want exactly 1 (no duplicate registration)", creates)
-	}
-}
-
-// A public project key is intentionally server-governed. If the selected key
-// is rejected (for example, it has not been admitted to the shared namespace),
-// spawn must retain NTM's fail-open launch policy and must not publish an
-// identity under the physical checkout as an accidental fallback.
-func TestSpawnIdentityCoordinator_CanonicalOverrideRejectionFailsOpen(t *testing.T) {
-	isolateIdentityDirs(t)
-	const canonical = "/repos/github.com/biji-biji-initiative/bbi-infrastructure"
-	t.Setenv(agentmail.ProjectKeyOverrideEnv, canonical)
-
-	var mu sync.Mutex
-	seenHumanKey := ""
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			ID     interface{} `json:"id"`
-			Params struct {
-				Name      string                 `json:"name"`
-				Arguments map[string]interface{} `json:"arguments"`
-			} `json:"params"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		if req.Params.Name == "health_check" {
-			raw, _ := json.Marshal(map[string]string{"status": "ok"})
-			_ = json.NewEncoder(w).Encode(agentmail.JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: raw})
-			return
-		}
-		if req.Params.Name == "ensure_project" {
-			mu.Lock()
-			seenHumanKey, _ = req.Params.Arguments["human_key"].(string)
-			mu.Unlock()
-			_ = json.NewEncoder(w).Encode(agentmail.JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &agentmail.JSONRPCError{Code: -32041, Message: "UNREGISTERED_PROJECT"}})
-			return
-		}
-		_ = json.NewEncoder(w).Encode(agentmail.JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &agentmail.JSONRPCError{Code: -32601, Message: "unexpected tool"}})
-	}))
-	t.Cleanup(srv.Close)
-
-	oldCfg := cfg
-	t.Cleanup(func() { cfg = oldCfg })
-	cfg = config.Default()
-	cfg.AgentMail.Enabled = true
-	cfg.AgentMail.AutoRegister = true
-	cfg.AgentMail.URL = srv.URL + "/"
-
-	physical := t.TempDir()
-	paneID := "%8"
-	coordinator := newSpawnIdentityCoordinator(physical, "canonical_override_rejection")
-	coordinator.prepareAgent(context.Background(), spawnedAgentInfo{
-		paneIndex: 1, paneID: paneID, paneTitle: "canonical_override_rejection__cc_1", agentType: "cc", model: "opus",
-	})
-
-	status := coordinator.finalStatus()
-	if status == nil || !status.Available || status.ProjectRegistered || status.AgentsFailed != 1 {
-		t.Fatalf("rejected canonical registration must fail open with one failed identity: %+v", status)
-	}
-	mu.Lock()
-	gotHumanKey := seenHumanKey
-	mu.Unlock()
-	if gotHumanKey != canonical {
-		t.Fatalf("ensure_project human_key = %q, want canonical key %q", gotHumanKey, canonical)
-	}
-	if _, err := os.Stat(agentmail.CanonicalIdentityPath(physical, paneID)); !os.IsNotExist(err) {
-		t.Fatalf("physical identity must not be published after canonical rejection: %v", err)
-	}
-	if _, err := os.Stat(agentmail.CanonicalIdentityPath(canonical, paneID)); !os.IsNotExist(err) {
-		t.Fatalf("canonical identity must not be published when registration failed: %v", err)
 	}
 }
 
@@ -332,11 +265,11 @@ func TestSpawnIdentityCoordinator_DisabledIsInert(t *testing.T) {
 	defer func() { cfg = oldCfg }()
 	cfg = nil
 
-	coordinator := newSpawnIdentityCoordinator(t.TempDir(), "spawn_disabled_test")
-	coordinator.prepareAgent(context.Background(), spawnedAgentInfo{
-		paneIndex: 1, paneID: "%3", paneTitle: "x__cc_1", agentType: "cc",
+	coordinator := newSpawnIdentityCoordinator(t.TempDir(), "spawn_disabled_test", false)
+	coordinator.PrepareAgent(context.Background(), spawnidentity.Agent{
+		PaneIndex: 1, PaneID: "%3", PaneTitle: "x__cc_1", AgentType: "cc",
 	})
-	if status := coordinator.finalStatus(); status != nil {
+	if status := coordinator.Status(); status != nil {
 		t.Fatalf("disabled coordinator status = %+v, want nil", status)
 	}
 }
@@ -360,11 +293,11 @@ func TestSpawnIdentityCoordinator_UnavailableFailsOpen(t *testing.T) {
 	cfg.AgentMail.AutoRegister = true
 	cfg.AgentMail.URL = srv.URL + "/"
 
-	coordinator := newSpawnIdentityCoordinator(t.TempDir(), "spawn_unavailable_test")
-	coordinator.prepareAgent(context.Background(), spawnedAgentInfo{
-		paneIndex: 1, paneID: "%5", paneTitle: "x__cc_1", agentType: "cc",
+	coordinator := newSpawnIdentityCoordinator(t.TempDir(), "spawn_unavailable_test", false)
+	coordinator.PrepareAgent(context.Background(), spawnidentity.Agent{
+		PaneIndex: 1, PaneID: "%5", PaneTitle: "x__cc_1", AgentType: "cc",
 	})
-	status := coordinator.finalStatus()
+	status := coordinator.Status()
 	if status == nil {
 		t.Fatal("enabled-but-unavailable coordinator must report a status")
 	}

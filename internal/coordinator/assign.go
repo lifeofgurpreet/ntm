@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -15,9 +16,12 @@ import (
 	assignmentstore "github.com/Dicklesworthstone/ntm/internal/assignment"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	ctxmon "github.com/Dicklesworthstone/ntm/internal/context"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
-	"github.com/Dicklesworthstone/ntm/internal/pressure"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
+	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/Dicklesworthstone/ntm/internal/status"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 // ScoreConfig controls how work assignments are scored.
@@ -78,63 +82,24 @@ type WorkAssignment struct {
 
 // AssignmentResult contains the result of an assignment attempt.
 type AssignmentResult struct {
-	Success          bool            `json:"success"`
-	Assignment       *WorkAssignment `json:"assignment,omitempty"`
-	Error            string          `json:"error,omitempty"`
-	Reservations     []string        `json:"reservations,omitempty"`
-	MessageSent      bool            `json:"message_sent"`
-	ClaimActor       string          `json:"claim_actor,omitempty"`
-	IdempotencyKey   string          `json:"idempotency_key,omitempty"`
-	Deferred         bool            `json:"deferred,omitempty"`
-	ReasonCode       string          `json:"reason_code,omitempty"`
-	PressureLevel    string          `json:"pressure_level,omitempty"`
-	PressureLimit    []string        `json:"pressure_limiting,omitempty"`
-	PressureOverride bool            `json:"pressure_override,omitempty"`
-}
-
-// AssignmentPressure is the exact live host-pressure evidence used by the
-// coordinator admission gate.
-type AssignmentPressure struct {
-	Available bool
-	Level     string
-	Limiting  []string
-}
-
-func liveCoordinatorAssignmentPressure(ctx context.Context) AssignmentPressure {
-	if ctx == nil || ctx.Err() != nil {
-		return AssignmentPressure{}
-	}
-	probeCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
-	defer cancel()
-	governor := pressure.New(pressure.Config{
-		Mode: pressure.ModeObserve, Providers: []pressure.Provider{pressure.NewSystemProvider()},
-	})
-	snapshot := governor.Refresh(probeCtx)
-	if len(snapshot.Readings) == 0 {
-		return AssignmentPressure{}
-	}
-	limiting := make([]string, 0, len(snapshot.Limiting))
-	for _, source := range snapshot.Limiting {
-		limiting = append(limiting, string(source))
-	}
-	return AssignmentPressure{Available: true, Level: snapshot.Overall.String(), Limiting: limiting}
+	Success        bool            `json:"success"`
+	Assignment     *WorkAssignment `json:"assignment,omitempty"`
+	Error          string          `json:"error,omitempty"`
+	Reservations   []string        `json:"reservations,omitempty"`
+	MessageSent    bool            `json:"message_sent"`
+	ClaimActor     string          `json:"claim_actor,omitempty"`
+	IdempotencyKey string          `json:"idempotency_key,omitempty"`
+	// CASSInjection and MemoryInjection report the fresh assignment's prompt
+	// enrichment, as on --robot-send; absent when not requested or when a
+	// recorded intent was recovered.
+	CASSInjection   *robot.CASSInjectionInfo `json:"cass_injection,omitempty"`
+	MemoryInjection *robot.CMInjectionInfo   `json:"memory_injection,omitempty"`
 }
 
 // AssignWork assigns verified actionable work to idle agents.
 func (c *SessionCoordinator) AssignWork(ctx context.Context) ([]AssignmentResult, error) {
 	if !c.config.AutoAssign {
 		return nil, nil
-	}
-	assignmentPressure := AssignmentPressure{}
-	if c.assignmentPressureFn != nil {
-		assignmentPressure = c.assignmentPressureFn(ctx)
-	}
-	criticalPressure := assignmentPressure.Available && strings.EqualFold(strings.TrimSpace(assignmentPressure.Level), "critical")
-	if criticalPressure && !c.config.AllowCriticalPressure {
-		return []AssignmentResult{{
-			Deferred: true, ReasonCode: "critical_pressure", PressureLevel: assignmentPressure.Level,
-			PressureLimit: append([]string(nil), assignmentPressure.Limiting...),
-		}}, nil
 	}
 	store, err := assignmentstore.LoadStoreStrict(c.session)
 	if err != nil {
@@ -160,7 +125,9 @@ func (c *SessionCoordinator) AssignWork(ctx context.Context) ([]AssignmentResult
 	if c.actionableRecommendationsFn != nil {
 		getActionableRecommendations = c.actionableRecommendationsFn
 	}
-	recommendations, err := getActionableRecommendations(ctx, c.projectKey, 0)
+	recommendations, err := bv.ReadForMutationContext(ctx, c.projectKey, func() ([]bv.TriageRecommendation, error) {
+		return getActionableRecommendations(ctx, c.projectKey, 0)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("getting verified actionable recommendations: %w", err)
 	}
@@ -206,11 +173,6 @@ func (c *SessionCoordinator) AssignWork(ctx context.Context) ([]AssignmentResult
 	// snapshot.
 	for _, scored := range ScoreAndSelectAssignments(assignmentCandidates, recommendations, DefaultScoreConfig(), nil) {
 		result := c.attemptAssignment(ctx, scored.Assignment, scored.Recommendation)
-		if criticalPressure {
-			result.PressureLevel = assignmentPressure.Level
-			result.PressureLimit = append([]string(nil), assignmentPressure.Limiting...)
-			result.PressureOverride = true
-		}
 		results = append(results, result)
 
 		if result.Success {
@@ -251,6 +213,350 @@ func coordinatorWorkAssignedEventDetails(result AssignmentResult, planned *WorkA
 	return details
 }
 
+const assignmentReservationRenewalLead = 15 * time.Minute
+
+// maintainAssignments retires terminal work and renews leases belonging to
+// delivered, still-owned work independently of new assignment admission. The
+// file-output watcher owns a separate set of reservations and cannot maintain
+// the durable assignment ledger's one-hour leases.
+func (c *SessionCoordinator) maintainAssignments(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	store, err := assignmentstore.LoadStoreStrictReadOnly(c.session)
+	if err != nil {
+		return fmt.Errorf("load assignment maintenance ledger: %w", err)
+	}
+	var failures []error
+	// Terminal work no longer needs protection, even when the operator has
+	// paused new assignments or another task's lease cannot be renewed. Keep
+	// maintaining healthy leases if one terminal cleanup needs a later retry.
+	if err := c.reconcileTerminalAssignments(ctx, store); err != nil {
+		failures = append(failures, fmt.Errorf("reconciling assignment ledger: %w", err))
+	}
+	if err := c.reconcileLostAssignments(ctx, store); err != nil {
+		failures = append(failures, fmt.Errorf("recovering lost assignment owners: %w", err))
+	}
+	for _, current := range store.ListActive() {
+		if err := ctx.Err(); err != nil {
+			failures = append(failures, err)
+			break
+		}
+		if current.DispatchState != assignmentstore.DispatchSent || current.ReservationState != assignmentstore.ReservationReserved || !current.ReservationCompleted ||
+			current.ClearState != assignmentstore.ClearStateNone || (current.Status != assignmentstore.StatusAssigned && current.Status != assignmentstore.StatusWorking) {
+			continue
+		}
+		if current.ReservationRenewalError == "" && current.ReservationExpiresAt != nil && current.ReservationExpiresAt.After(time.Now().Add(assignmentReservationRenewalLead)) {
+			continue
+		}
+		_, err := store.RefreshReservationIfCurrent(ctx, current, c.refreshAssignmentReservation)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("reservation protection for %s is unverified; assignment retained, inspect its leases before reassigning: %w", current.BeadID, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func (c *SessionCoordinator) refreshAssignmentReservation(ctx context.Context, current *assignmentstore.Assignment) (time.Time, error) {
+	// Another cycle may have renewed this generation while we waited for its
+	// external-operation lock. Recheck the persisted deadline under that lock.
+	now := time.Now().UTC()
+	if current.ReservationRenewalError == "" && current.ReservationExpiresAt != nil && current.ReservationExpiresAt.After(now.Add(assignmentReservationRenewalLead)) {
+		return time.Time{}, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	lookup := c.workItemDetailsFn
+	if lookup == nil {
+		lookup = func(ctx context.Context, beadID string) (*bv.BeadAssignmentDetails, error) {
+			return bv.GetBeadAssignmentDetailsContext(ctx, c.projectKey, beadID)
+		}
+	}
+	details, err := bv.ReadForMutationContext(ctx, c.projectKey, func() (*bv.BeadAssignmentDetails, error) {
+		return lookup(ctx, current.BeadID)
+	})
+	if err != nil {
+		return time.Time{}, fmt.Errorf("read live claim before renewal: %w", err)
+	}
+	if details == nil || details.ID != current.BeadID {
+		return time.Time{}, errors.New("live claim did not identify the assigned bead")
+	}
+	switch strings.ToLower(strings.TrimSpace(details.Status)) {
+	case "closed", "tombstone":
+		return time.Time{}, nil // Normal terminal reconciliation owns release.
+	case "open", "in_progress":
+	default:
+		return time.Time{}, fmt.Errorf("live work status %q does not authorize renewal", details.Status)
+	}
+	if current.ClaimActor == "" || strings.TrimSpace(details.Assignee) != current.ClaimActor {
+		return time.Time{}, fmt.Errorf("live claim owner %q differs from assignment owner %q", details.Assignee, current.ClaimActor)
+	}
+	target, err := assignmentstore.CanonicalPaneIdentity(current)
+	if err != nil {
+		return time.Time{}, err
+	}
+	lease := coordinatorLeaseFromAssignment(current)
+	if err := c.checkAssignmentReservationOwner(ctx, current, lease, target); err != nil {
+		return time.Time{}, err
+	}
+	port := &coordinatorAgentMailReservationPort{client: c.reservationClient, projectKey: agentmail.CanonicalProjectKey(c.projectKey)}
+	projectID, err := port.ensureProject(ctx)
+	if err != nil {
+		return time.Time{}, err
+	}
+	var verifiedRows []agentmail.FileReservation
+	readExpiry := func() (time.Time, error) {
+		rows, err := c.reservationClient.ListReservations(ctx, port.projectKey, lease.AgentName, false)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("read assignment lease ownership: %w", err)
+		}
+		expiresAt, err := verifiedAssignmentReservationExpiry(current, lease, rows, projectID, time.Now())
+		if err == nil {
+			verifiedRows = rows
+		}
+		return expiresAt, err
+	}
+	expiresAt, err := readExpiry()
+	if err != nil {
+		return time.Time{}, err
+	}
+	if expiresAt.After(time.Now().Add(assignmentReservationRenewalLead)) {
+		// Reconcile a prior successful renewal whose response or local
+		// persistence was lost, without extending the server lease twice.
+		return expiresAt, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return time.Time{}, err
+	}
+	// Project and lease reads can outlast a pane observation. Refresh liveness
+	// again before mutation rather than starving later agents in a slow batch.
+	if err := c.checkAssignmentReservationOwner(ctx, current, lease, target); err != nil {
+		return time.Time{}, err
+	}
+	// A partial previous renewal must not add another hour to already healthy
+	// IDs on every retry. Select only the saved IDs still inside the lead window.
+	if _, err := verifiedAssignmentReservationExpiry(current, lease, verifiedRows, projectID, time.Now()); err != nil {
+		return time.Time{}, err
+	}
+	dueIDs := make([]int, 0, len(lease.ReservationIDs))
+	for _, id := range lease.ReservationIDs {
+		for _, row := range verifiedRows {
+			if row.ID == id && !row.ExpiresTS.After(time.Now().Add(assignmentReservationRenewalLead)) {
+				dueIDs = append(dueIDs, id)
+				break
+			}
+		}
+	}
+	if len(dueIDs) == 0 {
+		return time.Time{}, errors.New("no exact assignment reservation IDs are eligible for renewal")
+	}
+	_, renewalErr := c.reservationClient.RenewReservations(ctx, agentmail.RenewReservationsOptions{
+		ProjectKey: port.projectKey, AgentName: lease.AgentName,
+		ExtendSeconds: 3600, ReservationIDs: dueIDs,
+	})
+	// The active listing is the authority, including when the server committed
+	// but its response was lost. A count-only receipt cannot prove protection.
+	renewedExpiry, readErr := readExpiry()
+	if readErr != nil {
+		return time.Time{}, errors.Join(renewalErr, fmt.Errorf("verify renewed assignment leases: %w", readErr))
+	}
+	if !renewedExpiry.After(expiresAt) || !renewedExpiry.After(time.Now().Add(assignmentReservationRenewalLead)) {
+		return time.Time{}, errors.Join(renewalErr, errors.New("renewal did not extend every assignment lease beyond the renewal window"))
+	}
+	return renewedExpiry, nil
+}
+
+func (c *SessionCoordinator) checkAssignmentReservationOwner(ctx context.Context, current *assignmentstore.Assignment, lease assignmentstore.LeaseReceipt, target string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if current.HasPendingPaneContinuation() {
+		return c.checkContinuationReservationOwner(ctx, current, lease, target)
+	}
+	readObserved := func() *AgentState {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		if pane := c.agents[target]; pane != nil {
+			copy := *pane
+			return &copy
+		}
+		return nil
+	}
+	observed := readObserved()
+	var refreshErr error
+	if observed == nil || !status.DispatchObservationIsCurrent(observed.ObservedAt, time.Now()) {
+		if err := c.updateAgentStatesContext(ctx); err != nil {
+			refreshErr = fmt.Errorf("refresh pane observation before reservation renewal: %w", err)
+		}
+		// A successful topology refresh can contain an unrelated pane's capture
+		// error. The freshly installed target observation is the authorization
+		// evidence; a sibling's failure must not expire its valid leases.
+		observed = readObserved()
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.Join(refreshErr, err)
+	}
+	if observed == nil || !observed.Healthy || observed.ObservationFreshness != status.FreshnessFresh ||
+		!status.DispatchObservationIsCurrent(observed.ObservedAt, time.Now()) || observed.Status == robot.StateUnknown || observed.Status == robot.StateError {
+		return errors.Join(refreshErr, fmt.Errorf("pane %s has no fresh healthy agent observation", target))
+	}
+	if err := pendingRecoveryIdentityError(current, observed); err != nil {
+		return err
+	}
+	// Re-read registration instead of trusting a cached AgentState after a
+	// registry read failure or an agent replacement between monitor cycles.
+	registry, err := agentmail.LoadSessionAgentRegistry(c.session, c.projectKey)
+	if err != nil {
+		return fmt.Errorf("read pane identity before renewal: %w", err)
+	}
+	registeredName, registered := registry.GetAgent("", target)
+	if !registered || lease.AgentName == "" || registeredName != lease.AgentName || registeredName != current.AgentName || lease.Target != target {
+		return fmt.Errorf("pane %s no longer has the assignment's registered reservation owner", target)
+	}
+	return nil
+}
+
+// A verified handoff moves the registry before the restart manifest and
+// assignment snapshots. Keep its original leases alive across a failed later
+// write without accepting the predecessor's title or a cached recipient name.
+func (c *SessionCoordinator) checkContinuationReservationOwner(ctx context.Context, current *assignmentstore.Assignment, lease assignmentstore.LeaseReceipt, target string) error {
+	continuation := current.PaneContinuation
+	if c.monitor == nil || continuation.Token == "" || continuation.SourcePane != target || lease.Target != target ||
+		lease.AgentName == "" || lease.AgentName != current.AgentName || lease.AgentName != current.ReservationAgent {
+		return errors.New("pending reservation renewal requires the original continuation and exact lease owner")
+	}
+	entries, err := ctxmon.GetPendingRotationsForSessionContext(ctx, c.session)
+	if err != nil {
+		return fmt.Errorf("read rotation ownership before renewal: %w", err)
+	}
+	var pending *ctxmon.PendingRotation
+	for _, entry := range entries {
+		if entry.Continuation == nil || entry.ExecutionID != continuation.Token && entry.Continuation.Token != continuation.Token {
+			continue
+		}
+		if pending != nil {
+			return errors.New("pending reservation renewal has ambiguous rotation receipts")
+		}
+		pending = entry
+	}
+	if pending == nil {
+		return errors.New("pending reservation renewal has no durable rotation receipt")
+	}
+	receipt := pending.Continuation
+	if pending.ExecutionID != continuation.Token || receipt.Token != continuation.Token || pending.SelectedAction != ctxmon.ConfirmRotate ||
+		pending.Remote != "" || tmux.DefaultClient.Remote != "" || pending.SessionName != c.session ||
+		receipt.BeadID != current.BeadID || receipt.AssignmentKey != current.IdempotencyKey || receipt.AgentName != lease.AgentName ||
+		pending.PaneID != target || receipt.Source.ID != target || pending.PanePID != receipt.Source.PID ||
+		!filepath.IsAbs(receipt.RegistryProject) || !agentmail.ProjectKeysEquivalent(receipt.RegistryProject, c.projectKey) {
+		return errors.New("pending reservation renewal does not match the durable rotation owner and project")
+	}
+	registry, err := agentmail.LoadSessionAgentRegistry(c.session, receipt.RegistryProject)
+	if err != nil || registry == nil {
+		return errors.Join(err, errors.New("pending reservation renewal has no verified agent registry"))
+	}
+	registeredTarget := ""
+	bindings := 0
+	for paneID, name := range registry.PaneIDMap {
+		if strings.EqualFold(strings.TrimSpace(name), lease.AgentName) {
+			bindings++
+			registeredTarget = paneID
+		}
+	}
+	if bindings != 1 || registry.PaneIDMap[registeredTarget] != lease.AgentName {
+		return errors.New("pending reservation renewal has no unique exact recipient binding")
+	}
+	if registeredTarget != target && (continuation.TargetPane == "" || registeredTarget != continuation.TargetPane ||
+		receipt.Replacement.ID != continuation.TargetPane || receipt.Phase != "handoff_accepted") {
+		return errors.New("reservation recipient moved outside the accepted continuation")
+	}
+	observation, err := c.monitor.ObserveSession(ctx)
+	if err != nil {
+		return fmt.Errorf("observe pending reservation owner: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	now := time.Now()
+	if observation.Session != c.session || !status.DispatchObservationIsCurrent(observation.ObservedAt, now) {
+		return errors.New("pending reservation renewal has no fresh session observation")
+	}
+	kind := agent.AgentType(current.AgentType).Canonical()
+	verifyPane := func(expected tmux.Pane) (status.PaneObservation, error) {
+		observed, ok := observation.PaneByID(expected.ID)
+		if !ok || expected.PID <= 0 || observed.Metadata.ID != expected.ID || observed.Metadata.PID != expected.PID ||
+			expected.RotationToken != continuation.Token || observed.Metadata.RotationToken != continuation.Token ||
+			expected.Type.Canonical() != kind || observed.Metadata.Type.Canonical() != kind || observed.Metadata.IsServicePane() {
+			return status.PaneObservation{}, fmt.Errorf("pane %s no longer has its exact rotation process and fence", expected.ID)
+		}
+		return observed, nil
+	}
+	source, err := verifyPane(receipt.Source)
+	if err != nil {
+		return err
+	}
+	owner := source
+	if registeredTarget != target {
+		owner, err = verifyPane(receipt.Replacement)
+		if err != nil {
+			return err
+		}
+	}
+	// Quarantine blocks new dispatch, not lease maintenance. A retired or
+	// unreadable source is acceptable after accepted handoff only while its
+	// exact fenced metadata remains and the registered replacement is healthy.
+	command := strings.TrimSpace(owner.Metadata.Command)
+	if owner.Metadata.Dead || registry.PanePID(registeredTarget) != owner.Metadata.PID ||
+		command == "" || tmux.PaneCommandIsStarting(command) || tmux.PaneCommandIsShell(command) && !owner.Metadata.ForegroundJobRunning() ||
+		owner.Current.Freshness != status.FreshnessFresh || owner.Current.Error != "" ||
+		!owner.Current.Status.IsHealthy() || !status.DispatchObservationIsCurrent(owner.Current.ObservedAt, now) {
+		return fmt.Errorf("pane %s has no fresh healthy registered continuation owner", registeredTarget)
+	}
+	return nil
+}
+
+// verifiedAssignmentReservationExpiry requires the exact saved ID set and all
+// its original bindings. Missing/expired leases are never reacquired here:
+// another agent may already have reserved the now-unprotected files.
+func verifiedAssignmentReservationExpiry(current *assignmentstore.Assignment, lease assignmentstore.LeaseReceipt, rows []agentmail.FileReservation, projectID int, now time.Time) (time.Time, error) {
+	if len(lease.ReservationIDs) == 0 || len(lease.Granted) == 0 {
+		return time.Time{}, errors.New("assignment lease has no exact durable IDs or paths")
+	}
+	wanted := make(map[int]bool, len(lease.ReservationIDs))
+	for _, id := range lease.ReservationIDs {
+		if id <= 0 || wanted[id] {
+			return time.Time{}, fmt.Errorf("invalid or repeated assignment reservation ID %d", id)
+		}
+		wanted[id] = true
+	}
+	paths := make(map[string]bool, len(lease.Granted))
+	for _, path := range lease.Granted {
+		if path == "" || paths[path] {
+			return time.Time{}, fmt.Errorf("empty or repeated assignment reservation path %q", path)
+		}
+		paths[path] = true
+	}
+	seen := make(map[int]bool, len(wanted))
+	seenPaths := make(map[string]bool, len(paths))
+	var expiresAt time.Time
+	for _, row := range rows {
+		if !wanted[row.ID] {
+			continue
+		}
+		if seen[row.ID] || !paths[row.PathPattern] || seenPaths[row.PathPattern] || row.ProjectID != projectID || row.AgentName != lease.AgentName ||
+			row.Reason != "bead assignment: "+current.BeadID || !row.Exclusive || row.ReleasedTS != nil || !row.ExpiresTS.After(now) {
+			return time.Time{}, fmt.Errorf("reservation %d lost its exact project, owner, bead, path, or live exclusive lease binding", row.ID)
+		}
+		seen[row.ID], seenPaths[row.PathPattern] = true, true
+		if expiresAt.IsZero() || row.ExpiresTS.Before(expiresAt) {
+			expiresAt = row.ExpiresTS.Time
+		}
+	}
+	if len(seen) != len(wanted) || len(seenPaths) != len(paths) {
+		return time.Time{}, errors.New("one or more exact assignment reservations are missing; refusing to renew or reacquire partial protection")
+	}
+	return expiresAt, nil
+}
+
 func (c *SessionCoordinator) filterActionableRecommendations(ctx context.Context, recommendations []bv.TriageRecommendation, activeBeads map[string]struct{}) ([]bv.TriageRecommendation, bool, error) {
 	filtered := make([]bv.TriageRecommendation, 0, len(recommendations))
 	terminalRecommendation := false
@@ -260,15 +566,15 @@ func (c *SessionCoordinator) filterActionableRecommendations(ctx context.Context
 		}
 		live := recommendation
 		var trackerStatus string
-		var trackerAssignee string
 		var err error
 		switch {
 		case c.workItemDetailsFn != nil:
 			var details *bv.BeadAssignmentDetails
-			details, err = c.workItemDetailsFn(ctx, recommendation.ID)
+			details, err = bv.ReadForMutationContext(ctx, c.projectKey, func() (*bv.BeadAssignmentDetails, error) {
+				return c.workItemDetailsFn(ctx, recommendation.ID)
+			})
 			if details != nil {
 				trackerStatus = details.Status
-				trackerAssignee = details.Assignee
 				live.Title = details.Title
 				live.Status = details.Status
 				live.Labels = append([]string(nil), details.Labels...)
@@ -276,14 +582,17 @@ func (c *SessionCoordinator) filterActionableRecommendations(ctx context.Context
 				live.Type = liveIssueType(details.IssueType, recommendation.Type)
 			}
 		case c.workItemStatusFn != nil:
-			trackerStatus, err = c.workItemStatusFn(ctx, recommendation.ID)
+			trackerStatus, err = bv.ReadForMutationContext(ctx, c.projectKey, func() (string, error) {
+				return c.workItemStatusFn(ctx, recommendation.ID)
+			})
 			live.Status = trackerStatus
 		default:
 			var details *bv.BeadAssignmentDetails
-			details, err = bv.GetBeadAssignmentDetailsContext(ctx, c.projectKey, recommendation.ID)
+			details, err = bv.ReadForMutationContext(ctx, c.projectKey, func() (*bv.BeadAssignmentDetails, error) {
+				return bv.GetBeadAssignmentDetailsContext(ctx, c.projectKey, recommendation.ID)
+			})
 			if details != nil {
 				trackerStatus = details.Status
-				trackerAssignee = details.Assignee
 				live.Title = details.Title
 				live.Status = details.Status
 				live.Labels = append([]string(nil), details.Labels...)
@@ -296,12 +605,6 @@ func (c *SessionCoordinator) filterActionableRecommendations(ctx context.Context
 		}
 		switch strings.ToLower(strings.TrimSpace(trackerStatus)) {
 		case "open":
-			// An open row can still be owned by another actor. Treat the live
-			// assignee as part of the authorization boundary so the planner
-			// cannot select it and then abort the whole cycle at atomic claim.
-			if strings.TrimSpace(trackerAssignee) != "" {
-				continue
-			}
 			// Type evidence is part of the authorization boundary, not a
 			// display field: without it the container (epic) gate below cannot
 			// prove this item is implementation work. bv's actionable-plan
@@ -392,13 +695,16 @@ func (c *SessionCoordinator) recoverPendingAssignments(ctx context.Context, stor
 		}
 		work := coordinatorWorkAssignmentFromRecord(recorded)
 		if recorded.DispatchState == assignmentstore.DispatchSending {
-			results = append(results, AssignmentResult{
-				Assignment: work, ClaimActor: recorded.ClaimActor, IdempotencyKey: recorded.IdempotencyKey,
-				Error: assignmentstore.ErrDispatchOutcomeUnknown.Error(),
-			})
+			// A stranded outcome-unknown dispatch owns its pane until external
+			// evidence resolves it. See internal/coordinator/stranded_dispatch.go
+			// for the gate; the default remains fail-closed (ntm#304).
+			results = append(results, c.resolveStrandedDispatch(ctx, store, recorded, work))
 			continue
 		}
 		if !coordinatorAssignmentIsRecoverable(recorded) {
+			continue
+		}
+		if !coordinatorDispatchRetryReady(recorded, time.Now()) {
 			continue
 		}
 		target := strings.TrimSpace(recorded.OccupancyKey)
@@ -423,6 +729,33 @@ func (c *SessionCoordinator) recoverPendingAssignments(ctx context.Context, stor
 		results = append(results, c.recoverPendingAssignment(ctx, store, recorded, work))
 	}
 	return results
+}
+
+const (
+	coordinatorDispatchRetryInitial = 5 * time.Second
+	coordinatorDispatchRetryMaximum = time.Minute
+)
+
+// coordinatorDispatchRetryReady spaces out retries of a dispatch that failed
+// before actuation. Such a failure is safe to retry (ntm#294), but a pane whose
+// composer stays stuck would otherwise be re-attempted on every cycle forever.
+// DispatchStartedAt anchors the last attempt and DispatchAttempts counts them,
+// both durably, so the backoff survives a coordinator restart.
+//
+// A row with no recorded dispatch error has not failed yet and is never held
+// back.
+func coordinatorDispatchRetryReady(recorded *assignmentstore.Assignment, now time.Time) bool {
+	if recorded == nil || recorded.LastDispatchError == "" || recorded.DispatchStartedAt == nil {
+		return true
+	}
+	delay := coordinatorDispatchRetryInitial
+	for attempt := 1; attempt < recorded.DispatchAttempts && delay < coordinatorDispatchRetryMaximum; attempt++ {
+		delay *= 2
+		if delay > coordinatorDispatchRetryMaximum {
+			delay = coordinatorDispatchRetryMaximum
+		}
+	}
+	return !now.Before(recorded.DispatchStartedAt.Add(delay))
 }
 
 func pendingRecoveryIdentityError(recorded *assignmentstore.Assignment, candidate *AgentState) error {
@@ -510,13 +843,19 @@ func (c *SessionCoordinator) reconcileTerminalAssignments(ctx context.Context, s
 
 	var reconcileErrors []error
 	for _, active := range store.ListActive() {
+		if err := ctx.Err(); err != nil {
+			reconcileErrors = append(reconcileErrors, err)
+			break
+		}
 		if active == nil {
 			continue
 		}
 		terminalStatus := active.PendingTerminalStatus
 		terminalReason := active.PendingTerminalReason
 		if terminalStatus != assignmentstore.StatusCompleted && terminalStatus != assignmentstore.StatusFailed {
-			trackerStatus, err := lookup(ctx, active.BeadID)
+			trackerStatus, err := bv.ReadForMutationContext(ctx, c.projectKey, func() (string, error) {
+				return lookup(ctx, active.BeadID)
+			})
 			if err != nil {
 				reconcileErrors = append(reconcileErrors, fmt.Errorf("read %s status: %w", active.BeadID, err))
 				continue
@@ -555,6 +894,16 @@ func (c *SessionCoordinator) reconcileTerminalAssignments(ctx context.Context, s
 }
 
 func (c *SessionCoordinator) reconcileTerminalAssignment(ctx context.Context, store *assignmentstore.AssignmentStore, observed *assignmentstore.Assignment, terminalStatus assignmentstore.AssignmentStatus, terminalReason string) (bool, error) {
+	return c.reconcileTerminalAssignmentAuthorized(ctx, store, observed, terminalStatus, terminalReason, nil)
+}
+
+// authorize runs against the current generation under its external cleanup
+// lock, before the terminal barrier is persisted. Once a barrier exists its
+// recorded outcome owns retries, including retries after the proof disappears.
+func (c *SessionCoordinator) reconcileTerminalAssignmentAuthorized(ctx context.Context, store *assignmentstore.AssignmentStore, observed *assignmentstore.Assignment, terminalStatus assignmentstore.AssignmentStatus, terminalReason string, authorize func(context.Context, *assignmentstore.Assignment) error) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	cleanupUnlock, err := store.AcquireExternalCleanupLock(ctx, observed.BeadID)
 	if err != nil {
 		return false, fmt.Errorf("lock terminal assignment %s external cleanup: %w", observed.BeadID, err)
@@ -568,14 +917,25 @@ func (c *SessionCoordinator) reconcileTerminalAssignment(ctx context.Context, st
 		return false, nil
 	}
 	if current.ClearState == assignmentstore.ClearStateNone && (current.Status == assignmentstore.StatusCompleted || current.Status == assignmentstore.StatusFailed) {
+		// A competing watcher may already have consumed and acknowledged the
+		// completion. Its cleared outbox is not proof an event was never made;
+		// do not resurrect one from an older active assignment observation.
 		return false, nil
 	}
 	if current.PendingTerminalStatus == assignmentstore.StatusCompleted || current.PendingTerminalStatus == assignmentstore.StatusFailed {
 		terminalStatus = current.PendingTerminalStatus
 		terminalReason = current.PendingTerminalReason
+	} else if authorize != nil {
+		if err := authorize(ctx, current); err != nil {
+			return false, fmt.Errorf("authorize terminal assignment %s: %w", observed.BeadID, err)
+		}
 	}
 
-	barrier, applied, err := store.BeginTerminalReconciliationIfCurrent(ctx, current, terminalStatus, terminalReason)
+	begin := store.BeginTerminalReconciliationIfCurrent
+	if c.completionEvents {
+		begin = store.BeginTerminalReconciliationWithCompletionEventIfCurrent
+	}
+	barrier, applied, err := begin(ctx, current, terminalStatus, terminalReason)
 	if err != nil {
 		return false, fmt.Errorf("begin terminal reconciliation for %s: %w", observed.BeadID, err)
 	}
@@ -653,7 +1013,7 @@ func (c *SessionCoordinator) releaseTerminalAssignmentReservations(ctx context.C
 		return fmt.Errorf("reconcile reservation for %s: %w", current.BeadID, err)
 	}
 	lease.Requested = requested
-	port := &coordinatorAgentMailReservationPort{client: c.reservationClient, projectKey: c.mailProjectKey}
+	port := &coordinatorAgentMailReservationPort{client: c.reservationClient, projectKey: agentmail.CanonicalProjectKey(c.projectKey)}
 	reconciled, err := port.ReconcileReservation(ctx, assignmentstore.ReservationRequest{
 		BeadID: current.BeadID, BeadTitle: current.BeadTitle, AgentName: lease.AgentName,
 		Target: lease.Target, RequestedPaths: requested, TTL: time.Hour,
@@ -701,7 +1061,7 @@ func (c *SessionCoordinator) releaseCoordinatorLease(ctx context.Context, curren
 	if c.reservationClient == nil {
 		return errors.New("agent mail reservation client is not configured")
 	}
-	manager := assignpkg.NewFileReservationManager(c.reservationClient, c.mailProjectKey)
+	manager := assignpkg.NewFileReservationManager(c.reservationClient, c.projectKey)
 	_, err := manager.ReleaseExactForBead(ctx, current, lease.ReservationIDs, lease.Granted)
 	return err
 }
@@ -746,10 +1106,23 @@ func (c *SessionCoordinator) attemptAssignment(ctx context.Context, assignment *
 	}
 	claimActor := assignmentstore.StableClaimActor(assignment.AgentMailName, idempotencyKey)
 	body := c.formatAssignmentMessage(assignment, rec, claimActor)
+	requestedPaths := repositoryReservationPaths(c.projectKey, assignment.FilesToReserve)
 
 	store, err := assignmentstore.LoadStoreStrict(c.session)
 	if err != nil {
 		return AssignmentResult{Assignment: safeCoordinatorWorkProjection(assignment), ClaimActor: claimActor, IdempotencyKey: idempotencyKey, Error: fmt.Sprintf("loading assignment ledger: %v", err)}
+	}
+	// Enrich the fresh intent before Execute records it, so the ledger holds
+	// exactly the prompt the agent receives and recoverPendingAssignment
+	// replays it without querying cass or cm again. The triage record carries
+	// no description, so the retrieval query is the title and labels.
+	prompt, cassInjection, memoryInjection := robot.EnrichAssignmentPrompt(ctx, robot.AssignmentPrompt{
+		Prompt: body, Title: assignment.BeadTitle, Labels: rec.Labels, AgentType: assignment.AgentType,
+		Session: c.session, ProjectDir: c.projectKey,
+	}, c.promptContext)
+	baseIntentSHA256 := ""
+	if c.promptContext.Enabled() {
+		baseIntentSHA256 = assignmentstore.PromptSHA256(body)
 	}
 	request := assignmentstore.AtomicRequest{
 		BeadID:             assignment.BeadID,
@@ -760,13 +1133,71 @@ func (c *SessionCoordinator) attemptAssignment(ctx context.Context, assignment *
 		AgentType:          assignment.AgentType,
 		AgentName:          assignment.AgentMailName,
 		Actor:              assignment.AgentMailName,
-		Prompt:             body,
+		Prompt:             prompt,
 		IdempotencyKey:     idempotencyKey,
-		RequireReservation: len(assignment.FilesToReserve) > 0,
-		RequestedPaths:     append([]string(nil), assignment.FilesToReserve...),
+		BaseIntentSHA256:   baseIntentSHA256,
+		RequireReservation: len(requestedPaths) > 0,
+		RequestedPaths:     requestedPaths,
 		ReservationTTL:     time.Hour,
 	}
-	return c.executeAtomicAssignment(ctx, store, assignment, request)
+	result := c.executeAtomicAssignment(ctx, store, assignment, request)
+	result.CASSInjection, result.MemoryInjection = cassInjection, memoryInjection
+	return result
+}
+
+// repositoryReservationPaths keeps path-shaped prose out of Agent Mail
+// reservations. Reservation candidates are extracted from free-text bead
+// titles and bodies, so they include things that merely look like paths; a
+// candidate only survives if it actually resolves inside the repository. For a
+// glob, its literal prefix must resolve — that is the part that names a real
+// place in the tree.
+//
+// Relative, in-tree paths only: an absolute path or one that escapes the root
+// is never a reservation this coordinator may take (ntm#302).
+func repositoryReservationPaths(projectKey string, candidates []string) []string {
+	root := filepath.Clean(strings.TrimSpace(projectKey))
+	if root == "" || root == "." {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(candidates))
+	paths := make([]string, 0, len(candidates))
+	for _, raw := range candidates {
+		candidate := filepath.Clean(strings.TrimSpace(raw))
+		if candidate == "" || candidate == "." || filepath.IsAbs(candidate) {
+			continue
+		}
+		if candidate == ".." || strings.HasPrefix(candidate, ".."+string(filepath.Separator)) {
+			continue
+		}
+		prefix := candidate
+		if wildcard := strings.IndexAny(prefix, "*?["); wildcard >= 0 {
+			prefix = strings.TrimRight(prefix[:wildcard], string(filepath.Separator))
+			if prefix == "" {
+				prefix = "."
+			}
+		}
+		// The path itself, or — for a file the bead asks the agent to CREATE —
+		// its parent directory, must exist in the repository. Requiring the
+		// file itself would silently drop reservations for new files.
+		if !pathExistsUnder(root, prefix) && !pathExistsUnder(root, filepath.Dir(prefix)) {
+			continue
+		}
+		candidate = filepath.ToSlash(candidate)
+		if _, duplicate := seen[candidate]; duplicate {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		paths = append(paths, candidate)
+	}
+	return paths
+}
+
+func pathExistsUnder(root, relative string) bool {
+	if relative == "" || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(root, relative))
+	return err == nil
 }
 
 func (c *SessionCoordinator) executeAtomicAssignment(ctx context.Context, store *assignmentstore.AssignmentStore, work *WorkAssignment, request assignmentstore.AtomicRequest) AssignmentResult {
@@ -1067,24 +1498,24 @@ func (c *SessionCoordinator) newAtomicAssignmentCoordinator(store *assignmentsto
 			BeadID: claim.ID, Actor: claim.Actor, Status: claim.Status, ClaimedAt: claim.ClaimedAt,
 		}, nil
 	})
-	reservationPort := &coordinatorAgentMailReservationPort{client: c.reservationClient, projectKey: c.mailProjectKey}
+	reservationPort := &coordinatorAgentMailReservationPort{client: c.reservationClient, projectKey: agentmail.CanonicalProjectKey(c.projectKey)}
 	dispatchPort := assignmentstore.DispatchFunc(func(ctx context.Context, req assignmentstore.DispatchRequest) (assignmentstore.DispatchReceipt, error) {
 		started := time.Now()
-		project, err := c.mailClient.EnsureProject(ctx, c.mailProjectKey)
+		project, err := c.mailClient.EnsureProject(ctx, c.projectKey)
 		if err != nil {
 			return assignmentstore.DispatchReceipt{Duration: time.Since(started)}, assignmentstore.GuaranteeNoActuation(
 				fmt.Errorf("ensure Agent Mail dispatch project: %w", err),
 			)
 		}
-		projectID, projectErr := validatedCoordinatorAgentMailProjectID(project, c.mailProjectKey)
+		projectID, projectErr := validatedCoordinatorAgentMailProjectID(project, c.projectKey)
 		if projectErr != nil {
 			return assignmentstore.DispatchReceipt{Duration: time.Since(started)}, assignmentstore.GuaranteeNoActuation(
 				fmt.Errorf("validate Agent Mail dispatch project: %w", projectErr),
 			)
 		}
-		subject := fmt.Sprintf("Work Assignment: %s", req.BeadID)
+		subject := coordinatorAssignmentSubject(req.BeadID)
 		sent, err := c.mailClient.SendMessage(ctx, agentmail.SendMessageOptions{
-			ProjectKey:  c.mailProjectKey,
+			ProjectKey:  c.projectKey,
 			SenderName:  c.agentName,
 			To:          []string{req.AgentName},
 			Subject:     subject,
@@ -1094,10 +1525,17 @@ func (c *SessionCoordinator) newAtomicAssignmentCoordinator(store *assignmentsto
 		})
 		receipt := assignmentstore.DispatchReceipt{Duration: time.Since(started)}
 		if err != nil {
-			return receipt, err
+			// An explicit MCP tool-level rejection is a completed negative
+			// response: the server received the request and refused to send.
+			// Mark it as guaranteed no-actuation so the atomic ledger returns
+			// the assignment from sending back to pending (retryable) instead
+			// of stranding the bead and pane behind a permanent
+			// dispatch_state="sending" barrier. Timeouts and transport
+			// failures stay outcome-unknown to preserve at-most-once delivery.
+			return receipt, coordinatorMailDispatchError(err)
 		}
 		deliveryID, receiptErr := validatedAgentMailDeliveryID(
-			sent, c.mailProjectKey, projectID, c.agentName, req.AgentName, subject, req.Prompt,
+			sent, c.projectKey, projectID, c.agentName, req.AgentName, subject, req.Prompt,
 		)
 		if receiptErr != nil {
 			return receipt, receiptErr
@@ -1198,6 +1636,17 @@ func (c *SessionCoordinator) newAtomicAssignmentCoordinator(store *assignmentsto
 		WithWorkingReplacementAuthorizationPort(replacementAuthorization)
 }
 
+// coordinatorMailDispatchError classifies an Agent Mail send failure for the
+// atomic dispatch ledger. Only a typed tool-level rejection proves the server
+// did not deliver; everything else (timeout, transport, decode) remains
+// outcome-unknown.
+func coordinatorMailDispatchError(err error) error {
+	if err != nil && agentmail.IsToolRejection(err) {
+		return assignmentstore.GuaranteeNoActuation(err)
+	}
+	return err
+}
+
 func validatedAgentMailDeliveryID(sent *agentmail.SendResult, projectKey string, projectID int, senderName, agentName, subject, body string) (string, error) {
 	if sent == nil {
 		return "", errors.New("agent mail returned no delivery result")
@@ -1281,10 +1730,10 @@ func (c *SessionCoordinator) formatAssignmentMessage(assignment *WorkAssignment,
 	return sb.String()
 }
 
-// ScoreAndSelectAssignments computes optimal agent-task pairings using multi-factor scoring.
-// It scores every agent-recommendation combination, then greedily selects the
-// highest-scoring non-conflicting set (each agent and each task appear at most
-// once). AssignWork calls it every auto-assignment cycle (bd-v394r).
+// ScoreAndSelectAssignments maximizes total score across eligible agent-task
+// pairings, with each agent and each task used at most once. Semantic gates
+// remain in force, and the original scored records carry all dispatch metadata.
+// AssignWork calls this planner every auto-assignment cycle (bd-v394r).
 func ScoreAndSelectAssignments(
 	idleAgents []*AgentState,
 	recommendations []bv.TriageRecommendation,
@@ -1296,9 +1745,13 @@ func ScoreAndSelectAssignments(
 	}
 
 	var candidates []ScoredAssignment
+	var edges []assignmentMatchEdge
 
-	// Score all possible agent-task combinations
+	// Score all eligible agent-task combinations before selecting a batch.
 	for _, agent := range idleAgents {
+		if agent == nil || strings.TrimSpace(agent.PaneID) == "" {
+			continue
+		}
 		for i := range recommendations {
 			rec := &recommendations[i]
 
@@ -1309,45 +1762,29 @@ func ScoreAndSelectAssignments(
 			}
 
 			scored := scoreAssignment(agent, rec, config, existingReservations)
-			if scored.TotalScore > 0 {
+			edge := assignmentMatchEdge{agentID: agent.PaneID, taskID: rec.ID, score: scored.TotalScore}
+			if validAssignmentMatchEdge(edge) {
 				candidates = append(candidates, scored)
+				edges = append(edges, edge)
 			}
 		}
 	}
 
-	// Sort by total score (highest first)
-	sortScoredAssignments(candidates)
-
-	// Select non-conflicting assignments (each agent gets at most one task)
 	var selected []ScoredAssignment
-	assignedAgents := make(map[string]bool)
-	assignedTasks := make(map[string]bool)
-
-	for _, candidate := range candidates {
-		agentID := candidate.Agent.PaneID
-		taskID := candidate.Recommendation.ID
-
-		if assignedAgents[agentID] || assignedTasks[taskID] {
-			continue
-		}
-
-		selected = append(selected, candidate)
-		assignedAgents[agentID] = true
-		assignedTasks[taskID] = true
+	for _, index := range maximumWeightAssignment(edges) {
+		selected = append(selected, candidates[index])
 	}
-
+	// Only the selected batch needs ordering, not every A*T candidate.
+	// The solver supplies canonical identity order as the tie-break baseline.
+	sortScoredAssignments(selected)
 	return selected
 }
 
 // sortScoredAssignments sorts assignments by total score (highest first).
 func sortScoredAssignments(candidates []ScoredAssignment) {
-	for i := 0; i < len(candidates)-1; i++ {
-		for j := i + 1; j < len(candidates); j++ {
-			if candidates[j].TotalScore > candidates[i].TotalScore {
-				candidates[i], candidates[j] = candidates[j], candidates[i]
-			}
-		}
-	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].TotalScore > candidates[j].TotalScore
+	})
 }
 
 // scoreAssignment computes the score for a single agent-task pairing.
@@ -1633,51 +2070,166 @@ func ExtractTaskTags(title, description string) []string {
 	return tags
 }
 
-// ExtractMentionedFiles extracts file paths mentioned in task text.
+// ExtractMentionedFiles extracts local file intent from task text, preserving
+// first-mention order. Links and source locations are not reservation paths:
+// strip their presentation syntax before classification, but leave project
+// confinement and glob validation to the authoritative reservation boundary.
 func ExtractMentionedFiles(title, description string) []string {
-	text := title + " " + description
-	words := strings.Fields(text)
 	var files []string
-
-	for _, word := range words {
-		// Clean punctuation
-		word = strings.Trim(word, ",.;:()[]{}\"'`")
-		if isFilePath(word) {
-			files = append(files, word)
+	seen := make(map[string]bool)
+	for _, word := range strings.Fields(title + " " + description) {
+		path := normalizeAssignmentFileMention(word)
+		if isFilePath(path) && !seen[path] {
+			seen[path] = true
+			files = append(files, path)
 		}
 	}
 	return files
 }
 
-// isFilePath checks if a string looks like a file path.
-func isFilePath(s string) bool {
-	if len(s) < 3 {
+func normalizeAssignmentFileMention(word string) string {
+	word = trimAssignmentMentionDecorations(word)
+	// A Markdown link's destination is its resource. Do not mistake a remote
+	// URL (or the whole "[label](URL)" token) for a repository path.
+	if link := strings.Index(word, "]("); link >= 1 && strings.HasPrefix(word, "[") && strings.HasSuffix(word, ")") {
+		word = trimAssignmentMentionDecorations(word[link+2 : len(word)-1])
+	}
+	if fragment := strings.IndexByte(word, '#'); fragment > 0 {
+		base := word[:fragment]
+		if assignmentMentionHasFileName(base) {
+			word = base // src/file.go#L12-L20 or README.md#design
+		} else if assignmentMentionDigits(word[fragment+1:]) {
+			return "" // owner/repository#123 is an issue reference, not a file.
+		}
+	}
+	// Compiler/editor locations name a file, not a file literally ending in
+	// ":line:column". A Windows drive prefix is retained because its suffix
+	// is not all digits. URI classification below still rejects URL schemes.
+	for {
+		colon := strings.LastIndexByte(word, ':')
+		if colon <= 0 || !assignmentMentionDigits(word[colon+1:]) {
+			break
+		}
+		word = word[:colon]
+	}
+	return word
+}
+
+func trimAssignmentMentionDecorations(word string) string {
+	// Handle the common quote/emphasis/parenthesis layers without becoming a
+	// Markdown parser. In particular, never strip balanced glob braces.
+	for pass := 0; pass < 2; pass++ {
+		word = strings.TrimRight(word, ",.;:")
+		word = strings.Trim(word, "\"'`")
+		for _, marker := range []string{"**", "__"} {
+			if len(word) > 2*len(marker) && strings.HasPrefix(word, marker) && strings.HasSuffix(word, marker) {
+				word = word[len(marker) : len(word)-len(marker)]
+			}
+		}
+		for _, pair := range []string{"()", "[]", "<>"} {
+			if assignmentMentionOuterPair(word, pair[0], pair[1]) {
+				word = word[1 : len(word)-1]
+				break
+			}
+		}
+	}
+	for _, pair := range []string{"()", "[]", "<>"} {
+		extra := strings.Count(word, pair[1:]) - strings.Count(word, pair[:1])
+		for extra > 0 && strings.HasSuffix(word, pair[1:]) {
+			word = word[:len(word)-1]
+			extra--
+		}
+	}
+	return word
+}
+
+func assignmentMentionOuterPair(word string, open, close byte) bool {
+	if len(word) < 2 || word[0] != open || word[len(word)-1] != close {
 		return false
 	}
-
-	// Contains path separator or file extension
-	if strings.Contains(s, "/") || strings.Contains(s, "\\") {
-		return true
+	depth := 0
+	for i := range word {
+		switch word[i] {
+		case open:
+			depth++
+		case close:
+			depth--
+		}
+		if depth == 0 && i != len(word)-1 {
+			return false // [ab]/file.go is a glob, not an outer wrapper.
+		}
 	}
+	return depth == 0
+}
 
-	// Has common file extensions
-	extensions := []string{".go", ".ts", ".js", ".py", ".rs", ".md", ".yaml", ".yml", ".json", ".toml"}
-	for _, ext := range extensions {
-		if strings.HasSuffix(s, ext) {
+func assignmentMentionDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := range s {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// isFilePath classifies a normalized mention, not arbitrary remote resources.
+func isFilePath(s string) bool {
+	if len(s) < 3 || strings.HasPrefix(s, "-") || strings.Contains(s, "=") || strings.ContainsAny(s, " \t\r\n") {
+		return false
+	}
+	lower := strings.ToLower(s)
+	if strings.Contains(s, "://") || strings.HasPrefix(lower, "www.") || strings.HasPrefix(lower, "git@") || assignmentMentionIsURI(s) {
+		return false
+	}
+	fileName := assignmentMentionHasFileName(s)
+	// Preserve the date/quantity exclusion (ntm#302), but allow explicit
+	// numeric filenames such as migrations/001_init.sql and 2026/report.md.
+	if s[0] >= '0' && s[0] <= '9' && !fileName {
+		return false
+	}
+	return fileName || strings.ContainsAny(s, "/\\*") || strings.HasPrefix(s, ".")
+}
+
+func assignmentMentionIsURI(s string) bool {
+	colon := strings.IndexByte(s, ':')
+	if colon < 1 {
+		return false
+	}
+	isLetter := func(c byte) bool { return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' }
+	if !isLetter(s[0]) {
+		return false
+	}
+	if colon == 1 && len(s) > 2 && (s[2] == '/' || s[2] == '\\') {
+		return false // Drive-qualified local path; confinement is checked later.
+	}
+	for i := 1; i < colon; i++ {
+		c := s[i]
+		if !isLetter(c) && !(c >= '0' && c <= '9') && c != '+' && c != '-' && c != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func assignmentMentionHasFileName(s string) bool {
+	lower := strings.ToLower(s)
+	for _, extension := range []string{
+		".go", ".ts", ".tsx", ".js", ".jsx", ".py", ".rs", ".md", ".yaml", ".yml", ".json", ".toml",
+		".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".java", ".kt", ".kts", ".swift", ".rb", ".php",
+		".sh", ".bash", ".zsh", ".sql", ".proto", ".xml", ".html", ".css", ".scss", ".vue", ".svelte",
+		".mod", ".sum", ".lock", ".txt", ".ini", ".conf", ".cfg",
+	} {
+		if strings.HasSuffix(lower, extension) {
 			return true
 		}
 	}
-
-	// Contains glob patterns
-	if strings.Contains(s, "*") || strings.Contains(s, "**") {
+	base := s[strings.LastIndexAny(s, "/\\")+1:]
+	switch base {
+	case "Makefile", "GNUmakefile", "Dockerfile", "Containerfile", "Jenkinsfile", "Justfile", "README", "LICENSE", "NOTICE":
 		return true
 	}
-
-	// Starts with dot (hidden file/directory)
-	if strings.HasPrefix(s, ".") && len(s) > 1 {
-		return true
-	}
-
 	return false
 }
 

@@ -557,11 +557,41 @@ url = "http://original:1234/mcp/"
 
 func TestModelsConfig(t *testing.T) {
 	cfg := Default()
-	if cfg.Models.DefaultClaude == "" {
-		t.Error("DefaultClaude should not be empty")
+	// Empty by design: no --model is injected, so Claude Code launches with
+	// its own default / saved model instead of a stale pinned ID (ntm#334).
+	if cfg.Models.DefaultClaude != "" {
+		t.Errorf("DefaultClaude = %q, want empty (delegate to Claude Code)", cfg.Models.DefaultClaude)
 	}
 	if len(cfg.Models.Claude) == 0 {
 		t.Error("Claude aliases should not be empty")
+	}
+}
+
+// TestDefaultClaudeLaunchPassesNoModel is the ntm#334 guard: with the built-in
+// config a bare --cc pane must launch without --model, so Claude Code uses its
+// own default/saved model; an explicit alias still reaches the command line.
+func TestDefaultClaudeLaunchPassesNoModel(t *testing.T) {
+	cfg := Default()
+	bare, err := GenerateAgentCommand(cfg.Agents.Claude, AgentTemplateVars{
+		AgentType: "cc",
+		Model:     cfg.Models.GetModelName("cc", ""),
+	})
+	if err != nil {
+		t.Fatalf("GenerateAgentCommand (bare) error = %v", err)
+	}
+	if strings.Contains(bare, "--model") {
+		t.Fatalf("bare Claude launch injected a model: %q", bare)
+	}
+
+	aliased, err := GenerateAgentCommand(cfg.Agents.Claude, AgentTemplateVars{
+		AgentType: "cc",
+		Model:     cfg.Models.GetModelName("cc", "opus"),
+	})
+	if err != nil {
+		t.Fatalf("GenerateAgentCommand (alias) error = %v", err)
+	}
+	if !strings.Contains(aliased, "--model 'opus'") {
+		t.Fatalf("aliased Claude launch = %q, want it to contain --model 'opus'", aliased)
 	}
 }
 
@@ -576,7 +606,9 @@ func TestGetModelName(t *testing.T) {
 		{"gemini", "", models.DefaultGemini},
 		{"grok", "", ""},
 		{"grok-build", "", ""},
-		{"claude", "opus", "claude-opus-4-8"},
+		{"claude", "", ""},
+		{"claude", "opus", "opus"},
+		{"claude", "fast", "sonnet"},
 		{"codex", "gpt4", "gpt-4"},
 		{"gemini", "flash", "gemini-3-flash"},
 		{"claude", "custom-model", "custom-model"},
@@ -1152,39 +1184,24 @@ func TestContextRotationDefaults(t *testing.T) {
 	cfg := Default()
 
 	// Defaults should be sensible
-	if !cfg.ContextRotation.Enabled {
-		t.Error("ContextRotation should be enabled by default")
-	}
-	if cfg.ContextRotation.WarningThreshold != 0.80 {
-		t.Errorf("Expected warning_threshold 0.80, got %f", cfg.ContextRotation.WarningThreshold)
-	}
 	if cfg.ContextRotation.RotateThreshold != 0.95 {
 		t.Errorf("Expected rotate_threshold 0.95, got %f", cfg.ContextRotation.RotateThreshold)
 	}
 	if cfg.ContextRotation.SummaryMaxTokens != 2000 {
 		t.Errorf("Expected summary_max_tokens 2000, got %d", cfg.ContextRotation.SummaryMaxTokens)
 	}
-	if cfg.ContextRotation.MinSessionAgeSec != 300 {
-		t.Errorf("Expected min_session_age_sec 300, got %d", cfg.ContextRotation.MinSessionAgeSec)
-	}
 	if !cfg.ContextRotation.TryCompactFirst {
 		t.Error("TryCompactFirst should be true by default")
-	}
-	if cfg.ContextRotation.RequireConfirm {
-		t.Error("RequireConfirm should be false by default")
 	}
 }
 
 func TestContextRotationFromTOML(t *testing.T) {
 	configContent := `
 [context_rotation]
-enabled = false
-warning_threshold = 0.70
 rotate_threshold = 0.90
 summary_max_tokens = 3000
-min_session_age_sec = 600
 try_compact_first = false
-require_confirm = true
+confirm_timeout_sec = 120
 `
 	configPath := createTempConfig(t, configContent)
 	cfg, err := Load(configPath)
@@ -1192,26 +1209,17 @@ require_confirm = true
 		t.Fatalf("Failed to load config: %v", err)
 	}
 
-	if cfg.ContextRotation.Enabled {
-		t.Error("Expected enabled = false")
-	}
-	if cfg.ContextRotation.WarningThreshold != 0.70 {
-		t.Errorf("Expected warning_threshold 0.70, got %f", cfg.ContextRotation.WarningThreshold)
-	}
 	if cfg.ContextRotation.RotateThreshold != 0.90 {
 		t.Errorf("Expected rotate_threshold 0.90, got %f", cfg.ContextRotation.RotateThreshold)
 	}
 	if cfg.ContextRotation.SummaryMaxTokens != 3000 {
 		t.Errorf("Expected summary_max_tokens 3000, got %d", cfg.ContextRotation.SummaryMaxTokens)
 	}
-	if cfg.ContextRotation.MinSessionAgeSec != 600 {
-		t.Errorf("Expected min_session_age_sec 600, got %d", cfg.ContextRotation.MinSessionAgeSec)
-	}
 	if cfg.ContextRotation.TryCompactFirst {
 		t.Error("Expected try_compact_first = false")
 	}
-	if !cfg.ContextRotation.RequireConfirm {
-		t.Error("Expected require_confirm = true")
+	if cfg.ContextRotation.ConfirmTimeoutSec != 120 {
+		t.Errorf("Expected confirm_timeout_sec 120, got %+v", cfg.ContextRotation)
 	}
 }
 
@@ -1224,36 +1232,14 @@ func TestValidateContextRotationConfig(t *testing.T) {
 		{
 			name: "valid config",
 			cfg: ContextRotationConfig{
-				Enabled:          true,
-				WarningThreshold: 0.80,
 				RotateThreshold:  0.95,
 				SummaryMaxTokens: 2000,
-				MinSessionAgeSec: 300,
 			},
 			wantErr: false,
 		},
 		{
-			name: "warning_threshold too low",
-			cfg: ContextRotationConfig{
-				WarningThreshold: -0.1,
-				RotateThreshold:  0.95,
-				SummaryMaxTokens: 2000,
-			},
-			wantErr: true,
-		},
-		{
-			name: "warning_threshold too high",
-			cfg: ContextRotationConfig{
-				WarningThreshold: 1.5,
-				RotateThreshold:  0.95,
-				SummaryMaxTokens: 2000,
-			},
-			wantErr: true,
-		},
-		{
 			name: "rotate_threshold too low",
 			cfg: ContextRotationConfig{
-				WarningThreshold: 0.80,
 				RotateThreshold:  -0.1,
 				SummaryMaxTokens: 2000,
 			},
@@ -1262,26 +1248,7 @@ func TestValidateContextRotationConfig(t *testing.T) {
 		{
 			name: "rotate_threshold too high",
 			cfg: ContextRotationConfig{
-				WarningThreshold: 0.80,
 				RotateThreshold:  1.5,
-				SummaryMaxTokens: 2000,
-			},
-			wantErr: true,
-		},
-		{
-			name: "warning >= rotate threshold",
-			cfg: ContextRotationConfig{
-				WarningThreshold: 0.95,
-				RotateThreshold:  0.80,
-				SummaryMaxTokens: 2000,
-			},
-			wantErr: true,
-		},
-		{
-			name: "warning == rotate threshold",
-			cfg: ContextRotationConfig{
-				WarningThreshold: 0.80,
-				RotateThreshold:  0.80,
 				SummaryMaxTokens: 2000,
 			},
 			wantErr: true,
@@ -1289,7 +1256,6 @@ func TestValidateContextRotationConfig(t *testing.T) {
 		{
 			name: "summary_max_tokens too low",
 			cfg: ContextRotationConfig{
-				WarningThreshold: 0.80,
 				RotateThreshold:  0.95,
 				SummaryMaxTokens: 100,
 			},
@@ -1298,31 +1264,19 @@ func TestValidateContextRotationConfig(t *testing.T) {
 		{
 			name: "summary_max_tokens too high",
 			cfg: ContextRotationConfig{
-				WarningThreshold: 0.80,
 				RotateThreshold:  0.95,
 				SummaryMaxTokens: 20000,
 			},
 			wantErr: true,
 		},
 		{
-			name: "min_session_age negative",
+			name: "confirm_timeout_sec negative",
 			cfg: ContextRotationConfig{
-				WarningThreshold: 0.80,
-				RotateThreshold:  0.95,
-				SummaryMaxTokens: 2000,
-				MinSessionAgeSec: -1,
+				RotateThreshold:   0.95,
+				SummaryMaxTokens:  2000,
+				ConfirmTimeoutSec: -1,
 			},
 			wantErr: true,
-		},
-		{
-			name: "min_session_age zero is valid",
-			cfg: ContextRotationConfig{
-				WarningThreshold: 0.80,
-				RotateThreshold:  0.95,
-				SummaryMaxTokens: 2000,
-				MinSessionAgeSec: 0,
-			},
-			wantErr: false,
 		},
 	}
 
@@ -1349,11 +1303,18 @@ func TestContextRotationPrintOutput(t *testing.T) {
 	if !strings.Contains(output, "[context_rotation]") {
 		t.Error("Expected output to contain [context_rotation]")
 	}
-	if !strings.Contains(output, "warning_threshold") {
-		t.Error("Expected output to contain warning_threshold")
-	}
 	if !strings.Contains(output, "rotate_threshold") {
 		t.Error("Expected output to contain rotate_threshold")
+	}
+	// `ntm config init` writes this output; it must not seed reader-less
+	// keys that the strict loader then rejects (bd-syx9t).
+	for _, dead := range []string{"warning_threshold", "min_session_age_sec", "require_confirm"} {
+		if strings.Contains(output, "\n"+dead+" =") {
+			t.Errorf("Print output still writes the removed key %s", dead)
+		}
+	}
+	if _, err := Load(createTempConfig(t, output)); err != nil {
+		t.Errorf("the printed default config must load cleanly: %v", err)
 	}
 }
 
@@ -2475,6 +2436,7 @@ func TestPrintIncludesRemainingLiveConfigSections(t *testing.T) {
 		"[assign]",
 		"[spawn_pacing]",
 		"[spawn_pacing.agent_caps]",
+		"[spawn]",
 		"[encryption]",
 		"[send]",
 		"[prompts]",
@@ -2832,7 +2794,6 @@ func TestValidateContextRotationConfig_MissingBranches(t *testing.T) {
 		{
 			name: "confirm_timeout_sec negative",
 			cfg: ContextRotationConfig{
-				WarningThreshold:  0.80,
 				RotateThreshold:   0.95,
 				SummaryMaxTokens:  2000,
 				ConfirmTimeoutSec: -1,
@@ -2840,32 +2801,10 @@ func TestValidateContextRotationConfig_MissingBranches(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "invalid default_confirm_action",
+			name: "confirm_timeout_sec zero uses the default",
 			cfg: ContextRotationConfig{
-				WarningThreshold:     0.80,
-				RotateThreshold:      0.95,
-				SummaryMaxTokens:     2000,
-				DefaultConfirmAction: "invalid",
-			},
-			wantErr: true,
-		},
-		{
-			name: "empty default_confirm_action is valid",
-			cfg: ContextRotationConfig{
-				WarningThreshold:     0.80,
-				RotateThreshold:      0.95,
-				SummaryMaxTokens:     2000,
-				DefaultConfirmAction: "",
-			},
-			wantErr: false,
-		},
-		{
-			name: "compact default_confirm_action is valid",
-			cfg: ContextRotationConfig{
-				WarningThreshold:     0.80,
-				RotateThreshold:      0.95,
-				SummaryMaxTokens:     2000,
-				DefaultConfirmAction: "compact",
+				RotateThreshold:  0.95,
+				SummaryMaxTokens: 2000,
 			},
 			wantErr: false,
 		},
@@ -3387,6 +3326,61 @@ func TestDefaultRedactionConfig(t *testing.T) {
 	}
 }
 
+func TestRedactionAllowlistEnvironmentOverride(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		env  *string
+		want []string
+	}{
+		{name: "unset preserves TOML", want: []string{"^configured-fixture$"}},
+		{name: "replaces TOML", env: new("^first-fixture$,^second-fixture$"), want: []string{"^first-fixture$", "^second-fixture$"}},
+		{name: "trims and ignores empty entries", env: new(" , ^first-fixture$ ,, ^second-fixture$ , "), want: []string{"^first-fixture$", "^second-fixture$"}},
+		{name: "explicit empty clears TOML", env: new("")},
+		{name: "separators alone clear TOML", env: new(" , , ")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("NTM_REDACTION_ALLOWLIST", "")
+			if tt.env == nil {
+				if err := os.Unsetenv("NTM_REDACTION_ALLOWLIST"); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				t.Setenv("NTM_REDACTION_ALLOWLIST", *tt.env)
+			}
+			path := createTempConfig(t, `[redaction]
+mode = "block"
+allowlist = ['^configured-fixture$']
+disabled_categories = ["JWT"]
+[redaction.extra_patterns]
+CUSTOM = ['fixture-[a-z]+']
+`)
+			loaded, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(loaded.Redaction.Allowlist, tt.want) {
+				t.Fatalf("allowlist = %#v, want %#v", loaded.Redaction.Allowlist, tt.want)
+			}
+			if loaded.Redaction.Mode != "block" ||
+				!reflect.DeepEqual(loaded.Redaction.DisabledCategories, []string{"JWT"}) ||
+				!reflect.DeepEqual(loaded.Redaction.ExtraPatterns["CUSTOM"], []string{"fixture-[a-z]+"}) {
+				t.Fatalf("allowlist override changed unrelated redaction settings: %#v", loaded.Redaction)
+			}
+		})
+	}
+
+	t.Run("works without a config file", func(t *testing.T) {
+		t.Setenv("NTM_REDACTION_ALLOWLIST", "^environment-fixture$")
+		loaded, err := Load(filepath.Join(t.TempDir(), "absent.toml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(loaded.Redaction.Allowlist, []string{"^environment-fixture$"}) {
+			t.Fatalf("allowlist = %#v", loaded.Redaction.Allowlist)
+		}
+	})
+}
+
 func TestValidateRedactionConfig(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -3803,18 +3797,23 @@ func TestValidateMemoryConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "max_rules zero is valid",
-			cfg:     MemoryConfig{MaxRules: 0, QueryTimeoutSeconds: 5},
+			name:    "send_max_rules zero is valid",
+			cfg:     MemoryConfig{SendMaxRules: 0, QueryTimeoutSeconds: 5},
 			wantErr: false,
 		},
 		{
-			name:    "max_rules negative",
-			cfg:     MemoryConfig{MaxRules: -1, QueryTimeoutSeconds: 5},
+			name:    "send_max_rules negative",
+			cfg:     MemoryConfig{SendMaxRules: -1, QueryTimeoutSeconds: 5},
+			wantErr: true,
+		},
+		{
+			name:    "send_budget_tokens negative",
+			cfg:     MemoryConfig{SendBudgetTokens: -1, QueryTimeoutSeconds: 5},
 			wantErr: true,
 		},
 		{
 			name:    "timeout too low",
-			cfg:     MemoryConfig{MaxRules: 10, QueryTimeoutSeconds: 0},
+			cfg:     MemoryConfig{QueryTimeoutSeconds: 0},
 			wantErr: true,
 		},
 	}

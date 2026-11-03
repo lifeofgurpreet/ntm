@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os/exec"
@@ -21,7 +22,10 @@ import (
 // the round overlay from withRoundOverrides instead of falling back to
 // the (post-bd-2ubxp.20 unpopulated) state.Variables["round"].
 func (e *Executor) resolveBranch(ctx context.Context, step *Step) (string, error) {
-	expr := e.substituteVariablesCtx(ctx, step.Branch)
+	expr, err := e.substituteVariablesStrictCtx(ctx, step.Branch)
+	if err != nil {
+		return "", fmt.Errorf("branch predicate substitution failed: %w", err)
+	}
 
 	if strings.HasPrefix(expr, "$(") && strings.HasSuffix(expr, ")") {
 		shellCmd := expr[2 : len(expr)-1]
@@ -33,19 +37,26 @@ func (e *Executor) resolveBranch(ctx context.Context, step *Step) (string, error
 			"command", shellCmd,
 		)
 
-		cmd := exec.CommandContext(ctx, "/bin/sh", "-c", shellCmd)
-		configureCommandProcessGroup(cmd)
-		cmd.Cancel = func() error { return cancelCommandProcessGroup(cmd) }
+		cmd := exec.Command("/bin/sh", "-c", shellCmd)
 		if e.config.ProjectDir != "" {
 			cmd.Dir = e.config.ProjectDir
 		}
 
-		out, err := cmd.Output()
+		// A partial key must not select a branch (including its default).
+		// Share command-step ownership and enforce the workflow's byte limits.
+		limits := e.limits.EffectiveLimits()
+		evaluationCtx, cancel := e.selectorEvaluationContext(ctx, step)
+		defer cancel()
+		out, err := runCommandOutput(evaluationCtx, cmd, limits.MaxCommandStdoutBytes, limits.MaxCommandStderrBytes)
 		if err != nil {
 			return "", fmt.Errorf("branch shell command failed: %w", err)
 		}
 
-		return strings.TrimSpace(string(out)), nil
+		key := strings.TrimSpace(string(out))
+		if err := evaluationCtx.Err(); err != nil {
+			return "", err
+		}
+		return key, nil
 	}
 
 	return expr, nil
@@ -112,10 +123,15 @@ func scopedChildStepID(parentID, childID string, ordinal int) string {
 // executeBranch resolves the branch predicate, looks up the matching branch,
 // parses the branch body into steps, and executes them sequentially.
 func (e *Executor) executeBranch(ctx context.Context, step *Step, workflow *Workflow) StepResult {
+	ctx, releaseMaterializations := withMaterializationOwner(ctx)
+	defer releaseMaterializations()
 	result := StepResult{
 		StepID:    step.ID,
 		Status:    StatusRunning,
 		StartedAt: time.Now(),
+	}
+	if e.stopBeforeDispatch(ctx, &result) {
+		return result
 	}
 
 	slog.Info("branch step starting",
@@ -136,16 +152,21 @@ func (e *Executor) executeBranch(ctx context.Context, step *Step, workflow *Work
 		return result
 	}
 
-	key, err := e.resolveBranch(ctx, step)
+	decision, branchSteps, err := e.prepareBranchDecision(ctx, step)
 	if err != nil {
 		result.Status = StatusFailed
 		result.Error = &StepError{
 			Type:      "branch",
-			Message:   fmt.Sprintf("branch predicate failed: %v", err),
+			Message:   err.Error(),
 			Timestamp: time.Now(),
 		}
+		if errors.Is(err, errCommandOutputUnsettled) {
+			result.Error.Type = "execution_unknown"
+		} else if isStepAdmissionError(err) {
+			result.Error.Type = "step_limit"
+		}
 		result.FinishedAt = time.Now()
-		slog.Error("branch predicate failed",
+		slog.Error("branch decision failed",
 			"run_id", e.state.RunID,
 			"step_id", step.ID,
 			"error", err,
@@ -153,41 +174,12 @@ func (e *Executor) executeBranch(ctx context.Context, step *Step, workflow *Work
 		return result
 	}
 
-	branchVal, lookupErr := lookupBranch(step.Branches, key)
-	if lookupErr != nil {
-		result.Status = StatusFailed
-		result.Error = &StepError{
-			Type:      "branch",
-			Message:   lookupErr.Error(),
-			Timestamp: time.Now(),
-		}
-		result.FinishedAt = time.Now()
-		slog.Error("branch lookup failed",
-			"run_id", e.state.RunID,
-			"step_id", step.ID,
-			"branch_key", key,
-			"error", lookupErr,
-		)
-		return result
-	}
-
+	key := decision.SelectorKey
 	slog.Info("branch step resolved",
 		"run_id", e.state.RunID,
 		"step_id", step.ID,
 		"branch_key", key,
 	)
-
-	branchSteps, parseErr := parseBranchSteps(branchVal, step.ID, key)
-	if parseErr != nil {
-		result.Status = StatusFailed
-		result.Error = &StepError{
-			Type:      "branch",
-			Message:   fmt.Sprintf("failed to parse branch body: %v", parseErr),
-			Timestamp: time.Now(),
-		}
-		result.FinishedAt = time.Now()
-		return result
-	}
 
 	// Snapshot variables before the branch body for scoping.
 	//
@@ -209,6 +201,16 @@ func (e *Executor) executeBranch(ctx context.Context, step *Step, workflow *Work
 	e.varMu.RLock()
 	varSnapshot := captureAllVariables(e.state.Variables)
 	e.varMu.RUnlock()
+	if varSnapshot == nil && len(decision.Scope) > 0 {
+		varSnapshot = make(map[string]interface{})
+	}
+	for name, saved := range decision.Scope {
+		if saved.Exists {
+			varSnapshot[name] = cloneInterfaceValue(saved.Value)
+		} else {
+			delete(varSnapshot, name)
+		}
+	}
 	defer func() {
 		e.varMu.Lock()
 		runtimePersist := extractRuntimeKeys(e.state.Variables)
@@ -242,34 +244,46 @@ func (e *Executor) executeBranch(ctx context.Context, step *Step, workflow *Work
 		// keys this branch owns. Nested constructs namespace their own children
 		// under this ID, so a prefix match covers them too.
 		bodyStepIDs = append(bodyStepIDs, bs.ID)
-		sr := e.executeStepOnce(ctx, &bs, workflow)
-
-		// bd-afwly: branch body steps now honor the on_failure runtime
-		// action / recovery contract used by top-level executeStep, so
-		// fallback_to_ntm_inbox / suppress_failure work the same inside
-		// a branch as outside it.
-		if sr.Status == StatusFailed {
-			sr = e.executeOnFailureAction(&bs, sr)
-			if sr.Status == StatusFailed {
-				sr = e.executeOnFailureRecovery(ctx, &bs, workflow, sr)
+		// Preserve the identity fence for every recorded result, including
+		// unfinished work that will re-enter the canonical lifecycle.
+		e.stateMu.RLock()
+		saved, recorded := e.state.Steps[bs.ID]
+		e.stateMu.RUnlock()
+		if recorded && saved.StepID != bs.ID {
+			result.Status = StatusFailed
+			result.FinishedAt = time.Now()
+			result.Error = &StepError{Type: "recovery", Message: fmt.Sprintf("branch child %q has mismatched saved result identity %q; refusing replay", bs.ID, saved.StepID), Timestamp: result.FinishedAt}
+			return result
+		}
+		sr, adopted, err := e.adoptBranchChild(ctx, decision, &bs, workflow)
+		if err != nil {
+			result.Status = StatusFailed
+			result.Output = strings.Join(outputs, "\n")
+			result.FinishedAt = time.Now()
+			result.Error = &StepError{Type: "branch_recovery", Message: err.Error(), Timestamp: result.FinishedAt}
+			if isStepAdmissionError(err) {
+				result.Error.Type = "step_limit"
 			}
+			return result
+		}
+		if !adopted {
+			// Unsettled children retain the canonical retry, cancellation and
+			// external-effect receipt rules. Only proven completion is adopted.
+			sr = e.executeStep(ctx, &bs, workflow)
+		} else {
+			slog.Info("branch child result adopted", "run_id", e.state.RunID, "step_id", bs.ID, "status", sr.Status)
 		}
 		outputs = append(outputs, sr.Output)
 
-		e.stateMu.Lock()
-		e.state.Steps[bs.ID] = sr
-		e.stateMu.Unlock()
-
-		// bd-2g48y: branch body steps reach this seam via executeStepOnce
-		// (not the executeStep retry loop), so the OnSuccess hook at
-		// executor.go:847 was never fired for an on_success chain attached
-		// to a branch body step. Fire it here on the same Completed
-		// contract (matches command-step parents and bd-h8lc4's top-level
-		// Parallel/Loop fix). bs.ID is already namespaced via
-		// scopedChildStepID above so OnSuccess child results land at
-		// <branch.ID>_<branchKey>_<chosenChild>_on_success_<...>.
-		if sr.Status == StatusCompleted {
-			e.runOnSuccessSteps(ctx, &bs, workflow)
+		// executeStep has retired this child's in-flight marker. Persist the
+		// settled result before another child (or any of its side effects) can
+		// begin. A storage fault is fatal even under on_error: continue.
+		if err := e.checkpointBranchChild(ctx, step.ID, &bs, sr); err != nil {
+			result.Output = strings.Join(outputs, "\n")
+			result.Status = StatusFailed
+			result.FinishedAt = time.Now()
+			result.Error = &StepError{Type: "checkpoint", Message: err.Error(), Timestamp: result.FinishedAt}
+			return result
 		}
 
 		if sr.Status == StatusFailed || sr.Status == StatusCancelled {
@@ -301,6 +315,26 @@ func (e *Executor) executeOnFailureRecovery(ctx context.Context, step *Step, wor
 	if step == nil || len(step.OnFailure.Fallback) == 0 {
 		return failed
 	}
+	// Even a nonsuppressing fallback creates owned child evidence that can
+	// make an unresolved selector ineligible for explicit acceptance.
+	if e.hasUnresolvedCommandExecution(step) || e.hasUnresolvedCommandEvaluation(step) {
+		return failed
+	}
+	if delivery, exists := e.loadAgentDelivery(onFailureStepID(step.ID)); exists && delivery.Status != agentDeliveryNotSent {
+		// An accepted child cannot suppress a failure caused by changing its
+		// parent or its own materialized definition during recovery.
+		if err := e.validateOnFailureDelivery(ctx, step, delivery); err != nil {
+			return e.recordRecoveryFailure(failed, step.ID, err)
+		}
+	}
+	if err := e.admitRuntimeIDs(ctx, []string{onFailureStepID(step.ID)}); err != nil {
+		return e.recordRecoveryFailure(failed, step.ID, err)
+	}
+	release, err := e.acquireStepMaterialization(ctx, 1)
+	if err != nil {
+		return e.recordRecoveryFailure(failed, step.ID, err)
+	}
+	defer release()
 
 	recoveryStep, suppressFailure, err := e.recoveryStepFromFallback(ctx, step)
 	if err != nil {
@@ -363,17 +397,37 @@ func onSuccessChildStepID(parentID, childID string, ordinal int) string {
 	return fmt.Sprintf("%s_on_success_%s", parentID, childID)
 }
 
+var errStepProcessUnsettled = errors.New("step process settlement is uncertain")
+
+func unsettledProcessStepFailure(result StepResult, err error) StepResult {
+	result.Status, result.FinishedAt = StatusFailed, time.Now()
+	diagnostic := &StepError{Type: "execution_unknown", Message: err.Error(), Timestamp: result.FinishedAt}
+	if result.Error != nil {
+		diagnostic.Aggregated = []StepError{cloneStepErrorValue(*result.Error)}
+	}
+	result.Error = diagnostic
+	return result
+}
+
+func successHookExecutionFailure(result StepResult, err error) StepResult {
+	if !isStepAdmissionError(err) && errors.Is(err, errStepProcessUnsettled) {
+		return unsettledProcessStepFailure(result, err)
+	}
+	return stepAdmissionExecutionFailure(result, err)
+}
+
 // runOnSuccessSteps walks Step.OnSuccess sequentially after a parent
 // step has reached StatusCompleted. Each child runs through executeStep
 // (so its own OnSuccess chain fires recursively) up to maxOnSuccessDepth
 // total. Depth is tracked in the context so recursion through executeStep
-// is bounded even though the call site stays simple. Failures inside an
-// OnSuccess child are logged but NEVER change the parent's Status —
-// they're side-effect dispatches (notifications, hand-offs) rather
-// than gating steps (bd-w6nth.7).
-func (e *Executor) runOnSuccessSteps(ctx context.Context, parent *Step, workflow *Workflow) {
+// is bounded even though the call site stays simple. Ordinary child failures
+// are logged without changing the parent's status (bd-w6nth.7). Capacity
+// refusal or uncertain process settlement leaves the parent failed with its
+// native receipt intact so a later attempt can finish pending hooks without
+// repeating the parent effect.
+func (e *Executor) runOnSuccessSteps(ctx context.Context, parent *Step, workflow *Workflow) error {
 	if parent == nil || len(parent.OnSuccess) == 0 {
-		return
+		return nil
 	}
 	depth := onSuccessDepth(ctx)
 	if depth >= maxOnSuccessDepth {
@@ -384,7 +438,7 @@ func (e *Executor) runOnSuccessSteps(ctx context.Context, parent *Step, workflow
 			"depth", depth,
 			"max_depth", maxOnSuccessDepth,
 		)
-		return
+		return nil
 	}
 
 	childCtx := withOnSuccessDepth(ctx, depth+1)
@@ -392,10 +446,33 @@ func (e *Executor) runOnSuccessSteps(ctx context.Context, parent *Step, workflow
 	for i := range parent.OnSuccess {
 		child := parent.OnSuccess[i]
 		child.ID = onSuccessChildStepID(parent.ID, child.ID, i+1)
+		e.stateMu.RLock()
+		prior, exists := e.state.Steps[child.ID]
+		e.stateMu.RUnlock()
+		if exists && !shouldRerunStep(prior) {
+			// The parent command/delivery receipt can be durable before its
+			// StepResult. Adopting it must not repeat already-finished hooks.
+			continue
+		}
 
 		result := e.executeStep(childCtx, &child, workflow)
+		if !e.runtimeIDAdmitted(child.ID) {
+			if cause := findStepAdmissionError(result.Error); cause != nil {
+				return &stepAdmissionPropagationError{message: fmt.Sprintf("success hook %q was not admitted: %s", child.ID, cause.Message)}
+			}
+			if result.Error != nil {
+				return fmt.Errorf("success hook %q was not admitted: %s", child.ID, result.Error.Message)
+			}
+			return fmt.Errorf("success hook %q was not admitted", child.ID)
+		}
 		if result.FinishedAt.IsZero() {
 			result.FinishedAt = time.Now()
+		}
+		var settlementErr error
+		if findStepAdmissionError(result.Error) == nil &&
+			(e.hasUnresolvedCommandExecutionForOutcome(&child, &result) || e.hasUnresolvedCommandEvaluation(&child)) {
+			settlementErr = fmt.Errorf("%w for success hook %q", errStepProcessUnsettled, child.ID)
+			result = unsettledProcessStepFailure(result, settlementErr)
 		}
 
 		e.stateMu.Lock()
@@ -411,6 +488,12 @@ func (e *Executor) runOnSuccessSteps(ctx context.Context, parent *Step, workflow
 			)
 		}
 		e.stateMu.Unlock()
+		if cause := findStepAdmissionError(result.Error); cause != nil {
+			return &stepAdmissionPropagationError{message: fmt.Sprintf("success hook %q exceeded capacity: %s", child.ID, cause.Message)}
+		}
+		if settlementErr != nil {
+			return settlementErr
+		}
 
 		if child.OutputVar != "" && result.Status == StatusCompleted {
 			e.varMu.Lock()
@@ -422,6 +505,7 @@ func (e *Executor) runOnSuccessSteps(ctx context.Context, parent *Step, workflow
 			e.varMu.Unlock()
 		}
 	}
+	return e.stepAdmissionFailure(ctx)
 }
 
 // runPostPipelineSteps iterates Workflow.PostPipelineSteps in order after
@@ -429,24 +513,54 @@ func (e *Executor) runOnSuccessSteps(ctx context.Context, parent *Step, workflow
 // executeStep machinery so it inherits retries, on_failure, and routing.
 // Failures here are persisted into state.Steps but DO NOT change the
 // overall pipeline status — post-pipeline steps are for cleanup and
-// notification, not gating (bd-w6nth.5).
-func (e *Executor) runPostPipelineSteps(ctx context.Context, workflow *Workflow) {
+// notification, not gating (bd-w6nth.5). Only ambiguous ownership of persisted
+// step/dispatch identities is returned as a fatal workflow error.
+func (e *Executor) runPostPipelineSteps(ctx context.Context, workflow *Workflow) error {
+	ctx = finalizationContext(ctx)
 	if workflow == nil || len(workflow.PostPipelineSteps) == 0 {
-		return
+		return nil
+	}
+	checkOwnership := func() error {
+		e.stateMu.RLock()
+		defer e.stateMu.RUnlock()
+		if e.graph != nil {
+			if phaseErrors := e.graph.validatePhaseOwnership(e.state); len(phaseErrors) > 0 {
+				return phaseErrors[0]
+			}
+		}
+		return nil
 	}
 
 	for i := range workflow.PostPipelineSteps {
+		if ctx.Err() != nil || e.checkpointFailure() != nil {
+			return nil
+		}
+		// Main work or an earlier hook may materialize dynamic IDs after
+		// initial preflight. Do not adopt them as a different hook's result.
+		if err := checkOwnership(); err != nil {
+			return err
+		}
 		step := workflow.PostPipelineSteps[i]
 		if step.ID == "" {
 			step.ID = fmt.Sprintf("post_pipeline_%d", i+1)
 		}
 
 		e.stateMu.Lock()
+		if prior, exists := e.state.Steps[step.ID]; exists && !shouldRerunStep(prior) {
+			// A previous attempt may have checkpointed only part of the
+			// post-pipeline tail. Resume restores these outputs before the
+			// main graph runs; do not repeat a completed handoff's effects.
+			e.stateMu.Unlock()
+			continue
+		}
 		e.state.CurrentStep = step.ID
 		e.state.UpdatedAt = time.Now()
 		e.stateMu.Unlock()
 
 		result := e.executeStep(ctx, &step, workflow)
+		if !e.runtimeIDAdmitted(step.ID) {
+			continue
+		}
 		if result.FinishedAt.IsZero() {
 			result.FinishedAt = time.Now()
 		}
@@ -483,6 +597,7 @@ func (e *Executor) runPostPipelineSteps(ctx context.Context, workflow *Workflow)
 
 		e.persistState()
 	}
+	return checkOwnership()
 }
 
 func (e *Executor) executeOnFailureAction(step *Step, failed StepResult) StepResult {
@@ -491,6 +606,11 @@ func (e *Executor) executeOnFailureAction(step *Step, failed StepResult) StepRes
 	}
 	action := strings.TrimSpace(step.OnFailure.Action)
 	if action == "" || knownFailureAction(action) {
+		return failed
+	}
+	// A skipped source is treated as consumed output during recovery. Keep
+	// the original failed result and variables until settlement is known.
+	if e.hasUnresolvedCommandExecution(step) || e.hasUnresolvedCommandEvaluation(step) {
 		return failed
 	}
 
@@ -579,31 +699,47 @@ func knownFailureAction(action string) bool {
 // per-iteration overlay instead of falling back to the unpopulated
 // state.Variables["round"].
 func (e *Executor) recoveryStepFromFallback(ctx context.Context, step *Step) (*Step, bool, error) {
-	fallback := step.OnFailure.Fallback
+	return recoveryStepDefinition(step.ID, step.OnFailure.Fallback, func(value string) string {
+		return e.substituteVariablesCtx(ctx, value)
+	})
+}
+
+const onFailureStepSuffix = ".on_failure"
+
+func onFailureStepID(parentID string) string { return parentID + onFailureStepSuffix }
+
+// The namespace resolver and dispatcher share one definition constructor.
+// A nil substitution function describes the frozen authoring structure only;
+// unresolved pane expressions cannot be used to dispatch until materialized.
+func recoveryStepDefinition(parentID string, fallback map[string]interface{}, substitute func(string) string) (*Step, bool, error) {
+	static := substitute == nil
+	if static {
+		substitute = func(value string) string { return value }
+	}
 	template, ok := recoveryStringValue(fallback["template"])
 	if !ok || strings.TrimSpace(template) == "" {
 		return nil, false, fmt.Errorf("on_failure recovery requires non-empty template")
 	}
-	template = e.substituteVariablesCtx(ctx, template)
+	template = substitute(template)
 
-	pane, err := e.recoveryPaneSpec(ctx, fallback["pane"])
+	pane, err := recoveryPaneSpec(fallback["pane"], substitute, static)
 	if err != nil {
 		return nil, false, err
 	}
 
-	params, err := e.recoveryParams(ctx, fallback["params"])
+	params, err := recoveryParams(fallback["params"], substitute)
 	if err != nil {
 		return nil, false, err
 	}
 
 	wait := WaitNone
 	if rawWait, ok := recoveryStringValue(fallback["wait"]); ok && strings.TrimSpace(rawWait) != "" {
-		wait = WaitCondition(e.substituteVariablesCtx(ctx, rawWait))
+		wait = WaitCondition(substitute(rawWait))
 	}
 
 	return &Step{
-		ID:       step.ID + ".on_failure",
-		Name:     "on_failure recovery for " + step.ID,
+		ID:       onFailureStepID(parentID),
+		Name:     "on_failure recovery for " + parentID,
 		Template: template,
 		Pane:     pane,
 		Params:   params,
@@ -611,7 +747,7 @@ func (e *Executor) recoveryStepFromFallback(ctx context.Context, step *Step) (*S
 	}, recoveryBoolValue(fallback["suppress_failure"]), nil
 }
 
-func (e *Executor) recoveryPaneSpec(ctx context.Context, raw interface{}) (PaneSpec, error) {
+func recoveryPaneSpec(raw interface{}, substitute func(string) string, static bool) (PaneSpec, error) {
 	switch v := raw.(type) {
 	case int:
 		if v > 0 {
@@ -631,17 +767,20 @@ func (e *Executor) recoveryPaneSpec(ctx context.Context, raw interface{}) (PaneS
 			return PaneSpec{Index: int(n)}, nil
 		}
 	case string:
-		resolved := strings.TrimSpace(e.substituteVariablesCtx(ctx, v))
+		resolved := strings.TrimSpace(substitute(v))
 		n, err := strconv.Atoi(resolved)
 		if err == nil && n > 0 {
 			return PaneSpec{Index: n}, nil
+		}
+		if static && strings.Contains(resolved, "${") {
+			return PaneSpec{Expr: resolved}, nil
 		}
 		return PaneSpec{}, fmt.Errorf("on_failure pane %q must resolve to a positive pane index", v)
 	}
 	return PaneSpec{}, fmt.Errorf("on_failure recovery requires positive pane index")
 }
 
-func (e *Executor) recoveryParams(ctx context.Context, raw interface{}) (map[string]interface{}, error) {
+func recoveryParams(raw interface{}, substitute func(string) string) (map[string]interface{}, error) {
 	if raw == nil {
 		return nil, nil
 	}
@@ -658,30 +797,102 @@ func (e *Executor) recoveryParams(ctx context.Context, raw interface{}) (map[str
 
 	resolved := make(map[string]interface{}, len(params))
 	for key, val := range params {
-		resolved[key] = e.recoveryParamValue(ctx, val)
+		resolved[key] = recoveryParamValue(val, substitute)
 	}
 	return resolved, nil
 }
 
-func (e *Executor) recoveryParamValue(ctx context.Context, val interface{}) interface{} {
+func recoveryParamValue(val interface{}, substitute func(string) string) interface{} {
 	switch v := val.(type) {
 	case string:
-		return e.substituteVariablesCtx(ctx, v)
+		return substitute(v)
 	case []interface{}:
 		out := make([]interface{}, len(v))
 		for i, item := range v {
-			out[i] = e.recoveryParamValue(ctx, item)
+			out[i] = recoveryParamValue(item, substitute)
 		}
 		return out
 	case map[string]interface{}:
 		out := make(map[string]interface{}, len(v))
 		for key, item := range v {
-			out[key] = e.recoveryParamValue(ctx, item)
+			out[key] = recoveryParamValue(item, substitute)
 		}
 		return out
 	default:
 		return val
 	}
+}
+
+func onFailureRuntimeStep(parentID, runtimeID string, parent *Step) (*Step, bool) {
+	if runtimeID != onFailureStepID(parentID) || len(parent.OnFailure.Fallback) == 0 {
+		return nil, false
+	}
+	child, _, err := recoveryStepDefinition(parentID, parent.OnFailure.Fallback, nil)
+	return child, err == nil
+}
+
+// A fallback delivery proves the parent already reached failure recovery. Do
+// not repeat its settled command merely to revisit an uncertain delivery or
+// publish an already-completed suppressing fallback. Non-suppressing completed
+// recovery retains the ordinary policy for retrying a failed command.
+func (e *Executor) pendingOnFailureDelivery(step *Step) (AgentDeliveryState, bool) {
+	if len(step.OnFailure.Fallback) == 0 {
+		return AgentDeliveryState{}, false
+	}
+	record, exists := e.loadAgentDelivery(onFailureStepID(step.ID))
+	return record, exists && record.Status != agentDeliveryNotSent &&
+		(record.Status != agentDeliveryCompleted || recoveryBoolValue(step.OnFailure.Fallback["suppress_failure"]))
+}
+
+func (e *Executor) validateOnFailureDelivery(ctx context.Context, parent *Step, record AgentDeliveryState) error {
+	if err := validateAgentDelivery(onFailureStepID(parent.ID), record, e.config.Session); err != nil {
+		return err
+	}
+	if record.ResolutionAction != "" {
+		e.stateMu.RLock()
+		_, err := agentDeliveryRecoveryEntry(e.state, record)
+		e.stateMu.RUnlock()
+		if err != nil {
+			return err
+		}
+	}
+	child, _, err := e.recoveryStepFromFallback(ctx, parent)
+	if err != nil {
+		return err
+	}
+	digest, err := agentStepHash(child)
+	if err != nil {
+		return err
+	}
+	if record.Kind != StepKindTemplate || record.StepHash != digest {
+		return fmt.Errorf("saved failure recovery for %q belongs to a different materialized definition; refusing to repeat its parent or delivery", parent.ID)
+	}
+	if parent.Command != "" {
+		original, exists := e.loadCommandExecution(parent.ID)
+		if !exists {
+			return fmt.Errorf("failure recovery for %q has lost its original command receipt", parent.ID)
+		}
+		if err := validateCommandExecution(parent.ID, original); err != nil {
+			return err
+		}
+		if original.ResolutionAction != "" {
+			e.stateMu.RLock()
+			_, err := commandExecutionRecoveryEntry(e.state, original)
+			e.stateMu.RUnlock()
+			if err != nil {
+				return err
+			}
+		}
+		digest, err := commandDefinitionHash(parent)
+		if err != nil {
+			return err
+		}
+		if original.Status != commandExecutionSettled || original.Result.Status != StatusFailed ||
+			original.StepHash != digest || original.StartedAt.After(record.StartedAt) {
+			return fmt.Errorf("failure recovery for %q no longer belongs to the original settled failed command; refusing to suppress or repeat it", parent.ID)
+		}
+	}
+	return nil
 }
 
 func (e *Executor) recordRecoveryFailure(failed StepResult, stepID string, err error) StepResult {
@@ -696,18 +907,25 @@ func (e *Executor) recordRecoveryFailure(failed StepResult, stepID string, err e
 	})
 	e.stateMu.Unlock()
 
-	if failed.Error == nil {
+	if failed.Error != nil {
+		// The original native receipt can share this pointer. Recovery
+		// diagnostics belong to the scheduler result, not its launch evidence.
+		original := cloneStepErrorValue(*failed.Error)
+		failed.Error = &original
+		if failed.Error.Details != "" {
+			failed.Error.Details += "\n"
+		}
+		failed.Error.Details += msg
+	} else {
 		failed.Error = &StepError{
 			Type:      "on_failure",
 			Message:   msg,
 			Timestamp: time.Now(),
 		}
-		return failed
 	}
-	if failed.Error.Details != "" {
-		failed.Error.Details += "\n"
+	if isStepAdmissionError(err) {
+		failed.Error.Aggregated = append(failed.Error.Aggregated, StepError{Type: "step_limit", Message: err.Error(), Timestamp: time.Now()})
 	}
-	failed.Error.Details += msg
 	return failed
 }
 

@@ -2,10 +2,11 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/sha256"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -17,12 +18,14 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
 	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/agent/ollama"
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/agentsession"
 	"github.com/Dicklesworthstone/ntm/internal/audit"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/checkpoint"
@@ -33,15 +36,18 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/gemini"
 	"github.com/Dicklesworthstone/ntm/internal/handoff"
 	"github.com/Dicklesworthstone/ntm/internal/hooks"
-	"github.com/Dicklesworthstone/ntm/internal/integrations/dcg"
 	"github.com/Dicklesworthstone/ntm/internal/models"
 	"github.com/Dicklesworthstone/ntm/internal/output"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/plugins"
+	"github.com/Dicklesworthstone/ntm/internal/policy"
+	"github.com/Dicklesworthstone/ntm/internal/privacy"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 	"github.com/Dicklesworthstone/ntm/internal/recipe"
+	"github.com/Dicklesworthstone/ntm/internal/recovery"
 	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/Dicklesworthstone/ntm/internal/spawnidentity"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/swarm"
@@ -60,8 +66,6 @@ type optionalDurationValue struct {
 	duration        *time.Duration
 	enabled         *bool
 }
-
-const maxStaggerInterval = 5 * time.Minute
 
 func newOptionalDurationValue(defaultDur time.Duration, dur *time.Duration, enabled *bool) *optionalDurationValue {
 	*dur = defaultDur // Set default
@@ -98,8 +102,8 @@ func (v *optionalDurationValue) Set(s string) error {
 	if dur < 0 {
 		return fmt.Errorf("stagger duration cannot be negative")
 	}
-	if dur > maxStaggerInterval {
-		return fmt.Errorf("stagger duration cannot exceed %s", maxStaggerInterval)
+	if dur > config.MaxSpawnStaggerDelay {
+		return fmt.Errorf("stagger duration cannot exceed %s", config.MaxSpawnStaggerDelay)
 	}
 	*v.duration = dur
 	return nil
@@ -324,8 +328,10 @@ func parseLocalFallbackProvider(raw string) (AgentType, error) {
 		return AgentTypeGemini, nil
 	case agentpkg.AgentTypeAntigravity:
 		return AgentTypeAntigravity, nil
+	case agentpkg.AgentTypeOmp:
+		return AgentTypeOmp, nil
 	default:
-		return "", fmt.Errorf("invalid --local-fallback-provider %q (expected one of: cc|cod|gmi|agy)", raw)
+		return "", fmt.Errorf("invalid --local-fallback-provider %q (expected one of: cc|cod|gmi|agy|omp)", raw)
 	}
 }
 
@@ -349,9 +355,14 @@ func canonicalSpawnAgentType(raw string) (AgentType, bool) {
 		return AgentTypeAider, true
 	case agentpkg.AgentTypeOpencode:
 		return AgentTypeOpencode, true
+	case agentpkg.AgentTypeOmp:
+		return AgentTypeOmp, true
 	case agentpkg.AgentTypeOllama:
 		return AgentTypeOllama, true
 	default:
+		if agentpkg.IsPluginType(agentpkg.AgentType(raw)) {
+			return AgentType(strings.ToLower(strings.TrimSpace(raw))), true
+		}
 		return "", false
 	}
 }
@@ -367,6 +378,7 @@ func orderedSpawnAgentTypes() []AgentType {
 		AgentTypeWindsurf,
 		AgentTypeAider,
 		AgentTypeOpencode,
+		AgentTypeOmp,
 		AgentTypeOllama,
 	}
 }
@@ -394,10 +406,28 @@ func canonicalSpawnCountTotals(counts map[string]int) map[AgentType]int {
 	return totals
 }
 
+// Keep the established built-in pane order, then append registered plugin
+// types deterministically. Template counts must not silently drop pi panes.
+func orderedSpawnCountTypes(totals map[AgentType]int) []AgentType {
+	ordered := orderedSpawnAgentTypes()
+	seen := make(map[AgentType]bool, len(ordered))
+	for _, agentType := range ordered {
+		seen[agentType] = true
+	}
+	var extra []AgentType
+	for agentType := range totals {
+		if !seen[agentType] {
+			extra = append(extra, agentType)
+		}
+	}
+	sort.Slice(extra, func(i, j int) bool { return extra[i] < extra[j] })
+	return append(ordered, extra...)
+}
+
 func formatSpawnCountSummary(counts map[string]int) string {
 	totals := canonicalSpawnCountTotals(counts)
 	parts := make([]string, 0, len(totals))
-	for _, agentType := range orderedSpawnAgentTypes() {
+	for _, agentType := range orderedSpawnCountTypes(totals) {
 		count := totals[agentType]
 		if count <= 0 {
 			continue
@@ -414,7 +444,7 @@ func appendMissingCountMapAgentSpecs(agentSpecs *AgentSpecs, counts map[string]i
 
 	existing := existingSpawnAgentTypes(*agentSpecs)
 	totals := canonicalSpawnCountTotals(counts)
-	for _, agentType := range orderedSpawnAgentTypes() {
+	for _, agentType := range orderedSpawnCountTypes(totals) {
 		count := totals[agentType]
 		if count <= 0 || existing[agentType] {
 			continue
@@ -595,6 +625,7 @@ func recomputeSpawnAgentCounts(opts *SpawnOptions) {
 	opts.WindsurfCount = 0
 	opts.AiderCount = 0
 	opts.OpencodeCount = 0
+	opts.OmpCount = 0
 	opts.OllamaCount = 0
 
 	for _, agent := range opts.Agents {
@@ -617,6 +648,8 @@ func recomputeSpawnAgentCounts(opts *SpawnOptions) {
 			opts.AiderCount++
 		case AgentTypeOpencode:
 			opts.OpencodeCount++
+		case AgentTypeOmp:
+			opts.OmpCount++
 		case AgentTypeOllama:
 			opts.OllamaCount++
 		}
@@ -642,6 +675,7 @@ func populateSpawnAgentsFromCounts(opts *SpawnOptions) {
 		{agentType: AgentTypeWindsurf, count: opts.WindsurfCount},
 		{agentType: AgentTypeAider, count: opts.AiderCount},
 		{agentType: AgentTypeOpencode, count: opts.OpencodeCount},
+		{agentType: AgentTypeOmp, count: opts.OmpCount},
 		{agentType: AgentTypeOllama, count: opts.OllamaCount},
 	}
 	for _, entry := range legacyCounts {
@@ -663,19 +697,47 @@ func normalizeSpawnOptions(opts *SpawnOptions) {
 	}
 }
 
+// validateSpawnStaggerOptions checks the stagger flags against the shared
+// vocabulary and bounds in internal/config (the same ones --robot-spawn and
+// the [spawn] table use). An out-of-range delay is rejected whatever the
+// mode, exactly as --robot-spawn rejects it.
 func validateSpawnStaggerOptions(opts SpawnOptions) error {
-	switch opts.StaggerMode {
-	case "", "none", "fixed", "smart":
-	default:
-		return fmt.Errorf("--stagger-mode must be one of none, fixed, or smart; got %q", opts.StaggerMode)
+	if err := config.ValidateSpawnStaggerMode(opts.StaggerMode); err != nil {
+		return fmt.Errorf("--stagger-mode %w", err)
 	}
-	if opts.Stagger < 0 || opts.Stagger > maxStaggerInterval {
-		return fmt.Errorf("--stagger must be between 0 and %s", maxStaggerInterval)
+	if err := config.ValidateSpawnStaggerDelay(opts.Stagger); err != nil {
+		return fmt.Errorf("--stagger %w", err)
 	}
-	if opts.StaggerMode == "fixed" && (opts.StaggerDelay < 0 || opts.StaggerDelay > maxStaggerInterval) {
-		return fmt.Errorf("--stagger-delay must be between 0 and %s", maxStaggerInterval)
+	if err := config.ValidateSpawnStaggerDelay(opts.StaggerDelay); err != nil {
+		return fmt.Errorf("--stagger-delay %w", err)
 	}
 	return nil
+}
+
+// resolveSpawnStaggerDefaults fills the stagger settings a caller did not set
+// explicitly from the [spawn] config table: an explicit flag wins, then
+// [spawn], then the built-in default. `ntm spawn` and `--robot-spawn` both
+// resolve through here so they honor the table identically. A config-sourced
+// value is validated here so its error names the config key, not a flag.
+func resolveSpawnStaggerDefaults(cfg *config.Config, mode string, modeSet bool, delay time.Duration, delaySet bool) (string, time.Duration, error) {
+	if cfg == nil {
+		return mode, delay, nil
+	}
+	if !modeSet {
+		if err := config.ValidateSpawnStaggerMode(cfg.Spawn.StaggerMode); err != nil {
+			return "", 0, fmt.Errorf("[spawn] stagger_mode %w", err)
+		}
+		if cfg.Spawn.StaggerMode != "" {
+			mode = cfg.Spawn.StaggerMode
+		}
+	}
+	if !delaySet {
+		if err := config.ValidateSpawnStaggerDelay(cfg.Spawn.StaggerDelay); err != nil {
+			return "", 0, fmt.Errorf("[spawn] stagger_delay %w", err)
+		}
+		delay = cfg.Spawn.StaggerDelay
+	}
+	return mode, delay, nil
 }
 
 func validateSpawnPaneEnv(env map[string]string) error {
@@ -730,6 +792,65 @@ func prependSpawnPaneEnv(command string, env map[string]string) string {
 	return prefix.String() + command
 }
 
+// captureAgentLaunchSpec records the rendered template before runtime-only
+// environment is injected. Explicit environment values remain outside durable
+// metadata; their names prevent recovery from silently launching without them.
+func captureAgentLaunchSpec(agentType AgentType, command, model, modelAlias, personaName, effort, systemPromptFile string, environments ...map[string]string) (tmux.AgentLaunchSpec, error) {
+	spec := tmux.AgentLaunchSpec{
+		Version:         tmux.AgentLaunchSpecVersion,
+		AgentType:       tmux.AgentType(agentType).Canonical(),
+		Command:         command,
+		Model:           model,
+		ModelAlias:      modelAlias,
+		Persona:         personaName,
+		ReasoningEffort: effort,
+	}
+	if binding := resilience.CaptureLaunchBinding(string(agentType)); binding != nil {
+		spec.CAAMProfile = binding.Identifier
+	}
+	if agentType == AgentTypeClaude && cfg != nil && cfg.Agents.ClaudeIsolateCredentials {
+		spec.ClaudeIsolateCredentials = true
+		var err error
+		spec.ClaudeTokenFile, err = swarm.ResolveClaudeSetupTokenFile(cfg.Agents.ClaudeTokenFile)
+		if err != nil {
+			return spec, fmt.Errorf("capture Claude token file reference: %w", err)
+		}
+	}
+	if systemPromptFile != "" {
+		file, err := os.Open(systemPromptFile)
+		if err != nil {
+			return spec, fmt.Errorf("open prepared persona prompt: %w", err)
+		}
+		defer file.Close()
+		info, err := file.Stat()
+		if err != nil || !info.Mode().IsRegular() {
+			return spec, errors.New("prepared persona prompt must be a readable regular file")
+		}
+		hash := sha256.New()
+		const maxPromptBytes = 1 << 20
+		count, err := io.Copy(hash, io.LimitReader(file, maxPromptBytes+1))
+		if err != nil {
+			return spec, fmt.Errorf("read prepared persona prompt: %w", err)
+		}
+		if count > maxPromptBytes {
+			return spec, errors.New("prepared persona prompt exceeds launch metadata verification limit")
+		}
+		spec.SystemPromptFile = systemPromptFile
+		spec.SystemPromptSHA256 = fmt.Sprintf("%x", hash.Sum(nil))
+	}
+	keys := make(map[string]bool)
+	for _, environment := range environments {
+		for name := range environment {
+			keys[name] = true
+		}
+	}
+	for name := range keys {
+		spec.OmittedEnv = append(spec.OmittedEnv, name)
+	}
+	sort.Strings(spec.OmittedEnv)
+	return spec, nil
+}
+
 func validateSpawnAgentTypes(agents []FlatAgent, pluginMap map[string]plugins.AgentPlugin, personaMap map[string]*persona.Persona) error {
 	if err := validateAgentModelOverrides(agents, personaMap); err != nil {
 		return err
@@ -737,7 +858,7 @@ func validateSpawnAgentTypes(agents []FlatAgent, pluginMap map[string]plugins.Ag
 	for _, agent := range agents {
 		switch agent.Type {
 		case AgentTypeClaude, AgentTypeCodex, AgentTypeGemini, AgentTypeAntigravity, AgentTypeGrok,
-			AgentTypeOllama, AgentTypeCursor, AgentTypeWindsurf, AgentTypeAider, AgentTypeOpencode:
+			AgentTypeOllama, AgentTypeCursor, AgentTypeWindsurf, AgentTypeAider, AgentTypeOpencode, AgentTypeOmp:
 			continue
 		default:
 			if _, ok := pluginMap[string(agent.Type)]; !ok {
@@ -795,6 +916,10 @@ func spawnAgentCommandTemplate(agentType AgentType, pluginMap map[string]plugins
 		// `[agents] oc = "..."` to point at a wrapper script or pin a
 		// specific provider/model. See ntm#193.
 		return opencodeCommandOrDefault(cfg.Agents.Opencode), nil, nil
+	case AgentTypeOmp:
+		// `omp --auto-approve` with --model/--thinking/--append-system-prompt
+		// injected only when requested; `[agents] omp = "..."` overrides.
+		return config.OmpCommandOrDefault(cfg.Agents.Omp), nil, nil
 	default:
 		if p, ok := pluginMap[string(agentType)]; ok {
 			return p.Command, p.Env, nil
@@ -909,21 +1034,26 @@ func validateSpawnPaneCapacity(panes []tmux.Pane, startIdx, agentCount int) erro
 	return nil
 }
 
-func validateSpawnGrokPaneBaselines(panes []tmux.Pane, startIdx int, agents []FlatAgent) error {
+// validateSpawnPaneBaselines preflights every pane the batch will launch
+// into, for every agent type, before any agent is launched. Spawning into an
+// existing session reuses its panes positionally; if one of them is already
+// running a process (a live agent, `cat`, an editor), tmux send-keys would
+// happily type the launch command into that process and spawn would report
+// success (#291). Checking the whole batch first also prevents a partial
+// launch where agents 1..k start and agent k+1 is refused.
+func validateSpawnPaneBaselines(ctx context.Context, session string, panes []tmux.Pane, startIdx int, agents []FlatAgent) error {
 	for agentOffset, launch := range agents {
-		if launch.Type != AgentTypeGrok {
-			continue
-		}
 		paneOffset := startIdx + agentOffset
 		if paneOffset < 0 || paneOffset >= len(panes) {
 			return fmt.Errorf(
-				"no assigned pane for Grok Build agent %d at offset %d",
+				"no assigned pane for %s agent %d at offset %d",
+				launch.Type,
 				launch.Index,
 				paneOffset,
 			)
 		}
-		if err := tmux.ValidatePaneLaunchBaseline(panes[paneOffset]); err != nil {
-			return fmt.Errorf("validate Grok Build agent %d: %w", launch.Index, err)
+		if err := tmux.ValidatePaneLaunchBaselineSettledContext(ctx, session, panes[paneOffset]); err != nil {
+			return fmt.Errorf("%s agent %d: %w (use `ntm add` to grow a session that already has running panes)", launch.Type, launch.Index, err)
 		}
 	}
 	return nil
@@ -1025,7 +1155,7 @@ func sortPanesForAssignment(panes []tmux.Pane) {
 }
 
 func legacySpawnTotalAgentCount(opts SpawnOptions) int {
-	return opts.CCCount + opts.CodCount + opts.GmiCount + opts.AgyCount + opts.GrokCount + opts.CursorCount + opts.WindsurfCount + opts.AiderCount + opts.OpencodeCount + opts.OllamaCount
+	return opts.CCCount + opts.CodCount + opts.GmiCount + opts.AgyCount + opts.GrokCount + opts.CursorCount + opts.WindsurfCount + opts.AiderCount + opts.OpencodeCount + opts.OmpCount + opts.OllamaCount
 }
 
 func spawnHookCountEnv(totalAgents int, opts SpawnOptions) map[string]string {
@@ -1039,6 +1169,7 @@ func spawnHookCountEnv(totalAgents int, opts SpawnOptions) map[string]string {
 		"NTM_AGENT_COUNT_WINDSURF": fmt.Sprintf("%d", opts.WindsurfCount),
 		"NTM_AGENT_COUNT_AIDER":    fmt.Sprintf("%d", opts.AiderCount),
 		"NTM_AGENT_COUNT_OC":       fmt.Sprintf("%d", opts.OpencodeCount),
+		"NTM_AGENT_COUNT_OMP":      fmt.Sprintf("%d", opts.OmpCount),
 		"NTM_AGENT_COUNT_OLLAMA":   fmt.Sprintf("%d", opts.OllamaCount),
 		"NTM_AGENT_COUNT_TOTAL":    fmt.Sprintf("%d", totalAgents),
 	}
@@ -1058,6 +1189,7 @@ func spawnSessionCreatedEventFields(opts SpawnOptions, dir string) map[string]st
 		"agent_windsurf": fmt.Sprintf("%d", opts.WindsurfCount),
 		"agent_aider":    fmt.Sprintf("%d", opts.AiderCount),
 		"agent_oc":       fmt.Sprintf("%d", opts.OpencodeCount),
+		"agent_omp":      fmt.Sprintf("%d", opts.OmpCount),
 		"agent_ollama":   fmt.Sprintf("%d", opts.OllamaCount),
 	}
 }
@@ -1124,61 +1256,25 @@ func (v *optionalDurationValue) NoOptDefVal() string {
 	return v.defaultDuration.String()
 }
 
-func resolveEffectiveStaggerMode(opts SpawnOptions) string {
-	effective := opts.StaggerMode
-	if effective == "" || effective == "none" {
-		if opts.StaggerEnabled && opts.Stagger > 0 {
-			return "legacy"
-		}
+// spawnStaggerRequest maps the stagger flags onto the shared stagger contract.
+// A bare --stagger (or --stagger=DURATION) is the legacy interval and applies
+// only while --stagger-mode is none.
+func spawnStaggerRequest(opts SpawnOptions) robot.SpawnStaggerRequest {
+	request := robot.SpawnStaggerRequest{Mode: opts.StaggerMode, Delay: opts.StaggerDelay}
+	if opts.StaggerEnabled {
+		request.Legacy = opts.Stagger
 	}
-	return effective
+	return request
 }
 
-func resolveStaggerInterval(mode string, opts SpawnOptions, tracker *ratelimit.RateLimitTracker) time.Duration {
-	interval := opts.Stagger
-	switch mode {
-	case "fixed":
-		interval = opts.StaggerDelay
-	case "smart":
-		if tracker != nil {
-			// Determine provider priority: Anthropic > OpenAI > Google
-			provider := "anthropic" // Default to strictest
-
-			hasAnthropic := opts.CCCount > 0
-			hasOpenAI := opts.CodCount > 0
-			hasGoogle := opts.GmiCount > 0 || opts.AgyCount > 0
-
-			// Check detailed agent list if available (source of truth)
-			if len(opts.Agents) > 0 {
-				hasAnthropic = false
-				hasOpenAI = false
-				hasGoogle = false
-				for _, a := range opts.Agents {
-					switch a.Type {
-					case AgentTypeClaude:
-						hasAnthropic = true
-					case AgentTypeCodex:
-						hasOpenAI = true
-					case AgentTypeGemini:
-						hasGoogle = true
-					case AgentTypeAntigravity:
-						hasGoogle = true
-					}
-				}
-			}
-
-			if hasAnthropic {
-				provider = "anthropic"
-			} else if hasOpenAI {
-				provider = "openai"
-			} else if hasGoogle {
-				provider = "google"
-			}
-
-			interval = tracker.GetOptimalDelay(provider)
-		}
+// spawnStaggerAgentTypes lists the batch's agent types in launch order for
+// smart-mode provider selection.
+func spawnStaggerAgentTypes(agents []FlatAgent) []string {
+	types := make([]string, 0, len(agents))
+	for _, agent := range agents {
+		types = append(types, string(agent.Type))
 	}
-	return interval
+	return types
 }
 
 func codexCooldownRemaining(tracker *ratelimit.RateLimitTracker, alreadyWaited bool) (time.Duration, bool) {
@@ -1203,6 +1299,7 @@ type SpawnOptions struct {
 	WindsurfCount      int
 	AiderCount         int
 	OpencodeCount      int
+	OmpCount           int
 	OllamaCount        int
 	UserPane           bool
 	AutoRestart        bool
@@ -1477,6 +1574,8 @@ func cloneSpawnActionableRecommendations(source []bv.TriageRecommendation) []bv.
 // RecoveryContext holds all the information needed to help an agent recover
 // from a previous session, including beads, messages, and procedural memories.
 type RecoveryContext struct {
+	// Handoff preserves the previous session's authored task and decisions.
+	Handoff *RecoveryHandoff `json:"handoff,omitempty"`
 	// Checkpoint contains checkpoint info for recovery
 	Checkpoint *RecoveryCheckpoint `json:"checkpoint,omitempty"`
 	// Beads contains in-progress beads from BV
@@ -1501,6 +1600,13 @@ type RecoveryContext struct {
 	TokenCount int `json:"token_count,omitempty"`
 	// Error contains error info if recovery was partial
 	Error *RecoveryError `json:"error,omitempty"`
+}
+
+// RecoveryHandoff retains the selected source and the bounded shared recovery
+// formatter output. The prepared text is reused for every newly spawned agent.
+type RecoveryHandoff struct {
+	Path   string `json:"path"`
+	Prompt string `json:"prompt"`
 }
 
 // RecoveryError represents an error during recovery context building.
@@ -1723,6 +1829,8 @@ Stagger mode (--stagger-mode):
 
   Legacy --stagger flag still works for duration-based staggering.
   Smart mode automatically backs off on rate limits and speeds up on success.
+  Defaults come from the [spawn] config table (stagger_mode, stagger_delay)
+  when the flags are not given; --robot-spawn shares the same stagger planner.
 
 Worktree isolation (--worktrees):
   Creates separate Git worktrees for each agent, allowing safe parallel work.
@@ -1737,7 +1845,7 @@ Worktree isolation (--worktrees):
 Local fallback (--local-fallback):
   If Ollama is unavailable or model preflight fails, local agents can be
   converted to cloud agents instead of failing spawn.
-  --local-fallback-provider selects fallback target (cc, cod, gmi, agy).
+  --local-fallback-provider selects fallback target (cc, cod, gmi, agy, omp).
 
 For running multiple agent swarms on the same project with different goals,
 use --label:
@@ -1752,6 +1860,8 @@ Examples:
   ntm spawn myproject --cc=2 --cod=2           # 2 Claude, 2 Codex + user pane
   ntm spawn myproject --cc=3 --cod=3 --agy=1   # 3 Claude, 3 Codex, 1 Antigravity
   ntm spawn myproject --cc=3 --cod=3 --gmi=1   # legacy: Gemini CLI instead of Antigravity
+  ntm spawn myproject --omp=8 --no-user        # 8 Oh My Pi agents on omp's configured default model
+  ntm spawn myproject --omp=2:opus:high        # omp with --model opus --thinking high
   ntm spawn myproject --cc=4 --no-user         # 4 Claude, no user pane
   ntm spawn myproject -r full-stack            # Use full-stack recipe
   ntm spawn myproject -t red-green             # Use red-green workflow template
@@ -1983,6 +2093,18 @@ Examples:
 				agentsFlat = expanded
 			}
 
+			// [spawn] supplies stagger defaults beneath the flags. An explicit
+			// legacy --stagger also counts as choosing the mode, so it is not
+			// overridden by a configured stagger_mode.
+			var staggerErr error
+			staggerMode, staggerDelay, staggerErr = resolveSpawnStaggerDefaults(
+				cfg, staggerMode, cmd.Flags().Changed("stagger-mode") || cmd.Flags().Changed("stagger"),
+				staggerDelay, cmd.Flags().Changed("stagger-delay"),
+			)
+			if staggerErr != nil {
+				return staggerErr
+			}
+
 			opts := SpawnOptions{
 				Session:                 sessionName,
 				PaneEnv:                 paneEnv,
@@ -2051,18 +2173,19 @@ Examples:
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeClaude, &agentSpecs), "cc", "Claude agents (N, N:model, N:model:effort, or N:model@effort)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeCodex, &agentSpecs), "cod", "Codex agents (N, N:model, N:model:effort, or N:model@effort)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGemini, &agentSpecs), "gmi", "Gemini agents (N or N:model, model charset: a-zA-Z0-9._/@:+-)")
-	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAntigravity, &agentSpecs), "agy", "Antigravity (agy) agents (N; model is pinned to Gemini 3.7 Flash (High))")
+	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAntigravity, &agentSpecs), "agy", "Antigravity (agy) agents (N; model is pinned to Gemini 4 Argon (High))")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGrok, &agentSpecs), "grok", "Grok Build agents (N, N:model, N:model:effort, or N:model@effort)")
 	cmd.Flags().IntVar(&localCount, "local", 0, "Local agents via Ollama (alias: --ollama)")
 	cmd.Flags().IntVar(&ollamaCount, "ollama", 0, "Alias for --local (explicit Ollama)")
 	cmd.Flags().StringVar(&localModel, "local-model", "codellama:latest", "Ollama model to run for --local/--ollama agents")
 	cmd.Flags().StringVar(&localHost, "local-host", "", "Ollama host URL for --local/--ollama agents (overrides OLLAMA_HOST/NTM_OLLAMA_HOST)")
 	cmd.Flags().BoolVar(&localFallback, "local-fallback", false, "Fallback local Ollama agents to cloud provider when preflight fails")
-	cmd.Flags().StringVar(&localFallbackProvider, "local-fallback-provider", "cod", "Provider for --local-fallback: cc|cod|gmi|agy")
+	cmd.Flags().StringVar(&localFallbackProvider, "local-fallback-provider", "cod", "Provider for --local-fallback: cc|cod|gmi|agy|omp")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeCursor, &agentSpecs), "cursor", "Cursor agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeWindsurf, &agentSpecs), "windsurf", "Windsurf agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAider, &agentSpecs), "aider", "Aider agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeOpencode, &agentSpecs), "oc", "Opencode agents (N or N:model)")
+	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeOmp, &agentSpecs), "omp", "Oh My Pi (omp) agents (N, N:model, N:model:effort, or N:model@effort; effort maps to omp --thinking)")
 	cmd.Flags().Var(&personaSpecs, "persona", "Persona-defined agents (name or name:count)")
 	cmd.Flags().BoolVar(&noUserPane, "no-user", false, "don't reserve a pane for the user")
 	cmd.Flags().StringVarP(&recipeName, "recipe", "r", "", "use a recipe for agent configuration")
@@ -2080,8 +2203,8 @@ Examples:
 	cmd.Flags().Lookup("stagger").NoOptDefVal = staggerValue.NoOptDefVal()
 
 	// New stagger mode flags (bd-2wih)
-	cmd.Flags().StringVar(&staggerMode, "stagger-mode", "none", "Stagger mode: smart (adaptive), fixed, or none")
-	cmd.Flags().DurationVar(&staggerDelay, "stagger-delay", 30*time.Second, "Fixed delay between agents (used with --stagger-mode=fixed)")
+	cmd.Flags().StringVar(&staggerMode, "stagger-mode", config.SpawnStaggerNone, "Stagger mode: smart (adaptive), fixed, or none (unset: [spawn] stagger_mode)")
+	cmd.Flags().DurationVar(&staggerDelay, "stagger-delay", config.DefaultSpawnStaggerDelay, "Fixed delay between agents (used with --stagger-mode=fixed; unset: [spawn] stagger_delay)")
 
 	// CASS context flags
 	cmd.Flags().StringVar(&contextQuery, "cass-context", "", "Explicit context query for CASS")
@@ -2251,7 +2374,7 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 	if len(opts.Agents) == 0 {
 		totalAgents = legacySpawnTotalAgentCount(opts)
 		if totalAgents == 0 {
-			return outputError(fmt.Errorf("no agents specified (use --cc, --cod, --gmi, --agy, --grok, --cursor, --windsurf, --aider, --ollama or plugin flags)"))
+			return outputError(fmt.Errorf("no agents specified (use --cc, --cod, --gmi, --agy, --grok, --omp, --cursor, --windsurf, --aider, --oc, --ollama or plugin flags)"))
 		}
 	} else {
 		totalAgents = len(opts.Agents)
@@ -2573,6 +2696,16 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 	}
 	lifecycleSessionMayExist = true
 
+	// --privacy / --allow-persist bind every ntm process that persists this
+	// session's data, so they are recorded on the session before any agent
+	// starts. A privacy promise that cannot be recorded aborts the spawn.
+	if opts.PrivacyMode || opts.AllowPersist {
+		if err := tmux.SetSessionPrivacyContext(ctx, opts.Session, opts.PrivacyMode, opts.AllowPersist); err != nil {
+			return outputError(fmt.Errorf("recording privacy settings for session %s: %w", opts.Session, err))
+		}
+		privacy.GetDefaultManager().RegisterSession(opts.Session, opts.PrivacyMode, opts.AllowPersist)
+	}
+
 	// Make pane titles visible on stock tmux: pane-border-status defaults to
 	// "off", which hides every title NTM sets. Session-local only, and an
 	// existing user preference (top/bottom, local or inherited) is respected
@@ -2722,8 +2855,8 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 	if err := validateSpawnPaneCapacity(panes, startIdx, len(opts.Agents)); err != nil {
 		return outputError(err)
 	}
-	if err := validateSpawnGrokPaneBaselines(panes, startIdx, opts.Agents); err != nil {
-		return outputError(fmt.Errorf("validating Grok Build launch panes: %w", err))
+	if err := validateSpawnPaneBaselines(ctx, opts.Session, panes, startIdx, opts.Agents); err != nil {
+		return outputError(fmt.Errorf("validating agent launch panes: %w", err))
 	}
 
 	agentNum := startIdx
@@ -2774,6 +2907,17 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 		setupErrors[paneID] = errors.Join(setupErrors[paneID], setupErr)
 		setupErrorsMu.Unlock()
 	}
+	// promptedPanes records panes that received a delivered spawn prompt
+	// (recovery context, CASS context, or the user prompt). Delivery already
+	// waited for the pane to be idle at its prompt, so such a pane has booted;
+	// --verify-boot then accepts it working on that prompt (see
+	// bootedAgentPanesFromObservation).
+	promptedPanes := make(map[string]bool)
+	recordPromptDelivered := func(paneID string) {
+		setupErrorsMu.Lock()
+		promptedPanes[paneID] = true
+		setupErrorsMu.Unlock()
+	}
 
 	// Initialize rate limit tracker for smart stagger mode or Codex cooldown gating (bd-3qoly)
 	var rateLimitTracker *ratelimit.RateLimitTracker
@@ -2787,7 +2931,7 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 			}
 		}
 	}
-	if opts.StaggerMode == "smart" || hasCodex {
+	if opts.StaggerMode == config.SpawnStaggerSmart || hasCodex {
 		rateLimitTracker = ratelimit.NewRateLimitTracker(dir)
 		if err := rateLimitTracker.LoadFromDir(dir); err != nil {
 			if !IsJSONOutput() {
@@ -2796,16 +2940,16 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 		}
 	}
 
-	// Determine effective stagger mode (new mode takes precedence over legacy)
-	effectiveStaggerMode := resolveEffectiveStaggerMode(opts)
+	// Resolve the stagger through the planner shared with --robot-spawn (an
+	// explicit --stagger-mode takes precedence over the legacy --stagger).
+	stagger := robot.ResolveSpawnStagger(spawnStaggerRequest(opts), spawnStaggerAgentTypes(opts.Agents), rateLimitTracker)
 
 	// Spawn state for dashboard display (only used when stagger is enabled)
 	var spawnState *SpawnState
-	staggerInterval := resolveStaggerInterval(effectiveStaggerMode, opts, rateLimitTracker)
-	if effectiveStaggerMode != "none" && effectiveStaggerMode != "" && spawnHasPromptDelivery(opts) {
-		spawnState = NewSpawnState(spawnCtx.BatchID, int(staggerInterval.Seconds()), len(opts.Agents))
+	if stagger.Mode != config.SpawnStaggerNone && spawnHasPromptDelivery(opts) {
+		spawnState = NewSpawnState(spawnCtx.BatchID, int(stagger.Interval.Seconds()), len(opts.Agents))
 	}
-	isStaggered := effectiveStaggerMode != "none" && effectiveStaggerMode != "" && staggerInterval > 0
+	isStaggered := stagger.Active()
 	openAICooldownWaited := false
 
 	// Resolve CASS context if enabled
@@ -2863,10 +3007,27 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 	// instruction instead of racing the post-launch registration that used to
 	// run here. Lazily initialized — no Agent Mail traffic when registration
 	// is disabled or no agents launch.
-	identityCoordinator := newSpawnIdentityCoordinator(dir, opts.Session)
+	identityCoordinator := newSpawnIdentityCoordinator(dir, opts.Session, true)
+
+	// CAAM seat selection (ntm#319). One ranked query per provider for the
+	// whole spawn, resolved before the first agent command is sent. Off by
+	// default. A pane that already carries a persona — from --persona,
+	// --profile-set, or a recipe — is not offered to the planner, so its pin
+	// is never overridden.
+	spawnSeatCandidates := make([]caamSeatCandidate, 0, len(opts.Agents))
+	for i, agent := range opts.Agents {
+		_, mapped := opts.PersonaMap[agent.Model]
+		spawnSeatCandidates = append(spawnSeatCandidates, caamSeatCandidate{
+			Index:  i,
+			Type:   agent.Type,
+			Pinned: agent.Persona != nil || mapped,
+		})
+	}
+	seatPlan := planCAAMSeats(ctx, cfg, dir, spawnSeatCandidates)
+	var seatSkips []output.SeatSkipResponse
 
 	// Launch agents using flattened specs (preserves model info for pane naming)
-	for _, agent := range opts.Agents {
+	for agentIdx, agent := range opts.Agents {
 		if agentNum >= len(panes) {
 			return outputError(fmt.Errorf(
 				"spawn pane assignment invariant failed for agent %q index %d: pane offset %d exceeds %d discovered panes",
@@ -2875,10 +3036,24 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 		}
 
 		pane := panes[agentNum]
-		if agent.Type == AgentTypeGrok {
-			if err := tmux.ValidatePaneLaunchBaseline(pane); err != nil {
-				return outputError(fmt.Errorf("launching %s agent: %w", agent.Type, err))
+
+		// Seat selection refused this pane's pool: launch nothing into it and
+		// keep going, so a mixed spawn still brings up the providers that
+		// answered. The pane itself was already split before this loop, so it
+		// is left as a plain shell rather than silently launched on whatever
+		// the agent command template pins statically (ntm#319).
+		if reason, skipped := seatPlan.SkipReason(agentIdx); skipped {
+			decision, _ := seatPlan.For(agentIdx)
+			seatSkips = append(seatSkips, output.SeatSkipResponse{
+				AgentType: string(agent.Type),
+				Provider:  decision.Provider,
+				Reason:    reason,
+			})
+			if !IsJSONOutput() {
+				output.PrintWarningf("%s (pane %s left empty)", caamSeatSkipMessage(agent.Type, reason), pane.ID)
 			}
+			agentNum++
+			continue
 		}
 
 		if testPacing.agentDelay > 0 && staggerAgentIdx > 0 {
@@ -2907,59 +3082,16 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 			return outputError(err)
 		}
 
-		// Configure Claude hooks for DCG and RCH integrations
+		// Claude Code reads hooks only from settings, so the safety policy,
+		// dcg and rch PreToolUse hooks travel on the launch command as
+		// --settings (GenerateAgentCommand attaches them). The env var this
+		// used to set was never read by Claude Code.
+		var claudeLaunch policy.ClaudeAgentLaunch
 		if agent.Type == AgentTypeClaude {
-			var preToolHooks []dcg.HookEntry
-			var hookSources []string
-
-			if cfg.Integrations.DCG.Enabled && dcg.ShouldConfigureHooks(cfg.Integrations.DCG.Enabled, cfg.Integrations.DCG.BinaryPath) {
-				dcgOpts := dcg.DCGHookOptions{
-					BinaryPath:      cfg.Integrations.DCG.BinaryPath,
-					AuditLog:        cfg.Integrations.DCG.AuditLog,
-					Timeout:         5,
-					CustomBlocklist: cfg.Integrations.DCG.CustomBlocklist,
-					CustomWhitelist: cfg.Integrations.DCG.CustomWhitelist,
-				}
-				dcgConfig, err := dcg.GenerateHookConfig(dcgOpts)
-				if err == nil {
-					preToolHooks = append(preToolHooks, dcgConfig.Hooks.PreToolUse...)
-					hookSources = append(hookSources, "dcg")
-				} else if !IsJSONOutput() {
-					output.PrintWarningf("Failed to configure DCG hooks for agent %d: %v", agent.Index, err)
-				}
-			}
-
-			if dcg.ShouldConfigureRCHHooks(cfg.Integrations.RCH.Enabled, cfg.Integrations.RCH.InterceptPatterns) {
-				rchHook, err := dcg.GenerateRCHHookEntry(dcg.RCHHookOptions{
-					BinaryPath: cfg.Integrations.RCH.BinaryPath,
-					Patterns:   cfg.Integrations.RCH.InterceptPatterns,
-					Timeout:    5,
-				})
-				if err == nil {
-					preToolHooks = append(preToolHooks, rchHook)
-					hookSources = append(hookSources, "rch")
-				} else if !IsJSONOutput() {
-					output.PrintWarningf("Failed to configure RCH hooks for agent %d: %v", agent.Index, err)
-				}
-			}
-
-			if len(preToolHooks) > 0 {
-				hookConfig := dcg.ClaudeHookConfig{
-					Hooks: dcg.HooksSection{
-						PreToolUse: preToolHooks,
-					},
-				}
-				hookJSON, err := json.Marshal(hookConfig)
-				if err == nil {
-					if envVars == nil {
-						envVars = make(map[string]string)
-					}
-					envVars["CLAUDE_CODE_HOOKS"] = string(hookJSON)
-					if !IsJSONOutput() {
-						output.PrintInfof("Claude hooks configured for agent %d (%s)", agent.Index, strings.Join(hookSources, ", "))
-					}
-				} else if !IsJSONOutput() {
-					output.PrintWarningf("Failed to configure Claude hooks for agent %d: %v", agent.Index, err)
+			claudeLaunch = policy.ClaudeAgentLaunchSettings(cfg)
+			if !IsJSONOutput() {
+				for _, warning := range claudeLaunch.Warnings {
+					output.PrintWarningf("Agent %d: %s", agent.Index, warning)
 				}
 			}
 		}
@@ -3036,6 +3168,40 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 			}
 		}
 
+		// No persona pin from either source: take the seat CAAM ranked for
+		// this provider (ntm#319). Only reached when seat_selection is on —
+		// the planner records no decision for a pinned pane, so this cannot
+		// override either branch above.
+		if personaName == "" {
+			if seat, ok := seatPlan.Seat(agentIdx); ok {
+				personaName = seat.Persona
+				if p := seat.Registered; p != nil {
+					// Mirrors the --profile-set branch above, which guards its
+					// model override the same way.
+					if model, ok := caamSeatModelOverride(p, modelRequested); ok {
+						modelRequested = true
+						resolvedModel = resolveAgentModel(agent.Type, model, opts.PluginMap)
+					}
+					if strings.TrimSpace(p.ReasoningEffort) != "" {
+						resolvedReasoningEffort = p.ReasoningEffort
+					}
+					promptFile, err := prepareRequiredPersonaSystemPrompt(p, dir)
+					if err != nil {
+						return outputError(fmt.Errorf(
+							"preparing system prompt for CAAM-selected seat persona %s after configuring pane %s: %w; the session and pane still exist",
+							p.Name, pane.ID, err,
+						))
+					}
+					systemPromptFile = promptFile
+				} else if seat.TypeMismatch && !IsJSONOutput() {
+					output.PrintWarningf("%s", caamSeatTypeMismatchMessage(agent.Type, seat.Persona))
+				}
+				if !IsJSONOutput() {
+					fmt.Printf("  → seat '%s' → pane %s_%d\n", seat.Persona, agent.Type, agent.Index)
+				}
+			}
+		}
+
 		// Advisory model did-you-mean (bd-uh7la item 6): an explicitly
 		// requested model that resolves to an ID the model registry doesn't
 		// know, but that sits a small edit away from a known registry ID, is
@@ -3048,13 +3214,9 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 			}
 		}
 
-		// Settle the pane title now that model, persona, and reasoning effort
-		// are all resolved. The variant carries model AND effort, because the
-		// title is the only record of the launch spec that survives into a
-		// respawn: encoding just the model let a recovery silently relaunch the
-		// pane on the config DEFAULT effort, with no operator signal that the
-		// swarm's reasoning budget had changed underneath them (bd-qs6rj).
-		// A persona name replaces the model in the variant, as before.
+		// Keep the resolved model/effort or persona visible in the title. The
+		// pane-local launch specification below preserves the full command
+		// independently of this human-readable label.
 		titleVariant := tmux.FormatPaneVariant(agent.Model, resolvedReasoningEffort)
 		if personaName != "" {
 			titleVariant = personaName
@@ -3080,9 +3242,24 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 			SystemPromptFile: systemPromptFile,
 			PersonaName:      personaName,
 			ReasoningEffort:  resolvedReasoningEffort,
+			ClaudeSettings:   claudeLaunch.Settings,
 		})
 		if err != nil {
 			return outputError(fmt.Errorf("generating command for %s agent: %w", agent.Type, err))
+		}
+		if agentsession.ResumeProvider(string(agent.Type)) == "pi" {
+			agentCmd = agentsession.PinPiLaunchSession(agentCmd)
+		}
+		if warning := policy.LogClaudeHooksNotApplied("spawn", agentCmd, claudeLaunch.Settings); warning != "" {
+			if !IsJSONOutput() {
+				output.PrintWarningf("Agent %d: %s", agent.Index, warning)
+			}
+		} else if len(claudeLaunch.Sources) > 0 && !IsJSONOutput() {
+			output.PrintInfof("Claude hooks configured for agent %d (%s)", agent.Index, strings.Join(claudeLaunch.Sources, ", "))
+		}
+		launchSpec, err := captureAgentLaunchSpec(agent.Type, agentCmd, resolvedModel, agent.Model, personaName, resolvedReasoningEffort, systemPromptFile, envVars, opts.PaneEnv)
+		if err != nil {
+			return outputError(fmt.Errorf("capturing %s launch specification: %w", agent.Type, err))
 		}
 
 		// Per-pane Claude credential isolation (GH#237). Claude Code rewrites
@@ -3117,6 +3294,7 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 						envVars = make(map[string]string)
 					}
 					envVars["AGENT_MAIL_PROJECT"] = dir
+					launchSpec.AgentMailProject = dir
 				}
 			}
 		}
@@ -3143,10 +3321,7 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 		agentCmd = prependSpawnPaneEnv(agentCmd, paneEnv)
 
 		// Calculate stagger delay for this agent (used for spawn context)
-		var promptDelay time.Duration
-		if isStaggered {
-			promptDelay = time.Duration(staggerAgentIdx) * staggerInterval
-		}
+		promptDelay := stagger.Delay(staggerAgentIdx)
 
 		// Create agent-specific spawn context with order (1-based) and stagger delay
 		agentSpawnCtx := spawnCtx.ForAgent(staggerAgentIdx+1, promptDelay)
@@ -3222,15 +3397,29 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 		if workingDir != dir {
 			paneDir = workingDir
 		}
-		identityCoordinator.prepareAgent(ctx, spawnedAgentInfo{
-			paneIndex:     pane.Index,
-			paneID:        pane.ID,
-			paneTitle:     title,
-			paneDir:       paneDir,
-			agentType:     string(agent.Type),
-			model:         agent.Model,
-			resolvedModel: resolvedModel,
+		identityCoordinator.PrepareAgent(ctx, spawnidentity.Agent{
+			PaneIndex:     pane.Index,
+			PaneID:        pane.ID,
+			PaneTitle:     title,
+			PaneDir:       paneDir,
+			AgentType:     string(agent.Type),
+			Model:         agent.Model,
+			ResolvedModel: resolvedModel,
 		})
+
+		// Re-read the exact pane immediately before typing into it: the batch
+		// preflight above ran before identity registration and command
+		// preparation, and send-keys cannot tell whether a shell or a live
+		// process receives the bytes (#291). Refuse rather than retarget.
+		if err := tmux.ValidatePaneLaunchBaselineLiveContext(ctx, opts.Session, pane.ID); err != nil {
+			return outputError(fmt.Errorf(
+				"refusing to launch %s agent %d into pane %s: %w",
+				agent.Type, agent.Index, pane.ID, err,
+			))
+		}
+		if err := tmux.SetPaneLaunchSpecContext(ctx, pane.ID, launchSpec); err != nil {
+			return outputError(fmt.Errorf("recording launch specification for %s agent in pane %s: %w; the session and pane still exist", agent.Type, pane.ID, err))
+		}
 
 		if err := tmux.SendKeysContext(ctx, pane.ID, cmd, true); err != nil {
 			launchErr := fmt.Errorf(
@@ -3242,13 +3431,17 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 			}
 			return outputError(launchErr)
 		}
-		if agent.Type == AgentTypeGrok {
-			if _, err := tmux.WaitForPaneProcessStartContext(ctx, opts.Session, pane.ID); err != nil {
-				return outputError(fmt.Errorf(
-					"launching %s agent in pane %s did not start a stable process: %w",
-					agent.Type, pane.ID, err,
-				))
-			}
+		// Wait until the agent CLI actually replaced the shell in the pane, for
+		// every agent type: prompt delivery runs right after this and refuses a
+		// pane whose foreground is still a bare shell (PANE_AGENT_DEAD), so
+		// typing the launch line and immediately dispatching the prompt raced
+		// that check. The stability requirement also catches a CLI that exits
+		// at once.
+		if _, err := tmux.WaitForPaneProcessStartContext(ctx, opts.Session, pane.ID); err != nil {
+			return outputError(fmt.Errorf(
+				"launching %s agent in pane %s did not start a stable process: %w",
+				agent.Type, pane.ID, err,
+			))
 		}
 		if rateLimitTracker != nil && agent.Type == AgentTypeCodex {
 			rateLimitTracker.RecordSuccess("openai")
@@ -3261,7 +3454,15 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 		// This prevents sequential blocking and ensures correct ordering (Context -> Prompt)
 		setupWg.Add(1)
 
-		panePrompt, promptResolveErr := resolveSpawnPanePrompt(opts, agent.Type, staggerAgentIdx)
+		// Keyed by the agent's position in opts.Agents, NOT by staggerAgentIdx.
+		// MarchingOrders is documented as "agent pane order (0-based)" and
+		// spawnHasPromptDelivery resolves it with exactly that index, so the
+		// two must agree. They happened to be the same number while every
+		// agent launched; a pane skipped by seat selection (ntm#319) advances
+		// the loop without advancing staggerAgentIdx, which would have handed
+		// the skipped pane's orders to the next surviving pane and dropped the
+		// last set entirely.
+		panePrompt, promptResolveErr := resolveSpawnPanePrompt(opts, agent.Type, agentIdx)
 		if promptResolveErr != nil {
 			recordSetupError(pane.ID, fmt.Errorf(
 				"agent %d (%s) default prompt resolution: %w",
@@ -3319,10 +3520,13 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 					}
 				}
 			}
-			_, promptErr := dispatchSpawnPromptSequence(
+			promptReceipts, promptErr := dispatchSpawnPromptSequence(
 				setupCtx, opts.Session, paneID, promptSteps,
 				spawnObserver, spawnDispatcher, spawnPromptReadyTimeout, spawnReadyPollInterval,
 			)
+			if len(promptReceipts) > 0 {
+				recordPromptDelivered(paneID)
+			}
 			if promptErr != nil {
 				if spawnPromptSequenceIsCassOnly(promptSteps) {
 					if !IsJSONOutput() {
@@ -3553,6 +3757,7 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 		WindsurfCount:    opts.WindsurfCount,
 		AiderCount:       opts.AiderCount,
 		OpencodeCount:    opts.OpencodeCount,
+		OmpCount:         opts.OmpCount,
 		OllamaCount:      opts.OllamaCount,
 		WorkDir:          dir,
 		Recipe:           opts.RecipeName,
@@ -3574,8 +3779,14 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 		if !IsJSONOutput() {
 			steps.Start(fmt.Sprintf("Verifying %d agent(s) reached a working prompt", len(opts.Agents)))
 		}
-		readyCount, bootErr := waitForAgentsReadyWithObserver(
-			ctx, opts.Session, spawnVerifyBootTimeout, spawnReadyPollInterval, spawnObserver,
+		setupErrorsMu.Lock()
+		booted := make(map[string]bool, len(promptedPanes))
+		for paneID := range promptedPanes {
+			booted[paneID] = true
+		}
+		setupErrorsMu.Unlock()
+		readyCount, bootErr := waitForAgentsBootedWithObserver(
+			ctx, opts.Session, spawnVerifyBootTimeout, spawnReadyPollInterval, spawnObserver, booted,
 		)
 		if bootErr != nil {
 			if !IsJSONOutput() {
@@ -3619,21 +3830,31 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 			incrementAgentCounts(&agentCounts, p.Type)
 		}
 
-		// Build stagger config if enabled
+		// Report the resolved stagger (flag, [spawn] config, or legacy
+		// --stagger) whenever prompt delivery is actually paced.
 		var staggerCfg *output.StaggerConfig
-		if opts.StaggerEnabled {
+		if stagger.Active() {
 			staggerCfg = &output.StaggerConfig{
 				Enabled:    true,
-				IntervalMs: opts.Stagger.Milliseconds(),
+				Mode:       stagger.Mode,
+				IntervalMs: stagger.Interval.Milliseconds(),
 			}
 		}
 
 		// Register session coordinator with Agent Mail (creates agent.json for ntm lock)
-		registerSessionAgent(ctx, opts.Session, dir)
+		sessionAgent := registerSessionAgent(ctx, opts.Session, dir)
+
+		// Every agent is launched: reconcile the pane badges published as
+		// "starting" before each launch so they reflect the running agents
+		// (ntm#312). Best-effort by contract.
+		identityCoordinator.ReconcileBadges(ctx)
 
 		// Agent Mail identities were prepared and published per-pane before
 		// each launch (gh#255); assemble the accumulated status for output.
-		agentMailStatus := identityCoordinator.finalStatus()
+		agentMailStatus := identityCoordinator.Status()
+		if agentMailStatus != nil {
+			agentMailStatus.SessionAgent = sessionAgent
+		}
 		if err := ctx.Err(); err != nil {
 			return outputError(fmt.Errorf("spawn registration canceled: %w", err))
 		}
@@ -3649,6 +3870,7 @@ func spawnSessionLogicContextWithOutput(ctx context.Context, opts SpawnOptions, 
 			AgentMail:           agentMailStatus,
 			Recovery:            newRecoverySpawnStatus(recoveryEnabled, rc),
 			ProfileSet:          opts.ProfileSetName,
+			SeatSkips:           seatSkips,
 		}
 
 		// If assignment is enabled, wait for agents and run assignment phase
@@ -4213,550 +4435,72 @@ func preflightOllamaSpawnContext(ctx context.Context, opts SpawnOptions) (string
 	return normalizedHost, nil
 }
 
-// agentMailRegistrationEnabled reports whether spawn may contact Agent Mail
-// to register identities. It fails closed: a missing config never authorizes
-// a network-facing side effect, and both the top-level toggle and the
-// auto_register preference must be on. This is a user-preference and privacy
-// boundary (#243): registration sends the absolute project path, session
-// metadata, and any configured bearer token to the configured endpoint.
-func agentMailRegistrationEnabled() bool {
-	return cfg != nil && cfg.AgentMail.Enabled && cfg.AgentMail.AutoRegister
+// registerSessionAgent registers the session-level identity `ntm lock` acts
+// as and returns its name ("" when disabled or failed). It logs but never
+// fails when Agent Mail is unavailable.
+func registerSessionAgent(parentCtx context.Context, sessionName, workingDir string) string {
+	return spawnidentity.RegisterSession(parentCtx, workingDir, sessionName, spawnIdentityOptions())
 }
 
-// registerSessionAgent registers the session with Agent Mail.
-// This is non-blocking and logs but does not fail if unavailable.
-func registerSessionAgent(parentCtx context.Context, sessionName, workingDir string) {
-	if !agentMailRegistrationEnabled() {
-		return
-	}
-	if parentCtx == nil {
-		if !IsJSONOutput() {
-			output.PrintWarning("Agent Mail registration skipped: missing command context")
-		}
-		return
-	}
-	client := newAgentMailClient(workingDir)
-	ctx, cancel := context.WithTimeout(parentCtx, 15*time.Second)
-	defer cancel()
-
-	info, err := client.RegisterSessionAgent(ctx, sessionName, workingDir)
-	if err != nil {
-		// Log but don't fail
-		if !IsJSONOutput() {
-			output.PrintWarningf("Agent Mail registration failed: %v", err)
-		}
-		return
-	}
-	if info != nil && !IsJSONOutput() {
-		output.PrintInfof("Registered with Agent Mail as %s", info.AgentName)
-	}
-}
-
-// spawnedAgentInfo holds agent info for registration with Agent Mail.
-type spawnedAgentInfo struct {
-	paneIndex     int
-	paneID        string
-	paneTitle     string
-	agentType     string
-	model         string
-	resolvedModel string
-	// paneDir is the directory the agent process is launched in when it
-	// differs from the session's project key (linked worktrees). Empty for
-	// ordinary panes. The identity is additionally published under this key
-	// so cwd-derived resolution finds it (ntm#257).
-	paneDir string
-}
-
-// registerSpawnedAgents registers each spawned agent with Agent Mail and returns status.
-// This function implements graceful degradation - Agent Mail unavailability does not
-// cause spawn to fail. Returns nil if Agent Mail is not available or disabled.
-//
-// It is the batch (post-launch) entry point used by add, adopt, and relaunch,
-// where the agent processes already exist. The spawn path instead uses a
-// spawnIdentityCoordinator directly so each pane's identity is published
-// BEFORE its agent command is sent (gh#255); both paths share the same
-// per-pane logic below.
-func registerSpawnedAgents(parentCtx context.Context, workingDir, sessionName string, agents []spawnedAgentInfo) *output.AgentMailSpawnStatus {
-	if parentCtx == nil {
-		return &output.AgentMailSpawnStatus{AgentsFailed: len(agents)}
-	}
-	coordinator := newSpawnIdentityCoordinator(workingDir, sessionName)
-	for _, agent := range agents {
-		coordinator.prepareAgent(parentCtx, agent)
-	}
-	return coordinator.finalStatus()
-}
-
-// spawnIdentityCoordinator owns one Agent Mail client, availability probe,
-// project registration, session registry, and transient-busy reconciliation
-// set for the lifetime of a spawn (or batch registration). Initialization is
-// lazy: nothing contacts Agent Mail until the first prepareAgent call, so a
-// spawn with zero agents (or with registration disabled) pays no cost.
-//
-// The coordinator exists to fix a startup race (gh#255): identities used to
-// be created and published only after every agent had been launched, so an
-// agent that resolved its pane identity during boot could read a previous
-// occupant's name — or none. prepareAgent is designed to run immediately
-// before tmux.SendKeysContext for each pane, making the identity file and
-// registry entry durable before the agent process starts.
-//
-// Failure policy is unchanged from the historical batch path: Agent Mail
-// being disabled, unavailable, or failing per-pane never blocks the launch
-// (graceful degradation); failures are counted and warned, not fatal.
-type spawnIdentityCoordinator struct {
-	workingDir  string
-	sessionName string
-
-	initialized bool
-	enabled     bool
-	client      *agentmail.Client
-	available   bool
-	projectOK   bool
-	registry    *agentmail.SessionAgentRegistry
-	// reconciledIDs tracks agent IDs already claimed by transient-busy
-	// reconciliation so two panes never match the same server-side agent.
-	reconciledIDs map[int]bool
-	status        *output.AgentMailSpawnStatus
-	// livePanes maps pane id -> #{pane_pid} for the session as observed when
-	// the coordinator initialized (refreshed on a miss); liveness derives from
-	// it. Both are nil when the topology could not be read, which makes every
-	// recorded holder count as live — the fail-safe is a fresh identity,
-	// never a shared one (ntm#256).
-	livePanes map[string]int
-	liveness  agentmail.PaneLiveness
-}
+// The per-pane Agent Mail identity coordinator (gh#255, ntm#256, ntm#257,
+// ntm#312, ntm#321) lives in internal/spawnidentity so robot and REST spawn
+// provision identities exactly like the cli lifecycle commands. The helpers
+// below bind it to the cli configuration and human output.
 
 // spawnIdentityPaneProbe lists a session's panes for liveness judgement. It
 // is a variable so tests can supply a topology without a tmux server.
 var spawnIdentityPaneProbe = tmux.GetPanesContext
 
-func newSpawnIdentityCoordinator(workingDir, sessionName string) *spawnIdentityCoordinator {
-	return &spawnIdentityCoordinator{
-		workingDir:    workingDir,
-		sessionName:   sessionName,
-		reconciledIDs: make(map[int]bool),
-	}
-}
+// cliIdentityReporter prints coordinator diagnostics on the human output
+// paths and stays silent under --json, where the agent_mail status object
+// carries the outcome.
+type cliIdentityReporter struct{}
 
-// ensureInit performs the one-time spawn-scoped setup: config gate, client
-// construction, availability probe, registry load, and project registration.
-func (c *spawnIdentityCoordinator) ensureInit(parentCtx context.Context) {
-	if c.initialized {
-		return
-	}
-	c.initialized = true
-
-	// Fail closed: no config never authorizes contacting Agent Mail, and both
-	// enabled and auto_register must be on (#243).
-	if !agentMailRegistrationEnabled() {
-		return
-	}
-	c.enabled = true
-
-	c.client = newAgentMailClient(c.workingDir)
-
-	// Check availability first (uses cached result)
-	if !c.client.IsAvailable() {
-		c.status = &output.AgentMailSpawnStatus{
-			Available:         false,
-			ProjectRegistered: false,
-		}
-		return
-	}
-	c.available = true
-	c.status = &output.AgentMailSpawnStatus{
-		Available: true,
-		AgentMap:  make(map[string]string),
-	}
-
-	// Load existing registry to reuse identities on respawn (#69),
-	// falling back to a fresh registry if none exists.
-	c.registry, _ = agentmail.LoadSessionAgentRegistry(c.sessionName, c.workingDir)
-	if c.registry == nil {
-		c.registry = agentmail.NewSessionAgentRegistry(c.sessionName, c.workingDir)
-	}
-	c.observeLivePanes(parentCtx)
-
-	// Ensure project exists
-	ctx, cancel := context.WithTimeout(parentCtx, 5*time.Second)
-	defer cancel()
-	if _, err := c.client.EnsureProject(ctx, c.workingDir); err != nil {
-		if !IsJSONOutput() {
-			output.PrintWarningf("Agent Mail project registration failed: %v", err)
-		}
-		return
-	}
-	c.projectOK = true
-	c.status.ProjectRegistered = true
-}
-
-// prepareAgent reuses or creates the Agent Mail identity for one pane and
-// publishes it (canonical identity file, legacy compat file, session
-// registry) so the identity is resolvable before the agent process starts.
-// All failures degrade gracefully: they are counted in the aggregate status
-// and never block the pane's launch.
-func (c *spawnIdentityCoordinator) prepareAgent(parentCtx context.Context, agent spawnedAgentInfo) {
-	if parentCtx == nil {
-		return
-	}
-	c.ensureInit(parentCtx)
-	if !c.enabled {
-		return
-	}
-	if !c.available || !c.projectOK {
-		c.status.AgentsFailed++
-		return
-	}
-	if parentCtx.Err() != nil {
-		c.status.AgentsFailed++
-		return
-	}
-
-	// Reuse the identity of a prior occupant of this slot (#69) — but only a
-	// DEAD one. The pane id is the primary key; a matching title whose
-	// recorded pane is still live means the slot is occupied and the running
-	// agent keeps its name, so this pane gets a fresh identity (ntm#256).
-	if existingName, recoveredFrom, ok := c.registry.ResolveForPane(agent.paneTitle, agent.paneID, c.liveness); ok && existingName != "" {
-		c.status.AgentsRegistered++
-		c.status.AgentMap[agent.paneID] = existingName
-		if !IsJSONOutput() {
-			if recoveredFrom != "" {
-				output.PrintInfof("Reused existing identity for pane %d: %s (recovered from pane %s, no longer live)", agent.paneIndex, existingName, recoveredFrom)
-			} else {
-				output.PrintInfof("Reused existing identity for pane %d: %s", agent.paneIndex, existingName)
-			}
-		}
-		c.publishIdentity(agent, existingName)
-		c.registry.AddAgent(agent.paneTitle, agent.paneID, existingName)
-		c.recordPanePID(parentCtx, agent.paneID)
-		c.persistRegistry()
-		return
-	}
-
-	// Map agent type to program name
-	program := agentTypeToProgram(agent.agentType)
-	model := agent.resolvedModel
-	if model == "" {
-		model = agent.model
-	}
-	// Agent Mail rejects an empty model, but several agent types legitimately
-	// delegate model selection to the CLI's own config (bare --oc=N, --grok=N,
-	// plugins without a default). Register with a stable, clearly-delegated
-	// delegation marker instead of failing the pane's identity (ntm#261).
-	if strings.TrimSpace(model) == "" {
-		model = delegatedModelPlaceholder(program)
-		if !IsJSONOutput() {
-			output.PrintInfof("No model resolved for pane %d (%s); registering with Agent Mail as %q — set models.default_%s or pass an explicit model to name it",
-				agent.paneIndex, agent.agentType, model, modelDefaultKeyForType(agent.agentType))
-		}
-	}
-
-	regCtx, regCancel := context.WithTimeout(parentCtx, 15*time.Second)
-	registered, err := c.client.CreateAgentIdentity(regCtx, agentmail.RegisterAgentOptions{
-		ProjectKey: c.workingDir,
-		Program:    program,
-		Model:      model,
-	})
-	regCancel()
-
-	if err != nil {
-		// On transient busy errors, the agent may have been created server-side
-		// despite the error. Reconcile by listing agents and checking.
-		if errors.Is(err, agentmail.ErrTransientBusy) {
-			reconcileCtx, reconcileCancel := context.WithTimeout(parentCtx, 5*time.Second)
-			allAgents, listErr := c.client.ListAgents(reconcileCtx, c.workingDir)
-			reconcileCancel()
-			if listErr == nil {
-				// Look for a recently-created agent matching our program/model
-				// that hasn't already been claimed by a prior pane.
-				var found *agentmail.Agent
-				for i := range allAgents {
-					if allAgents[i].Program == program && allAgents[i].Model == model {
-						if !c.reconciledIDs[allAgents[i].ID] {
-							if found == nil || allAgents[i].ID > found.ID {
-								found = &allAgents[i]
-							}
-						}
-					}
-				}
-				if found != nil {
-					// Agent was actually created — treat as success
-					c.reconciledIDs[found.ID] = true
-					registered = found
-					err = nil
-					if !IsJSONOutput() {
-						output.PrintInfof("Reconciled busy response for pane %d: agent %s exists", agent.paneIndex, found.Name)
-					}
-				}
-			}
-		}
-		if err != nil {
-			c.status.AgentsFailed++
-			if !IsJSONOutput() {
-				output.PrintWarningf("Agent Mail registration failed for pane %d: %v", agent.paneIndex, err)
-			}
-			return
-		}
-	}
-
-	// Write the per-pane identity file(s) so Agent Mail and notify hooks can
-	// resolve AGENT_MAIL_AGENT before the agent process starts.
-	c.publishIdentity(agent, registered.Name)
-
-	c.status.AgentsRegistered++
-	c.status.AgentMap[agent.paneID] = registered.Name
-
-	// Add to registry for persistence
-	c.registry.AddAgent(agent.paneTitle, agent.paneID, registered.Name)
-	c.recordPanePID(parentCtx, agent.paneID)
-	// Persist the registration_token alongside the agent name so
-	// later ntm processes can re-authenticate as this agent on
-	// mcp-agent-mail >=2.13 (ntm#146).
-	if registered.RegistrationToken != "" {
-		c.registry.SetRegistrationToken(registered.Name, registered.RegistrationToken)
-	}
-	c.persistRegistry()
-
+func (cliIdentityReporter) Infof(format string, args ...any) {
 	if !IsJSONOutput() {
-		output.PrintInfof("Registered agent pane %d as %s", agent.paneIndex, registered.Name)
+		output.PrintInfof(format, args...)
 	}
 }
 
-// persistRegistry saves the session registry after each mutation so the
-// pane-to-name mapping is durable before the pane's agent process launches.
-func (c *spawnIdentityCoordinator) persistRegistry() {
-	if c.registry == nil || c.registry.Count() == 0 {
-		return
-	}
-	if err := agentmail.SaveSessionAgentRegistry(c.registry); err != nil {
-		if !IsJSONOutput() {
-			output.PrintWarningf("Failed to persist agent registry: %v", err)
-		}
+func (cliIdentityReporter) Warnf(format string, args ...any) {
+	if !IsJSONOutput() {
+		output.PrintWarningf(format, args...)
 	}
 }
 
-// finalStatus returns the aggregate registration status for output assembly.
-// It returns nil when registration is disabled or no agent was ever prepared,
-// matching the historical registerSpawnedAgents contract.
-func (c *spawnIdentityCoordinator) finalStatus() *output.AgentMailSpawnStatus {
-	return c.status
+// spawnIdentityOptions binds the shared identity coordinator to the cli
+// configuration (registration gate, endpoint, badges), human output, and the
+// cli's tmux ports.
+func spawnIdentityOptions() spawnidentity.Options {
+	opts := spawnidentity.ConfigOptions(cfg)
+	opts.Reporter = cliIdentityReporter{}
+	opts.ListPanes = spawnIdentityPaneProbe
+	opts.BadgeTmux = paneBadgeTmux
+	return opts
 }
 
-// observeLivePanes snapshots the session's pane ids and pids so registry
-// bindings can be judged live or dead (ntm#256). When the topology cannot be
-// read the snapshot is nil and ResolveForPane treats every recorded holder as
-// live: titles then never trigger reuse, pane ids still do.
-func (c *spawnIdentityCoordinator) observeLivePanes(ctx context.Context) {
-	panes, err := spawnIdentityPaneProbe(ctx, c.sessionName)
-	if err != nil {
-		c.livePanes = nil
-		c.liveness = nil
-		return
-	}
-	live := make(map[string]int, len(panes))
-	for _, p := range panes {
-		if p.ID != "" {
-			live[p.ID] = p.PID
-		}
-	}
-	c.livePanes = live
-	c.liveness = livenessFromPanes(panes)
+// newSpawnIdentityCoordinator returns a cli-bound coordinator. preLaunch is
+// true on the spawn path, where each pane's identity (and starting badge) is
+// published before its agent command is sent.
+func newSpawnIdentityCoordinator(workingDir, sessionName string, preLaunch bool) *spawnidentity.Coordinator {
+	opts := spawnIdentityOptions()
+	opts.PreLaunch = preLaunch
+	return spawnidentity.New(workingDir, sessionName, opts)
 }
 
-// recordPanePID stores the registering pane's current #{pane_pid} beside its
-// binding so a later process can tell this incarnation from a recycled %N.
-// A pane absent from the init snapshot (created after it) triggers one
-// refresh; an unknown pid is simply left unrecorded.
-func (c *spawnIdentityCoordinator) recordPanePID(ctx context.Context, paneID string) {
-	if paneID == "" || c.registry == nil {
-		return
-	}
-	pid, ok := c.livePanes[paneID]
-	if !ok {
-		c.observeLivePanes(ctx)
-		pid = c.livePanes[paneID]
-	}
-	c.registry.SetPanePID(paneID, pid)
-}
-
-// publishIdentity writes the canonical identity file (XDG-compliant, atomic,
-// Agent-Mail-compatible; see agentmail.CanonicalIdentityPath and the
-// mcp-agent-mail Rust reference in pane_identity.rs) plus the legacy /tmp
-// compat file still read by older hooks, under every project key the pane may
-// resolve its identity through: the session key, its symlink-resolved form,
-// and the pane's worktree directory (ntm#257). The extra keys are best-effort;
-// only a failure on the session key itself is reported.
-func (c *spawnIdentityCoordinator) publishIdentity(agent spawnedAgentInfo, name string) {
-	for i, key := range identityPublishKeys(c.workingDir, agent.paneDir) {
-		if _, writeErr := agentmail.WriteIdentity(key, agent.paneID, name); writeErr != nil && i == 0 && !IsJSONOutput() {
-			output.PrintWarningf("Failed to write identity file for pane %d: %v", agent.paneIndex, writeErr)
-		}
-		_ = agentmail.WriteLegacyCompatIdentity(key, agent.paneID, name)
-	}
-}
-
-// delegatedModelPlaceholder is the model identifier NTM registers with Agent
-// Mail when the agent type delegates model selection to its own CLI config
-// and no explicit model was given. It is stable per program, so the same
-// pane re-registers identically, and unmistakably not a real model name.
-func delegatedModelPlaceholder(program string) string {
-	program = strings.TrimSpace(program)
-	if program == "" {
-		program = "agent"
-	}
-	return program + "/cli-default"
-}
-
-// modelDefaultKeyForType names the [models] key a user would set to give the
-// type a real default model, for the delegation notice.
-func modelDefaultKeyForType(agentType string) string {
-	switch agentpkg.AgentType(agentType).Canonical() {
-	case agentpkg.AgentTypeOpencode:
-		return "opencode"
-	case agentpkg.AgentTypeGrok:
-		return "grok"
-	case agentpkg.AgentTypeClaudeCode:
-		return "claude"
-	case agentpkg.AgentTypeCodex:
-		return "codex"
-	case agentpkg.AgentTypeGemini:
-		return "gemini"
-	case agentpkg.AgentTypeOllama:
-		return "ollama"
-	default:
-		return strings.ToLower(strings.TrimSpace(agentType))
-	}
-}
-
-// agentTypeToProgram maps NTM agent types to Agent Mail program names.
-func agentTypeToProgram(agentType string) string {
-	switch agentType {
-	case "cc":
-		return "claude-code"
-	case "cod":
-		return "codex-cli"
-	case "gmi":
-		return "gemini-cli"
-	case "cursor":
-		return "cursor"
-	case "windsurf":
-		return "windsurf"
-	case "aider":
-		return "aider"
-	case "oc":
-		return "opencode"
-	default:
-		return agentType
-	}
+// registerSpawnedAgents registers already-running agents with Agent Mail and
+// returns the status (nil when registration is disabled). It is the batch
+// entry point used by add, adopt, and relaunch; spawn prepares each pane
+// before launch instead (gh#255). Agent Mail unavailability never fails the
+// caller.
+func registerSpawnedAgents(parentCtx context.Context, workingDir, sessionName string, agents []spawnidentity.Agent) *spawnidentity.AgentMailSpawnStatus {
+	return spawnidentity.RegisterBatch(parentCtx, workingDir, sessionName, agents, spawnIdentityOptions())
 }
 
 // Identity file path helpers moved to internal/agentmail/pane_identity.go so
 // they can be shared with the file reservation watcher and so they converge
 // on the same contract as the mcp-agent-mail Rust reference implementation.
 // See agentmail.CanonicalIdentityPath / agentmail.WriteIdentity.
-
-// getMemoryContext retrieves and formats CM (CASS Memory) memories for agent spawn.
-// Returns a formatted markdown string with project-specific rules and anti-patterns
-// from past sessions. Returns empty string if CM is unavailable or disabled.
-//
-// This function implements graceful degradation - CM unavailability does not
-// cause spawn to fail, it simply returns an empty string.
-func getMemoryContext(projectName, task string) string {
-	// Check if memory integration is enabled in config
-	if cfg == nil || !cfg.SessionRecovery.IncludeCMMemories {
-		return ""
-	}
-
-	// Create CM CLI client
-	cmClient := cm.NewCLIClient()
-
-	// Check if CM is installed
-	if !cmClient.IsInstalled() {
-		return ""
-	}
-
-	// Determine the query task
-	queryTask := task
-	if queryTask == "" {
-		queryTask = projectName
-	}
-
-	// Query CM for context with limits from config
-	maxRules := cfg.SessionRecovery.MaxCMRules
-	maxSnippets := cfg.SessionRecovery.MaxCMSnippets
-	if maxRules == 0 {
-		maxRules = 10 // Fallback default
-	}
-	if maxSnippets == 0 {
-		maxSnippets = 3 // Fallback default
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// `getMemoryContext` is invoked from a path that doesn't carry the absolute
-	// workspace; an empty workspace falls through to CM's unscoped query, which
-	// preserves prior behavior for this surface (the workspace-scoped path is
-	// `loadRecoveryCMMemories`, which carries `workingDir`).
-	result, err := cmClient.GetRecoveryContext(ctx, queryTask, "", maxRules, maxSnippets)
-	if err != nil {
-		// Log warning but don't fail - graceful degradation
-		if !IsJSONOutput() {
-			output.PrintWarningf("CM context retrieval failed: %v", err)
-		}
-		return ""
-	}
-
-	if result == nil {
-		return ""
-	}
-
-	// Format the result as markdown with the specified structure
-	return formatMemoryContext(result)
-}
-
-// formatMemoryContext formats CM context result into the standard recovery format.
-// Output format:
-//
-//	# Project Memory from Past Sessions
-//
-//	## Key Rules for This Project
-//	- [b-8f3a2c] Always use structured logging with log/slog
-//
-//	## Anti-Patterns to Avoid
-//	- [b-7d3e8c] Don't add backwards-compatibility shims
-func formatMemoryContext(result *cm.CLIContextResponse) string {
-	if result == nil {
-		return ""
-	}
-
-	// Check if there's anything to format
-	if len(result.RelevantBullets) == 0 && len(result.AntiPatterns) == 0 {
-		return ""
-	}
-
-	var buf strings.Builder
-
-	buf.WriteString("# Project Memory from Past Sessions\n\n")
-
-	if len(result.RelevantBullets) > 0 {
-		buf.WriteString("## Key Rules for This Project\n")
-		for _, rule := range result.RelevantBullets {
-			buf.WriteString(fmt.Sprintf("- [%s] %s\n", rule.ID, rule.Content))
-		}
-		buf.WriteString("\n")
-	}
-
-	if len(result.AntiPatterns) > 0 {
-		buf.WriteString("## Anti-Patterns to Avoid\n")
-		for _, pattern := range result.AntiPatterns {
-			buf.WriteString(fmt.Sprintf("- [%s] %s\n", pattern.ID, pattern.Content))
-		}
-		buf.WriteString("\n")
-	}
-
-	return buf.String()
-}
 
 func recoveryContextTermination(err error) error {
 	switch {
@@ -4770,7 +4514,7 @@ func recoveryContextTermination(err error) error {
 }
 
 // buildRecoveryContext builds the full recovery context for session recovery.
-// It gathers information from BV (beads), Agent Mail (messages), and CM (memories).
+// It gathers the local handoff, BV beads, Agent Mail messages, and CM memories.
 func buildRecoveryContext(ctx context.Context, sessionName, workingDir string, recoveryCfg config.SessionRecoveryConfig) (*RecoveryContext, error) {
 	if !recoveryCfg.Enabled {
 		return nil, nil
@@ -4813,6 +4557,21 @@ func buildRecoveryContext(ctx context.Context, sessionName, workingDir string, r
 		return true
 	}
 
+	// A local handoff is useful even when all optional integrations are off.
+	// Scope it to the resolved spawn project and session, never the caller's
+	// current directory or a similarly named session in another repository.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		h, err := loadRecoveryHandoff(ctx, sessionName, workingDir)
+		if recordSourceError("handoff", err) {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		rc.Handoff = h
+	}()
+
 	// Load beads if enabled
 	if recoveryCfg.IncludeBeadsContext {
 		wg.Add(1)
@@ -4852,7 +4611,7 @@ func buildRecoveryContext(ctx context.Context, sessionName, workingDir string, r
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			memories, err := loadRecoveryCMMemories(ctx, workingDir)
+			memories, err := loadRecoveryCMMemories(ctx, workingDir, recoveryCfg.MaxCMRules, recoveryCfg.MaxCMSnippets)
 			if recordSourceError("cm memories", err) {
 				return
 			}
@@ -4898,7 +4657,7 @@ func buildRecoveryContext(ctx context.Context, sessionName, workingDir string, r
 		return nil, terminalErr
 	}
 
-	// bd-wnzhl: errs accumulates from 4 parallel goroutines under a
+	// bd-wnzhl: errs accumulates from parallel goroutines under a
 	// mutex, so without sorting it ends up in goroutine-completion
 	// order — sibling of bd-brr6h / bd-c9wr1 / bd-aj2qv. Sort
 	// alphabetically so rc.Error.Details (and the printed warnings
@@ -4945,12 +4704,85 @@ func newRecoverySpawnStatus(enabled bool, rc *RecoveryContext) *output.RecoveryS
 		return status
 	}
 	status.Applied = FormatRecoveryPrompt(rc, AgentTypeClaude) != ""
+	if rc.Handoff != nil && rc.Handoff.Prompt != "" {
+		status.HandoffPath = rc.Handoff.Path
+	}
 	if rc.Error != nil {
 		status.Partial = true
 		status.ErrorCode = rc.Error.Code
 		status.Warnings = append(status.Warnings, rc.Error.Details...)
 	}
 	return status
+}
+
+func loadRecoveryHandoff(ctx context.Context, sessionName, workingDir string) (*RecoveryHandoff, error) {
+	if ctx == nil {
+		return nil, errors.New("recovery handoff requires a command context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if tmux.DefaultClient != nil && tmux.DefaultClient.Remote != "" {
+		return nil, errors.New("local handoff recovery is unavailable for remote tmux sessions")
+	}
+	if err := tmux.ValidateSessionName(sessionName); err != nil {
+		return nil, fmt.Errorf("invalid handoff session: %w", err)
+	}
+	if !filepath.IsAbs(workingDir) {
+		return nil, errors.New("recovery handoff requires an absolute project directory")
+	}
+	projectDir, err := filepath.EvalSymlinks(workingDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve handoff project: %w", err)
+	}
+	h, path, err := handoff.NewReader(projectDir).FindLatest(sessionName)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if err != nil || h == nil {
+		return nil, err
+	}
+	if h.Session != sessionName {
+		return nil, fmt.Errorf("handoff session %q does not match spawn session %q", h.Session, sessionName)
+	}
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve handoff source: %w", err)
+	}
+	relative, err := filepath.Rel(projectDir, resolvedPath)
+	if err != nil || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return nil, errors.New("handoff source is outside the spawn project")
+	}
+	if strings.TrimSpace(h.Goal) == "" && strings.TrimSpace(h.Now) == "" &&
+		len(h.Next)+len(h.Decisions)+len(h.Findings)+len(h.Blockers) == 0 {
+		return nil, nil
+	}
+	handoffContext := recovery.HandoffContextFromHandoff(h, resolvedPath)
+	prompt := recovery.GetInjectionForType(recovery.SessionFreshSpawn, handoffContext, nil)
+	return &RecoveryHandoff{
+		Path:   resolvedPath,
+		Prompt: truncateRecoveryHandoff(prompt, recovery.MaxHandoffTokens*4),
+	}, nil
+}
+
+// Keep a prefix so the shared formatter's immediate-task-first ordering also
+// determines which context survives a tight budget. Never split a UTF-8 rune.
+func truncateRecoveryHandoff(prompt string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(prompt) <= maxBytes {
+		return prompt
+	}
+	const suffix = "\n[Handoff truncated to fit recovery budget.]\n"
+	if maxBytes <= len(suffix) {
+		return ""
+	}
+	end := maxBytes - len(suffix)
+	for end > 0 && !utf8.RuneStart(prompt[end]) {
+		end--
+	}
+	return strings.TrimSpace(prompt[:end]) + suffix
 }
 
 // loadRecoveryBeads loads in-progress, completed, and blocked beads from BV.
@@ -5259,21 +5091,27 @@ func attemptReservationTransfer(ctx context.Context, client *agentmail.Client, s
 // share recovery memories — the basename-derived projectName alone would
 // produce identical task text and silently bleed context across unrelated
 // projects (#132).
-func loadRecoveryCMMemories(ctx context.Context, workingDir string) (*RecoveryCMMemories, error) {
+func loadRecoveryCMMemories(ctx context.Context, workingDir string, maxRules, maxSnippets int) (*RecoveryCMMemories, error) {
 	client := cm.NewCLIClient()
 	if !client.IsInstalled() {
 		return nil, nil // Graceful degradation
 	}
 
-	// Get recovery context with reasonable limits. Use the absolute working
-	// directory as the workspace scope so basename collisions across repos
-	// are kept distinct.
+	// [recovery] max_cm_rules / max_cm_snippets; zero means the defaults.
+	if maxRules <= 0 {
+		maxRules = 10
+	}
+	if maxSnippets <= 0 {
+		maxSnippets = 3
+	}
+	// Use the absolute working directory as the workspace scope so basename
+	// collisions across repos are kept distinct.
 	projectName := filepath.Base(workingDir)
 	absWorkspace := workingDir
 	if abs, err := filepath.Abs(workingDir); err == nil {
 		absWorkspace = abs
 	}
-	result, err := client.GetRecoveryContext(ctx, projectName, absWorkspace, 10, 3)
+	result, err := client.GetRecoveryContext(ctx, projectName, absWorkspace, maxRules, maxSnippets)
 	if err != nil {
 		return nil, fmt.Errorf("get recovery context: %w", err)
 	}
@@ -5434,6 +5272,9 @@ func estimateRecoveryTokens(rc *RecoveryContext) int {
 	}
 
 	chars := 0
+	if rc.Handoff != nil {
+		chars += len(rc.Handoff.Prompt)
+	}
 
 	// Count checkpoint
 	if rc.Checkpoint != nil {
@@ -5528,6 +5369,18 @@ func truncateRecoveryContext(rc *RecoveryContext, maxTokens int) {
 		rc.Messages = rc.Messages[:2]
 	}
 
+	if rc.Handoff != nil && estimateRecoveryTokens(rc) > maxTokens {
+		h := rc.Handoff
+		rc.Handoff = nil
+		remaining := maxTokens - estimateRecoveryTokens(rc)
+		if remaining > 0 {
+			h.Prompt = truncateRecoveryHandoff(h.Prompt, remaining*4)
+			if h.Prompt != "" {
+				rc.Handoff = h
+			}
+		}
+	}
+
 	rc.TokenCount = estimateRecoveryTokens(rc)
 }
 
@@ -5538,6 +5391,10 @@ func generateRecoverySummary(rc *RecoveryContext) string {
 	}
 
 	var parts []string
+
+	if rc.Handoff != nil && rc.Handoff.Prompt != "" {
+		parts = append(parts, "previous session handoff")
+	}
 
 	if len(rc.Beads) > 0 {
 		parts = append(parts, fmt.Sprintf("%d in-progress bead(s)", len(rc.Beads)))
@@ -5593,7 +5450,8 @@ func FormatRecoveryPrompt(rc *RecoveryContext, agentType AgentType) string {
 	}
 
 	// Check if there's any meaningful content
-	hasMeaningfulContent := len(rc.Beads) > 0 ||
+	hasMeaningfulContent := (rc.Handoff != nil && rc.Handoff.Prompt != "") ||
+		len(rc.Beads) > 0 ||
 		len(rc.CompletedBeads) > 0 ||
 		len(rc.BlockedBeads) > 0 ||
 		len(rc.Messages) > 0 ||
@@ -5607,6 +5465,11 @@ func FormatRecoveryPrompt(rc *RecoveryContext, agentType AgentType) string {
 
 	var sb strings.Builder
 	sb.WriteString("# Session Recovery Context\n\n")
+
+	if rc.Handoff != nil && rc.Handoff.Prompt != "" {
+		sb.WriteString(escapeForShell(rc.Handoff.Prompt))
+		sb.WriteString("\n")
+	}
 
 	// Your Previous Work section
 	if rc.Checkpoint != nil || len(rc.Beads) > 0 || len(rc.FileReservations) > 0 {
@@ -5913,6 +5776,26 @@ func waitForAgentsReadyWithObserver(
 	timeout, pollInterval time.Duration,
 	observer spawnSessionObserver,
 ) (int, error) {
+	return waitForAgentsBootedWithObserver(ctx, session, timeout, pollInterval, observer, nil)
+}
+
+// waitForAgentsBootedWithObserver is the --verify-boot form of
+// waitForAgentsReadyWithObserver. A pane in prompted (keyed by tmux pane ID)
+// received a delivered spawn prompt — delivery itself waited for the pane to
+// sit idle at its prompt — so it counts as booted while it is idle OR freshly
+// observed working on that prompt. Every agent type that NTM injects recovery,
+// CASS, or user prompts into at spawn behaves this way (an omp or Claude pane
+// handed "Reread AGENTS.md and continue" starts a turn at once); requiring
+// idle there made --verify-boot time out on healthy panes. Error, rate-limit,
+// unknown, stale, and dead-agent observations never count. A nil prompted set
+// is the idle-only readiness wait used before assignment.
+func waitForAgentsBootedWithObserver(
+	ctx context.Context,
+	session string,
+	timeout, pollInterval time.Duration,
+	observer spawnSessionObserver,
+	prompted map[string]bool,
+) (int, error) {
 	if observer == nil {
 		return 0, errors.New("waiting for agents requires a session observer")
 	}
@@ -5932,7 +5815,7 @@ func waitForAgentsReadyWithObserver(
 		observation, observeErr := observer.Observe(ctx, session)
 		lastObservation = observation
 		lastObserveErr = observeErr
-		readyPanes, agentCount := readyAgentPanesFromObservation(observation)
+		readyPanes, agentCount := bootedAgentPanesFromObservation(observation, prompted)
 		lastReady = len(readyPanes)
 		lastAgents = agentCount
 		if observeErr == nil && agentCount > 0 && lastReady == agentCount {
@@ -5941,7 +5824,7 @@ func waitForAgentsReadyWithObserver(
 		if !time.Now().Before(deadline) {
 			return lastReady, spawnReadinessError(
 				fmt.Sprintf("timeout waiting for agents to become ready (%d/%d ready)", lastReady, lastAgents),
-				lastObservation, lastObserveErr, "",
+				withoutBootedPanes(lastObservation, prompted), lastObserveErr, "",
 			)
 		}
 		if err := waitUntilNextSpawnPoll(ctx, deadline, pollInterval); err != nil {
@@ -6021,6 +5904,13 @@ func sendInitPromptToReadyAgentsWith(
 }
 
 func readyAgentPanesFromObservation(observation statuspkg.SessionObservation) ([]tmux.Pane, int) {
+	return bootedAgentPanesFromObservation(observation, nil)
+}
+
+// bootedAgentPanesFromObservation returns the agent panes that are idle and
+// safe to dispatch, plus — for panes in prompted — panes freshly observed
+// working on their delivered spawn prompt, along with the agent pane count.
+func bootedAgentPanesFromObservation(observation statuspkg.SessionObservation, prompted map[string]bool) ([]tmux.Pane, int) {
 	readyPanes := make([]tmux.Pane, 0, len(observation.Panes))
 	agentCount := 0
 	for _, pane := range observation.Panes {
@@ -6029,11 +5919,49 @@ func readyAgentPanesFromObservation(observation statuspkg.SessionObservation) ([
 			continue
 		}
 		agentCount++
-		if spawnPaneObservationSafeToDispatch(pane) && statuspkg.DispatchObservationIsCurrent(pane.Current.ObservedAt, time.Now()) {
+		if spawnPaneBooted(pane, prompted) {
 			readyPanes = append(readyPanes, pane.Metadata)
 		}
 	}
 	return readyPanes, agentCount
+}
+
+// spawnPaneBooted reports whether one agent pane counts as booted: idle and
+// safe to dispatch, or (only when it received a delivered spawn prompt) a
+// fresh, confident, current working observation whose agent process has
+// replaced the shell.
+func spawnPaneBooted(pane statuspkg.PaneObservation, prompted map[string]bool) bool {
+	if !statuspkg.DispatchObservationIsCurrent(pane.Current.ObservedAt, time.Now()) {
+		return false
+	}
+	if spawnPaneObservationSafeToDispatch(pane) {
+		return true
+	}
+	if !prompted[pane.Metadata.ID] {
+		return false
+	}
+	current := pane.Current
+	return current.Error == "" &&
+		current.Freshness == statuspkg.FreshnessFresh &&
+		current.Status.State == statuspkg.StateWorking &&
+		statuspkg.ObservationConfidenceIsActionable(current.Confidence) &&
+		!spawnPaneCommandIsShell(pane.Metadata.Command)
+}
+
+// withoutBootedPanes drops booted panes from an observation so a readiness
+// timeout names only the panes that actually failed to boot.
+func withoutBootedPanes(observation statuspkg.SessionObservation, prompted map[string]bool) statuspkg.SessionObservation {
+	if len(prompted) == 0 {
+		return observation
+	}
+	filtered := observation
+	filtered.Panes = make([]statuspkg.PaneObservation, 0, len(observation.Panes))
+	for _, pane := range observation.Panes {
+		if !spawnPaneBooted(pane, prompted) {
+			filtered.Panes = append(filtered.Panes, pane)
+		}
+	}
+	return filtered
 }
 
 func readinessIssuesForAgentPanes(observation statuspkg.SessionObservation) []string {

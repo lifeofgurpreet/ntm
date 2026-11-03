@@ -3,8 +3,9 @@
 //
 // When [rotation] usage_percent_threshold is > 0, every coordinator cycle
 // compares each agent pane's TRANSCRIPT-SOURCED context usage — ground truth
-// read from the agent CLI's own session transcript, never scrollback
-// estimates (that minimum-confidence gate is fixed by design, not
+// read from the agent CLI's own session transcript (or, for Oh My Pi, the
+// context gauge the agent itself renders in its composer border), never
+// scrollback estimates (that minimum-confidence gate is fixed by design, not
 // configurable) — against the threshold. Panes above it get a pending
 // rotation enqueued through internal/context's existing pending/confirm
 // machinery (the same storage `ntm rotate context pending/confirm` reads);
@@ -21,8 +22,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -39,13 +40,6 @@ import (
 // fire-time safety gates. The working/gate/composer detectors all operate on
 // bounded tails, so a moderate capture is sufficient and cheap.
 const rotationCaptureLines = 100
-
-func init() {
-	// G2 config-key liveness claims (WS6-wire): this package reads the
-	// [rotation.thresholds] restart triggers in newRotationChecker.
-	config.RegisterReader("rotation.thresholds.restart_if_tokens_above", newRotationChecker)
-	config.RegisterReader("rotation.thresholds.restart_if_session_hours", newRotationChecker)
-}
 
 // rotationDecision records one trigger decision for logging and tests.
 type rotationDecision struct {
@@ -78,18 +72,26 @@ type rotationChecker struct {
 
 	rotator    *ntmctx.Rotator
 	ctxMonitor *ntmctx.ContextMonitor
+	forecaster *ntmctx.ExhaustionForecaster
 
 	// Seams (default to real implementations).
-	getPanes        func(session string) ([]tmux.Pane, error)
-	paneCwd         func(paneID string) (string, bool)
+	getPanes func(session string) ([]tmux.Pane, error)
+	allPanes func(context.Context) (map[string][]tmux.Pane, error)
+	paneCwd  func(paneID string) (string, bool)
+	// Fleet probes share one deadline instead of multiplying command timeouts.
+	paneCwdContext func(context.Context, string) (string, bool)
+	processUsage   func(agentType string, panePID int) (*ntmctx.TranscriptUsage, bool)
+	// An injected reader owns workspace attribution in its observation domain.
+	// Production leaves this nil and checks the entire tmux server below.
 	transcriptUsage func(agentType, cwd string) (*ntmctx.TranscriptUsage, bool)
 	capturePane     func(paneID string, lines int) (string, error)
 	contextLimit    func(model string) int
 	sessionCreated  func(session string) (time.Time, bool)
 	storedPending   func(agentID string) (*ntmctx.PendingRotation, error)
 	enqueue         func(agentID, paneID string, usagePct float64) *ntmctx.PendingRotation
-	confirm         func(agentID string) ntmctx.RotationResult
+	confirm         func(ctx context.Context, agentID string) ntmctx.RotationResult
 	publish         func(record robot.ActuationRecord)
+	publishForecast func(event robot.AttentionEvent)
 	now             func() time.Time
 }
 
@@ -108,10 +110,7 @@ func newRotationChecker(session, workDir string, coordCfg CoordinatorConfig, ntm
 		thresholds = ntmCfg.Rotation.Thresholds
 	}
 	// The checker decides eligibility itself and only uses the Rotator's
-	// pending/confirm machinery; Enabled/RequireConfirm reflect that entry
-	// point regardless of the [context_rotation] scrollback-driven settings.
-	rotCfg.Enabled = true
-	rotCfg.RequireConfirm = true
+	// pending/confirm machinery and rotation path.
 
 	ctxMonitor := ntmctx.NewContextMonitor(ntmctx.DefaultMonitorConfig())
 	rotator := ntmctx.NewRotator(ntmctx.RotatorConfig{
@@ -134,15 +133,8 @@ func newRotationChecker(session, workDir string, coordCfg CoordinatorConfig, ntm
 		ctxMonitor:         ctxMonitor,
 		getPanes:           tmux.GetPanes,
 		sessionCreated: func(session string) (time.Time, bool) {
-			out, err := tmux.DefaultClient.Run("display-message", "-p", "-t", tmux.TargetSession(session), "#{session_created}")
-			if err != nil {
-				return time.Time{}, false
-			}
-			secs, convErr := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
-			if convErr != nil || secs <= 0 {
-				return time.Time{}, false
-			}
-			return time.Unix(secs, 0), true
+			created, err := tmux.SessionCreatedAt(session)
+			return created, err == nil
 		},
 		paneCwd: func(paneID string) (string, bool) {
 			cwd, err := tmux.DefaultClient.Run("display-message", "-p", "-t", tmux.ExactTarget(paneID), "#{pane_current_path}")
@@ -152,8 +144,13 @@ func newRotationChecker(session, workDir string, coordCfg CoordinatorConfig, ntm
 			cwd = strings.TrimSpace(cwd)
 			return cwd, cwd != ""
 		},
-		transcriptUsage: func(agentType, cwd string) (*ntmctx.TranscriptUsage, bool) {
-			return ntmctx.LatestAgentTranscriptUsage(agentType, cwd, time.Time{})
+		processUsage: func(agentType string, panePID int) (*ntmctx.TranscriptUsage, bool) {
+			return ntmctx.ProcessTranscriptUsage(context.Background(), agentType, panePID)
+		},
+		paneCwdContext: func(ctx context.Context, paneID string) (string, bool) {
+			cwd, err := tmux.DefaultClient.RunContext(ctx, "display-message", "-p", "-t", tmux.ExactTarget(paneID), "#{pane_current_path}")
+			cwd = strings.TrimSpace(cwd)
+			return cwd, err == nil && cwd != ""
 		},
 		capturePane:   tmux.CapturePaneOutput,
 		contextLimit:  models.GetContextLimit,
@@ -161,21 +158,24 @@ func newRotationChecker(session, workDir string, coordCfg CoordinatorConfig, ntm
 		publish: func(record robot.ActuationRecord) {
 			robot.GetAttentionFeed().PublishActuation(record)
 		},
+		publishForecast: func(event robot.AttentionEvent) {
+			robot.GetAttentionFeed().Append(event)
+		},
 		now: time.Now,
 	}
 	rc.enqueue = func(agentID, paneID string, usagePct float64) *ntmctx.PendingRotation {
 		return rc.rotator.EnqueuePendingRotation(rc.session, agentID, paneID, usagePct, rc.workDir)
 	}
-	rc.confirm = func(agentID string) ntmctx.RotationResult {
-		return rc.rotator.ConfirmRotation(agentID, ntmctx.ConfirmRotate, 0)
+	rc.confirm = func(ctx context.Context, agentID string) ntmctx.RotationResult {
+		return rc.rotator.ConfirmRotationContext(ctx, agentID, ntmctx.ConfirmRotate, 0)
 	}
 	return rc
 }
 
 // runOnce executes one rotation check pass and returns the decisions made.
 // Panes without an unambiguous transcript-sourced usage reading are ignored
-// entirely (the fixed minimum-confidence gate), as are panes at or below the
-// threshold.
+// entirely (the fixed minimum-confidence gate). Below-threshold panes may
+// publish advisory forecasts, but forecasts never trigger rotation.
 func (rc *rotationChecker) runOnce(ctx context.Context) []rotationDecision {
 	if rc == nil || rc.threshold <= 0 {
 		return nil
@@ -186,12 +186,17 @@ func (rc *rotationChecker) runOnce(ctx context.Context) []rotationDecision {
 
 	panes, err := rc.getPanes(rc.session)
 	if err != nil {
+		rc.reportContextForecasts(nil, nil)
 		slog.Warn("context rotation check could not list panes",
 			"session", rc.session, "error", err)
 		return nil
 	}
 
 	usages := rc.resolvePaneTranscripts(panes)
+	if ctx != nil && ctx.Err() != nil {
+		return nil
+	}
+	rc.reportContextForecasts(panes, usages)
 	if len(usages) == 0 {
 		return nil
 	}
@@ -210,7 +215,7 @@ func (rc *rotationChecker) runOnce(ctx context.Context) []rotationDecision {
 		if ctx != nil && ctx.Err() != nil {
 			break
 		}
-		if decision, acted := rc.checkPane(pane, usages[pane.ID]); acted {
+		if decision, acted := rc.checkPane(ctx, pane, usages[pane.ID]); acted {
 			decisions = append(decisions, decision)
 		}
 	}
@@ -220,7 +225,7 @@ func (rc *rotationChecker) runOnce(ctx context.Context) []rotationDecision {
 // checkPane evaluates one pane's transcript usage against the threshold and,
 // when exceeded, runs the safety gates and enqueues/auto-confirms a rotation.
 // The bool result reports whether a decision (enqueue/confirm/skip) was made.
-func (rc *rotationChecker) checkPane(pane tmux.Pane, usage *ntmctx.TranscriptUsage) (rotationDecision, bool) {
+func (rc *rotationChecker) checkPane(ctx context.Context, pane tmux.Pane, usage *ntmctx.TranscriptUsage) (rotationDecision, bool) {
 	now := rc.now()
 
 	// Usage percent: transcript-reported window when available (Codex),
@@ -265,8 +270,17 @@ func (rc *rotationChecker) checkPane(pane tmux.Pane, usage *ntmctx.TranscriptUsa
 		UsagePct:   pct,
 		Tokens:     usage.Tokens,
 		Limit:      limit,
-		Source:     usage.Path,
+		Source:     rotationUsageSource(usage),
 		Confidence: ntmctx.TranscriptConfidence(usage.UpdatedAt, now),
+	}
+	if pane.Type.Canonical() == agent.AgentTypeGemini &&
+		(usage.UpdatedAt.IsZero() || usage.UpdatedAt.After(now) || decision.Confidence != "high") {
+		// Gemini metadata writes and rewinds do not refresh the accounting
+		// timestamp. An old conversation must not trigger a fresh rotation.
+		decision.Action = "skipped"
+		decision.SkipReason = "stale_transcript"
+		rc.reportSkip(decision)
+		return decision, true
 	}
 
 	if strings.TrimSpace(pane.Title) == "" {
@@ -333,7 +347,7 @@ func (rc *rotationChecker) checkPane(pane tmux.Pane, usage *ntmctx.TranscriptUsa
 		rc.ctxMonitor.RegisterAgent(decision.AgentID, pane.ID, usage.Model)
 		rc.ctxMonitor.SetAgentType(decision.AgentID, string(pane.Type.Canonical()))
 	}
-	result := rc.confirm(decision.AgentID)
+	result := rc.confirm(ctx, decision.AgentID)
 	if result.Success {
 		decision.Action = "auto_confirmed"
 		slog.Info("context rotation auto-confirmed",
@@ -404,6 +418,15 @@ func (rc *rotationChecker) publishDecision(record robot.ActuationRecord) {
 
 // rotationEvidence renders the triggering evidence (tokens, limit, source
 // path, confidence) for attention-feed consumers.
+// rotationUsageSource names a usage reading's evidence: the transcript path,
+// or "status_bar" for an agent-rendered gauge reading (which has no file).
+func rotationUsageSource(usage *ntmctx.TranscriptUsage) string {
+	if usage.Path == "" {
+		return "status_bar"
+	}
+	return usage.Path
+}
+
 func rotationEvidence(d rotationDecision) string {
 	return fmt.Sprintf("usage=%.1f%% tokens=%d limit=%d source=%s confidence=%s",
 		d.UsagePct, d.Tokens, d.Limit, d.Source, d.Confidence)
@@ -419,9 +442,14 @@ func rotationEvidence(d rotationDecision) string {
 //  4. unsubmitted_input  — the composer holds typed-but-unsent text
 //  5. queued_messages    — the TUI reports queued unsubmitted messages
 //
-// Only Claude Code and Codex panes can reach this point (they are the only
-// agent types with known transcript locations); any other type is refused
-// outright because the automated rotation path does not support it.
+// This gate admits only agent types with an authoritative live working
+// detector; every other type is refused outright rather than typed into while
+// its state is unknown. Context rotation itself reaches this gate for Claude
+// Code, Codex, Gemini, and Oh My Pi panes (the types that can produce a ground-truth
+// usage trigger: transcripts, or omp's own context gauge), and the mail nudge
+// loop shares the gate and can reach it for Grok Build too: its TUI working
+// detector and composer inspection are capture-based and independent of
+// transcript discovery.
 func rotationSafetySkipReason(captured string, pane tmux.Pane) string {
 	canonical := pane.Type.Canonical()
 	switch canonical {
@@ -431,6 +459,29 @@ func rotationSafetySkipReason(captured string, pane tmux.Pane) string {
 		}
 	case agent.AgentTypeCodex:
 		if agent.CodexActivelyWorking(captured, pane.Width) {
+			return "working"
+		}
+	case agent.AgentTypeGemini:
+		// Unlike absence of a spinner, an observed empty live composer is
+		// positive readiness evidence. Unknown or modal frames fail closed.
+		switch agent.DetectGeminiTurn(captured) {
+		case agent.GeminiTurnWorking:
+			return "working"
+		case agent.GeminiTurnRateLimited:
+			return "rate_limited"
+		case agent.GeminiTurnIdle:
+		default:
+			return "unknown_agent_state"
+		}
+	case agent.AgentTypeGrok:
+		if agent.GrokActivelyWorking(captured, pane.Width) {
+			return "working"
+		}
+	case agent.AgentTypeOmp:
+		// omp's composer-anchored detector (spinner+timer, Esc-hint line,
+		// pending steering) is authoritative; composer inspection below
+		// parses the same box for unsubmitted drafts.
+		if agent.OmpActivelyWorking(captured, pane.Width) {
 			return "working"
 		}
 	default:
@@ -457,48 +508,179 @@ func rotationSafetySkipReason(captured string, pane tmux.Pane) string {
 }
 
 // resolvePaneTranscripts correlates panes with their agent CLI's own session
-// transcripts by (agent type, pane working directory), returning usage keyed
-// by pane ID.
+// transcripts, returning usage keyed by pane ID, under the same attribution
+// rule as robot's context and snapshot views (ntmctx.AttributePaneTranscripts).
 //
-// This mirrors the semantics of internal/robot's unexported
-// resolvePaneTranscripts (robot.go): correlation is by (agent type, cwd), so
-// when SEVERAL panes of the same agent type share one directory — the normal
-// NTM swarm layout — the newest transcript cannot be attributed to any
-// specific pane and those panes get NO transcript reading (the check simply
-// does not fire for them) rather than all being assigned the same session's
-// numbers. Lookups are memoized per (type, cwd) group so a tick over many
-// panes costs one filesystem probe per group. robot does not export the
-// helper, hence this local implementation (kept in lockstep by the shared
-// ambiguity rule above).
+// A pane whose agent process names its session (Claude Code's per-process
+// session record, a resumed session id) reads exactly that transcript, even
+// when several panes of its type share one directory — the normal NTM swarm
+// layout. Otherwise correlation is by (agent type, cwd) and only for a pane
+// that is the sole pane of its type there; panes left ambiguous get NO reading
+// (the check simply does not fire for them) rather than another pane's.
+//
+// Oh My Pi panes are read from their own composer-border context gauge first
+// (ntmctx.OmpStatusBarUsage, the same reading robot's snapshot and context
+// views prefer): it is the agent's own live accounting and belongs to the
+// captured pane by construction.
 func (rc *rotationChecker) resolvePaneTranscripts(panes []tmux.Pane) map[string]*ntmctx.TranscriptUsage {
-	type paneKey struct{ agentType, cwd string }
-	groups := make(map[paneKey][]string)
+	refs := make([]ntmctx.PaneTranscriptRef, 0, len(panes))
+	gauges := make(map[string]*ntmctx.TranscriptUsage)
+	remote := tmux.DefaultClient != nil && tmux.DefaultClient.Remote != ""
 	for _, pane := range panes {
+		if pane.Dead || pane.IsServicePane() {
+			continue
+		}
 		var agentType string
 		switch pane.Type.Canonical() {
 		case agent.AgentTypeClaudeCode:
 			agentType = "claude"
 		case agent.AgentTypeCodex:
 			agentType = "codex"
+		case agent.AgentTypeGemini:
+			agentType = "gemini"
+		case agent.AgentTypeOmp:
+			// omp renders its own context accounting in the composer border.
+			// That reading is attributed to this pane by construction, so it
+			// needs no cwd correlation and survives the shared-directory swarm
+			// layout that leaves transcripts ambiguous.
+			if rc.capturePane != nil {
+				if captured, err := rc.capturePane(pane.ID, rotationCaptureLines); err == nil {
+					if usage, ok := ntmctx.OmpStatusBarUsage(captured, rc.now()); ok {
+						gauges[pane.ID] = usage
+					}
+				}
+			}
+			agentType = "omp"
 		default:
 			// Other agent CLIs have no known transcript locations; the fixed
 			// transcript-only confidence gate excludes them.
 			continue
 		}
-		cwd, ok := rc.paneCwd(pane.ID)
-		if !ok {
+		if remote {
+			continue // A captured gauge is remote evidence; local files/PIDs are not.
+		}
+		cwd, _ := rc.paneCwd(pane.ID)
+		refs = append(refs, ntmctx.PaneTranscriptRef{PaneID: pane.ID, AgentType: agentType, PID: pane.PID, Cwd: cwd})
+	}
+	known := ntmctx.AttributePaneTranscripts(refs, gauges, rc.processUsage, nil)
+	if rc.transcriptUsage != nil {
+		return ntmctx.AttributePaneTranscripts(refs, known, nil, rc.transcriptUsage)
+	}
+	return rc.resolveServerScopedTranscripts(refs, known)
+}
+
+// resolveServerScopedTranscripts adds only workspace readings proven unique in
+// a complete, fresh server inventory. A different session shares the same native
+// transcript store; a local-session count cannot prove ownership. Exact process
+// readings and pane-local gauges survive an unavailable inventory, but never
+// remove a peer from the ambiguity count. No other session's transcript is read.
+func (rc *rotationChecker) resolveServerScopedTranscripts(targets []ntmctx.PaneTranscriptRef, known map[string]*ntmctx.TranscriptUsage) map[string]*ntmctx.TranscriptUsage {
+	needed := make(map[string]bool)
+	for _, target := range targets {
+		if known[target.PaneID] == nil {
+			needed[target.AgentType] = true
+		}
+	}
+	if len(needed) == 0 {
+		return known
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	list := rc.allPanes
+	if list == nil {
+		list = tmux.GetAllPanesContext
+	}
+	inventory, err := list(ctx)
+	if err != nil || ctx.Err() != nil {
+		return known
+	}
+	physical := make(map[string]tmux.Pane)
+	for _, panes := range inventory {
+		for _, pane := range panes {
+			previous, exists := physical[pane.ID]
+			if exists &&
+				(previous.PID != pane.PID || previous.Type.Canonical() != pane.Type.Canonical() || previous.Dead != pane.Dead || previous.Service != pane.Service) {
+				return known // Conflicting observations are not a complete inventory.
+			}
+			if pane.ID == "" || (!exists && len(physical) >= 4096) || ctx.Err() != nil {
+				return known
+			}
+			physical[pane.ID] = pane
+		}
+	}
+	ids := make([]string, 0, len(physical))
+	for id := range physical {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	type scopeKey struct{ provider, cwd string }
+	refs := make([]ntmctx.PaneTranscriptRef, 0, len(physical))
+	uncertain := make(map[string]bool)
+	claudeStores := make(map[string]int)
+	eligible := make(map[scopeKey]string) // canonical group -> original target cwd
+	targetByID := make(map[string]ntmctx.PaneTranscriptRef, len(targets))
+	for _, target := range targets {
+		targetByID[target.PaneID] = target
+	}
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return known
+		}
+		pane := physical[id]
+		if pane.Dead || pane.IsServicePane() {
 			continue
 		}
-		groups[paneKey{agentType: agentType, cwd: cwd}] = append(groups[paneKey{agentType: agentType, cwd: cwd}], pane.ID)
-	}
-
-	result := make(map[string]*ntmctx.TranscriptUsage)
-	for key, paneIDs := range groups {
-		if len(paneIDs) != 1 {
-			continue // ambiguous attribution: no transcript beats a wrong one
+		provider := ""
+		switch pane.Type.Canonical() {
+		case agent.AgentTypeClaudeCode:
+			provider = "claude"
+		case agent.AgentTypeCodex:
+			provider = "codex"
+		case agent.AgentTypeGemini:
+			provider = "gemini"
+		case agent.AgentTypeOmp:
+			provider = "omp"
 		}
-		if usage, ok := rc.transcriptUsage(key.agentType, key.cwd); ok && usage != nil {
-			result[paneIDs[0]] = usage
+		if !needed[provider] {
+			continue
+		}
+		var cwd string
+		var ok bool
+		if rc.paneCwdContext != nil {
+			cwd, ok = rc.paneCwdContext(ctx, id)
+		} else if rc.paneCwd != nil {
+			cwd, ok = rc.paneCwd(id)
+		}
+		canonical, pathErr := filepath.EvalSymlinks(cwd)
+		if !ok || !filepath.IsAbs(cwd) || pathErr != nil {
+			uncertain[provider] = true // Unknown cwd may overlap any target of this type.
+			continue
+		}
+		canonical = filepath.Clean(canonical)
+		refs = append(refs, ntmctx.PaneTranscriptRef{PaneID: id, AgentType: provider, PID: pane.PID, Cwd: canonical})
+		if provider == "claude" {
+			claudeStores[ntmctx.MungeProjectPath(cwd)]++
+		}
+		target, isTarget := targetByID[id]
+		targetCwd, targetErr := filepath.EvalSymlinks(target.Cwd)
+		if isTarget && target.PID == pane.PID && target.AgentType == provider && targetErr == nil && filepath.Clean(targetCwd) == canonical {
+			eligible[scopeKey{provider, canonical}] = target.Cwd
+		}
+	}
+	result := ntmctx.AttributePaneTranscripts(refs, known, nil, func(provider, cwd string) (*ntmctx.TranscriptUsage, bool) {
+		original, ok := eligible[scopeKey{provider, cwd}]
+		if !ok || uncertain[provider] || ctx.Err() != nil ||
+			(provider == "claude" && claudeStores[ntmctx.MungeProjectPath(original)] != 1) {
+			return nil, false
+		}
+		return ntmctx.LatestAgentTranscriptUsage(provider, original, time.Time{})
+	})
+	if ctx.Err() != nil {
+		return known
+	}
+	for id := range result {
+		if _, isTarget := targetByID[id]; !isTarget {
+			delete(result, id)
 		}
 	}
 	return result

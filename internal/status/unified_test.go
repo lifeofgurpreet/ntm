@@ -943,6 +943,50 @@ func TestDetermineStateCodexIdleBeatsWindowVelocity(t *testing.T) {
 	}
 }
 
+func TestDetermineStateAntigravityIdleBeatsWindowVelocity(t *testing.T) {
+	t.Parallel()
+
+	const idle = "Implemented the requested change.\n" +
+		"──────────────────────────────────────────────────\n" +
+		">\n" +
+		"──────────────────────────────────────────────────\n" +
+		"? for shortcuts\n"
+	const working = "Inspecting the project.\n" +
+		"──────────────────────────────────────────────────\n" +
+		">\n" +
+		"──────────────────────────────────────────────────\n" +
+		"esc to cancel\n"
+	observedAt := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		agentType string
+		output    string
+		quietFor  time.Duration
+		want      AgentState
+	}{
+		{name: "idle with busy sibling", agentType: "agy", output: idle, want: StateIdle},
+		{name: "idle alias with busy sibling", agentType: " Antigravity ", output: idle, want: StateIdle},
+		{name: "idle with quiet window", agentType: "agy", output: idle, quietFor: time.Hour, want: StateIdle},
+		{name: "working with fresh activity", agentType: "agy", output: working, want: StateWorking},
+		{name: "working during quiet tool call", agentType: "agy", output: working, quietFor: time.Hour, want: StateWorking},
+		{name: "ANSI cancel hint", agentType: "AGY", output: strings.ReplaceAll(working, "esc to cancel", "\x1b[33mesc to cancel\x1b[0m"), quietFor: time.Hour, want: StateWorking},
+		{name: "historical cancel hint is not live", agentType: "agy", output: working + strings.Repeat("Previous response line.\n", 20) + idle, want: StateIdle},
+		{name: "no idle evidence keeps fresh activity", agentType: "agy", output: "Inspecting the source tree before choosing the next change", want: StateWorking},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := NewDetector()
+			got := d.AnalyzeAt("%4", "s__agy_1", tt.agentType, tt.output, observedAt.Add(-tt.quietFor), observedAt)
+			if got.State != tt.want || got.ErrorType != ErrorNone {
+				t.Fatalf("AnalyzeAt() = %v/%v, want %v without an error", got.State, got.ErrorType, tt.want)
+			}
+			if got.AgentType != "agy" {
+				t.Fatalf("AnalyzeAt() agent type = %q, want agy", got.AgentType)
+			}
+		})
+	}
+}
+
 // TestSessionObserverAppliesPaneLocalActivityBound covers the second half of
 // #234: the pane-content fingerprint bound from ntm#213 lived only in
 // UnifiedDetector.Detect, not in SessionObserver.buildPaneObservation — and the
@@ -957,16 +1001,19 @@ func TestSessionObserverAppliesPaneLocalActivityBound(t *testing.T) {
 	second := first.Add(time.Minute)
 	nowValues := []time.Time{first, second}
 	nowIndex := 0
-	// A Gemini pane at its prompt: no agent-specific short-circuit, so its
-	// verdict is decided purely by the velocity gate.
-	const capture = "Analysis complete.\ngemini>"
+	// A Cursor pane at its prompt: Cursor has no pane-local live-frame arm, so
+	// its verdict is decided purely by the velocity gate. (Gemini, Claude,
+	// Codex, Antigravity, Grok, OpenCode and Oh My Pi frames now outrank window
+	// activity on the first observation; TestGeminiTurnSharedObservation
+	// covers the Gemini frame through this observer.)
+	const capture = "Analysis complete.\ncursor>"
 
 	observer := NewSessionObserverWithDependencies(NewDetector(), DefaultSessionObserverConfig(DefaultConfig()), SessionObserverDependencies{
 		ListPanes: func(context.Context, string) ([]tmux.PaneActivity, error) {
 			// The window-scoped timestamp is always "now": the sibling pane in
 			// this window is chatty.
 			return []tmux.PaneActivity{{
-				Pane:         tmux.Pane{ID: "%7", WindowIndex: 0, Index: 1, Title: "s__gmi_1", Type: tmux.AgentGemini},
+				Pane:         tmux.Pane{ID: "%7", WindowIndex: 0, Index: 1, Title: "s__cursor_1", Type: tmux.AgentCursor},
 				LastActivity: nowValues[min(nowIndex, len(nowValues)-1)],
 			}}, nil
 		},
@@ -1103,19 +1150,34 @@ func TestPaneObservationSafeToDispatchFailsClosed(t *testing.T) {
 	if !base.SafeToDispatch() {
 		t.Fatal("fresh, confident idle observation should be dispatchable")
 	}
+	if refusal := base.DispatchRefusal(); refusal != DispatchRefusalNone {
+		t.Fatalf("dispatchable observation reported refusal %q", refusal)
+	}
 
 	tests := []struct {
-		name   string
-		mutate func(*PaneObservation)
+		name    string
+		mutate  func(*PaneObservation)
+		refusal DispatchRefusal
 	}{
-		{name: "stale", mutate: func(p *PaneObservation) { p.Current.Freshness = FreshnessStale }},
-		{name: "unavailable", mutate: func(p *PaneObservation) { p.Current.Freshness = FreshnessUnavailable }},
-		{name: "low confidence", mutate: func(p *PaneObservation) { p.Current.Confidence = minimumDispatchConfidence - 0.01 }},
-		{name: "invalid high confidence", mutate: func(p *PaneObservation) { p.Current.Confidence = 1.01 }},
-		{name: "capture error", mutate: func(p *PaneObservation) { p.Current.Error = "capture failed" }},
-		{name: "working", mutate: func(p *PaneObservation) { p.Current.Status.State = StateWorking }},
-		{name: "error", mutate: func(p *PaneObservation) { p.Current.Status.State = StateError }},
-		{name: "unknown", mutate: func(p *PaneObservation) { p.Current.Status.State = StateUnknown }},
+		{name: "stale", mutate: func(p *PaneObservation) { p.Current.Freshness = FreshnessStale }, refusal: DispatchRefusalStale},
+		{name: "rotation quarantine", mutate: func(p *PaneObservation) { p.Metadata.RotationToken = "handoff-owner" }, refusal: DispatchRefusalRotation},
+		{name: "unavailable", mutate: func(p *PaneObservation) { p.Current.Freshness = FreshnessUnavailable }, refusal: DispatchRefusalStale},
+		{name: "low confidence", mutate: func(p *PaneObservation) { p.Current.Confidence = minimumDispatchConfidence - 0.01 }, refusal: DispatchRefusalLowConfidence},
+		{name: "invalid high confidence", mutate: func(p *PaneObservation) { p.Current.Confidence = 1.01 }, refusal: DispatchRefusalLowConfidence},
+		{name: "capture error", mutate: func(p *PaneObservation) { p.Current.Error = "capture failed" }, refusal: DispatchRefusalError},
+		{name: "working", mutate: func(p *PaneObservation) { p.Current.Status.State = StateWorking }, refusal: DispatchRefusalNotIdle},
+		{name: "error", mutate: func(p *PaneObservation) { p.Current.Status.State = StateError }, refusal: DispatchRefusalNotIdle},
+		{name: "unknown", mutate: func(p *PaneObservation) { p.Current.Status.State = StateUnknown }, refusal: DispatchRefusalNotIdle},
+		// Clause order: a stale capture that is also not idle is reported as
+		// stale, because evidence quality is judged before the state it carries.
+		{name: "stale outranks state", mutate: func(p *PaneObservation) {
+			p.Current.Freshness = FreshnessStale
+			p.Current.Status.State = StateWorking
+		}, refusal: DispatchRefusalStale},
+		{name: "error outranks confidence", mutate: func(p *PaneObservation) {
+			p.Current.Error = "capture failed"
+			p.Current.Confidence = 0.1
+		}, refusal: DispatchRefusalError},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1123,6 +1185,9 @@ func TestPaneObservationSafeToDispatchFailsClosed(t *testing.T) {
 			test.mutate(&candidate)
 			if candidate.SafeToDispatch() {
 				t.Fatal("unsafe observation was accepted for dispatch")
+			}
+			if got := candidate.DispatchRefusal(); got != test.refusal {
+				t.Fatalf("DispatchRefusal() = %q, want %q", got, test.refusal)
 			}
 		})
 	}

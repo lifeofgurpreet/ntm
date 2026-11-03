@@ -3,11 +3,10 @@
 package supervisor
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -54,20 +53,29 @@ type DaemonSpec struct {
 
 // ManagedDaemon represents a running daemon process.
 type ManagedDaemon struct {
-	Spec       DaemonSpec  `json:"spec"`
-	State      DaemonState `json:"state"`
-	PID        int         `json:"pid"`
-	Port       int         `json:"port"`
-	StartedAt  time.Time   `json:"started_at"`
-	LastHealth time.Time   `json:"last_health"`
-	Restarts   int         `json:"restarts"`
-	OwnerID    string      `json:"owner_id"` // Session ID that owns this daemon
+	Spec        DaemonSpec  `json:"spec"`
+	State       DaemonState `json:"state"`
+	PID         int         `json:"pid"`
+	Port        int         `json:"port"`
+	StartedAt   time.Time   `json:"started_at"`
+	LastHealth  time.Time   `json:"last_health"`
+	Restarts    int         `json:"restarts"`
+	OwnerID     string      `json:"owner_id"` // Session ID that owns this daemon
+	LastError   string      `json:"last_error,omitempty"`
+	HealthMode  string      `json:"health_mode"` // process, http, mcp, command
+	HealthError string      `json:"health_error,omitempty"`
 
-	cmd        *exec.Cmd
-	logFile    *os.File
-	cancelFunc context.CancelFunc
-	done       chan struct{}
-	mu         sync.RWMutex
+	cmd          *exec.Cmd
+	logFile      *os.File
+	cancelFunc   context.CancelFunc
+	done         chan struct{}
+	ownership    *daemonOwnership
+	healthCtx    context.Context
+	healthCancel context.CancelFunc
+	monitorDone  chan struct{}
+	healthDir    string
+	healthEnv    []string
+	mu           sync.RWMutex
 }
 
 // PIDFileInfo stores information written to PID files.
@@ -95,6 +103,7 @@ type Supervisor struct {
 	restartBackoffMax    time.Duration
 	startupHealthTimeout time.Duration
 
+	healthCtx  context.Context
 	shutdownCh chan struct{}
 	cancel     func()
 }
@@ -114,8 +123,8 @@ type Config struct {
 
 // DefaultMaxRestarts is the default restart budget applied when
 // Config.MaxRestarts is zero. Exported so foreground callers (ntm memory
-// serve) can tell "transiently failed, restart pending" apart from
-// "restart budget exhausted".
+// serve) can report exhaustion, which is recorded as StateFailed with
+// Restarts one greater than the configured budget.
 const DefaultMaxRestarts = 5
 
 // New creates a new Supervisor for the given session.
@@ -125,6 +134,10 @@ func New(cfg Config) (*Supervisor, error) {
 	}
 	if cfg.ProjectDir == "" {
 		return nil, fmt.Errorf("project directory required")
+	}
+
+	if err := validateDaemonComponent(cfg.SessionID, "session ID"); err != nil {
+		return nil, err
 	}
 
 	ntmDir := filepath.Join(cfg.ProjectDir, ".ntm")
@@ -140,7 +153,7 @@ func New(cfg Config) (*Supervisor, error) {
 	if cfg.MaxRestarts == 0 {
 		cfg.MaxRestarts = DefaultMaxRestarts
 	}
-	if cfg.RestartBackoffMax == 0 {
+	if cfg.RestartBackoffMax <= 0 {
 		cfg.RestartBackoffMax = 60 * time.Second
 	}
 	if cfg.StartupHealthTimeout <= 0 {
@@ -158,10 +171,12 @@ func New(cfg Config) (*Supervisor, error) {
 		}
 	}
 
+	healthCtx, cancelHealth := context.WithCancel(context.Background())
 	shutdownCh := make(chan struct{})
 	var cancelOnce sync.Once
 	cancel := func() {
 		cancelOnce.Do(func() {
+			cancelHealth()
 			close(shutdownCh)
 		})
 	}
@@ -175,6 +190,7 @@ func New(cfg Config) (*Supervisor, error) {
 		maxRestarts:          cfg.MaxRestarts,
 		restartBackoffMax:    cfg.RestartBackoffMax,
 		startupHealthTimeout: cfg.StartupHealthTimeout,
+		healthCtx:            healthCtx,
 		shutdownCh:           shutdownCh,
 		cancel:               cancel,
 	}, nil
@@ -192,14 +208,69 @@ func (s *Supervisor) Start(spec DaemonSpec) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Check if already running or starting
-	// Note: StateRestarting is allowed because handleDaemonFailure sets it before calling Start()
+	// Only an explicitly stopped daemon or an exhausted recovery may be
+	// replaced by a public start. Unhealthy processes are still alive, and a
+	// pending restart owns this name until recovery completes or is stopped.
 	if d, exists := s.daemons[spec.Name]; exists {
-		if d.State == StateRunning || d.State == StateStarting {
-			return fmt.Errorf("daemon %s already running (state: %s)", spec.Name, d.State)
+		d.mu.RLock()
+		state := d.State
+		d.mu.RUnlock()
+		if state != StateStopped && state != StateFailed {
+			return fmt.Errorf("daemon %s already managed (state: %s)", spec.Name, state)
 		}
 	}
 
+	if err := validateDaemonComponent(spec.Name, "daemon name"); err != nil {
+		return err
+	}
+	owner, err := acquireDaemonOwnership(s.ntmDir, spec.Name, s.sessionID)
+	if err != nil {
+		return err
+	}
+	if err := s.startDaemonLocked(spec, 0, owner); err != nil {
+		// Failed preflight/exec must not leak the fence. If a child did
+		// start, startDaemonLocked has stopped and reaped that child first.
+		return errors.Join(err, owner.finish())
+	}
+	return nil
+}
+
+// restartDaemon admits a replacement only while the failed generation still
+// owns its name and recovery state. A stopped or superseded generation must
+// never launch over a newer process. The bool reports whether a launch was
+// attempted; false means recovery was cancelled, not a retryable launch error.
+func (s *Supervisor) restartDaemon(previous *ManagedDaemon) (bool, error) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	if s.stopped {
+		return false, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.daemons[previous.Spec.Name] != previous {
+		return false, nil
+	}
+
+	previous.mu.RLock()
+	state := previous.State
+	restarts := previous.Restarts
+	previous.mu.RUnlock()
+	if state != StateRestarting {
+		return false, nil
+	}
+
+	return true, s.startDaemonLocked(previous.Spec, restarts, previous.ownership)
+}
+
+// startDaemonLocked launches an admitted generation. The caller holds both
+// lifecycleMu and mu, so shutdown and other launches cannot replace its owner
+// between admission and registration.
+func (s *Supervisor) startDaemonLocked(spec DaemonSpec, restartCount int, owner *daemonOwnership) error {
+	if owner == nil {
+		return fmt.Errorf("%w: daemon %s has no ownership fence", ErrDaemonRecoveryRequired, spec.Name)
+	}
 	// Fail fast and loud when the daemon binary does not exist. Without this
 	// check a missing binary would only surface as a launch-retry loop in the
 	// log file — silence is the sin (bd-ws1-truth-safety-l5ddi.2).
@@ -248,36 +319,59 @@ func (s *Supervisor) Start(spec DaemonSpec) error {
 	if cmd.Dir == "" {
 		cmd.Dir = s.projectDir
 	}
+	// Freeze the effective launch scope before exec. Later parent cwd/env
+	// changes must not point a health command at a different store.
+	launchDir, err := filepath.Abs(cmd.Dir)
+	if err != nil {
+		_ = logFile.Close()
+		cancel()
+		return fmt.Errorf("resolve daemon working directory: %w", err)
+	}
+	cmd.Dir = launchDir
 	cmd.Env = append(os.Environ(), spec.Env...)
 
 	// Set process group for clean shutdown (platform-specific)
 	setSysProcAttr(cmd)
 
+	// Journal the launch boundary before exec; an unlocked fence after a
+	// supervisor crash is not proof that no daemon was launched.
+	if err := owner.prepare(); err != nil {
+		_ = logFile.Close()
+		cancel()
+		return err
+	}
+
 	// Start the process
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
 		cancel()
-		return fmt.Errorf("start daemon %s: %w", spec.Name, err)
+		return errors.Join(fmt.Errorf("start daemon %s: %w", spec.Name, err), owner.startFailed())
 	}
 
-	// Preserve restart count from existing daemon if this is a restart
-	var restartCount int
-	if existing, exists := s.daemons[spec.Name]; exists && existing.State == StateRestarting {
-		restartCount = existing.Restarts
+	healthParent := s.healthCtx
+	if healthParent == nil {
+		healthParent = context.Background()
 	}
-
+	healthCtx, cancelHealth := context.WithCancel(healthParent)
 	daemon := &ManagedDaemon{
-		Spec:       copyDaemonSpec(spec),
-		State:      StateStarting,
-		PID:        cmd.Process.Pid,
-		Port:       port,
-		StartedAt:  time.Now(),
-		Restarts:   restartCount,
-		OwnerID:    s.sessionID,
-		cmd:        cmd,
-		logFile:    logFile,
-		cancelFunc: cancel,
-		done:       make(chan struct{}),
+		Spec:         copyDaemonSpec(spec),
+		State:        StateStarting,
+		PID:          cmd.Process.Pid,
+		Port:         port,
+		StartedAt:    time.Now(),
+		Restarts:     restartCount,
+		OwnerID:      s.sessionID,
+		cmd:          cmd,
+		logFile:      logFile,
+		cancelFunc:   cancel,
+		done:         make(chan struct{}),
+		ownership:    owner,
+		healthCtx:    healthCtx,
+		healthCancel: cancelHealth,
+		monitorDone:  make(chan struct{}),
+		HealthMode:   daemonHealthMode(spec),
+		healthDir:    launchDir,
+		healthEnv:    append([]string(nil), cmd.Env...),
 	}
 
 	// Update health URL with actual port, preserving the original path
@@ -293,6 +387,30 @@ func (s *Supervisor) Start(spec DaemonSpec) error {
 	}
 
 	s.daemons[spec.Name] = daemon
+	if err := owner.started(daemon.PID); err != nil {
+		// Do not launch a replacement after a successful exec whose PID
+		// could not be checkpointed. Stop only this known child and reap it.
+		daemon.LastError = err.Error()
+		daemon.State = StateStopping
+		terminateProcess(cmd.Process)
+		// No exit/restart worker exists yet. Wait exactly once here.
+		waited := make(chan error, 1)
+		go func() { waited <- cmd.Wait() }()
+		select {
+		case <-waited:
+		case <-time.After(2 * time.Second):
+			forceKillProcess(cmd.Process)
+			<-waited
+		}
+		cancel()
+		cancelHealth()
+		close(daemon.monitorDone)
+		close(daemon.done)
+		_ = logFile.Close()
+		daemon.logFile = nil
+		daemon.State = StateFailed
+		return errors.Join(err, owner.finish())
+	}
 
 	// Log the launch so every attempt (first start and each restart) is
 	// diagnosable from the log alone.
@@ -345,7 +463,7 @@ func (s *Supervisor) stopAllOwnedDaemons() error {
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf("errors stopping daemons: %v", errs)
+		return fmt.Errorf("errors stopping daemons: %w", errors.Join(errs...))
 	}
 	return nil
 }
@@ -366,14 +484,17 @@ func (s *Supervisor) GetDaemon(name string) (*ManagedDaemon, bool) {
 
 func snapshotDaemonLocked(d *ManagedDaemon) *ManagedDaemon {
 	return &ManagedDaemon{
-		Spec:       copyDaemonSpec(d.Spec),
-		State:      d.State,
-		PID:        d.PID,
-		Port:       d.Port,
-		StartedAt:  d.StartedAt,
-		LastHealth: d.LastHealth,
-		Restarts:   d.Restarts,
-		OwnerID:    d.OwnerID,
+		Spec:        copyDaemonSpec(d.Spec),
+		State:       d.State,
+		PID:         d.PID,
+		Port:        d.Port,
+		StartedAt:   d.StartedAt,
+		LastHealth:  d.LastHealth,
+		Restarts:    d.Restarts,
+		OwnerID:     d.OwnerID,
+		LastError:   d.LastError,
+		HealthMode:  d.HealthMode,
+		HealthError: d.HealthError,
 	}
 }
 
@@ -411,13 +532,26 @@ func (s *Supervisor) stopDaemon(d *ManagedDaemon) error {
 	d.State = StateStopping
 	cmd := d.cmd
 	done := d.done
+	cancelHealth := d.healthCancel
+	monitorDone := d.monitorDone
 	d.mu.Unlock()
+	if cancelHealth != nil {
+		cancelHealth()
+	}
 
 	// Do not cancel the CommandContext here: its default cancellation handler
 	// calls Process.Kill, which races (and usually wins) against the graceful
 	// platform-specific termination signal below. waitForExit cancels the
 	// context after Wait has reaped the process.
-	if cmd != nil && cmd.Process != nil {
+	alreadyExited := false
+	if done != nil {
+		select {
+		case <-done:
+			alreadyExited = true
+		default:
+		}
+	}
+	if !alreadyExited && cmd != nil && cmd.Process != nil {
 		terminateProcess(cmd.Process)
 		if done != nil {
 			const gracefulShutdownTimeout = 2 * time.Second
@@ -430,9 +564,9 @@ func (s *Supervisor) stopDaemon(d *ManagedDaemon) error {
 		}
 	}
 
-	// Clean up PID file
-	s.removePIDFile(d.Spec.Name)
-
+	if monitorDone != nil {
+		<-monitorDone
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -443,92 +577,97 @@ func (s *Supervisor) stopDaemon(d *ManagedDaemon) error {
 		d.logFile = nil
 	}
 
+	err := d.ownership.finishWithCleanup(func() { s.removePIDFile(d.Spec.Name) })
+	if err != nil {
+		d.LastError = err.Error()
+	}
 	d.State = StateStopped
-	return nil
+	return err
 }
 
-// monitorDaemon runs health checks for a daemon.
+// monitorDaemon runs health checks for one process generation. A cancelled or
+// retired generation cannot publish a delayed health result or keep probing
+// after the ownership fence is handed to another controller.
 func (s *Supervisor) monitorDaemon(d *ManagedDaemon) {
+	if d.monitorDone != nil {
+		defer close(d.monitorDone)
+	}
+	ctx := d.healthCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	ticker := time.NewTicker(s.healthInterval)
 	defer ticker.Stop()
-
-	// Wait a bit for daemon to start
-	time.Sleep(2 * time.Second)
-
+	startupTimer := time.NewTimer(2 * time.Second)
+	defer startupTimer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-s.shutdownCh:
+		return
+	case <-d.done:
+		return
+	case <-startupTimer.C:
+	}
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-s.shutdownCh:
+			return
+		case <-d.done:
 			return
 		case <-ticker.C:
 			d.mu.RLock()
-			state := d.State
-			healthURL := d.Spec.HealthURL
-			healthCmd := d.Spec.HealthCmd
-			healthMCP := d.Spec.HealthMCP
+			state, spec := d.State, copyDaemonSpec(d.Spec)
 			d.mu.RUnlock()
-
 			if state != StateRunning && state != StateStarting && state != StateUnhealthy {
 				return
 			}
-
-			if healthURL == "" && len(healthCmd) == 0 {
-				// No health check configured, just check if process is running.
-				// Reading cmd.ProcessState here would race with the
-				// waitForExit goroutine's cmd.Wait(), which writes it
-				// (bd-2c0yh.5) — so observe the done channel that waitForExit
-				// closes after Wait returns instead. waitForExit already calls
-				// handleDaemonFailure for unexpected exits; that call is
-				// idempotent per failure, so this monitor-side signal is a
-				// belt-and-suspenders no-op when the wait goroutine got there
-				// first.
-				select {
-				case <-d.done:
-					s.handleDaemonFailure(d)
-				default:
-				}
-				continue
-			}
-
-			// Perform health check
-			var healthy bool
-			switch {
-			case healthMCP:
-				healthy = s.checkHealthMCP(healthURL)
-			case healthURL != "":
-				healthy = s.checkHealthHTTP(healthURL)
-			case len(healthCmd) > 0:
-				healthy = s.checkHealthCmd(healthCmd)
-			}
-
+			probeCtx, cancel := context.WithTimeout(ctx, daemonHealthTimeout)
+			err := probeDaemonHealthInScope(probeCtx, spec, d.healthDir, d.healthEnv)
+			cancel()
 			d.mu.Lock()
-			logFile := d.logFile
-			if healthy {
-				d.LastHealth = time.Now()
+			if ctx.Err() != nil || (d.State != StateRunning && d.State != StateStarting && d.State != StateUnhealthy) {
+				d.mu.Unlock()
+				return
+			}
+			select {
+			case <-d.done:
+				d.mu.Unlock()
+				return
+			default:
+			}
+			d.HealthMode = daemonHealthMode(spec)
+			if err == nil {
+				d.HealthError = ""
+				// No configured probe means process liveness, not a fabricated
+				// successful protocol check. Expose the distinction explicitly.
+				if d.HealthMode != "process" {
+					d.LastHealth = time.Now()
+				}
 				if d.State == StateStarting || d.State == StateUnhealthy {
 					prev := d.State
 					d.State = StateRunning
-					if logFile != nil {
-						fmt.Fprintf(logFile, "[supervisor] daemon %s health probe passed; state %s -> %s\n",
-							d.Spec.Name, prev, StateRunning)
+					if d.logFile != nil {
+						evidence := "health probe passed"
+						if d.HealthMode == "process" {
+							evidence = "process liveness observed"
+						}
+						fmt.Fprintf(d.logFile, "[supervisor] daemon %s %s (mode=%s); state %s -> %s\n", d.Spec.Name, evidence, d.HealthMode, prev, StateRunning)
 					}
 				}
 			} else {
-				// A daemon must never pin in "starting" (or silently rot in
-				// "running") while its probe keeps failing: after the startup
-				// health timeout it transitions to unhealthy, loudly.
-				var sinceOK time.Duration
-				switch d.State {
-				case StateStarting:
-					sinceOK = time.Since(d.StartedAt)
-				case StateRunning:
+				d.HealthError = err.Error()
+				sinceOK := time.Since(d.StartedAt)
+				if d.State == StateRunning {
 					sinceOK = time.Since(d.LastHealth)
 				}
 				if (d.State == StateStarting || d.State == StateRunning) && sinceOK > s.startupHealthTimeout {
 					prev := d.State
 					d.State = StateUnhealthy
-					if logFile != nil {
-						fmt.Fprintf(logFile, "[supervisor] daemon %s health probe failing for %v (timeout %v); state %s -> %s\n",
-							d.Spec.Name, sinceOK.Round(time.Millisecond), s.startupHealthTimeout, prev, StateUnhealthy)
+					if d.logFile != nil {
+						fmt.Fprintf(d.logFile, "[supervisor] daemon %s health probe failing for %v (timeout %v); state %s -> %s\n", d.Spec.Name, sinceOK.Round(time.Millisecond), s.startupHealthTimeout, prev, StateUnhealthy)
 					}
 				}
 			}
@@ -547,8 +686,14 @@ func (s *Supervisor) waitForExit(d *ManagedDaemon) {
 	if d.cancelFunc != nil {
 		d.cancelFunc()
 	}
+	if d.healthCancel != nil {
+		d.healthCancel()
+	}
 	if d.done != nil {
 		close(d.done)
+	}
+	if d.monitorDone != nil {
+		<-d.monitorDone
 	}
 
 	d.mu.Lock()
@@ -577,61 +722,97 @@ func (s *Supervisor) waitForExit(d *ManagedDaemon) {
 
 // handleDaemonFailure handles a daemon crash and potentially restarts it.
 func (s *Supervisor) handleDaemonFailure(d *ManagedDaemon) {
+	s.mu.RLock()
+	if s.daemons[d.Spec.Name] != d {
+		s.mu.RUnlock()
+		return
+	}
 	d.mu.Lock()
-	// Avoid double-handling the same failure (e.g. monitor + wait goroutines).
+	// Avoid double-handling the same failure after repeated notifications.
 	// If a daemon is already in a terminal/recovery state, a second failure signal is noise.
 	if d.State == StateStopping || d.State == StateStopped || d.State == StateFailed || d.State == StateRestarting {
 		d.mu.Unlock()
-		return
-	}
-	d.Restarts++
-	restarts := d.Restarts
-	d.State = StateFailed
-	logFile := d.logFile
-	d.mu.Unlock()
-
-	// Check if we should restart
-	if restarts > s.maxRestarts {
-		if logFile != nil {
-			fmt.Fprintf(logFile, "[supervisor] max restarts (%d) exceeded, not restarting\n", s.maxRestarts)
-		}
-		return
-	}
-
-	// Calculate backoff
-	backoff := time.Duration(1<<uint(restarts-1)) * time.Second
-	if backoff > s.restartBackoffMax {
-		backoff = s.restartBackoffMax
-	}
-
-	if logFile != nil {
-		fmt.Fprintf(logFile, "[supervisor] restarting in %v (attempt %d/%d)\n", backoff, restarts, s.maxRestarts)
-	}
-
-	select {
-	case <-s.shutdownCh:
-		return
-	case <-time.After(backoff):
-	}
-
-	d.mu.Lock()
-	// Don't restart if daemon was explicitly stopped
-	if d.State == StateStopping || d.State == StateStopped {
-		d.mu.Unlock()
+		s.mu.RUnlock()
 		return
 	}
 	d.State = StateRestarting
 	d.mu.Unlock()
+	s.mu.RUnlock()
 
-	// Restart the daemon
-	if err := s.Start(d.Spec); err != nil {
-		d.mu.RLock()
-		logFile = d.logFile
-		d.mu.RUnlock()
-		if logFile != nil {
-			fmt.Fprintf(logFile, "[supervisor] restart failed: %v\n", err)
+	for {
+		d.mu.Lock()
+		if d.State != StateRestarting {
+			d.mu.Unlock()
+			return
 		}
+		d.Restarts++
+		restarts := d.Restarts
+		if restarts > s.maxRestarts {
+			if err := d.ownership.finishWithCleanup(func() { s.removePIDFile(d.Spec.Name) }); err != nil {
+				d.LastError = err.Error()
+			}
+			d.State = StateFailed
+			if d.logFile != nil {
+				fmt.Fprintf(d.logFile, "[supervisor] max restarts (%d) exceeded, not restarting\n", s.maxRestarts)
+			}
+			d.mu.Unlock()
+			return
+		}
+
+		backoff := s.restartBackoff(restarts)
+		if d.logFile != nil {
+			fmt.Fprintf(d.logFile, "[supervisor] restarting in %v (attempt %d/%d)\n", backoff, restarts, s.maxRestarts)
+		}
+		d.mu.Unlock()
+
+		timer := time.NewTimer(backoff)
+		select {
+		case <-s.shutdownCh:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		attempted, err := s.restartDaemon(d)
+		if !attempted || err == nil {
+			return
+		}
+
+		if errors.Is(err, ErrDaemonRecoveryRequired) {
+			d.mu.Lock()
+			d.LastError = errors.Join(err, d.ownership.finish()).Error()
+			if d.State == StateRestarting {
+				d.State = StateFailed
+			}
+			d.mu.Unlock()
+			return
+		}
+
+		// Port collisions, binary upgrades and launch errors all consume the
+		// same bounded restart budget as a new process that immediately exits.
+		// Retain this generation and its log while the next attempt is pending.
+		d.mu.Lock()
+		if d.logFile != nil {
+			fmt.Fprintf(d.logFile, "[supervisor] restart failed: %v\n", err)
+		}
+		d.mu.Unlock()
 	}
+}
+
+// restartBackoff doubles the delay until the configured cap, without shifts
+// or duration multiplication overflowing when a large budget is configured.
+func (s *Supervisor) restartBackoff(attempt int) time.Duration {
+	backoff := time.Second
+	for i := 1; i < attempt && backoff < s.restartBackoffMax; i++ {
+		if backoff > s.restartBackoffMax/2 {
+			return s.restartBackoffMax
+		}
+		backoff *= 2
+	}
+	if backoff > s.restartBackoffMax {
+		return s.restartBackoffMax
+	}
+	return backoff
 }
 
 // healthCheckClient is a shared HTTP client for health checks with appropriate timeouts.
@@ -650,126 +831,8 @@ var healthCheckClient = &http.Client{
 	},
 }
 
-// checkHealthHTTP performs an HTTP health check.
-func (s *Supervisor) checkHealthHTTP(url string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return false
-	}
-
-	resp, err := healthCheckClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body) // Drain body
-
-	return resp.StatusCode >= 200 && resp.StatusCode < 300
-}
-
-// checkHealthMCP performs an MCP-aware health check: a JSON-RPC `initialize`
-// round-trip POSTed to the daemon root. cm 0.2.x speaks MCP JSON-RPC at its
-// root and has NO REST /health endpoint, so a GET probe can never pass
-// (bd-ws1-truth-safety-l5ddi.2). Two traps this probe defends against:
-//   - 200-with-error: cm answers HTTP 200 with a JSON-RPC error object in the
-//     body; that is UNHEALTHY, not healthy.
-//   - arbitrary HTTP squatters: a service that answers 200 with non-JSON-RPC
-//     content (a REST server, a proxy error page) must not be blessed, so a
-//     response without a JSON-RPC result object is unhealthy.
-func (s *Supervisor) checkHealthMCP(baseURL string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	reqBody := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "initialize",
-		"params": map[string]any{
-			"protocolVersion": "2024-11-05",
-			"capabilities":    map[string]any{},
-			"clientInfo": map[string]any{
-				"name":    "ntm-supervisor",
-				"version": "health-probe",
-			},
-		},
-	}
-	data, err := json.Marshal(reqBody)
-	if err != nil {
-		return false
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL, bytes.NewReader(data))
-	if err != nil {
-		return false
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := healthCheckClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		io.Copy(io.Discard, resp.Body)
-		return false
-	}
-
-	var envelope struct {
-		JSONRPC string          `json:"jsonrpc"`
-		Result  json.RawMessage `json:"result"`
-		Error   json.RawMessage `json:"error"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&envelope); err != nil {
-		return false
-	}
-	if len(envelope.Error) > 0 && string(envelope.Error) != "null" {
-		return false // the 200-with-error trap
-	}
-	if len(envelope.Result) == 0 || string(envelope.Result) == "null" {
-		return false // not a JSON-RPC answer at all
-	}
-	// Squatter defense (bd-2c0yh.3): a 200 whose JSON merely has a non-null
-	// "result" is NOT proof of an MCP server. Require the JSON-RPC 2.0
-	// version marker AND an initialize-shaped result carrying serverInfo,
-	// which the MCP spec mandates — a REST server or proxy error page that
-	// happens to answer {"result": ...} no longer gets blessed.
-	if envelope.JSONRPC != "2.0" {
-		return false
-	}
-	var initResult struct {
-		ServerInfo json.RawMessage `json:"serverInfo"`
-	}
-	if err := json.Unmarshal(envelope.Result, &initResult); err != nil {
-		return false // result is not a JSON object (e.g. a bare string/number)
-	}
-	if len(initResult.ServerInfo) == 0 || string(initResult.ServerInfo) == "null" {
-		return false // no serverInfo: not an MCP initialize response
-	}
-	return true
-}
-
-// checkHealthCmd performs a command-based health check.
-func (s *Supervisor) checkHealthCmd(cmdArgs []string) bool {
-	if len(cmdArgs) == 0 {
-		return false
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
-	cmd.WaitDelay = 2 * time.Second
-	cmd.Dir = s.projectDir // Execute in project dir context
-
-	if err := cmd.Run(); err != nil {
-		return false
-	}
-	return true
-}
+const daemonHealthTimeout = 3 * time.Second
+const daemonHealthWaitDelay = 2 * time.Second
 
 // writePIDFile writes the PID file for a daemon.
 func (s *Supervisor) writePIDFile(d *ManagedDaemon) error {

@@ -2,6 +2,7 @@
 package process
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -245,7 +246,13 @@ var IsChildAlive = HasChildAlive
 // shows up as the process's basename, but the agent it's running is
 // usually visible in argv (e.g. `bun /home/.../codex ...`).
 func GetCmdline(pid int) []string {
-	if pid <= 0 {
+	return GetCmdlineContext(context.Background(), pid)
+}
+
+// GetCmdlineContext reads argv while allowing callers to stop the external
+// ps fallback. Native /proc reads remain the inexpensive first choice.
+func GetCmdlineContext(ctx context.Context, pid int) []string {
+	if ctx == nil || ctx.Err() != nil || pid <= 0 {
 		return nil
 	}
 	if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil {
@@ -260,7 +267,8 @@ func GetCmdline(pid int) []string {
 	// space-separated string with no easy way to recover argv0
 	// boundaries inside arguments, but it's enough for substring
 	// matching against agent binary names.
-	cmd := exec.Command("ps", "-o", "command=", "-p", strconv.Itoa(pid))
+	cmd := exec.CommandContext(ctx, "ps", "-o", "command=", "-p", strconv.Itoa(pid))
+	cmd.WaitDelay = 100 * time.Millisecond
 	out, err := cmd.Output()
 	if err != nil {
 		return nil
@@ -276,7 +284,13 @@ func GetCmdline(pid int) []string {
 // Linux fast path reads `/proc/<pid>/task/<pid>/children`; falls back
 // to `pgrep -P`. Returns nil on failure.
 func GetChildPIDs(parentPID int, limit int) []int {
-	if parentPID <= 0 {
+	return GetChildPIDsContext(context.Background(), parentPID, limit)
+}
+
+// GetChildPIDsContext reads the bounded child list with cancellation for the
+// pgrep fallback, so optional pane inspection cannot outlive its operation.
+func GetChildPIDsContext(ctx context.Context, parentPID int, limit int) []int {
+	if ctx == nil || ctx.Err() != nil || parentPID <= 0 {
 		return nil
 	}
 	if limit <= 0 {
@@ -315,7 +329,8 @@ func GetChildPIDs(parentPID int, limit int) []int {
 		}
 		return out
 	}
-	cmd := exec.Command("pgrep", "-P", strconv.Itoa(parentPID))
+	cmd := exec.CommandContext(ctx, "pgrep", "-P", strconv.Itoa(parentPID))
+	cmd.WaitDelay = 100 * time.Millisecond
 	if out, err := cmd.Output(); err == nil {
 		return collect(strings.Fields(string(out)))
 	}
@@ -342,6 +357,40 @@ var processStateNames = map[string]string{
 // It tries /proc/<pid>/status on Linux and falls back to ps on macOS/Linux.
 // Returns the single-character state code (R, S, D, Z, T, etc.),
 // a human-readable name, and any error.
+// TerminalForeground reports which process group currently owns the
+// controlling terminal of pid (tpgid) and pid's own process group (pgrp),
+// read from /proc/<pid>/stat. A shell whose pgrp equals tpgid is itself in
+// the foreground (idle, or running a builtin / same-group rc children); a job
+// it launched with job control owns the terminal under a different group.
+// ok is false when the fields cannot be read (non-Linux, process gone).
+func TerminalForeground(pid int) (tpgid, pgrp int, ok bool) {
+	if pid <= 0 {
+		return 0, 0, false
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, 0, false
+	}
+	// "pid (comm) state ppid pgrp session tty_nr tpgid ..." — comm may contain
+	// spaces and parentheses, so split after the LAST ')'.
+	text := string(data)
+	end := strings.LastIndex(text, ")")
+	if end < 0 || end+2 > len(text) {
+		return 0, 0, false
+	}
+	fields := strings.Fields(text[end+2:])
+	// fields[0]=state fields[1]=ppid fields[2]=pgrp fields[3]=session fields[4]=tty_nr fields[5]=tpgid
+	if len(fields) < 6 {
+		return 0, 0, false
+	}
+	pg, err1 := strconv.Atoi(fields[2])
+	tp, err2 := strconv.Atoi(fields[5])
+	if err1 != nil || err2 != nil || pg <= 0 {
+		return 0, 0, false
+	}
+	return tp, pg, true
+}
+
 func GetProcessState(pid int) (string, string, error) {
 	if pid <= 0 {
 		return "", "", fmt.Errorf("invalid pid: %d", pid)

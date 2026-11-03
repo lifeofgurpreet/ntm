@@ -9,8 +9,6 @@ package quota
 
 import (
 	"sync"
-
-	"github.com/Dicklesworthstone/ntm/internal/config"
 )
 
 const (
@@ -56,7 +54,7 @@ const (
 // [rotation.thresholds]. A nil or errored reading classifies as OK — absence
 // of data is never grounds for rotating an account.
 func ClassifyRotation(info *QuotaInfo) RotationClass {
-	if info == nil || info.Error != "" {
+	if info == nil || info.Error != "" || info.Unsupported != "" {
 		return RotationOK
 	}
 	rotationThresholdMu.RLock()
@@ -74,12 +72,4 @@ func ClassifyRotation(info *QuotaInfo) RotationClass {
 		return RotationWarning
 	}
 	return RotationOK
-}
-
-func init() {
-	// G2 config-key liveness claims: this package reads
-	// rotation.thresholds.{warning,critical}_percent via
-	// ApplyRotationThresholds at startup.
-	config.RegisterReader("rotation.thresholds.warning_percent", ApplyRotationThresholds)
-	config.RegisterReader("rotation.thresholds.critical_percent", ApplyRotationThresholds)
 }

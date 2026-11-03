@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 )
@@ -22,6 +23,7 @@ type WSEventStore struct {
 	retentionSecs int64 // How long to keep events in SQLite
 	seq           int64
 	seqMu         sync.Mutex
+	storeMu       sync.Mutex // serializes durable append and ring publication
 	cleanupTicker *time.Ticker
 	done          chan struct{}
 	stopOnce      sync.Once
@@ -92,13 +94,14 @@ func NewWSEventStore(db *sql.DB, cfg WSEventStoreConfig) *WSEventStore {
 		done:          make(chan struct{}),
 	}
 
-	// Load highest seq from database if available
+	// AUTOINCREMENT retains the high-water mark even after retention removes
+	// every event. MAX(seq) alone would rewind cursors on an idle restart.
 	if db != nil {
-		var maxSeq sql.NullInt64
-		err := db.QueryRow("SELECT MAX(seq) FROM ws_events").Scan(&maxSeq)
-		if err == nil && maxSeq.Valid {
-			store.seq = maxSeq.Int64
+		err := db.QueryRow("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'ws_events'), 0)").Scan(&store.seq)
+		if err == nil {
 			log.Printf("ws_events: initialized seq from db seq=%d", store.seq)
+		} else {
+			log.Printf("ws_events: read sequence high-water mark: %v", err)
 		}
 	}
 
@@ -190,62 +193,84 @@ func (s *WSEventStore) Store(topic, eventType string, data interface{}) (*WSStor
 	if err != nil {
 		return nil, fmt.Errorf("marshal event data: %w", err)
 	}
+	s.storeMu.Lock()
+	defer s.storeMu.Unlock()
 
 	event := &WSStoredEvent{
-		Seq:       s.nextSeq(),
 		Topic:     topic,
 		EventType: eventType,
 		Data:      string(jsonData),
 		CreatedAt: time.Now(),
 	}
 
-	// Store in ring buffer
+	// Let SQLite allocate durable cursors. Explicit locally allocated seqs can
+	// collide with another store, and reuse pruned IDs after a restart. Publish
+	// only after persistence succeeds; a memory-only success here would claim a
+	// resumable cursor for an event that disappears on restart.
+	if s.db != nil {
+		result, err := s.db.Exec(
+			"INSERT INTO ws_events (topic, event_type, data, created_at) VALUES (?, ?, ?, ?)",
+			event.Topic, event.EventType, event.Data, event.CreatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("persist event: %w", err)
+		}
+		event.Seq, err = result.LastInsertId()
+		if err != nil {
+			return nil, fmt.Errorf("read persisted event sequence: %w", err)
+		}
+		s.seqMu.Lock()
+		if event.Seq > s.seq {
+			s.seq = event.Seq
+		}
+		s.seqMu.Unlock()
+	} else {
+		event.Seq = s.nextSeq()
+	}
+
+	// Keep append order identical to cursor order for memory-only replay too.
 	s.bufferMu.Lock()
 	s.buffer.Value = event
 	s.buffer = s.buffer.Next()
 	s.bufferMu.Unlock()
 
-	// Persist to database
-	if s.db != nil {
-		_, err = s.db.Exec(
-			"INSERT INTO ws_events (seq, topic, event_type, data, created_at) VALUES (?, ?, ?, ?, ?)",
-			event.Seq, event.Topic, event.EventType, event.Data, event.CreatedAt,
-		)
-		if err != nil {
-			log.Printf("ws_events: persist error seq=%d: %v", event.Seq, err)
-			// Continue even if persist fails - event is in memory
-		}
-	}
-
 	return event, nil
 }
 
 // GetSince retrieves events after the given sequence number.
-// First tries the ring buffer, falls back to database if needed.
+// The database is authoritative when configured: a ring can outlive retention
+// or miss events written by another store sharing the same runtime database.
 // Returns events and a boolean indicating if a cursor reset is needed.
 func (s *WSEventStore) GetSince(since int64, topic string, limit int) ([]WSStoredEvent, bool, error) {
+	var topics []string
+	if topic != "" {
+		topics = []string{topic}
+	}
+	return s.getSinceTopics(since, topics, limit)
+}
+
+// getSinceTopics applies every subscription pattern before the result limit.
+// An empty list selects all topics, as GetSince's empty topic has always done.
+func (s *WSEventStore) getSinceTopics(since int64, topics []string, limit int) ([]WSStoredEvent, bool, error) {
 	if limit <= 0 {
 		limit = 1000
 	}
+	if s.db != nil {
+		return s.getFromDB(since, topics, limit)
+	}
 
 	// Try ring buffer first
-	events, found := s.getFromBuffer(since, topic, limit)
+	events, found := s.getFromBuffer(since, topics, limit)
 	if found {
 		return events, false, nil
 	}
 
-	// Fall back to database
-	if s.db == nil {
-		// No database - cursor is too old, return reset signal
-		return nil, true, nil
-	}
-
-	return s.getFromDB(since, topic, limit)
+	return nil, true, nil
 }
 
 // getFromBuffer retrieves events from the ring buffer.
 // Returns events and whether the since cursor was found in the buffer.
-func (s *WSEventStore) getFromBuffer(since int64, topic string, limit int) ([]WSStoredEvent, bool) {
+func (s *WSEventStore) getFromBuffer(since int64, topics []string, limit int) ([]WSStoredEvent, bool) {
 	s.bufferMu.RLock()
 	defer s.bufferMu.RUnlock()
 
@@ -282,7 +307,7 @@ func (s *WSEventStore) getFromBuffer(since int64, topic string, limit int) ([]WS
 	curr := s.buffer
 	for i := 0; i < ringSize; i++ {
 		if ev, ok := curr.Value.(*WSStoredEvent); ok && ev != nil {
-			if ev.Seq > since && (topic == "" || matchTopic(topic, ev.Topic)) {
+			if ev.Seq > since && (len(topics) == 0 || matchAnyTopic(topics, ev.Topic)) {
 				events = append(events, *ev)
 				if len(events) >= limit {
 					break
@@ -297,34 +322,59 @@ func (s *WSEventStore) getFromBuffer(since int64, topic string, limit int) ([]WS
 
 // getFromDB retrieves events from the database.
 // Returns events and whether a reset is needed (cursor too old for DB too).
-func (s *WSEventStore) getFromDB(since int64, topic string, limit int) ([]WSStoredEvent, bool, error) {
-	// Check if since cursor is too old before querying
-	if since > 0 {
-		var minSeq sql.NullInt64
-		if err := s.db.QueryRow("SELECT MIN(seq) FROM ws_events").Scan(&minSeq); err != nil && err != sql.ErrNoRows {
-			return nil, false, fmt.Errorf("query min seq: %w", err)
-		}
-		if minSeq.Valid && since < minSeq.Int64-1 {
-			// Cursor is too old even for database
-			return nil, true, nil
-		}
+func (s *WSEventStore) getFromDB(since int64, topics []string, limit int) ([]WSStoredEvent, bool, error) {
+	// Keep retention validation and selection on one snapshot. Otherwise a
+	// concurrent cleanup can erase the requested history between the two reads
+	// and turn an expired cursor into a successful empty replay.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, false, fmt.Errorf("begin replay: %w", err)
+	}
+	defer tx.Rollback()
+	var minSeq sql.NullInt64
+	var highWater int64
+	if err := tx.QueryRow(`SELECT MIN(seq),
+		COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'ws_events'), 0)
+		FROM ws_events`).Scan(&minSeq, &highWater); err != nil {
+		return nil, false, fmt.Errorf("query replay window: %w", err)
+	}
+	s.seqMu.Lock()
+	if highWater > s.seq {
+		s.seq = highWater
+	}
+	s.seqMu.Unlock()
+	if since > 0 && (since > highWater || (minSeq.Valid && since < minSeq.Int64-1) || (!minSeq.Valid && since < highWater)) {
+		return nil, true, nil
 	}
 
-	var rows *sql.Rows
-	var err error
-
-	if topic == "" {
-		rows, err = s.db.Query(
-			"SELECT seq, topic, event_type, data, created_at FROM ws_events WHERE seq > ? ORDER BY seq LIMIT ?",
-			since, limit,
-		)
+	query := "SELECT seq, topic, event_type, data, created_at FROM ws_events WHERE seq > ?"
+	args := []interface{}{since}
+	predicates := make([]string, 0, len(topics))
+	matchAll := len(topics) == 0
+	for _, topic := range topics {
+		if topic == "*" {
+			matchAll = true
+			break
+		}
+		if strings.HasSuffix(topic, ":*") {
+			// Keep matchTopic's literal, case-sensitive prefix semantics.
+			// SQL LIKE/GLOB would reinterpret characters in valid topics.
+			prefix := strings.TrimSuffix(topic, "*")
+			predicates = append(predicates, "substr(topic, 1, length(?)) = ?")
+			args = append(args, prefix, prefix)
+		} else {
+			predicates = append(predicates, "topic = ?")
+			args = append(args, topic)
+		}
+	}
+	if matchAll {
+		args = args[:1]
 	} else {
-		// For topic filtering, we need to handle wildcards in Go
-		rows, err = s.db.Query(
-			"SELECT seq, topic, event_type, data, created_at FROM ws_events WHERE seq > ? ORDER BY seq LIMIT ?",
-			since, limit*10, // Fetch more to account for filtering
-		)
+		query += " AND (" + strings.Join(predicates, " OR ") + ")"
 	}
+	query += " ORDER BY seq LIMIT ?"
+	args = append(args, limit)
+	rows, err := tx.Query(query, args...)
 	if err != nil {
 		return nil, false, fmt.Errorf("query events: %w", err)
 	}
@@ -339,11 +389,6 @@ func (s *WSEventStore) getFromDB(since int64, topic string, limit int) ([]WSStor
 		var ev WSStoredEvent
 		if err := rows.Scan(&ev.Seq, &ev.Topic, &ev.EventType, &ev.Data, &ev.CreatedAt); err != nil {
 			return nil, false, fmt.Errorf("scan event: %w", err)
-		}
-
-		// Apply topic filter
-		if topic != "" && !matchTopic(topic, ev.Topic) {
-			continue
 		}
 
 		events = append(events, ev)
@@ -434,6 +479,9 @@ func (s *WSEventStore) BufferStats() (size int, used int, oldestSeq int64, newes
 //     server sends a `stream.reset` frame carrying `current_seq` and
 //     `oldest_available` instead of replaying; the client should treat its
 //     state as fresh and re-sync out of band.
+//   - A replay must fit both the bounded history batch and the client's send
+//     queue, including space for the subscribe ack. Larger backlogs produce
+//     an explicit reset instead of a successful but incomplete replay.
 //   - Events dropped to a slow client are recorded in ws_dropped_events
 //     (coalesced per topic into seq ranges, reason "slow_client"); once the
 //     client drains and delivery succeeds again, it receives a
@@ -453,10 +501,11 @@ const wsReplayLimit = 1000
 // wsReplayRequest asks the hub loop to commit a subscription and replay
 // persisted events past a cursor before live delivery begins.
 type wsReplayRequest struct {
-	client *WSClient
-	topics []string
-	since  int64
-	resp   chan wsReplayResult
+	client   *WSClient
+	topics   []string
+	since    int64
+	complete func(wsReplayResult) bool
+	resp     chan wsReplayResult
 }
 
 // wsReplayResult reports the outcome of a replay request.
@@ -494,13 +543,15 @@ func (h *WSHub) currentSeq() int64 {
 
 // SubscribeWithReplay commits a subscription for topics and replays persisted
 // events with seq > since before live delivery, per the replay contract above.
-// It blocks until the hub loop has finished queueing replay frames.
-func (h *WSHub) SubscribeWithReplay(client *WSClient, topics []string, since int64) wsReplayResult {
+// It blocks until the hub loop has queued replay frames and called complete,
+// when provided, to queue the subscribe acknowledgment before live delivery.
+func (h *WSHub) SubscribeWithReplay(client *WSClient, topics []string, since int64, complete func(wsReplayResult) bool) wsReplayResult {
 	req := &wsReplayRequest{
-		client: client,
-		topics: topics,
-		since:  since,
-		resp:   make(chan wsReplayResult, 1),
+		client:   client,
+		topics:   topics,
+		since:    since,
+		complete: complete,
+		resp:     make(chan wsReplayResult, 1),
 	}
 	select {
 	case h.replayCh <- req:
@@ -527,6 +578,16 @@ func (h *WSHub) handleReplay(req *wsReplayRequest) {
 	req.client.Subscribe(req.topics)
 
 	res := wsReplayResult{}
+	defer func() {
+		// Keep the replay's completion acknowledgment in this same hub turn.
+		// Otherwise a live event could consume its reserved queue slot after
+		// we respond to the read loop but before that loop queues the ack.
+		if req.complete != nil && !req.complete(res) {
+			res.reset = true
+			h.trySendReset(req.client, "", "replay_overflow", res.cursor, 0)
+		}
+		req.resp <- res
+	}()
 	store := h.eventStore()
 	if store == nil {
 		// No persistence wired: replay is unavailable. Tell the client to
@@ -534,35 +595,54 @@ func (h *WSHub) handleReplay(req *wsReplayRequest) {
 		res.reset = true
 		res.cursor = h.currentSeq()
 		h.trySendReset(req.client, "", "replay_unavailable", res.cursor, 0)
-		req.resp <- res
 		return
 	}
 	res.cursor = store.CurrentSeq()
+	if _, pending := h.pendingResets[req.client]; pending {
+		h.flushClientReset(req.client)
+		res.reset = true
+		return
+	}
 
-	// GetSince accepts a single topic pattern; for multi-topic subscribes we
-	// fetch unfiltered and match in Go (bounded by wsReplayLimit).
 	topicFilter := ""
 	if len(req.topics) == 1 {
 		topicFilter = req.topics[0]
 	}
-	events, needsReset, err := store.GetSince(req.since, topicFilter, wsReplayLimit)
+	// Filter before limiting, and request one extra matching event so a
+	// bounded prefix can never masquerade as a complete reconnect history.
+	events, needsReset, err := store.getSinceTopics(req.since, req.topics, wsReplayLimit+1)
+	res.cursor = store.CurrentSeq()
 	if err != nil {
 		log.Printf("ws_events: replay query failed client=%s since=%d: %v", req.client.id, req.since, err)
-		req.resp <- res
+		res.reset = true
+		h.trySendReset(req.client, topicFilter, "replay_failed", res.cursor, 0)
 		return
 	}
 	if needsReset {
 		_, _, oldestAvail, _ := store.BufferStats()
 		res.reset = true
 		h.trySendReset(req.client, topicFilter, "cursor_expired", res.cursor, oldestAvail)
-		req.resp <- res
 		return
 	}
 
+	if len(events) > wsReplayLimit {
+		res.reset = true
+		h.trySendReset(req.client, topicFilter, "replay_limit_exceeded", res.cursor, 0)
+		return
+	}
+	// The completion callback queues the subscribe ack before this hub turn
+	// ends. Keep a slot for it, and avoid a partial replay when a slow client
+	// cannot accept the whole batch. Concurrent control frames can still fill
+	// the queue, so the send loop below also preserves the reset barrier.
+	available := cap(req.client.send) - len(req.client.send) - 1
+	if len(events) > available {
+		res.reset = true
+		h.trySendReset(req.client, topicFilter, "replay_overflow", res.cursor, 0)
+		return
+	}
+
+	frames := make([][]byte, 0, len(events))
 	for _, ev := range events {
-		if topicFilter == "" && !matchAnyTopic(req.topics, ev.Topic) {
-			continue
-		}
 		frame := &WSEvent{
 			Type:      WSMsgEvent,
 			Timestamp: ev.CreatedAt.UTC().Format(time.RFC3339Nano),
@@ -572,34 +652,68 @@ func (h *WSHub) handleReplay(req *wsReplayRequest) {
 			Data:      json.RawMessage(ev.Data),
 			Replay:    true,
 		}
+		// History may have been recorded while redaction was disabled, or by
+		// an older server. Apply the current disclosure policy without changing
+		// the stored cursor, original record or routing identity.
+		if err := h.redactEvent(frame); err != nil {
+			log.Printf("ws_events: replay withheld by redaction seq=%d", ev.Seq)
+			res.reset = true
+			h.trySendReset(req.client, "", "redaction_failed", res.cursor, 0)
+			return
+		}
 		data, err := json.Marshal(frame)
 		if err != nil {
 			log.Printf("ws_events: replay marshal error seq=%d: %v", ev.Seq, err)
-			continue
+			res.reset = true
+			h.trySendReset(req.client, topicFilter, "replay_failed", res.cursor, 0)
+			return
 		}
+		frames = append(frames, data)
+	}
+	for i, data := range frames {
 		if !req.client.trySend(data, nil) {
-			// Client send buffer overflowed mid-replay: record the remainder
-			// and stop. The ack's replay.replayed count tells the client the
-			// batch was cut short so it can re-subscribe from its cursor.
+			ev := events[i]
 			lastSeq := events[len(events)-1].Seq
 			if recErr := store.RecordDropped(req.client.id, ev.Topic, "replay_overflow", ev.Seq, lastSeq); recErr != nil {
 				log.Printf("ws_events: record replay overflow client=%s: %v", req.client.id, recErr)
 			}
 			log.Printf("ws_events: replay overflow client=%s dropped=[%d,%d]", req.client.id, ev.Seq, lastSeq)
+			res.reset = true
+			h.trySendReset(req.client, topicFilter, "replay_overflow", res.cursor, 0)
 			break
 		}
 		res.replayed++
 	}
-	req.resp <- res
 }
 
-// trySendReset queues a stream.reset frame; best-effort.
+// trySendReset queues a stream.reset frame. If the transport is full, retain a
+// barrier: no later event may be delivered before the client learns about the
+// gap. In particular, a failed durable append has no sequence to expose it.
 func (h *WSHub) trySendReset(client *WSClient, topic, reason string, currentSeq, oldestAvail int64) {
 	data, err := json.Marshal(NewStreamReset(topic, reason, currentSeq, oldestAvail))
 	if err != nil {
 		return
 	}
-	client.trySend(data, nil)
+	if client.trySend(data, nil) {
+		delete(h.pendingResets, client)
+	} else {
+		if h.pendingResets == nil {
+			h.pendingResets = make(map[*WSClient][]byte)
+		}
+		h.pendingResets[client] = data
+	}
+}
+
+func (h *WSHub) flushClientReset(client *WSClient) bool {
+	data, pending := h.pendingResets[client]
+	if !pending {
+		return true
+	}
+	if !client.trySend(data, nil) {
+		return false
+	}
+	delete(h.pendingResets, client)
+	return true
 }
 
 // matchAnyTopic reports whether topic matches any of the subscription patterns.

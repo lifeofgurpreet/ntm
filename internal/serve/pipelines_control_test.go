@@ -1,0 +1,1872 @@
+//go:build unix
+
+package serve
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"gopkg.in/yaml.v3"
+
+	"github.com/Dicklesworthstone/ntm/internal/pipeline"
+	"github.com/Dicklesworthstone/ntm/internal/redaction"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
+)
+
+func pipelineControlRequest(method, runID string) *http.Request {
+	req := httptest.NewRequest(method, "/api/v1/pipelines/"+runID, nil)
+	route := chi.NewRouteContext()
+	route.URLParams.Add("id", runID)
+	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, route))
+}
+
+func TestPipelineCleanupHTTPRetainsRecoveryEvidenceAndLiveOwners(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	srv.auth = AuthConfig{Mode: AuthModeAPIKey, APIKey: "pipeline-recovery-test-key", Role: RoleOperator}
+	root := srv.projectDir
+	old := time.Now().Add(-48 * time.Hour).UTC()
+	writeCheckpoint := func(project, runID string, unresolved, recent bool) []byte {
+		t.Helper()
+		started, finished := old.Add(-time.Minute), old
+		result := pipeline.StepResult{
+			StepID: "work", Status: pipeline.StatusCompleted, AgentType: "command",
+			StartedAt: started, FinishedAt: finished, Output: "PRIVATE-CLEANUP-OUTPUT",
+		}
+		record := pipeline.CommandExecutionState{
+			Version: 1, StepID: result.StepID, StepHash: strings.Repeat("a", 64),
+			ProcessID: 2147483000, Status: "settled", StartedAt: started,
+			SettledAt: finished, Result: result,
+		}
+		status := pipeline.StatusCompleted
+		if unresolved {
+			// A failed scheduler result can coexist with a process group whose
+			// termination was never proved. Age must not erase that fence.
+			status, result.Status = pipeline.StatusFailed, pipeline.StatusFailed
+			result.Error = &pipeline.StepError{Type: "process_cleanup", Message: "process group observation failed"}
+			record.Status, record.SettledAt, record.Result = "unresolved", time.Time{}, result
+		}
+		state := &pipeline.ExecutionState{
+			RunID: runID, WorkflowID: "cleanup-http", Session: "cleanup-http",
+			Status: status, StartedAt: started, FinishedAt: finished, UpdatedAt: finished,
+			CommandEvaluationVersion: 2,
+			Steps:                    map[string]pipeline.StepResult{"work": result},
+			CommandExecutions:        map[string]pipeline.CommandExecutionState{"work": record},
+		}
+		if err := pipeline.SaveState(project, state); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(project, ".ntm", "pipelines", runID+".json")
+		if !recent {
+			if err := os.Chtimes(path, old, old); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return pipelineRecoveryHTTPJournal(t, project, runID)
+	}
+	before := map[string][]byte{
+		"cleanup-settled":    writeCheckpoint(root, "cleanup-settled", false, false),
+		"cleanup-unresolved": writeCheckpoint(root, "cleanup-unresolved", true, false),
+		"cleanup-owned":      writeCheckpoint(root, "cleanup-owned", false, false),
+		"cleanup-recent":     writeCheckpoint(root, "cleanup-recent", false, true),
+	}
+	otherProject := t.TempDir()
+	otherBefore := writeCheckpoint(otherProject, "cleanup-settled", false, false)
+	owner, err := pipeline.AcquireRunControl(context.Background(), root, "cleanup-owned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	const path = "/api/v1/pipelines/cleanup"
+	const body = `{"older_than_hours":24}`
+	request := func() *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		srv.router.ServeHTTP(rec, pipelineRecoveryHTTPRequest(http.MethodPost, path, body))
+		return rec
+	}
+
+	// Exercise the registered route and its permissions, not just the handler.
+	if rec := request(); rec.Code != http.StatusForbidden {
+		t.Fatalf("operator cleanup = %d %s, want forbidden", rec.Code, rec.Body)
+	}
+	for runID, original := range before {
+		if !bytes.Equal(original, pipelineRecoveryHTTPJournal(t, root, runID)) {
+			t.Fatalf("denied cleanup changed %s", runID)
+		}
+	}
+	srv.auth.Role = RoleAdmin
+	rec := request()
+	var response struct {
+		Success bool `json:"success"`
+		pipeline.StateCleanupResult
+		OlderThanHours int `json:"older_than_hours"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil || rec.Code != http.StatusOK || !response.Success {
+		t.Fatalf("cleanup failed: %d %s: %v", rec.Code, rec.Body, err)
+	}
+	if response.Deleted != 1 || response.Eligible != 1 || response.Retained != 3 || response.OlderThanHours != 24 || len(response.Entries) != 4 {
+		t.Fatalf("cleanup did not distinguish settled, uncertain, owned and recent state: %s", rec.Body)
+	}
+	want := map[string]pipeline.StateCleanupEntry{
+		"cleanup-settled":    {RunID: "cleanup-settled", Action: "deleted", Reason: "settled"},
+		"cleanup-unresolved": {RunID: "cleanup-unresolved", Action: "retained", Reason: "unsettled_command"},
+		"cleanup-owned":      {RunID: "cleanup-owned", Action: "retained", Reason: "owned"},
+		"cleanup-recent":     {RunID: "cleanup-recent", Action: "retained", Reason: "recent"},
+	}
+	for _, entry := range response.Entries {
+		if expected, ok := want[entry.RunID]; !ok || entry != expected {
+			t.Fatalf("unexpected cleanup decision: %+v", entry)
+		}
+		delete(want, entry.RunID)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing cleanup decisions: %+v", want)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".ntm", "pipelines", "cleanup-settled.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("settled checkpoint was not deleted: %v", err)
+	}
+	for _, runID := range []string{"cleanup-unresolved", "cleanup-owned", "cleanup-recent"} {
+		if !bytes.Equal(before[runID], pipelineRecoveryHTTPJournal(t, root, runID)) {
+			t.Fatalf("cleanup rewrote retained checkpoint %s", runID)
+		}
+	}
+	if !bytes.Equal(otherBefore, pipelineRecoveryHTTPJournal(t, otherProject, "cleanup-settled")) {
+		t.Fatal("cleanup escaped the configured project")
+	}
+	if owner.Context().Err() != nil {
+		t.Fatal("cleanup cancelled the live owner")
+	}
+	if second, err := pipeline.AcquireRunControl(context.Background(), root, "cleanup-owned"); !errors.Is(err, pipeline.ErrRunAlreadyOwned) {
+		if second != nil {
+			second.Close()
+		}
+		t.Fatalf("cleanup broke the owner's lock rendezvous: %v", err)
+	}
+	if strings.Contains(rec.Body.String(), "PRIVATE-CLEANUP-OUTPUT") || strings.Contains(rec.Body.String(), "process group observation failed") {
+		t.Fatal("cleanup report exposed receipt output or diagnostics")
+	}
+}
+
+func TestPipelineResumeRejectsLiveOwnerBeforeCheckpointMutation(t *testing.T) {
+	dir := t.TempDir()
+	runID := pipeline.GenerateRunID()
+	workflowPath := filepath.Join(dir, "owned.yaml")
+	workflow, err := yaml.Marshal(&pipeline.Workflow{
+		SchemaVersion: "2.0", Name: "owned",
+		Steps: []pipeline.Step{{ID: "work", Command: "true"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(workflowPath, workflow, 0600); err != nil {
+		t.Fatal(err)
+	}
+	state := &pipeline.ExecutionState{RunID: runID, WorkflowID: "owned", WorkflowFile: workflowPath, Session: "owned", Status: pipeline.StatusRunning}
+	if err := pipeline.SaveState(dir, state); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, ".ntm", "pipelines", runID+".json")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := pipeline.AcquireRunControl(context.Background(), dir, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	srv := &Server{projectDir: dir}
+	rec := httptest.NewRecorder()
+	srv.handleResumePipeline(rec, pipelineControlRequest(http.MethodPost, runID))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("concurrent resume = %d %s, want conflict", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		ErrorCode string `json:"error_code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil || response.ErrorCode != ErrCodePipelineRunning {
+		t.Fatalf("missing live-owner error: %s %v", rec.Body.String(), err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(before, after) || owner.Context().Err() != nil {
+		t.Fatalf("rejected resume mutated checkpoint or canceled owner: %v", err)
+	}
+}
+
+func TestPipelineResumeReloadsCheckpointInsideOwnership(t *testing.T) {
+	dir := t.TempDir()
+	runID := pipeline.GenerateRunID()
+	marker := filepath.Join(dir, "must-not-repeat")
+	workflowPath := filepath.Join(dir, "resume.yaml")
+	workflow, err := yaml.Marshal(&pipeline.Workflow{
+		SchemaVersion: "2.0", Name: "completed-work",
+		Steps: []pipeline.Step{{ID: "completed", Command: fmt.Sprintf("echo duplicate > %q", marker)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(workflowPath, workflow, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// This is the caller's old view. Another attempt has since completed the
+	// step and checkpointed it; passing this snapshot must not replay work.
+	stale := &pipeline.ExecutionState{
+		RunID: runID, WorkflowID: "completed-work", WorkflowFile: workflowPath,
+		Session: "resumecontrol", Status: pipeline.StatusFailed,
+		Variables: map[string]interface{}{}, Steps: map[string]pipeline.StepResult{},
+	}
+	latest := *stale
+	latest.Steps = map[string]pipeline.StepResult{"completed": {Status: pipeline.StatusCompleted}}
+	if err := pipeline.SaveState(dir, &latest); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{projectDir: dir}
+	out := srv.resumePipelineWithResult(context.Background(), runID, stale.Session, nil, stale, pipeline.ResumeOptions{})
+	if !out.Success || out.Status != "completed" || out.RunID != runID {
+		t.Fatalf("resume from fresh checkpoint failed: %+v", out)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("resume replayed already completed work: %v", err)
+	}
+}
+
+func TestPipelineCancelRequiresAcknowledgingOwner(t *testing.T) {
+	dir := t.TempDir()
+	runID := pipeline.GenerateRunID()
+	state := &pipeline.ExecutionState{RunID: runID, WorkflowID: "orphan", Session: "orphan", Status: pipeline.StatusRunning}
+	if err := pipeline.SaveState(dir, state); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{projectDir: dir}
+	rec := httptest.NewRecorder()
+	srv.handleCancelPipeline(rec, pipelineControlRequest(http.MethodDelete, runID))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("orphan status was mistaken for live cancellation: %d %s", rec.Code, rec.Body.String())
+	}
+	stillRunning, err := pipeline.LoadState(dir, runID)
+	if err != nil || stillRunning.Status != pipeline.StatusRunning {
+		t.Fatalf("controller forged a terminal state for an unacknowledged request: %+v %v", stillRunning, err)
+	}
+}
+
+func TestPipelineCancelReachesSeparateServerProcess(t *testing.T) {
+	dir := t.TempDir()
+	ready := filepath.Join(dir, "command-running")
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, stop := context.WithTimeout(context.Background(), 10*time.Second)
+	defer stop()
+	cmd := exec.CommandContext(ctx, binary, "-test.run=^TestPipelineRemoteControlProcessHelper$")
+	cmd.Env = append(os.Environ(), "NTM_PIPELINE_CONTROL_HELPER=1", "NTM_PIPELINE_CONTROL_ROOT="+dir, "NTM_PIPELINE_CONTROL_READY="+ready)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { defer close(done); done <- cmd.Wait() }()
+	defer func() {
+		stop()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("remote workflow did not start actual command work")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, ".ntm", "pipelines"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var runID string
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) == ".json" {
+			runID = entry.Name()[:len(entry.Name())-5]
+			break
+		}
+	}
+	if runID == "" {
+		t.Fatal("remote execution did not persist an inspectable run")
+	}
+	// No local registration and cwd is not dir: the configured project must
+	// supply the snapshot, and only the other process can acknowledge cancel.
+	srv := &Server{projectDir: dir}
+	inspect := httptest.NewRecorder()
+	srv.handleGetPipeline(inspect, pipelineControlRequest(http.MethodGet, runID))
+	if inspect.Code != http.StatusOK {
+		t.Fatalf("remote inspect: %d %s", inspect.Code, inspect.Body.String())
+	}
+	rec := httptest.NewRecorder()
+	srv.handleCancelPipeline(rec, pipelineControlRequest(http.MethodDelete, runID))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("remote cancellation: %d %s, want acknowledged 202", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil || response.Status != "cancellation_requested" {
+		t.Fatalf("acknowledgment overclaimed termination: %s %v", rec.Body.String(), err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("owning server did not stop real work: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("controller changed bookkeeping but the remote execution kept running")
+	}
+	final, err := pipeline.LoadState(dir, runID)
+	if err != nil || final.Status != pipeline.StatusCancelled {
+		t.Fatalf("owning executor did not checkpoint cancellation: %+v %v", final, err)
+	}
+}
+
+func TestPipelineRemoteControlProcessHelper(t *testing.T) {
+	if os.Getenv("NTM_PIPELINE_CONTROL_HELPER") == "" {
+		t.Skip("subprocess helper")
+	}
+	srv := &Server{projectDir: os.Getenv("NTM_PIPELINE_CONTROL_ROOT")}
+	workflow := &pipeline.Workflow{
+		SchemaVersion: "2.0", Name: "remote-control",
+		Steps: []pipeline.Step{{ID: "gate", Command: fmt.Sprintf("echo started > %q; exec sleep 30", os.Getenv("NTM_PIPELINE_CONTROL_READY"))}},
+	}
+	out := srv.execPipelineInline(context.Background(), workflow, "remotecontrol", nil, false)
+	if out.Success || out.RunID == "" {
+		t.Fatalf("canceled remote execution reported success: %+v", out)
+	}
+	state, err := pipeline.LoadState(srv.projectDir, out.RunID)
+	if err != nil || state.Status != pipeline.StatusCancelled {
+		t.Fatalf("cancellation did not reach executor: %+v %v", state, err)
+	}
+}
+
+func TestPipelineResumeHTTPRecoversConfirmedDeliveryWithoutResending(t *testing.T) {
+	root := t.TempDir()
+	workflow := &pipeline.Workflow{SchemaVersion: pipeline.SchemaVersion, Name: "http-agent-recovery", Steps: []pipeline.Step{
+		{ID: "agent", Pane: pipeline.PaneSpec{Index: 1}, Prompt: "Work on this HTTP request", Wait: pipeline.WaitTime, Timeout: pipeline.Duration{Duration: time.Second}},
+		{ID: "consume", Command: "cat", Stdin: "${steps.agent.output}", DependsOn: []string{"agent"}},
+	}}
+	frozen, workflowPath, err := pipeline.SnapshotWorkflow(context.Background(), root, workflow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock := pipeline.NewMockTmuxClient(tmux.Pane{ID: "%17", Index: 1, NTMIndex: 1, PID: 2718, Type: tmux.AgentClaude, Width: 120, Height: 40})
+	t.Cleanup(mock.Reset)
+	if err := mock.SetPaneOutput("%17", "OLD-ANSWER\n"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := pipeline.DefaultExecutorConfig("delivery-session")
+	cfg.ProjectDir, cfg.WorkflowFile, cfg.RunID = root, workflowPath, pipeline.GenerateRunID()
+	executor := pipeline.NewExecutor(cfg)
+	executor.SetTmuxClient(mock)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	watchDone := make(chan struct{})
+	delivered := false
+	go func() {
+		defer close(watchDone)
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				state, err := pipeline.LoadState(root, cfg.RunID)
+				if err == nil && state.AgentDeliveries["agent"].Status == "delivered" {
+					delivered = true
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	state, runErr := executor.Run(ctx, frozen, nil, nil)
+	cancel()
+	<-watchDone
+	if !delivered || runErr == nil || state == nil || state.Status != pipeline.StatusCancelled {
+		t.Fatalf("initial dispatch did not stop after confirmed delivery: delivered=%t state=%+v err=%v", delivered, state, runErr)
+	}
+	history, err := mock.PasteHistory("%17")
+	if err != nil || len(history) != 1 || len(mock.VerificationHistory()) != 1 {
+		t.Fatalf("initial dispatch was not sent and verified exactly once: pastes=%+v verifications=%+v err=%v", history, mock.VerificationHistory(), err)
+	}
+	prior, err := pipeline.LoadState(root, cfg.RunID)
+	if err != nil || prior.AgentDeliveries["agent"].Status != "delivered" {
+		t.Fatalf("initial delivery was not durably resumable: %+v %v", prior, err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "recovery-pane-output"), []byte(prior.AgentDeliveries["agent"].BeforeOutput+"\nFRESH-HTTP-ANSWER\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NTM_HTTP_PIPELINE_RECOVERY_ROOT", root)
+	const script = `#!/bin/sh
+printf '%s\n' "$*" >> "$NTM_HTTP_PIPELINE_RECOVERY_ROOT/recovery-tmux-calls"
+case "$1" in
+  -V) echo 'tmux 3.4' ;;
+  list-panes) echo '%17_NTM_SEP_1_NTM_SEP_delivery-session__cc_1_NTM_SEP_claude_NTM_SEP_120_NTM_SEP_40_NTM_SEP_1_NTM_SEP_2718_NTM_SEP_0_NTM_SEP_cc_NTM_SEP__NTM_SEP__NTM_SEP_0' ;;
+  capture-pane) cat "$NTM_HTTP_PIPELINE_RECOVERY_ROOT/recovery-pane-output" ;;
+  display-message) printf '%s\n' "$NTM_HTTP_PIPELINE_RECOVERY_ROOT" ;;
+  load-buffer|paste-buffer|send-keys) exit 97 ;;
+esac
+`
+	bin := filepath.Join(root, "recovery-tmux")
+	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NTM_TMUX_BINARY", bin)
+	oldClient := tmux.DefaultClient
+	tmux.DefaultClient = tmux.NewClient("")
+	t.Cleanup(func() { tmux.DefaultClient = oldClient })
+	srv := &Server{projectDir: root}
+	request := pipelineControlRequest(http.MethodPost, prior.RunID)
+	resumeCtx, cancelResume := context.WithTimeout(request.Context(), 10*time.Second)
+	defer cancelResume()
+	recorder := httptest.NewRecorder()
+	srv.handleResumePipeline(recorder, request.WithContext(resumeCtx))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("HTTP recovery failed: %d %s", recorder.Code, recorder.Body.String())
+	}
+	final, err := pipeline.LoadState(root, prior.RunID)
+	if err != nil || final.Status != pipeline.StatusCompleted {
+		t.Fatalf("HTTP recovery did not persist completion: %+v %v", final, err)
+	}
+	for _, stepID := range []string{"agent", "consume"} {
+		if got := strings.TrimSpace(final.Steps[stepID].Output); got != "FRESH-HTTP-ANSWER" {
+			t.Fatalf("HTTP recovery %s used stale or missing response: %q", stepID, got)
+		}
+	}
+	if receipt := final.AgentDeliveries["agent"]; receipt.Status != "completed" || receipt.DeliveredAt != prior.AgentDeliveries["agent"].DeliveredAt {
+		t.Fatalf("HTTP resume did not complete the original delivery: %+v", receipt)
+	}
+	calls, err := os.ReadFile(filepath.Join(root, "recovery-tmux-calls"))
+	if err != nil || !strings.Contains(string(calls), "capture-pane") {
+		t.Fatalf("HTTP resume did not observe original pane: %s %v", calls, err)
+	}
+	for _, transport := range []string{"load-buffer", "paste-buffer", "send-keys"} {
+		if strings.Contains(string(calls), transport) {
+			t.Fatalf("HTTP resume repeated transport %s: %s", transport, calls)
+		}
+	}
+}
+
+type pipelineRecoveryHTTPResponse struct {
+	Success    bool                                      `json:"success"`
+	ErrorCode  string                                    `json:"error_code"`
+	RunID      string                                    `json:"run_id"`
+	WorkflowID string                                    `json:"workflow_id"`
+	Session    string                                    `json:"session"`
+	Deliveries []pipeline.AgentDeliveryRecoveryEntry     `json:"deliveries"`
+	Delivery   pipeline.AgentDeliveryRecoveryEntry       `json:"delivery"`
+	Commands   []pipeline.CommandExecutionRecoveryEntry  `json:"commands"`
+	Command    pipeline.CommandExecutionRecoveryEntry    `json:"command"`
+	Selectors  []pipeline.CommandEvaluationRecoveryEntry `json:"selectors"`
+	Selector   pipeline.CommandEvaluationRecoveryEntry   `json:"selector"`
+	Replayed   bool                                      `json:"replayed"`
+}
+
+type pipelineRecoveryHTTPBodyBarrier struct {
+	*strings.Reader
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *pipelineRecoveryHTTPBodyBarrier) Read(p []byte) (int, error) {
+	b.once.Do(func() {
+		close(b.entered)
+		<-b.release
+	})
+	return b.Reader.Read(p)
+}
+
+func pipelineRecoveryHTTPRequest(method, path, body string) *http.Request {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer pipeline-recovery-test-key")
+	req.RemoteAddr = "127.0.0.1:12345"
+	return req
+}
+
+func pipelineRecoveryHTTPServe(t *testing.T, srv *Server, req *http.Request) (*httptest.ResponseRecorder, pipelineRecoveryHTTPResponse) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	srv.router.ServeHTTP(rec, req)
+	var out pipelineRecoveryHTTPResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("invalid recovery response: %d %s: %v", rec.Code, rec.Body, err)
+	}
+	return rec, out
+}
+
+func pipelineRecoveryHTTPBody(t *testing.T, token, reason string) string {
+	t.Helper()
+	body, err := json.Marshal(PipelineRecoverRequest{StepID: "agent", Receipt: token, AcceptDelivery: true, Reason: reason})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
+}
+
+func pipelineRecoveryHTTPJournal(t *testing.T, root, runID string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(root, ".ntm", "pipelines", runID+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// Produce a genuine uncertain dispatch: the transport pastes once but its
+// submission acknowledgment fails. Tests recover the executor's durable journal,
+// rather than inventing a receipt or bypassing production admission checks.
+func pipelineRecoveryHTTPCheckpoint(t *testing.T, root, kind string) *pipeline.ExecutionState {
+	t.Helper()
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	step := pipeline.Step{ID: "agent", Pane: pipeline.PaneSpec{Index: 1}, Prompt: "Work on this HTTP request", Wait: pipeline.WaitTime, Timeout: pipeline.Duration{Duration: time.Second}}
+	if kind == "template" {
+		path := filepath.Join(root, "review.md")
+		if err := os.WriteFile(path, []byte("Work on this HTTP template request"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		step.Prompt, step.Template = "", path
+	}
+	workflow := &pipeline.Workflow{SchemaVersion: pipeline.SchemaVersion, Name: "http-uncertain-recovery", Steps: []pipeline.Step{
+		step, {ID: "consume", Command: "cat", Stdin: "${steps.agent.output}", DependsOn: []string{"agent"}},
+	}}
+	frozen, path, err := pipeline.SnapshotWorkflow(context.Background(), root, workflow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock := pipeline.NewMockTmuxClient(tmux.Pane{ID: "%17", Index: 1, NTMIndex: 1, PID: 2718, Type: tmux.AgentClaude, Width: 120, Height: 40})
+	t.Cleanup(mock.Reset)
+	if err := mock.SetPaneOutput("%17", "OLD-ANSWER\n"); err != nil {
+		t.Fatal(err)
+	}
+	mock.SetSubmissionVerifier(func(_, _, _ string) error { return errors.New("submission acknowledgment was lost") })
+	cfg := pipeline.DefaultExecutorConfig("delivery-session")
+	cfg.ProjectDir, cfg.WorkflowFile, cfg.RunID = root, path, pipeline.GenerateRunID()
+	executor := pipeline.NewExecutor(cfg)
+	executor.SetTmuxClient(mock)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	state, runErr := executor.Run(ctx, frozen, nil, nil)
+	if runErr == nil || state == nil || state.Status != pipeline.StatusFailed {
+		t.Fatalf("dispatch did not fail after uncertain submission: %+v %v", state, runErr)
+	}
+	history, err := mock.PasteHistory("%17")
+	if err != nil || len(history) != 1 || len(mock.VerificationHistory()) != 1 {
+		t.Fatalf("initial dispatch must paste and verify exactly once: %+v %v", history, err)
+	}
+	prior, err := pipeline.LoadState(root, cfg.RunID)
+	if err != nil || prior.AgentDeliveries["agent"].Status != "sending" {
+		t.Fatalf("uncertain delivery was not persisted: %+v %v", prior, err)
+	}
+	return prior
+}
+
+func pipelineRecoveryHTTPTmux(t *testing.T, root, transcript string) string {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(root, "recovery-pane-output"), []byte(transcript), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NTM_HTTP_PIPELINE_RECOVERY_ROOT", root)
+	t.Setenv("NTM_HTTP_PIPELINE_RECOVERY_PID", "2718")
+	t.Setenv("NTM_HTTP_PIPELINE_RECOVERY_HANG", "0")
+	const script = `#!/bin/sh
+printf '%s\n' "$*" >> "$NTM_HTTP_PIPELINE_RECOVERY_ROOT/recovery-tmux-calls"
+case "$1" in
+  -V) echo 'tmux 3.4' ;;
+  list-sessions) echo 'delivery-session_NTM_SEP_1_NTM_SEP_0_NTM_SEP_1700000000' ;;
+  list-panes) printf '%%17_NTM_SEP_1_NTM_SEP_delivery-session__cc_1_NTM_SEP_claude_NTM_SEP_120_NTM_SEP_40_NTM_SEP_1_NTM_SEP_%s_NTM_SEP_0_NTM_SEP_cc_NTM_SEP__NTM_SEP__NTM_SEP_0\n' "$NTM_HTTP_PIPELINE_RECOVERY_PID" ;;
+  capture-pane)
+    if [ "$NTM_HTTP_PIPELINE_RECOVERY_HANG" = 1 ]; then exec sleep 30; fi
+    cat "$NTM_HTTP_PIPELINE_RECOVERY_ROOT/recovery-pane-output" ;;
+  display-message) printf '%s\n' "$NTM_HTTP_PIPELINE_RECOVERY_ROOT" ;;
+  load-buffer|paste-buffer|send-keys) exit 97 ;;
+esac
+`
+	bin := filepath.Join(root, "recovery-tmux")
+	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NTM_TMUX_BINARY", bin)
+	oldClient := tmux.DefaultClient
+	tmux.DefaultClient = tmux.NewClient("")
+	t.Cleanup(func() { tmux.DefaultClient = oldClient })
+	return filepath.Join(root, "recovery-tmux-calls")
+}
+
+func pipelineRecoveryHTTPAssertNoSend(t *testing.T, logPath string) {
+	t.Helper()
+	calls, err := os.ReadFile(logPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	for _, transport := range []string{"load-buffer", "paste-buffer", "send-keys"} {
+		if strings.Contains(string(calls), transport) {
+			t.Fatalf("recovery repeated prompt transport %s: %s", transport, calls)
+		}
+	}
+}
+
+func TestPipelineRecoverHTTPAcceptsThenResumesWithoutResending(t *testing.T) {
+	for _, kind := range []string{"prompt", "template"} {
+		t.Run(kind, func(t *testing.T) {
+			srv, _ := setupTestServer(t)
+			srv.auth = AuthConfig{Mode: AuthModeAPIKey, APIKey: "pipeline-recovery-test-key", Role: RoleOperator}
+			root := srv.projectDir
+			prior := pipelineRecoveryHTTPCheckpoint(t, root, kind)
+			original := prior.AgentDeliveries["agent"]
+			logPath := pipelineRecoveryHTTPTmux(t, root, original.BeforeOutput+"\nFRESH-HTTP-ANSWER\n")
+			path := "/api/v1/pipelines/" + prior.RunID + "/recover"
+			before := pipelineRecoveryHTTPJournal(t, root, prior.RunID)
+			rec, inspection := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodGet, path, ""))
+			if rec.Code != http.StatusOK || !inspection.Success || len(inspection.Deliveries) != 1 {
+				t.Fatalf("inspection failed: %d %s", rec.Code, rec.Body)
+			}
+			entry := inspection.Deliveries[0]
+			if entry.StepID != "agent" || entry.Kind != kind || entry.Status != "sending" || !entry.CanAccept || entry.PaneID != "%17" || entry.PanePID != 2718 || len(entry.ReceiptToken) != 64 {
+				t.Fatalf("wrong recovery identity: %+v", entry)
+			}
+			for _, hidden := range []string{"OLD-ANSWER", "FRESH-HTTP-ANSWER", "Work on this", "before_output", "prompt_hash", "workflow_file"} {
+				if strings.Contains(rec.Body.String(), hidden) {
+					t.Fatalf("inspection leaked %q: %s", hidden, rec.Body)
+				}
+			}
+			if !bytes.Equal(before, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+				t.Fatal("read-only inspection changed the delivery journal")
+			}
+			if calls, err := os.ReadFile(logPath); err == nil && len(calls) > 0 {
+				t.Fatalf("read-only inspection contacted tmux: %s", calls)
+			}
+			const reason = "Observed the original agent answer the submitted request"
+			body := pipelineRecoveryHTTPBody(t, entry.ReceiptToken, reason)
+			rec, accepted := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodPost, path, body))
+			if rec.Code != http.StatusOK || !accepted.Success || accepted.Replayed || accepted.Delivery.Status != "delivered" || accepted.Delivery.ResolutionAction != pipeline.AgentDeliveryResolutionAccept || accepted.Delivery.ResolutionReason != reason || accepted.Delivery.ResolvedAt.IsZero() {
+				t.Fatalf("acceptance failed: %d %s", rec.Code, rec.Body)
+			}
+			saved, err := pipeline.LoadState(root, prior.RunID)
+			if err != nil || saved.Status != prior.Status || saved.Steps["consume"].Status == pipeline.StatusCompleted {
+				t.Fatalf("acceptance executed or completed pipeline work: %+v %v", saved, err)
+			}
+			delivery := saved.AgentDeliveries["agent"]
+			if delivery.BeforeOutput != original.BeforeOutput || delivery.Output != original.Output || !delivery.StartedAt.Equal(original.StartedAt) {
+				t.Fatalf("acceptance replaced original evidence: %+v", delivery)
+			}
+			acceptedBytes := pipelineRecoveryHTTPJournal(t, root, prior.RunID)
+			rec, replay := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodPost, path, body))
+			if rec.Code != http.StatusOK || !replay.Replayed || replay.Delivery != accepted.Delivery || !bytes.Equal(acceptedBytes, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+				t.Fatalf("durable acceptance replay changed its decision: %d %s", rec.Code, rec.Body)
+			}
+			resume := pipelineRecoveryHTTPRequest(http.MethodPost, "/api/v1/pipelines/"+prior.RunID+"/resume", "{}")
+			ctx, cancel := context.WithTimeout(resume.Context(), 10*time.Second)
+			defer cancel()
+			rec, _ = pipelineRecoveryHTTPServe(t, srv, resume.WithContext(ctx))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("ordinary HTTP resume failed: %d %s", rec.Code, rec.Body)
+			}
+			final, err := pipeline.LoadState(root, prior.RunID)
+			if err != nil || final.Status != pipeline.StatusCompleted || final.AgentDeliveries["agent"].Status != "completed" {
+				t.Fatalf("resume did not complete original delivery: %+v %v", final, err)
+			}
+			for _, stepID := range []string{"agent", "consume"} {
+				if got := strings.TrimSpace(final.Steps[stepID].Output); got != "FRESH-HTTP-ANSWER" {
+					t.Fatalf("%s consumed stale or missing output: %q", stepID, got)
+				}
+			}
+			// An immutable decision remains replayable after completion, even
+			// when the old physical agent process has since been replaced.
+			t.Setenv("NTM_HTTP_PIPELINE_RECOVERY_PID", "9999")
+			completedBytes := pipelineRecoveryHTTPJournal(t, root, prior.RunID)
+			rec, replay = pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodPost, path, body))
+			if rec.Code != http.StatusOK || !replay.Replayed || replay.Delivery.Status != "completed" || replay.Delivery.ResolvedAt != accepted.Delivery.ResolvedAt || !bytes.Equal(completedBytes, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+				t.Fatalf("completed receipt could not replay its saved decision: %d %s", rec.Code, rec.Body)
+			}
+			pipelineRecoveryHTTPAssertNoSend(t, logPath)
+		})
+	}
+}
+
+func TestPipelineRecoverHTTPRefusalsPreserveJournal(t *testing.T) {
+	for _, scenario := range []string{"stale receipt", "changed pane lifetime", "lost output boundary", "live owner", "conflicting reason", "missing workflow"} {
+		t.Run(scenario, func(t *testing.T) {
+			srv, _ := setupTestServer(t)
+			srv.auth = AuthConfig{Mode: AuthModeAPIKey, APIKey: "pipeline-recovery-test-key", Role: RoleOperator}
+			root := srv.projectDir
+			prior := pipelineRecoveryHTTPCheckpoint(t, root, "prompt")
+			logPath := pipelineRecoveryHTTPTmux(t, root, prior.AgentDeliveries["agent"].BeforeOutput+"\nFRESH-HTTP-ANSWER\n")
+			path := "/api/v1/pipelines/" + prior.RunID + "/recover"
+			_, inspection := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodGet, path, ""))
+			if len(inspection.Deliveries) != 1 {
+				t.Fatalf("missing receipt: %+v", inspection)
+			}
+			token, reason := inspection.Deliveries[0].ReceiptToken, "Observed the original response"
+			wantStatus, wantCode := http.StatusConflict, ErrCodeRecoveryRefused
+			switch scenario {
+			case "stale receipt":
+				if token[0] == '0' {
+					token = "1" + token[1:]
+				} else {
+					token = "0" + token[1:]
+				}
+			case "changed pane lifetime":
+				t.Setenv("NTM_HTTP_PIPELINE_RECOVERY_PID", "9999")
+			case "lost output boundary":
+				if err := os.WriteFile(filepath.Join(root, "recovery-pane-output"), []byte("UNRELATED-REPLACEMENT-SCREEN"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "live owner":
+				owner, err := pipeline.AcquireRunControl(context.Background(), root, prior.RunID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(owner.Close)
+				// Ownership must win even when reading the checkpoint would fail.
+				if err := os.WriteFile(filepath.Join(root, ".ntm", "pipelines", prior.RunID+".json"), []byte("not a checkpoint"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				wantCode = ErrCodePipelineRunning
+			case "conflicting reason":
+				rec, accepted := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodPost, path, pipelineRecoveryHTTPBody(t, token, reason)))
+				if rec.Code != http.StatusOK || accepted.Replayed {
+					t.Fatalf("initial acceptance failed: %d %s", rec.Code, rec.Body)
+				}
+				reason = "A different operator explanation"
+			case "missing workflow":
+				// Keep a valid delivery fingerprint; only the frozen asset is
+				// unavailable. This must not become PIPELINE_NOT_FOUND.
+				if err := os.Rename(prior.WorkflowFile, prior.WorkflowFile+".unavailable"); err != nil {
+					t.Fatal(err)
+				}
+				wantStatus, wantCode = http.StatusServiceUnavailable, ErrCodeServiceUnavail
+			}
+			before := pipelineRecoveryHTTPJournal(t, root, prior.RunID)
+			rec, out := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodPost, path, pipelineRecoveryHTTPBody(t, token, reason)))
+			if rec.Code != wantStatus || out.Success || out.ErrorCode != wantCode {
+				t.Fatalf("unsafe recovery = %d %s, want %d %s", rec.Code, rec.Body, wantStatus, wantCode)
+			}
+			if !bytes.Equal(before, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+				t.Fatal("refused acceptance rewrote the checkpoint")
+			}
+			pipelineRecoveryHTTPAssertNoSend(t, logPath)
+		})
+	}
+}
+
+func TestPipelineRecoverHTTPRejectsMalformedDecisions(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	srv.auth = AuthConfig{Mode: AuthModeAPIKey, APIKey: "pipeline-recovery-test-key", Role: RoleOperator}
+	root := srv.projectDir
+	prior := pipelineRecoveryHTTPCheckpoint(t, root, "prompt")
+	path := "/api/v1/pipelines/" + prior.RunID + "/recover"
+	_, inspection := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodGet, path, ""))
+	if len(inspection.Deliveries) != 1 {
+		t.Fatalf("missing receipt: %+v", inspection)
+	}
+	token := inspection.Deliveries[0].ReceiptToken
+	valid := pipelineRecoveryHTTPBody(t, token, "Observed the response")
+	cases := map[string]string{
+		"empty": "", "null": "null", "array": "[]", "trailing document": valid + " {}", "trailing garbage": valid + " x",
+		"missing step":       strings.Replace(valid, `"step_id":"agent",`, "", 1),
+		"blank step":         strings.Replace(valid, `"step_id":"agent"`, `"step_id":" "`, 1),
+		"inexact step":       strings.Replace(valid, `"step_id":"agent"`, `"step_id":" agent"`, 1),
+		"missing receipt":    strings.Replace(valid, `"receipt":"`+token+`",`, "", 1),
+		"short receipt":      strings.Replace(valid, token, "abcd", 1),
+		"uppercase receipt":  strings.Replace(valid, token, strings.ToUpper(token), 1),
+		"missing acceptance": strings.Replace(valid, `"accept_delivery":true,`, "", 1),
+		"false acceptance":   strings.Replace(valid, `"accept_delivery":true`, `"accept_delivery":false`, 1),
+		"null acceptance":    strings.Replace(valid, `"accept_delivery":true`, `"accept_delivery":null`, 1),
+		"string acceptance":  strings.Replace(valid, `"accept_delivery":true`, `"accept_delivery":"true"`, 1),
+		"missing reason":     strings.Replace(valid, `,"reason":"Observed the response"`, "", 1),
+		"blank reason":       strings.Replace(valid, `"Observed the response"`, `" "`, 1),
+		"null reason":        strings.Replace(valid, `"Observed the response"`, `null`, 1),
+		"long reason":        pipelineRecoveryHTTPBody(t, token, strings.Repeat("r", 4097)),
+		"project override":   strings.TrimSuffix(valid, "}") + `,"project_dir":"/another-project"}`,
+		"session override":   strings.TrimSuffix(valid, "}") + `,"session":"another-session"}`,
+		"dry run":            strings.TrimSuffix(valid, "}") + `,"dry_run":true}`,
+		"oversized body":     strings.Repeat(" ", pipelineRecoveryMaxBodyBytes+1) + valid,
+	}
+	before := pipelineRecoveryHTTPJournal(t, root, prior.RunID)
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			rec, out := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodPost, path, body))
+			if rec.Code != http.StatusBadRequest || out.Success || out.ErrorCode != ErrCodeBadRequest {
+				t.Fatalf("malformed acceptance = %d %s", rec.Code, rec.Body)
+			}
+			if !bytes.Equal(before, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+				t.Fatal("malformed request changed the checkpoint")
+			}
+		})
+	}
+	for _, contentType := range []string{"", "text/plain", "application/jsonpatch"} {
+		t.Run("content type "+contentType, func(t *testing.T) {
+			req := pipelineRecoveryHTTPRequest(http.MethodPost, path, valid)
+			req.Header.Set("Content-Type", contentType)
+			rec, out := pipelineRecoveryHTTPServe(t, srv, req)
+			if rec.Code != http.StatusBadRequest || out.ErrorCode != ErrCodeBadRequest {
+				t.Fatalf("non-JSON content type bypassed validation: %d %s", rec.Code, rec.Body)
+			}
+		})
+	}
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		rec, out := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(method, path+"?project=/another-project", valid))
+		if rec.Code != http.StatusBadRequest || out.ErrorCode != ErrCodeBadRequest {
+			t.Fatalf("request project override was accepted: %d %s", rec.Code, rec.Body)
+		}
+		rec, out = pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(method, "/api/v1/pipelines/missing-run/recover", valid))
+		if rec.Code != http.StatusNotFound || out.ErrorCode != ErrCodePipelineNotFound {
+			t.Fatalf("missing run not distinguished: %d %s", rec.Code, rec.Body)
+		}
+	}
+	if !bytes.Equal(before, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+		t.Fatal("invalid request changed the original checkpoint")
+	}
+}
+
+func TestPipelineRecoverHTTPAuthenticationAndProjectScope(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	srv.auth = AuthConfig{Mode: AuthModeAPIKey, APIKey: "pipeline-recovery-test-key", Role: RoleViewer}
+	root := srv.projectDir
+	prior := pipelineRecoveryHTTPCheckpoint(t, root, "prompt")
+	path := "/api/v1/pipelines/" + prior.RunID + "/recover"
+	before := pipelineRecoveryHTTPJournal(t, root, prior.RunID)
+	req := pipelineRecoveryHTTPRequest(http.MethodGet, path, "")
+	req.Header.Del("Authorization")
+	rec, out := pipelineRecoveryHTTPServe(t, srv, req)
+	if rec.Code != http.StatusUnauthorized || out.Success {
+		t.Fatalf("anonymous recovery inspection = %d %s", rec.Code, rec.Body)
+	}
+	rec, out = pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodGet, path, ""))
+	if rec.Code != http.StatusOK || len(out.Deliveries) != 1 {
+		t.Fatalf("viewer cannot inspect recovery: %d %s", rec.Code, rec.Body)
+	}
+	body := pipelineRecoveryHTTPBody(t, out.Deliveries[0].ReceiptToken, "Observed the response")
+	for _, project := range []string{root, ""} {
+		srv.projectDir = project
+		rec, out = pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodPost, path, body))
+		if rec.Code != http.StatusForbidden || out.ErrorCode != ErrCodeForbidden {
+			t.Fatalf("viewer acceptance bypassed permission check: %d %s", rec.Code, rec.Body)
+		}
+	}
+	srv.auth.Role = RoleOperator
+	// A valid run in cwd must not substitute for an unconfigured project.
+	t.Chdir(root)
+	file := filepath.Join(root, "not-a-project")
+	if err := os.WriteFile(file, []byte("file"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, project := range []string{"", ".", filepath.Join(root, "absent-project"), file} {
+		srv.projectDir = project
+		for _, method := range []string{http.MethodGet, http.MethodPost} {
+			rec, out = pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(method, path, body))
+			if rec.Code != http.StatusServiceUnavailable || out.ErrorCode != ErrCodeServiceUnavail {
+				t.Fatalf("invalid configured project %q fell back to cwd: %d %s", project, rec.Code, rec.Body)
+			}
+		}
+	}
+	if !bytes.Equal(before, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+		t.Fatal("denied or unscoped recovery changed the checkpoint")
+	}
+}
+
+func TestPipelineRecoverHTTPIdempotencyIsProjectScoped(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	srv.auth = AuthConfig{Mode: AuthModeAPIKey, APIKey: "pipeline-recovery-test-key", Role: RoleAdmin}
+	root := srv.projectDir
+	prior := pipelineRecoveryHTTPCheckpoint(t, root, "prompt")
+	logPath := pipelineRecoveryHTTPTmux(t, root, prior.AgentDeliveries["agent"].BeforeOutput+"\nFRESH-HTTP-ANSWER\n")
+	other := t.TempDir()
+	if err := pipeline.SaveState(other, &pipeline.ExecutionState{RunID: prior.RunID, WorkflowID: "other-project-workflow", Session: "other-session", Status: pipeline.StatusFailed}); err != nil {
+		t.Fatal(err)
+	}
+	otherBefore := pipelineRecoveryHTTPJournal(t, other, prior.RunID)
+	path := "/api/v1/pipelines/" + prior.RunID + "/recover"
+	_, inspection := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodGet, path, ""))
+	if len(inspection.Deliveries) != 1 {
+		t.Fatalf("missing receipt: %+v", inspection)
+	}
+	body := pipelineRecoveryHTTPBody(t, inspection.Deliveries[0].ReceiptToken, "Observed the response")
+	post := func() (*httptest.ResponseRecorder, pipelineRecoveryHTTPResponse) {
+		req := pipelineRecoveryHTTPRequest(http.MethodPost, path, body)
+		req.Header.Set("Idempotency-Key", "same-recovery-key")
+		return pipelineRecoveryHTTPServe(t, srv, req)
+	}
+	patch := func(project string) {
+		t.Helper()
+		data, err := json.Marshal(map[string]string{"project_dir": project})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec, _ := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodPatch, "/api/v1/config", string(data)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("configuration patch failed: %d %s", rec.Code, rec.Body)
+		}
+	}
+	// Pause a real HTTP request as idempotency reads its body, after namespace
+	// capture and before the handler runs. A concurrent configuration PATCH
+	// must change neither this operation's target nor its cache namespace.
+	barrier := &pipelineRecoveryHTTPBodyBarrier{Reader: strings.NewReader(body), entered: make(chan struct{}), release: make(chan struct{})}
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(barrier.release) }) }
+	defer unblock()
+	req := pipelineRecoveryHTTPRequest(http.MethodPost, path, body)
+	req.Body = io.NopCloser(barrier)
+	req.Header.Set("Idempotency-Key", "same-recovery-key")
+	ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
+	defer cancel()
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.router.ServeHTTP(rec, req.WithContext(ctx))
+	}()
+	select {
+	case <-barrier.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("request never reached body admission")
+	}
+	patch(other)
+	unblock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovery did not finish after configuration changed")
+	}
+	var accepted pipelineRecoveryHTTPResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &accepted); err != nil || rec.Code != http.StatusOK || accepted.Replayed || accepted.WorkflowID != prior.WorkflowID || rec.Header().Get("X-Idempotent-Replay") != "" {
+		t.Fatalf("configuration patch redirected in-flight acceptance: %d %s: %v", rec.Code, rec.Body, err)
+	}
+	acceptedBytes := pipelineRecoveryHTTPJournal(t, root, prior.RunID)
+	rec, out := post()
+	if rec.Code != http.StatusConflict || out.ErrorCode != ErrCodeRecoveryRefused || rec.Header().Get("X-Idempotent-Replay") != "" {
+		t.Fatalf("another project replayed the original acceptance: %d %s", rec.Code, rec.Body)
+	}
+	rec, inspection = pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodGet, path, ""))
+	if rec.Code != http.StatusOK || inspection.WorkflowID != "other-project-workflow" || len(inspection.Deliveries) != 0 {
+		t.Fatalf("inspection escaped the configured namespace: %d %s", rec.Code, rec.Body)
+	}
+	patch(root)
+	rec, out = post()
+	if rec.Code != http.StatusOK || rec.Header().Get("X-Idempotent-Replay") != "true" || out.Delivery != accepted.Delivery {
+		t.Fatalf("original project lost its normal HTTP replay: %d %s", rec.Code, rec.Body)
+	}
+	if !bytes.Equal(otherBefore, pipelineRecoveryHTTPJournal(t, other, prior.RunID)) || !bytes.Equal(acceptedBytes, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+		t.Fatal("project changes or cache replays mutated either journal")
+	}
+	pipelineRecoveryHTTPAssertNoSend(t, logPath)
+}
+
+func TestPipelineRecoverHTTPCancellationPreservesReceipt(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	srv.auth = AuthConfig{Mode: AuthModeAPIKey, APIKey: "pipeline-recovery-test-key", Role: RoleOperator}
+	root := srv.projectDir
+	prior := pipelineRecoveryHTTPCheckpoint(t, root, "prompt")
+	logPath := pipelineRecoveryHTTPTmux(t, root, prior.AgentDeliveries["agent"].BeforeOutput+"\nFRESH-HTTP-ANSWER\n")
+	path := "/api/v1/pipelines/" + prior.RunID + "/recover"
+	_, inspection := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodGet, path, ""))
+	if len(inspection.Deliveries) != 1 {
+		t.Fatalf("missing receipt: %+v", inspection)
+	}
+	body := pipelineRecoveryHTTPBody(t, inspection.Deliveries[0].ReceiptToken, "Observed the response")
+	before := pipelineRecoveryHTTPJournal(t, root, prior.RunID)
+	t.Setenv("NTM_HTTP_PIPELINE_RECOVERY_HANG", "1")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req := pipelineRecoveryHTTPRequest(http.MethodPost, path, body).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.router.ServeHTTP(rec, req)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		calls, _ := os.ReadFile(logPath)
+		if strings.Contains(string(calls), "capture-pane") {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatalf("recovery never reached the cancellable pane capture: %d %s", rec.Code, rec.Body)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("request cancellation did not stop the original pane capture")
+	}
+	var out pipelineRecoveryHTTPResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || rec.Code != http.StatusGatewayTimeout || out.ErrorCode != ErrCodeTimeout {
+		t.Fatalf("canceled recovery = %d %s: %v", rec.Code, rec.Body, err)
+	}
+	if !bytes.Equal(before, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+		t.Fatal("canceled inspection persisted an acceptance")
+	}
+	// The same receipt can be accepted after cancellation: both the durable
+	// run owner and the shared physical-pane lock must have been released.
+	t.Setenv("NTM_HTTP_PIPELINE_RECOVERY_HANG", "0")
+	rec, out = pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodPost, path, body))
+	if rec.Code != http.StatusOK || out.Replayed {
+		t.Fatalf("canceled request retained ownership or accepted late: %d %s", rec.Code, rec.Body)
+	}
+	pipelineRecoveryHTTPAssertNoSend(t, logPath)
+}
+
+func TestPipelineRecoverHTTPPreservesConfiguredRedaction(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	srv.auth = AuthConfig{Mode: AuthModeAPIKey, APIKey: "pipeline-recovery-test-key", Role: RoleOperator}
+	srv.redactionCfg = &RedactionConfig{Enabled: true, Config: redaction.Config{Mode: redaction.ModeRedact}}
+	root := srv.projectDir
+	prior := pipelineRecoveryHTTPCheckpoint(t, root, "prompt")
+	logPath := pipelineRecoveryHTTPTmux(t, root, prior.AgentDeliveries["agent"].BeforeOutput+"\nFRESH-HTTP-ANSWER\n")
+	path := "/api/v1/pipelines/" + prior.RunID + "/recover"
+	_, inspection := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodGet, path, ""))
+	if len(inspection.Deliveries) != 1 {
+		t.Fatalf("redaction lost inspection receipt: %+v", inspection)
+	}
+	token := inspection.Deliveries[0].ReceiptToken
+	canonical, err := pipeline.InspectAgentDeliveryRecovery(context.Background(), root, prior.RunID)
+	if err != nil || token != canonical.Deliveries[0].ReceiptToken {
+		t.Fatalf("redaction changed the exact receipt token: %q %v", token, err)
+	}
+	const secret = "sk-proj-FAKEtestkey1234567890123456789012345678901234"
+	before := pipelineRecoveryHTTPJournal(t, root, prior.RunID)
+	body := pipelineRecoveryHTTPBody(t, token, "Observed original response using "+secret)
+	req := pipelineRecoveryHTTPRequest(http.MethodPost, path, body)
+	req.Header.Set("Idempotency-Key", "recovery-redaction-integrity")
+	rec, refusal := pipelineRecoveryHTTPServe(t, srv, req)
+	if rec.Code != http.StatusUnprocessableEntity || refusal.Success || refusal.ErrorCode != "SECRETS_DETECTED" || strings.Contains(rec.Body.String(), secret) {
+		t.Fatalf("sensitive recovery reason was not explicitly refused: %d %s", rec.Code, rec.Body)
+	}
+	if !bytes.Equal(before, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+		t.Fatal("refused recovery persisted a credential or replacement reason")
+	}
+
+	// Rejecting the operator's reason must leave the receipt usable, and must
+	// not reserve the HTTP replay key. The exact receipt travels under the
+	// request's `receipt` field; response receipt_token redaction remains scoped
+	// to the recovery route. The second attempt also exercises durable replay.
+	const reason = "Observed original response without including credentials"
+	body = pipelineRecoveryHTTPBody(t, token, reason)
+	for attempt := 0; attempt < 2; attempt++ {
+		req := pipelineRecoveryHTTPRequest(http.MethodPost, path, body)
+		if attempt == 0 {
+			req.Header.Set("Idempotency-Key", "recovery-redaction-integrity")
+		}
+		rec, out := pipelineRecoveryHTTPServe(t, srv, req)
+		if rec.Code != http.StatusOK || out.Replayed != (attempt == 1) || out.Delivery.ReceiptToken != token || out.Delivery.ResolutionReason != reason {
+			t.Fatalf("unchanged acceptance/replay failed: %d %s", rec.Code, rec.Body)
+		}
+		persisted, err := pipeline.LoadState(root, prior.RunID)
+		if err != nil || persisted.AgentDeliveries["agent"].ResolutionReason != reason {
+			t.Fatalf("durable decision and wire reason differ: %+v %v", persisted, err)
+		}
+		if bytes.Contains(pipelineRecoveryHTTPJournal(t, root, prior.RunID), []byte(secret)) {
+			t.Fatal("refused operator reason reached the recovery journal")
+		}
+	}
+	pipelineRecoveryHTTPAssertNoSend(t, logPath)
+}
+
+// Obstruct the real settlement checkpoint after the command/selector has
+// emitted its output. Restore its exact earlier launch journal after the owner
+// finishes, modelling an interrupted publication without inventing receipts.
+func pipelineRecoveryHTTPOutcomeCheckpoint(t *testing.T, root string, selector bool) (*pipeline.ExecutionState, string) {
+	t.Helper()
+	pipelineRecoveryHTTPTmux(t, root, "")
+	output := `{"answer":42}`
+	if selector {
+		output = "PRIVATE-SELECTOR-KEY"
+	}
+	if err := os.WriteFile(filepath.Join(root, "fixture-outcome"), []byte(output), 0600); err != nil {
+		t.Fatal(err)
+	}
+	script := "printf 'once\\n' >> outcome-effects; cat fixture-outcome; printf ready > outcome-ready; while [ ! -f outcome-release ]; do sleep 0.01; done"
+	work := pipeline.Step{ID: "work", Command: script, OutputVar: "recovered", OutputParse: pipeline.OutputParse{Type: "json"},
+		Timeout: pipeline.Duration{Duration: 10 * time.Second}}
+	consumer := pipeline.Step{ID: "consume", DependsOn: []string{"work"}, Command: "cat > outcome-dependent", Stdin: "${steps.work.data.answer}|${vars.recovered_parsed.answer}"}
+	if selector {
+		work.Command, work.OutputVar, work.OutputParse = "", "", pipeline.OutputParse{}
+		work.Branch = "$(" + script + ")"
+		work.Branches = map[string]interface{}{
+			output:    map[string]interface{}{"id": "chosen", "command": "printf chosen > outcome-children"},
+			"default": map[string]interface{}{"id": "fallback", "command": "printf wrong > outcome-children"},
+		}
+		consumer.Command, consumer.Stdin = "cat outcome-children > outcome-dependent", ""
+	}
+	workflow := &pipeline.Workflow{SchemaVersion: pipeline.SchemaVersion, Name: "http-outcome-recovery",
+		Settings: pipeline.WorkflowSettings{OnError: pipeline.ErrorActionFail}, Steps: []pipeline.Step{work, consumer}}
+	cfg := pipeline.DefaultExecutorConfig("delivery-session")
+	cfg.ProjectDir, cfg.RunID = root, pipeline.GenerateRunID()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	var final *pipeline.ExecutionState
+	var runErr error
+	go func() {
+		defer close(done)
+		final, runErr = pipeline.RunControlledPipeline(ctx, workflow, nil, cfg, nil)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(8 * time.Second):
+			t.Error("original outcome owner did not finish cleanup")
+		}
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		prior, err := pipeline.LoadState(root, cfg.RunID)
+		_, readyErr := os.Stat(filepath.Join(root, "outcome-ready"))
+		if err == nil && readyErr == nil && ((!selector && prior.CommandExecutions["work"].Status == "running") ||
+			(selector && prior.CommandEvaluations["work"].Status == "starting")) {
+			break
+		}
+		select {
+		case <-done:
+			t.Fatalf("outcome completed before its launch checkpoint: %+v %v", final, runErr)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("outcome did not reach its output gate and durable launch intent")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	statePath := filepath.Join(root, ".ntm", "pipelines", cfg.RunID+".json")
+	before := pipelineRecoveryHTTPJournal(t, root, cfg.RunID)
+	savedPath := statePath + ".before-outcome-settlement"
+	if err := os.Rename(statePath, savedPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(statePath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "outcome-release"), []byte("finish"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("outcome did not finish after its gate opened")
+	}
+	if !errors.Is(runErr, pipeline.ErrCheckpointFailed) || final == nil || final.Status != pipeline.StatusFailed {
+		t.Fatalf("fixture did not lose outcome publication at the storage boundary: %+v %v", final, runErr)
+	}
+	if _, err := os.Stat(filepath.Join(root, "outcome-dependent")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dependent consumed uncheckpointed output: %v", err)
+	}
+	if err := os.Rename(statePath, statePath+".blocked-outcome-directory"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(savedPath, statePath); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, pipelineRecoveryHTTPJournal(t, root, cfg.RunID)) {
+		t.Fatal("fixture changed its original launch evidence")
+	}
+	if data, err := os.ReadFile(filepath.Join(root, "outcome-effects")); err != nil || string(data) != "once\n" {
+		t.Fatalf("original outcome did not execute exactly once: %q %v", data, err)
+	}
+	prior, err := pipeline.LoadState(root, cfg.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return prior, output
+}
+
+func pipelineRecoveryHTTPOutcomeBody(t *testing.T, token string, selector bool, output string) string {
+	t.Helper()
+	exitCode, captured := 0, pipelineRecoveryOutput(output)
+	req := PipelineRecoverRequest{StepID: "work", Receipt: token, Reason: "Verified the original process and descendants finished with this complete output",
+		AcceptCommand: !selector, AcceptSelector: selector, ExitCode: &exitCode, Output: &captured}
+	body, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
+}
+
+func TestPipelineRecoverHTTPCommandAndSelectorOutcomesResumeWithoutReplay(t *testing.T) {
+	for _, selector := range []bool{false, true} {
+		t.Run(fmt.Sprintf("selector_%t", selector), func(t *testing.T) {
+			srv, _ := setupTestServer(t)
+			srv.auth = AuthConfig{Mode: AuthModeAPIKey, APIKey: "pipeline-recovery-test-key", Role: RoleOperator}
+			srv.redactionCfg = &RedactionConfig{Enabled: true, Config: redaction.Config{Mode: redaction.ModeRedact}}
+			root := srv.projectDir
+			prior, output := pipelineRecoveryHTTPOutcomeCheckpoint(t, root, selector)
+			path := "/api/v1/pipelines/" + prior.RunID + "/recover"
+			before := pipelineRecoveryHTTPJournal(t, root, prior.RunID)
+			rec, inspection := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodGet, path, ""))
+			if rec.Code != http.StatusOK || inspection.Deliveries == nil || inspection.Commands == nil || inspection.Selectors == nil ||
+				len(inspection.Deliveries) != 0 || len(inspection.Commands)+len(inspection.Selectors) != 1 {
+				t.Fatalf("recovery omitted command/selector receipts or empty collections: %d %s", rec.Code, rec.Body)
+			}
+			var token string
+			if selector {
+				if len(inspection.Selectors) != 1 || !inspection.Selectors[0].CanAccept {
+					t.Fatalf("selector outcome is not recoverable: %+v", inspection)
+				}
+				token = inspection.Selectors[0].ReceiptToken
+			} else {
+				if len(inspection.Commands) != 1 || !inspection.Commands[0].CanAccept {
+					t.Fatalf("command outcome is not recoverable: %+v", inspection)
+				}
+				token = inspection.Commands[0].ReceiptToken
+			}
+			if !bytes.Equal(before, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+				t.Fatal("inspection changed the launch journal")
+			}
+			body := pipelineRecoveryHTTPOutcomeBody(t, token, selector, output)
+			request := pipelineRecoveryHTTPRequest(http.MethodPost, path, body)
+			request.Header.Set("Idempotency-Key", "accept-original-outcome")
+			rec, accepted := pipelineRecoveryHTTPServe(t, srv, request)
+			if rec.Code != http.StatusOK || !accepted.Success || accepted.Replayed {
+				t.Fatalf("outcome acceptance failed: %d %s", rec.Code, rec.Body)
+			}
+			if selector {
+				if accepted.Selector.ReceiptToken != token || accepted.Selector.OutputBytes != len(output) || accepted.Selector.ExitCode == nil || *accepted.Selector.ExitCode != 0 {
+					t.Fatalf("selector response lost immutable outcome metadata: %+v", accepted.Selector)
+				}
+			} else if accepted.Command.ReceiptToken != token || accepted.Command.OutputBytes != len(output) || accepted.Command.ExitCode == nil || *accepted.Command.ExitCode != 0 {
+				t.Fatalf("command response lost immutable outcome metadata: %+v", accepted.Command)
+			}
+			if strings.Contains(rec.Body.String(), output) || strings.Contains(rec.Body.String(), "fixture-outcome") {
+				t.Fatalf("identity-only recovery exposed execution content: %s", rec.Body)
+			}
+			acceptedBytes := pipelineRecoveryHTTPJournal(t, root, prior.RunID)
+			request = pipelineRecoveryHTTPRequest(http.MethodPost, path, body)
+			request.Header.Set("Idempotency-Key", "accept-original-outcome")
+			rec, _ = pipelineRecoveryHTTPServe(t, srv, request)
+			if rec.Code != http.StatusOK || rec.Header().Get("X-Idempotent-Replay") != "true" || !bytes.Equal(acceptedBytes, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+				t.Fatalf("HTTP replay changed the accepted decision: %d %s", rec.Code, rec.Body)
+			}
+			rec, replay := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodPost, path, body))
+			if rec.Code != http.StatusOK || !replay.Replayed || !bytes.Equal(acceptedBytes, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+				t.Fatalf("durable acceptance replay changed the decision: %d %s", rec.Code, rec.Body)
+			}
+			conflict := pipelineRecoveryHTTPOutcomeBody(t, token, selector, output+"different")
+			rec, refused := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodPost, path, conflict))
+			if rec.Code != http.StatusConflict || refused.ErrorCode != ErrCodeRecoveryRefused || !bytes.Equal(acceptedBytes, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+				t.Fatalf("conflicting outcome replaced the accepted decision: %d %s", rec.Code, rec.Body)
+			}
+			if _, err := os.Stat(filepath.Join(root, "outcome-dependent")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("acceptance dispatched downstream work before resume: %v", err)
+			}
+			rec, resumed := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodPost, "/api/v1/pipelines/"+prior.RunID+"/resume", "{}"))
+			if rec.Code != http.StatusOK || !resumed.Success {
+				t.Fatalf("ordinary HTTP resume did not use the accepted outcome: %d %s", rec.Code, rec.Body)
+			}
+			final, err := pipeline.LoadState(root, prior.RunID)
+			if err != nil || final.Status != pipeline.StatusCompleted {
+				t.Fatalf("resumed outcome did not complete: %+v %v", final, err)
+			}
+			want := "42|42"
+			if selector {
+				want = "chosen"
+			}
+			if data, err := os.ReadFile(filepath.Join(root, "outcome-dependent")); err != nil || string(data) != want {
+				t.Fatalf("resume did not interpret the original outcome: %q %v", data, err)
+			}
+			if data, err := os.ReadFile(filepath.Join(root, "outcome-effects")); err != nil || string(data) != "once\n" {
+				t.Fatalf("HTTP recovery repeated command/selector effects: %q %v", data, err)
+			}
+		})
+	}
+}
+
+func TestPipelineRecoverHTTPOutcomeRefusalsPreserveJournal(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	srv.auth = AuthConfig{Mode: AuthModeAPIKey, APIKey: "pipeline-recovery-test-key", Role: RoleOperator}
+	srv.redactionCfg = &RedactionConfig{Enabled: true, Config: redaction.Config{Mode: redaction.ModeRedact}}
+	root := srv.projectDir
+	prior, output := pipelineRecoveryHTTPOutcomeCheckpoint(t, root, false)
+	path := "/api/v1/pipelines/" + prior.RunID + "/recover"
+	_, inspection := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodGet, path, ""))
+	if len(inspection.Commands) != 1 {
+		t.Fatalf("missing command receipt: %+v", inspection)
+	}
+	token := inspection.Commands[0].ReceiptToken
+	valid := pipelineRecoveryHTTPOutcomeBody(t, token, false, output)
+	before := pipelineRecoveryHTTPJournal(t, root, prior.RunID)
+	for name, mutate := range map[string]func(map[string]interface{}){
+		"missing exit":               func(body map[string]interface{}) { delete(body, "exit_code") },
+		"null exit":                  func(body map[string]interface{}) { body["exit_code"] = nil },
+		"invalid exit":               func(body map[string]interface{}) { body["exit_code"] = 256 },
+		"missing output":             func(body map[string]interface{}) { delete(body, "output") },
+		"null output":                func(body map[string]interface{}) { body["output"] = nil },
+		"ambiguous command selector": func(body map[string]interface{}) { body["accept_selector"] = true },
+		"ambiguous command delivery": func(body map[string]interface{}) { body["accept_delivery"] = true },
+		"delivery with output":       func(body map[string]interface{}) { body["accept_command"], body["accept_delivery"] = false, true },
+		"server path input":          func(body map[string]interface{}) { body["output_file"] = "/tmp/private-output" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			var body map[string]interface{}
+			if err := json.Unmarshal([]byte(valid), &body); err != nil {
+				t.Fatal(err)
+			}
+			mutate(body)
+			encoded, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec, refused := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodPost, path, string(encoded)))
+			if rec.Code != http.StatusBadRequest || refused.ErrorCode != ErrCodeBadRequest || !bytes.Equal(before, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+				t.Fatalf("invalid outcome request changed the journal: %d %s", rec.Code, rec.Body)
+			}
+		})
+	}
+	stale := strings.Repeat("a", 64)
+	if stale == token {
+		stale = strings.Repeat("b", 64)
+	}
+	rec, refused := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodPost, path, pipelineRecoveryHTTPOutcomeBody(t, stale, false, output)))
+	if rec.Code != http.StatusConflict || refused.ErrorCode != ErrCodeRecoveryRefused || !bytes.Equal(before, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+		t.Fatalf("stale receipt accepted an outcome: %d %s", rec.Code, rec.Body)
+	}
+	owner, err := pipeline.AcquireRunControl(context.Background(), root, prior.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, refused = pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodPost, path, valid))
+	owner.Close()
+	if rec.Code != http.StatusConflict || refused.ErrorCode != ErrCodePipelineRunning || !bytes.Equal(before, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+		t.Fatalf("acceptance bypassed live execution ownership: %d %s", rec.Code, rec.Body)
+	}
+	const secret = "sk-proj-FAKEtestkey1234567890123456789012345678901234"
+	req := pipelineRecoveryHTTPRequest(http.MethodPost, path, pipelineRecoveryHTTPOutcomeBody(t, token, false, secret))
+	req.Header.Set("Idempotency-Key", "refused-output")
+	rec, refused = pipelineRecoveryHTTPServe(t, srv, req)
+	if rec.Code != http.StatusUnprocessableEntity || refused.ErrorCode != "SECRETS_DETECTED" || strings.Contains(rec.Body.String(), secret) ||
+		!bytes.Equal(before, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+		t.Fatalf("sensitive output was persisted or silently rewritten: %d %s", rec.Code, rec.Body)
+	}
+	// A refused sensitive payload must not consume its HTTP replay key.
+	// Explicit empty output is valid, unlike either omission or JSON null.
+	req = pipelineRecoveryHTTPRequest(http.MethodPost, path, pipelineRecoveryHTTPOutcomeBody(t, token, false, ""))
+	req.Header.Set("Idempotency-Key", "refused-output")
+	rec, accepted := pipelineRecoveryHTTPServe(t, srv, req)
+	if rec.Code != http.StatusOK || !accepted.Success || accepted.Command.OutputBytes != 0 || accepted.Command.ExitCode == nil || *accepted.Command.ExitCode != 0 {
+		t.Fatalf("explicit empty output was not accepted after refusal: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func pipelineScopeHTTPPatchProject(t *testing.T, srv *Server, project string) {
+	t.Helper()
+	body, err := json.Marshal(map[string]string{"project_dir": project})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodPatch, "/api/v1/config", string(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("project configuration patch failed: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func pipelineScopeHTTPPost(t *testing.T, srv *Server, path, body, key string) (*httptest.ResponseRecorder, pipelineRecoveryHTTPResponse) {
+	t.Helper()
+	req := pipelineRecoveryHTTPRequest(http.MethodPost, path, body)
+	req.Header.Set("Idempotency-Key", key)
+	return pipelineRecoveryHTTPServe(t, srv, req)
+}
+
+// The body barrier stops the real router after request-scope capture but before
+// cache lookup and dispatch. Configuration changes must not redirect the request.
+func pipelineScopeHTTPSwitchDuringAdmission(t *testing.T, srv *Server, path, body, key, project string) (*httptest.ResponseRecorder, pipelineRecoveryHTTPResponse) {
+	t.Helper()
+	barrier := &pipelineRecoveryHTTPBodyBarrier{Reader: strings.NewReader(body), entered: make(chan struct{}), release: make(chan struct{})}
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(barrier.release) }) }
+	defer unblock()
+	req := pipelineRecoveryHTTPRequest(http.MethodPost, path, body)
+	req.Body = io.NopCloser(barrier)
+	req.Header.Set("Idempotency-Key", key)
+	ctx, cancel := context.WithTimeout(req.Context(), 15*time.Second)
+	defer cancel()
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.router.ServeHTTP(rec, req.WithContext(ctx))
+	}()
+	select {
+	case <-barrier.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pipeline request did not reach body admission")
+	}
+	pipelineScopeHTTPPatchProject(t, srv, project)
+	unblock()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("pipeline request did not finish after project change")
+	}
+	var out pipelineRecoveryHTTPResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("invalid pipeline response: %d %s: %v", rec.Code, rec.Body, err)
+	}
+	return rec, out
+}
+
+func pipelineScopeHTTPWriteWorkflow(t *testing.T, root, name string) {
+	t.Helper()
+	workflow := &pipeline.Workflow{SchemaVersion: pipeline.SchemaVersion, Name: name, Steps: []pipeline.Step{{
+		ID: "effect", Command: "printf 'once\\n' >> effects; pwd",
+	}}}
+	data, err := yaml.Marshal(workflow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "scope.yaml"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPipelineHTTPProjectScopeRunAndReplay(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	srv.auth = AuthConfig{Mode: AuthModeAPIKey, APIKey: "pipeline-recovery-test-key", Role: RoleAdmin}
+	srv.redactionCfg = &RedactionConfig{Enabled: true, Config: redaction.Config{Mode: redaction.ModeRedact}}
+	projectA, projectB := srv.projectDir, t.TempDir()
+	pipelineRecoveryHTTPTmux(t, projectA, "")
+	pipelineScopeHTTPWriteWorkflow(t, projectA, "project-a")
+	pipelineScopeHTTPWriteWorkflow(t, projectB, "project-b")
+	const path = "/api/v1/pipelines/run"
+	const body = `{"workflow_file":"scope.yaml","session":"delivery-session"}`
+	const key = "project-scoped-run"
+	rec, first := pipelineScopeHTTPSwitchDuringAdmission(t, srv, path, body, key, projectB)
+	if rec.Code != http.StatusOK || !first.Success || first.WorkflowID != "project-a" || first.RunID == "" || rec.Header().Get("X-Idempotent-Replay") != "" {
+		t.Fatalf("in-flight run followed the new project: %d %s", rec.Code, rec.Body)
+	}
+	state, err := pipeline.LoadState(projectA, first.RunID)
+	if err != nil || state.Status != pipeline.StatusCompleted || state.Steps["effect"].Output != projectA {
+		t.Fatalf("workflow source, working directory and state namespace diverged: %+v %v", state, err)
+	}
+	if _, err := os.Stat(filepath.Join(projectB, "effects")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("in-flight A request executed in B: %v", err)
+	}
+	firstBytes := pipelineRecoveryHTTPJournal(t, projectA, first.RunID)
+	rec, second := pipelineScopeHTTPPost(t, srv, path, body, key)
+	if rec.Code != http.StatusOK || !second.Success || second.WorkflowID != "project-b" || second.RunID == first.RunID || rec.Header().Get("X-Idempotent-Replay") != "" {
+		t.Fatalf("project B replayed project A's operation: %d %s", rec.Code, rec.Body)
+	}
+	state, err = pipeline.LoadState(projectB, second.RunID)
+	if err != nil || state.Steps["effect"].Output != projectB || state.Status != pipeline.StatusCompleted {
+		t.Fatalf("project B did not execute its own workflow: %+v %v", state, err)
+	}
+	pipelineScopeHTTPPatchProject(t, srv, projectA)
+	rec, replay := pipelineScopeHTTPPost(t, srv, path, body, key)
+	if rec.Code != http.StatusOK || replay.RunID != first.RunID || rec.Header().Get("X-Idempotent-Replay") != "true" {
+		t.Fatalf("project A lost its original replay: %d %s", rec.Code, rec.Body)
+	}
+	if !bytes.Equal(firstBytes, pipelineRecoveryHTTPJournal(t, projectA, first.RunID)) {
+		t.Fatal("HTTP replay rewrote the original run")
+	}
+	for _, project := range []string{projectA, projectB} {
+		if data, err := os.ReadFile(filepath.Join(project, "effects")); err != nil || string(data) != "once\n" {
+			t.Fatalf("project-scoped replay repeated effects in %s: %q %v", project, data, err)
+		}
+	}
+	// Template discovery uses the selected project even when the server's cwd
+	// contains a different project's files.
+	t.Chdir(projectB)
+	if err := os.WriteFile(filepath.Join(projectA, "only-a.yaml"), []byte("name: only-a\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectB, "only-b.yaml"), []byte("name: only-b\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ = pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodGet, "/api/v1/pipelines/templates", ""))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "only-a") || strings.Contains(rec.Body.String(), "only-b") {
+		t.Fatalf("template discovery escaped the configured project: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestPipelineHTTPProjectScopePreservesUnconfiguredPolicy(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	srv.auth = AuthConfig{Mode: AuthModeAPIKey, APIKey: "pipeline-recovery-test-key", Role: RoleAdmin}
+	project := srv.projectDir
+	t.Chdir(project)
+	pipelineRecoveryHTTPTmux(t, project, "")
+	pipelineScopeHTTPWriteWorkflow(t, project, "configured-file")
+	const path = "/api/v1/pipelines/run"
+	const body = `{"workflow_file":"scope.yaml","session":"delivery-session"}`
+	const key = "configured-versus-fallback"
+	rec, original := pipelineScopeHTTPPost(t, srv, path, body, key)
+	if rec.Code != http.StatusOK || !original.Success {
+		t.Fatalf("configured run failed: %d %s", rec.Code, rec.Body)
+	}
+	before := pipelineRecoveryHTTPJournal(t, project, original.RunID)
+	// Empty configuration is a supported server state; PATCH deliberately
+	// treats an omitted/empty value as no change, so set that state directly.
+	srv.mu.Lock()
+	srv.projectDir = ""
+	srv.mu.Unlock()
+	rec, refused := pipelineScopeHTTPPost(t, srv, path, body, key)
+	if rec.Code != http.StatusBadRequest || refused.Success || refused.ErrorCode != ErrCodeBadRequest || rec.Header().Get("X-Idempotent-Replay") != "" {
+		t.Fatalf("cwd fallback replayed configured file access: %d %s", rec.Code, rec.Body)
+	}
+	rec, refused = pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodGet, "/api/v1/pipelines/"+original.RunID+"/recover", ""))
+	if rec.Code != http.StatusServiceUnavailable || refused.Success {
+		t.Fatalf("recovery inferred configuration from cwd: %d %s", rec.Code, rec.Body)
+	}
+	inline, err := json.Marshal(PipelineExecRequest{Session: "delivery-session", Workflow: pipeline.Workflow{
+		SchemaVersion: pipeline.SchemaVersion, Name: "inline-cwd", Steps: []pipeline.Step{{ID: "where", Command: "printf 'once\\n' >> inline-effects; pwd"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, executed := pipelineScopeHTTPPost(t, srv, "/api/v1/pipelines/exec", string(inline), "inline-fallback")
+	if rec.Code != http.StatusOK || !executed.Success {
+		t.Fatalf("inline workflow lost its existing cwd fallback: %d %s", rec.Code, rec.Body)
+	}
+	state, err := pipeline.LoadState(project, executed.RunID)
+	if err != nil || state.Steps["where"].Output != project {
+		t.Fatalf("inline fallback executed outside its selected cwd: %+v %v", state, err)
+	}
+	// Relative configuration is normalized by the public config endpoint and
+	// must share the original absolute project's replay namespace.
+	pipelineScopeHTTPPatchProject(t, srv, ".")
+	rec, replay := pipelineScopeHTTPPost(t, srv, path, body, key)
+	if rec.Code != http.StatusOK || replay.RunID != original.RunID || rec.Header().Get("X-Idempotent-Replay") != "true" {
+		t.Fatalf("relative configuration lost the canonical project's replay: %d %s", rec.Code, rec.Body)
+	}
+	if !bytes.Equal(before, pipelineRecoveryHTTPJournal(t, project, original.RunID)) {
+		t.Fatal("configuration mode changes rewrote the original run")
+	}
+	if data, err := os.ReadFile(filepath.Join(project, "effects")); err != nil || string(data) != "once\n" {
+		t.Fatalf("configuration mode changes repeated the file workflow: %q %v", data, err)
+	}
+}
+
+func TestPipelineHTTPProjectScopeResumeKeepsOwnershipAndReplay(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	srv.auth = AuthConfig{Mode: AuthModeAPIKey, APIKey: "pipeline-recovery-test-key", Role: RoleAdmin}
+	projectA, projectB := srv.projectDir, t.TempDir()
+	pipelineRecoveryHTTPTmux(t, projectA, "")
+	const runID = "same-project-resume-run"
+	for i, project := range []string{projectA, projectB} {
+		workflow := &pipeline.Workflow{SchemaVersion: pipeline.SchemaVersion, Name: fmt.Sprintf("resume-project-%d", i), Steps: []pipeline.Step{
+			{ID: "once", Command: "printf 'once\\n' >> once"},
+			{ID: "continue", DependsOn: []string{"once"}, Command: "test -f continue && printf 'continued\\n' >> continued"},
+		}}
+		cfg := pipeline.DefaultExecutorConfig("delivery-session")
+		cfg.ProjectDir, cfg.RunID = project, runID
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		state, err := pipeline.RunControlledPipeline(ctx, workflow, nil, cfg, nil)
+		cancel()
+		if err == nil || state == nil || state.Status != pipeline.StatusFailed || state.Steps["once"].Status != pipeline.StatusCompleted {
+			t.Fatalf("original project run did not stop at its gate: %+v %v", state, err)
+		}
+	}
+	owner, err := pipeline.AcquireRunControl(context.Background(), projectB, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(owner.Close)
+	beforeB := pipelineRecoveryHTTPJournal(t, projectB, runID)
+	if err := os.WriteFile(filepath.Join(projectA, "continue"), []byte("ready"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/v1/pipelines/" + runID + "/resume"
+	const key = "project-scoped-resume"
+	rec, first := pipelineScopeHTTPSwitchDuringAdmission(t, srv, path, "{}", key, projectB)
+	if rec.Code != http.StatusOK || !first.Success || first.WorkflowID != "resume-project-0" || rec.Header().Get("X-Idempotent-Replay") != "" {
+		t.Fatalf("resume followed another project's owner or state: %d %s", rec.Code, rec.Body)
+	}
+	afterA := pipelineRecoveryHTTPJournal(t, projectA, runID)
+	if !bytes.Equal(beforeB, pipelineRecoveryHTTPJournal(t, projectB, runID)) || owner.Context().Err() != nil {
+		t.Fatal("A resume mutated or canceled B's owned run")
+	}
+	rec, refused := pipelineScopeHTTPPost(t, srv, path, "{}", key)
+	if rec.Code != http.StatusConflict || refused.ErrorCode != ErrCodePipelineRunning || rec.Header().Get("X-Idempotent-Replay") != "" {
+		t.Fatalf("B bypassed its live owner using A's cached resume: %d %s", rec.Code, rec.Body)
+	}
+	if !bytes.Equal(beforeB, pipelineRecoveryHTTPJournal(t, projectB, runID)) || owner.Context().Err() != nil {
+		t.Fatal("refused B resume changed its checkpoint or execution owner")
+	}
+	owner.Close()
+	if err := os.WriteFile(filepath.Join(projectB, "continue"), []byte("ready"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	rec, second := pipelineScopeHTTPPost(t, srv, path, "{}", key)
+	if rec.Code != http.StatusOK || !second.Success || second.WorkflowID != "resume-project-1" || rec.Header().Get("X-Idempotent-Replay") != "" {
+		t.Fatalf("B could not resume its own checkpoint: %d %s", rec.Code, rec.Body)
+	}
+	pipelineScopeHTTPPatchProject(t, srv, projectA)
+	rec, replay := pipelineScopeHTTPPost(t, srv, path, "{}", key)
+	if rec.Code != http.StatusOK || replay.WorkflowID != first.WorkflowID || rec.Header().Get("X-Idempotent-Replay") != "true" || !bytes.Equal(afterA, pipelineRecoveryHTTPJournal(t, projectA, runID)) {
+		t.Fatalf("A lost its original resume result: %d %s", rec.Code, rec.Body)
+	}
+	for _, project := range []string{projectA, projectB} {
+		state, err := pipeline.LoadState(project, runID)
+		if err != nil || state.Status != pipeline.StatusCompleted {
+			t.Fatalf("project resume did not complete: %+v %v", state, err)
+		}
+		for name, expected := range map[string]string{"once": "once\n", "continued": "continued\n"} {
+			if data, err := os.ReadFile(filepath.Join(project, name)); err != nil || string(data) != expected {
+				t.Fatalf("resume repeated or lost %s in %s: %q %v", name, project, data, err)
+			}
+		}
+	}
+}
+
+func TestPipelineHTTPProjectScopeCancellationKeepsOriginalOwner(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	srv.auth = AuthConfig{Mode: AuthModeAPIKey, APIKey: "pipeline-recovery-test-key", Role: RoleAdmin}
+	projectA, projectB := srv.projectDir, t.TempDir()
+	pipelineRecoveryHTTPTmux(t, projectA, "")
+	const runID = "same-project-cancel-run"
+	type outcome struct {
+		state *pipeline.ExecutionState
+		err   error
+	}
+	runs := make([]chan outcome, 0, 2)
+	for i, project := range []string{projectA, projectB} {
+		workflow := &pipeline.Workflow{SchemaVersion: pipeline.SchemaVersion, Name: fmt.Sprintf("cancel-project-%d", i), Steps: []pipeline.Step{{
+			ID: "hold", Command: "printf ready > running; while [ ! -f release ]; do sleep 0.01; done",
+		}}}
+		cfg := pipeline.DefaultExecutorConfig("delivery-session")
+		cfg.ProjectDir, cfg.RunID = project, runID
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		done := make(chan outcome, 1)
+		go func() {
+			defer close(done)
+			state, err := pipeline.RunControlledPipeline(ctx, workflow, nil, cfg, nil)
+			done <- outcome{state: state, err: err}
+		}()
+		t.Cleanup(func() {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Error("project command owner did not finish cleanup")
+			}
+		})
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			state, err := pipeline.LoadState(project, runID)
+			_, readyErr := os.Stat(filepath.Join(project, "running"))
+			if err == nil && readyErr == nil && state.CommandExecutions["hold"].Status == "running" {
+				break
+			}
+			select {
+			case result := <-done:
+				t.Fatalf("project command stopped before cancellation: %+v %v", result.state, result.err)
+			default:
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("project command did not enter its owned running state")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		runs = append(runs, done)
+	}
+	beforeB := pipelineRecoveryHTTPJournal(t, projectB, runID)
+	path := "/api/v1/pipelines/" + runID + "/cancel"
+	const key = "project-scoped-cancel"
+	rec, first := pipelineScopeHTTPSwitchDuringAdmission(t, srv, path, "{}", key, projectB)
+	if rec.Code != http.StatusAccepted || !first.Success || rec.Header().Get("X-Idempotent-Replay") != "" {
+		t.Fatalf("original owner did not acknowledge cancellation: %d %s", rec.Code, rec.Body)
+	}
+	select {
+	case result := <-runs[0]:
+		if result.err == nil || result.state == nil || result.state.Status != pipeline.StatusCancelled {
+			t.Fatalf("A cancellation did not finish its owned execution: %+v %v", result.state, result.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("A remained running after its cancellation was acknowledged")
+	}
+	select {
+	case result := <-runs[1]:
+		t.Fatalf("A cancellation reached B's same-ID owner: %+v %v", result.state, result.err)
+	default:
+	}
+	if !bytes.Equal(beforeB, pipelineRecoveryHTTPJournal(t, projectB, runID)) {
+		t.Fatal("A cancellation changed B's running checkpoint")
+	}
+	rec, second := pipelineScopeHTTPPost(t, srv, path, "{}", key)
+	if rec.Code != http.StatusAccepted || !second.Success || rec.Header().Get("X-Idempotent-Replay") != "" {
+		t.Fatalf("B replayed A's cancellation without reaching its own owner: %d %s", rec.Code, rec.Body)
+	}
+	select {
+	case result := <-runs[1]:
+		if result.err == nil || result.state == nil || result.state.Status != pipeline.StatusCancelled {
+			t.Fatalf("B cancellation did not finish its owned execution: %+v %v", result.state, result.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("B remained running after its own cancellation")
+	}
+	afterA, afterB := pipelineRecoveryHTTPJournal(t, projectA, runID), pipelineRecoveryHTTPJournal(t, projectB, runID)
+	pipelineScopeHTTPPatchProject(t, srv, projectA)
+	rec, replay := pipelineScopeHTTPPost(t, srv, path, "{}", key)
+	if rec.Code != http.StatusAccepted || !replay.Success || rec.Header().Get("X-Idempotent-Replay") != "true" {
+		t.Fatalf("A lost its acknowledged cancellation replay: %d %s", rec.Code, rec.Body)
+	}
+	if !bytes.Equal(afterA, pipelineRecoveryHTTPJournal(t, projectA, runID)) || !bytes.Equal(afterB, pipelineRecoveryHTTPJournal(t, projectB, runID)) {
+		t.Fatal("cancellation replay rewrote a terminal checkpoint")
+	}
+}
+
+func TestPipelineRecoveryOutputPreservesUnicode(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "empty", raw: `""`, want: ""},
+		{name: "ordinary escapes", raw: `"quote\" slash\/ backslash\\ newline\n tab\t"`, want: "quote\" slash/ backslash\\ newline\n tab\t"},
+		{name: "literal Unicode", raw: `"snowman ☃ and emoji 😀"`, want: "snowman ☃ and emoji 😀"},
+		{name: "surrogate pair", raw: `"before \ud83d\ude00 after"`, want: "before 😀 after"},
+		{name: "lowest pair", raw: `"\uD800\uDC00"`, want: "\U00010000"},
+		{name: "highest pair", raw: `"\uDBFF\uDFFF"`, want: "\U0010ffff"},
+		{name: "literal replacement", raw: `"�"`, want: "�"},
+		{name: "escaped replacement", raw: `"\ufffd"`, want: "�"},
+		{name: "literal escape spelling", raw: `"\\ud800"`, want: `\ud800`},
+		{name: "literal slash before pair", raw: `"\\\ud83d\ude00"`, want: "\\😀"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			value := pipelineRecoveryOutput("unchanged")
+			if err := json.Unmarshal([]byte(tc.raw), &value); err != nil {
+				t.Fatalf("valid output rejected: %v", err)
+			}
+			if string(value) != tc.want {
+				t.Fatalf("output changed: %q, want %q", value, tc.want)
+			}
+		})
+	}
+	for name, raw := range map[string]string{
+		"invalid UTF-8":          string([]byte{'"', 0xff, '"'}),
+		"UTF-8 surrogate":        string([]byte{'"', 0xed, 0xa0, 0x80, '"'}),
+		"orphaned high":          `"\ud800"`,
+		"orphaned low":           `"\udc00"`,
+		"reversed pair":          `"\udc00\ud800"`,
+		"separated pair":         `"\ud800x\udc00"`,
+		"paired with scalar":     `"\ud800\u0041"`,
+		"literal second escape":  `"\ud800\\udc00"`,
+		"unmatched after valid":  `"\ud83d\ude00\ud800"`,
+		"truncated escape":       `"\ud80"`,
+		"not a string":           `123`,
+		"null is not an outcome": `null`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			value := pipelineRecoveryOutput("unchanged")
+			if err := json.Unmarshal([]byte(raw), &value); err == nil {
+				t.Fatalf("malformed output accepted: %q", raw)
+			}
+			if value != "unchanged" {
+				t.Fatalf("failed decoding changed output: %q", value)
+			}
+		})
+	}
+}
+
+func TestPipelineRecoverHTTPRejectsUnicodeRepairBeforeDecision(t *testing.T) {
+	for _, selector := range []bool{false, true} {
+		for _, mode := range []redaction.Mode{redaction.ModeOff, redaction.ModeRedact} {
+			t.Run(fmt.Sprintf("selector=%v/redaction=%s", selector, mode), func(t *testing.T) {
+				srv, _ := setupTestServer(t)
+				srv.auth = AuthConfig{Mode: AuthModeAPIKey, APIKey: "pipeline-recovery-test-key", Role: RoleOperator}
+				srv.redactionCfg = &RedactionConfig{Enabled: true, Config: redaction.Config{Mode: mode}}
+				root := srv.projectDir
+				prior, _ := pipelineRecoveryHTTPOutcomeCheckpoint(t, root, selector)
+				path := "/api/v1/pipelines/" + prior.RunID + "/recover"
+				rec, inspection := pipelineRecoveryHTTPServe(t, srv, pipelineRecoveryHTTPRequest(http.MethodGet, path, ""))
+				if rec.Code != http.StatusOK {
+					t.Fatalf("recovery inspection: %d %s", rec.Code, rec.Body)
+				}
+				var token string
+				if selector {
+					if len(inspection.Selectors) != 1 {
+						t.Fatalf("missing selector receipt: %+v", inspection)
+					}
+					token = inspection.Selectors[0].ReceiptToken
+				} else {
+					if len(inspection.Commands) != 1 {
+						t.Fatalf("missing command receipt: %+v", inspection)
+					}
+					token = inspection.Commands[0].ReceiptToken
+				}
+				emptyBody := pipelineRecoveryHTTPOutcomeBody(t, token, selector, "")
+				if !strings.Contains(emptyBody, `"output":""`) {
+					t.Fatalf("fixture lacks explicit empty output: %s", emptyBody)
+				}
+				post := func(raw string) (*httptest.ResponseRecorder, pipelineRecoveryHTTPResponse) {
+					body := strings.Replace(emptyBody, `"output":""`, `"output":`+raw, 1)
+					req := pipelineRecoveryHTTPRequest(http.MethodPost, path, body)
+					req.Header.Set("Idempotency-Key", "exact-unicode-outcome")
+					return pipelineRecoveryHTTPServe(t, srv, req)
+				}
+				before := pipelineRecoveryHTTPJournal(t, root, prior.RunID)
+				for _, raw := range []string{
+					string([]byte{'"', 0xff, '"'}),
+					string([]byte{'"', 0xed, 0xa0, 0x80, '"'}),
+					`"\ud800"`, `"\udc00"`, `"\udc00\ud800"`,
+					`"\ud800x\udc00"`, `"\ud800\u0041"`, `"\ud800\\udc00"`,
+					`"\ud83d\ude00\ud800"`,
+				} {
+					rec, out := post(raw)
+					if rec.Code != http.StatusBadRequest || out.Success || out.ErrorCode != ErrCodeBadRequest {
+						t.Fatalf("malformed Unicode persisted a decision: %d %s", rec.Code, rec.Body)
+					}
+					if !bytes.Equal(before, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+						t.Fatal("rejected Unicode rewrote the execution checkpoint")
+					}
+				}
+
+				// Neither malformed input nor redaction may reserve the replay key
+				// or turn genuine replacement characters into a refusal. Persist
+				// one valid, exact outcome through the same HTTP admission path.
+				const raw = `"stable \u2713 \ud83d\ude00 � \\ud800\n"`
+				const want = "stable ✓ 😀 � \\ud800\n"
+				rec, accepted := post(raw)
+				if rec.Code != http.StatusOK || !accepted.Success || rec.Header().Get("X-Idempotent-Replay") != "" {
+					t.Fatalf("valid Unicode outcome rejected: %d %s", rec.Code, rec.Body)
+				}
+				if bytes.Contains(rec.Body.Bytes(), []byte(`"output":`)) {
+					t.Fatal("identity-only recovery response disclosed command output")
+				}
+				state, err := pipeline.LoadState(root, prior.RunID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := state.CommandExecutions["work"].Result.Output
+				if selector {
+					got = string(state.CommandEvaluations["work"].Output)
+				}
+				if got != want {
+					t.Fatalf("accepted output was repaired or normalized: %q, want %q", got, want)
+				}
+				acceptedBytes := pipelineRecoveryHTTPJournal(t, root, prior.RunID)
+				rec, replay := post(raw)
+				if rec.Code != http.StatusOK || !replay.Success || rec.Header().Get("X-Idempotent-Replay") != "true" || !bytes.Equal(acceptedBytes, pipelineRecoveryHTTPJournal(t, root, prior.RunID)) {
+					t.Fatalf("exact outcome replay was not immutable: %d %s", rec.Code, rec.Body)
+				}
+			})
+		}
+	}
+}

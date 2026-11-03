@@ -14,6 +14,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/internal/worksource"
 )
 
 // AssignOptions configures work assignment analysis
@@ -67,6 +68,8 @@ type AssignOutput struct {
 	UnassignableBeads []UnassignableBead `json:"unassignable_beads,omitempty"`
 	Summary           AssignSummary      `json:"summary"`
 	AgentHints        *AssignAgentHints  `json:"_agent_hints,omitempty"`
+	// WorkSourceMismatch is the STALE_WORK_COORDINATION remediation receipt.
+	WorkSourceMismatch *worksource.StaleError `json:"work_source_mismatch,omitempty"`
 }
 
 // AssignRecommend is a single assignment recommendation
@@ -407,9 +410,40 @@ func resolveAssignBlockedBeads(
 	return blocked, nil
 }
 
+// staleWorkHint is the remediation for ErrCodeStaleWorkCoordination. The code
+// covers more than a mid-read change (an unreadable or invalid canonical JSONL,
+// an opt-in ref or clean-checkout policy), so the hint defers to the error for
+// the reason; ntm never runs br to repair the tracker for the caller.
+const staleWorkHint = "The work source could not be verified as one revision; the error names why. Inspect the tracker and checkout, then retry. ntm does not repair Beads state on your behalf"
+
+// staleWorkError reports whether err is a work-source mismatch, with the code
+// and hint every assignment surface returns for one.
+func staleWorkError(err error) (string, string, bool) {
+	if errors.Is(err, worksource.ErrStale) {
+		return ErrCodeStaleWorkCoordination, staleWorkHint, true
+	}
+	return "", "", false
+}
+
+// staleWorkReceipt is the remediation receipt of a work-source mismatch: the
+// expected and observed JSONL digest and HEAD, as far as the source layer
+// recorded them. Assignment surfaces report it as work_source_mismatch.
+func staleWorkReceipt(err error) *worksource.StaleError {
+	var receipt *worksource.StaleError
+	if errors.As(err, &receipt) {
+		return receipt
+	}
+	return nil
+}
+
 func setAssignError(output *AssignOutput, err error, hint string) {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		output.RobotResponse = NewErrorResponse(err, ErrCodeTimeout, "Retry the command after cancellation")
+		return
+	}
+	if code, staleHint, ok := staleWorkError(err); ok {
+		output.RobotResponse = NewErrorResponse(err, code, staleHint)
+		output.WorkSourceMismatch = staleWorkReceipt(err)
 		return
 	}
 	if assignmentDependencyMissing(err) {
@@ -630,6 +664,9 @@ func loadAuthoritativeAssignmentPolicy(projectDir, globalPath string, requireGlo
 	}
 	if err := bv.ConfigureProjectOperatorGatedLabels(projectDir, effective.Assign.OperatorGatedLabels); err != nil {
 		return nil, fmt.Errorf("register assignment safety policy for %s: %w", strings.TrimSpace(projectDir), err)
+	}
+	if err := bv.ConfigureProjectWorkSourcePolicy(projectDir, effective.Assign.WorkSource.Policy()); err != nil {
+		return nil, fmt.Errorf("register work-source policy for %s: %w", strings.TrimSpace(projectDir), err)
 	}
 	// Keep the legacy process policy current for non-project-aware callers.
 	bv.ConfigureOperatorGatedLabels(effective.Assign.OperatorGatedLabels)

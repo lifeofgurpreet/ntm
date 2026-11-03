@@ -324,6 +324,46 @@ func TestRoundRobin_FilterSetsRotateIndependently(t *testing.T) {
 	}
 }
 
+// Different automatic filters may exclude panes that happen to share a local
+// index. They must keep independent rotation histories for their physical
+// candidate sets, including when those sets overlap.
+func TestRoundRobinPhysicalPaneFilterSetsRotateIndependently(t *testing.T) {
+	store := routingStateTestStore(t)
+	first := RouteOptions{Session: "window-filters", Strategy: StrategyRoundRobin, ExcludePaneIDs: []string{"%41"}}
+	second := RouteOptions{Session: "window-filters", Strategy: StrategyRoundRobin, ExcludePaneIDs: []string{"%51"}}
+	steps := []struct {
+		opts RouteOptions
+		want string
+	}{
+		{first, "%51"},
+		{second, "%41"},
+		{first, "%52"},
+		{second, "%52"},
+		{first, "%51"},
+		{second, "%41"},
+	}
+	for i, step := range steps {
+		agents := []ScoredAgent{
+			{PaneID: "%41", PaneIndex: 1, AgentType: "claude", Score: 50},
+			{PaneID: "%51", PaneIndex: 1, AgentType: "claude", Score: 50},
+			{PaneID: "%52", PaneIndex: 2, AgentType: "claude", Score: 50},
+		}
+		result := routeWithSessionState(agents, step.opts, store, true)
+		if result.Selected == nil || result.Selected.PaneID != step.want {
+			t.Fatalf("step %d excluding %v selected %+v, want %s", i+1, step.opts.ExcludePaneIDs, result.Selected, step.want)
+		}
+	}
+	for _, step := range []struct {
+		opts RouteOptions
+		want string
+	}{{first, "%51"}, {second, "%41"}} {
+		saved, err := store.GetRoutingState(step.opts.Session, routingStateFilterKey(step.opts))
+		if err != nil || saved == nil || saved.LastAgent != step.want {
+			t.Errorf("state for exclusion %v = %+v, %v; want last agent %s", step.opts.ExcludePaneIDs, saved, err, step.want)
+		}
+	}
+}
+
 // TestRoutingStateFilterKey pins the key derivation: unfiltered sends map to
 // the legacy empty key, and exclude sets are order-insensitive.
 func TestRoutingStateFilterKey(t *testing.T) {
@@ -347,6 +387,25 @@ func TestRoutingStateFilterKey(t *testing.T) {
 	}
 	if cod := routingStateFilterKey(RouteOptions{AgentType: "cod", ExcludePanes: []int{1, 3}}); cod != c {
 		t.Fatalf("alias cod keyed %q, canonical codex keyed %q; cursors diverge", cod, c)
+	}
+	if a != "type=claude;exclude=1,3" {
+		t.Fatalf("numeric exclusion key changed: %q", a)
+	}
+
+	withIDs := RouteOptions{AgentType: "cc", ExcludePanes: []int{3, 1}, ExcludePaneIDs: []string{"%51", "%41"}}
+	idKey := routingStateFilterKey(withIDs)
+	reordered := RouteOptions{AgentType: "claude", ExcludePanes: []int{1, 3}, ExcludePaneIDs: []string{"%41", "%51"}}
+	if want := "type=claude;exclude=1,3;exclude_ids=%41,%51"; idKey != want || routingStateFilterKey(reordered) != want {
+		t.Fatalf("physical exclusions were not keyed canonically: %q / %q, want %q", idKey, routingStateFilterKey(reordered), want)
+	}
+	if withIDs.ExcludePanes[0] != 3 || withIDs.ExcludePaneIDs[0] != "%51" {
+		t.Fatalf("key derivation mutated caller-owned exclusions: %+v", withIDs)
+	}
+	firstWindow := routingStateFilterKey(RouteOptions{ExcludePaneIDs: []string{"%41"}})
+	secondWindow := routingStateFilterKey(RouteOptions{ExcludePaneIDs: []string{"%51"}})
+	numeric := routingStateFilterKey(RouteOptions{ExcludePanes: []int{1}})
+	if firstWindow == "" || firstWindow == secondWindow || firstWindow == numeric || secondWindow == numeric {
+		t.Fatalf("distinct physical/index filters share state: %q / %q / %q", firstWindow, secondWindow, numeric)
 	}
 }
 
@@ -397,5 +456,49 @@ func TestRoutingState_ExplicitLastAgentWinsOverPersisted(t *testing.T) {
 		RouteOptions{Session: "explicitproj", Strategy: StrategySticky, LastAgent: "%3"}, store, true)
 	if result.Selected == nil || result.Selected.PaneID != "%3" {
 		t.Fatalf("selected %+v, want explicit last-agent %%3", result.Selected)
+	}
+}
+
+// TestExplicitLastAgentStillPersistsRoutingState guards the path where the
+// caller supplies --robot-route-last-agent instead of letting the persisted
+// cursor decide. That decision is not derived from the stored row, but it must
+// still advance the stored row, or the next invocation (which does read it)
+// resumes from a stale cursor and the override is silently forgotten.
+//
+// The guarded write added for the concurrent-send race must not turn this into
+// a no-op: with no baseline read, an insert-only claim hits the existing row,
+// reports contention that never happened, and drops the write.
+func TestExplicitLastAgentStillPersistsRoutingState(t *testing.T) {
+	store := routingStateTestStore(t)
+
+	// Seed a prior rotation so a row already exists.
+	seed := RouteOptions{Session: "explicit", Strategy: StrategyRoundRobin}
+	if result := routeWithSessionState(routingStateTestAgents(), seed, store, true); result.Selected == nil {
+		t.Fatal("seed route selected nothing")
+	}
+	before, err := store.GetRoutingState("explicit", "")
+	if err != nil || before == nil {
+		t.Fatalf("seed state: %v (rs=%+v)", err, before)
+	}
+
+	// Now route with an explicit last agent: the caller is overriding the
+	// stored cursor rather than reading it.
+	opts := RouteOptions{Session: "explicit", Strategy: StrategyRoundRobin, LastAgent: "%1"}
+	result := routeWithSessionState(routingStateTestAgents(), opts, store, true)
+	if result.Selected == nil {
+		t.Fatal("explicit-last-agent route selected nothing")
+	}
+
+	after, err := store.GetRoutingState("explicit", "")
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if after == nil {
+		t.Fatal("routing state vanished")
+	}
+	if after.LastAgent != result.Selected.PaneID {
+		t.Errorf("persisted last_agent = %q, want the selected pane %q; "+
+			"an explicit last-agent route did not advance the stored cursor, so the next "+
+			"invocation resumes from a stale one", after.LastAgent, result.Selected.PaneID)
 	}
 }

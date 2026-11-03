@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	pathpkg "path"
 	"sort"
 	"strings"
 	"sync"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/events"
+	"github.com/Dicklesworthstone/ntm/internal/reservationpath"
 )
 
 // Conflict represents a file reservation conflict between agents.
@@ -158,9 +158,9 @@ func reservationActiveAt(r agentmail.FileReservation, now time.Time) bool {
 	// A zero expiry means the server sent no expires_ts, or sent one this
 	// client could not parse (agentmail.FlexTime maps "" to the zero time).
 	// Comparing against it made every such reservation look EXPIRED, so
-	// DetectConflicts and CheckPathConflict skipped it entirely and reported
-	// "no conflict" for a path that is exclusively held — a fail-OPEN in the
-	// layer whose whole job is stopping two agents from editing the same file.
+	// DetectConflicts skipped it entirely and reported "no conflict" for a
+	// path that is exclusively held — a fail-OPEN in the layer whose whole
+	// job is stopping two agents from editing the same file.
 	//
 	// Treat unknown as ACTIVE: an unexpired-looking lease we cannot date is a
 	// reason to coordinate, not to ignore. internal/assign/reservation.go
@@ -183,15 +183,9 @@ func reservationsConflict(a, b agentmail.FileReservation) bool {
 }
 
 func reservationPatternsOverlap(a, b string) bool {
-	a = strings.TrimSpace(a)
-	b = strings.TrimSpace(b)
-	if a == "" || b == "" {
-		return false
-	}
-	if a == b {
-		return true
-	}
-	return matchesPattern(a, b) || matchesPattern(b, a)
+	// Matching globs against one another as literal paths misses intersections
+	// such as src/*/main.go and src/service/*.go. Compare their path languages.
+	return reservationpath.MayOverlap(a, b)
 }
 
 func conflictPatternLabel(a, b string) string {
@@ -267,7 +261,7 @@ func (c *SessionCoordinator) runConflictCycle(ctx context.Context) []ConflictOut
 	detect := c.detectConflictsFn
 	if detect == nil {
 		if c.conflictDetector == nil {
-			c.conflictDetector = NewConflictDetector(c.mailClient, c.mailProjectKey)
+			c.conflictDetector = NewConflictDetector(c.mailClient, c.projectKey)
 		}
 		detect = c.conflictDetector.DetectConflicts
 	}
@@ -504,7 +498,7 @@ func (c *SessionCoordinator) NegotiateConflict(ctx context.Context, conflict *Co
 	// Send negotiation request
 	body := c.formatNegotiationRequest(conflict, requester, lowestPriority)
 	_, err := c.mailClient.SendMessage(ctx, agentmail.SendMessageOptions{
-		ProjectKey:  c.mailProjectKey,
+		ProjectKey:  c.projectKey,
 		SenderName:  c.agentName,
 		To:          []string{lowestPriority.AgentName},
 		Subject:     fmt.Sprintf("File Reservation Conflict: %s", conflict.Pattern),
@@ -544,7 +538,7 @@ func (c *SessionCoordinator) NotifyConflict(ctx context.Context, conflict *Confl
 
 	body := c.formatConflictNotification(conflict)
 	_, err := c.mailClient.SendMessage(ctx, agentmail.SendMessageOptions{
-		ProjectKey:  c.mailProjectKey,
+		ProjectKey:  c.projectKey,
 		SenderName:  c.agentName,
 		To:          recipients,
 		Subject:     fmt.Sprintf("⚠️ Reservation Conflict Detected: %s", conflict.Pattern),
@@ -629,111 +623,4 @@ func sanitizeForID(s string) string {
 		s = s[:20]
 	}
 	return s
-}
-
-// matchesPattern checks if a path matches a glob pattern.
-// Supports:
-// - Exact match: "src/main.go"
-// - Prefix match: "src/" matches "src/main.go"
-// - Single * wildcard: "src/*.go" matches "src/main.go"
-// - Double ** wildcard: "src/**" matches any path under src/
-// - Combined: "src/**/test.go" matches "src/foo/bar/test.go"
-// - Combined with wildcard suffix: "src/**/*.go" matches "src/foo/bar/test.go"
-func matchesPattern(path, pattern string) bool {
-	// Exact match
-	if path == pattern {
-		return true
-	}
-
-	// Handle ** patterns (match any number of path segments)
-	if strings.Contains(pattern, "**") {
-		parts := strings.SplitN(pattern, "**", 2)
-		prefix := parts[0]
-		suffix := ""
-		if len(parts) > 1 {
-			suffix = strings.TrimPrefix(parts[1], "/")
-		}
-
-		// Path must start with prefix
-		if !strings.HasPrefix(path, prefix) {
-			return false
-		}
-
-		// If no suffix, just prefix match is enough
-		if suffix == "" {
-			return true
-		}
-
-		// Path must end with suffix (after stripping prefix)
-		remaining := strings.TrimPrefix(path, prefix)
-
-		// If suffix contains wildcards, we need pattern matching, not literal matching
-		if strings.Contains(suffix, "*") {
-			// The suffix is a pattern - check if the trailing part of remaining matches it
-			// For "*.go", we check if the last path segment matches
-			// For "foo/*.go", we check if the last two segments match
-			return matchesSuffixPattern(remaining, suffix)
-		}
-
-		// bd-eebvt: a literal suffix must occupy a whole basename, not a
-		// fragment of one — `**/test.go` should match files named test.go
-		// at any depth, NOT files like "mytest.go" whose basename merely
-		// ends with the byte sequence "test.go". Require the suffix to
-		// either equal `remaining` exactly OR be preceded by a path
-		// separator.
-		if !strings.HasSuffix(remaining, suffix) {
-			return false
-		}
-		if remaining == suffix {
-			return true
-		}
-		cut := len(remaining) - len(suffix)
-		return cut > 0 && remaining[cut-1] == '/'
-	}
-
-	// Handle single * patterns (match single path segment)
-	if strings.Contains(pattern, "*") {
-		return matchesWildcardPattern(path, pattern)
-	}
-
-	// Prefix match (pattern is a directory)
-	return strings.HasPrefix(path, pattern+"/")
-}
-
-// matchesWildcardPattern checks if path matches a pattern with single * wildcards.
-func matchesWildcardPattern(path, pattern string) bool {
-	// A basename-only pattern is intentionally recursive: reserving "*.go"
-	// covers Go files anywhere in the project. Directory-qualified patterns use
-	// path.Match below, so their wildcards remain confined to one segment.
-	if !strings.Contains(pattern, "/") {
-		matched, err := pathpkg.Match(pattern, pathpkg.Base(path))
-		return err == nil && matched
-	}
-
-	// path.Match gives glob semantics for slash-delimited reservation paths:
-	// '*' matches one path segment, never a directory separator. The previous
-	// substring-based matcher let "src/*.go" match "src/nested/file.go",
-	// creating false conflict reports for unreserved nested files.
-	matched, err := pathpkg.Match(pattern, path)
-	return err == nil && matched
-}
-
-// matchesSuffixPattern checks if the trailing portion of path matches a suffix pattern.
-// For example, "foo/bar/test.go" matches suffix pattern "*.go" (last segment matches).
-// "foo/bar/main.go" matches suffix pattern "bar/*.go" (last two segments match).
-func matchesSuffixPattern(path, suffixPattern string) bool {
-	// Count segments in the suffix pattern
-	suffixSegments := strings.Count(suffixPattern, "/") + 1
-
-	// Get the last N segments from path
-	pathParts := strings.Split(path, "/")
-	if len(pathParts) < suffixSegments {
-		return false
-	}
-
-	// Extract the last N segments
-	trailingPath := strings.Join(pathParts[len(pathParts)-suffixSegments:], "/")
-
-	// Now match the trailing path against the suffix pattern
-	return matchesWildcardPattern(trailingPath, suffixPattern)
 }

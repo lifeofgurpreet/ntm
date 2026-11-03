@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -18,14 +19,45 @@ import (
 // with Executor.SetTmuxClient to avoid touching a live tmux server.
 type TmuxClient interface {
 	GetPanes(session string) ([]tmux.Pane, error)
+	// PrepareDelivery applies the shared live-agent and composer preflight.
+	// It never sends prompt bytes. A marked pre-actuation failure allows the
+	// live executor to retain proof that its own attempt was never sent.
+	PrepareDelivery(ctx context.Context, pane tmux.Pane, agentType string) error
 	PasteKeys(target, content string, enter bool) error
 	CapturePaneOutput(target string, lines int) (string, error)
+	// VerifySubmission confirms that a payload just pasted into target
+	// actually left the agent's composer (ntm#320). A nil error means the
+	// submission is confirmed, or that this agent kind has no verifier and
+	// makes no claim; a non-nil error means the composer is still visibly
+	// holding the payload after a bounded rescue, so the dispatch must NOT be
+	// treated as delivered and must never be waited on for completion.
+	VerifySubmission(ctx context.Context, target, message, agentType string, paneWidth int) error
 }
 
 type realTmuxClient struct{}
 
+// Endpoint identifies the tmux server namespace used by physical pane IDs.
+// It is optional on TmuxClient so existing injected clients remain compatible.
+func (realTmuxClient) Endpoint() string {
+	if tmux.DefaultClient.Remote == "" {
+		return "local"
+	}
+	return "ssh:" + tmux.DefaultClient.Remote
+}
+
 func (realTmuxClient) GetPanes(session string) ([]tmux.Pane, error) {
 	return tmux.GetPanes(session)
+}
+
+func (realTmuxClient) GetPanesContext(ctx context.Context, session string) ([]tmux.Pane, error) {
+	return tmux.GetPanesContext(ctx, session)
+}
+
+func (realTmuxClient) PrepareDelivery(ctx context.Context, pane tmux.Pane, agentType string) error {
+	_, err := dispatch.PrepareTMUXDelivery(ctx, dispatch.Delivery{Target: dispatch.Target{
+		Pane: pane, Ref: pane.Ref(), AgentType: tmux.AgentType(agentType),
+	}})
+	return err
 }
 
 func (realTmuxClient) PasteKeys(target, content string, enter bool) error {
@@ -34,6 +66,14 @@ func (realTmuxClient) PasteKeys(target, content string, enter bool) error {
 
 func (realTmuxClient) CapturePaneOutput(target string, lines int) (string, error) {
 	return tmux.CapturePaneOutput(target, lines)
+}
+
+func (realTmuxClient) CapturePaneOutputContext(ctx context.Context, target string, lines int) (string, error) {
+	return tmux.CapturePaneOutputContext(ctx, target, lines)
+}
+
+func (realTmuxClient) VerifySubmission(ctx context.Context, target, message, agentType string, paneWidth int) error {
+	return dispatch.VerifyAgentSubmission(ctx, target, message, tmux.AgentType(agentType), paneWidth)
 }
 
 // MockTmuxPaste records one PasteKeys call made against the mock.
@@ -50,6 +90,14 @@ type mockTmuxPaneState struct {
 	pastes  []MockTmuxPaste
 }
 
+// MockTmuxVerification records one VerifySubmission call made against the mock.
+type MockTmuxVerification struct {
+	Target    string
+	Message   string
+	AgentType string
+	PaneWidth int
+}
+
 // MockTmuxClient is a deterministic in-memory tmux substitute for executor tests.
 type MockTmuxClient struct {
 	mu           sync.Mutex
@@ -57,6 +105,61 @@ type MockTmuxClient struct {
 	scripter     *AgentScripter
 	deliveryGate <-chan struct{}
 	deliveryWG   sync.WaitGroup
+	// verifier decides the outcome of VerifySubmission. Nil means "always
+	// confirmed", which is what an agent that submits normally looks like.
+	verifier      func(target, message, agentType string) error
+	verifications []MockTmuxVerification
+}
+
+// SetSubmissionVerifier installs the outcome of future VerifySubmission calls.
+// Returning a non-nil error models a composer that is still holding the
+// payload after the bounded rescue — the stranded-prompt case from ntm#320.
+// Passing nil restores the default "always confirmed" behavior.
+func (m *MockTmuxClient) SetSubmissionVerifier(fn func(target, message, agentType string) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.verifier = fn
+}
+
+// VerificationHistory returns a copy of the recorded VerifySubmission calls,
+// so a test can assert that dispatch verified before waiting and that it
+// verified exactly once per send.
+func (m *MockTmuxClient) VerificationHistory() []MockTmuxVerification {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	history := make([]MockTmuxVerification, len(m.verifications))
+	copy(history, m.verifications)
+	return history
+}
+
+// VerifySubmission records the call and returns the installed verdict.
+func (m *MockTmuxClient) VerifySubmission(ctx context.Context, target, message, agentType string, paneWidth int) error {
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	m.mu.Lock()
+	m.verifications = append(m.verifications, MockTmuxVerification{
+		Target:    target,
+		Message:   message,
+		AgentType: agentType,
+		PaneWidth: paneWidth,
+	})
+	verifier := m.verifier
+	m.mu.Unlock()
+	if verifier == nil {
+		return nil
+	}
+	return verifier(target, message, agentType)
+}
+
+// PrepareDelivery models a ready composer while retaining the shared refusal
+// for an agent that exited to a shell. Tests of visible UI gates can override
+// this method with realTmuxClient.PrepareDelivery and a captured-screen fixture.
+func (m *MockTmuxClient) PrepareDelivery(ctx context.Context, pane tmux.Pane, _ string) error {
+	if err := ctx.Err(); err != nil {
+		return dispatch.GuaranteeNoDeliveryActuation(err)
+	}
+	return dispatch.GuaranteeNoDeliveryActuation(dispatch.RefuseDeadAgentPane(pane))
 }
 
 // NewMockTmuxClient creates a mock with optional global pane fixtures.
@@ -99,6 +202,7 @@ func (m *MockTmuxClient) Reset() {
 		state.output = ""
 		state.pastes = nil
 	}
+	m.verifications = nil
 	if m.scripter != nil {
 		m.scripter.Reset()
 	}
@@ -270,6 +374,9 @@ func normalizeMockPane(pane tmux.Pane, ordinal int) tmux.Pane {
 	}
 	if pane.Index == 0 {
 		pane.Index = ordinal
+	}
+	if pane.PID == 0 {
+		pane.PID = 10000 + ordinal
 	}
 	return pane
 }

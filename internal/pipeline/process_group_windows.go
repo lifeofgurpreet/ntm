@@ -11,9 +11,11 @@ import (
 const commandCancelGracePeriod = 5 * time.Second
 
 type commandCleanupResult struct {
-	Err        error
-	Cancelled  bool
-	SignalSent string
+	Err                 error
+	Cancelled           bool
+	SignalSent          string
+	Settled             bool
+	ExitBeforeSignalErr error
 }
 
 // configureCommandProcessGroup is a no-op on Windows. Unix's Setpgid +
@@ -44,7 +46,7 @@ func waitCommandWithProcessGroupCleanup(ctx context.Context, cmd *exec.Cmd) comm
 
 	select {
 	case err := <-done:
-		return commandCleanupResult{Err: err}
+		return commandCleanupResult{Err: err, Settled: true}
 	case <-ctx.Done():
 		result := commandCleanupResult{
 			Cancelled:  true,
@@ -56,6 +58,7 @@ func waitCommandWithProcessGroupCleanup(ctx context.Context, cmd *exec.Cmd) comm
 		select {
 		case err := <-done:
 			result.Err = err
+			result.Settled = true
 			if result.Err == nil {
 				result.Err = ctx.Err()
 			}

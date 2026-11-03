@@ -154,14 +154,6 @@ func maxRenderedLineWidth(s string) int {
 	return maxWidth
 }
 
-func TestTimelineAgentIDUsesFinalSeparator(t *testing.T) {
-
-	pane := tmux.Pane{Title: "my__project__cc_2"}
-	if got := timelineAgentID(pane, "", ""); got != "cc_2" {
-		t.Fatalf("timelineAgentID() = %q, want %q", got, "cc_2")
-	}
-}
-
 func renderedHeight(s string) int {
 	plain := strings.TrimRight(status.StripANSI(s), "\n")
 	if plain == "" {
@@ -2320,7 +2312,6 @@ func TestDashboardSidebarRendersRotationConfirmPanelWhenPending(t *testing.T) {
 			SessionName:    "proj",
 			ContextPercent: 93,
 			TimeoutAt:      now.Add(30 * time.Second),
-			DefaultAction:  ctxmon.ConfirmRotate,
 		},
 	}, nil)
 
@@ -2357,7 +2348,6 @@ func TestDashboardRotationConfirmShortcutsOverrideGlobalBindings(t *testing.T) {
 					SessionName:    "proj",
 					ContextPercent: 93,
 					TimeoutAt:      now.Add(30 * time.Second),
-					DefaultAction:  ctxmon.ConfirmRotate,
 				},
 			}, nil)
 			_ = m.renderSidebar(60, 28)
@@ -2393,21 +2383,18 @@ func TestDashboardRotationConfirmNavigationMovesSingleStep(t *testing.T) {
 			SessionName:    "proj",
 			ContextPercent: 93,
 			TimeoutAt:      now.Add(30 * time.Second),
-			DefaultAction:  ctxmon.ConfirmRotate,
 		},
 		{
 			AgentID:        "proj__cc_2",
 			SessionName:    "proj",
 			ContextPercent: 94,
 			TimeoutAt:      now.Add(45 * time.Second),
-			DefaultAction:  ctxmon.ConfirmRotate,
 		},
 		{
 			AgentID:        "proj__cc_3",
 			SessionName:    "proj",
 			ContextPercent: 95,
 			TimeoutAt:      now.Add(60 * time.Second),
-			DefaultAction:  ctxmon.ConfirmRotate,
 		},
 	}, nil)
 	_ = m.renderSidebar(60, 28)

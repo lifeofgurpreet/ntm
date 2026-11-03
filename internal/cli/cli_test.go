@@ -331,6 +331,7 @@ func resetFlags() {
 	robotBulkAssignTemplate = ""
 	robotBulkAssignParallel = false
 	robotBulkAssignStagger = 0
+	robotReserveFiles = true
 	robotRequireReservation = false
 	robotReservationPaths = ""
 	robotDiff = ""
@@ -358,6 +359,8 @@ func resetFlags() {
 	robotSpawnGmi = ""
 	robotSpawnAgy = ""
 	robotSpawnGrok = ""
+	robotSpawnOmp = ""
+	robotSpawnOc = ""
 	robotSpawnPreset = ""
 	robotSpawnNoUser = false
 	robotSpawnWait = false
@@ -366,6 +369,10 @@ func resetFlags() {
 	robotSpawnAssignWork = false
 	robotSpawnNames = ""
 	robotSpawnLabel = ""
+	robotSpawnPrompt = ""
+	robotSpawnPromptFile = ""
+	robotSpawnStaggerMode = ""
+	robotSpawnStaggerDelay = ""
 	robotInterruptMsg = ""
 	robotInterruptAll = false
 	robotInterruptForce = false
@@ -2815,7 +2822,6 @@ func TestRunContextRotationPendingNormalizesExplicitPrefix(t *testing.T) {
 		ContextPercent: 91.2,
 		CreatedAt:      time.Now(),
 		TimeoutAt:      time.Now().Add(5 * time.Minute),
-		DefaultAction:  ctxmon.ConfirmRotate,
 		WorkDir:        projectDir,
 	}); err != nil {
 		t.Fatalf("AddPendingRotation() error = %v", err)
@@ -3113,10 +3119,17 @@ func TestSmartRestartHardKillFlagsRegistered(t *testing.T) {
 }
 
 func TestAtomicRobotAssignmentReservationFlagsRegistered(t *testing.T) {
-	for _, name := range []string{"require-reservation", "reservation-paths"} {
+	for _, name := range []string{"require-reservation", "reservation-paths", "reserve-files"} {
 		if rootCmd.Flags().Lookup(name) == nil {
 			t.Fatalf("expected --%s flag to be registered", name)
 		}
+	}
+	// Bulk assignment reserves by default, mirroring `ntm assign --reserve-files`.
+	if reserve := rootCmd.Flags().Lookup("reserve-files"); reserve.DefValue != "true" {
+		t.Fatalf("--reserve-files default = %q, want true", reserve.DefValue)
+	}
+	if assignReserve := newAssignCmd().Flags().Lookup("reserve-files"); assignReserve == nil || assignReserve.DefValue != "true" {
+		t.Fatalf("ntm assign --reserve-files = %+v, want a flag defaulting to true", assignReserve)
 	}
 }
 
@@ -5180,8 +5193,8 @@ func TestResolveRobotMailCheckUsesSharedCanonicalFlags(t *testing.T) {
 		t.Fatalf("set limit: %v", err)
 	}
 
-	if got := resolveRobotMailCheckSince(cmd); got != robotSince {
-		t.Fatalf("resolveRobotMailCheckSince() = %q, want %q", got, robotSince)
+	if got := resolveRobotCASSSince(cmd); got != robotSince {
+		t.Fatalf("resolveRobotCASSSince() = %q, want %q", got, robotSince)
 	}
 	if got := resolveRobotMailCheckLimit(cmd); got != 25 {
 		t.Fatalf("resolveRobotMailCheckLimit() = %d, want 25", got)
@@ -5215,8 +5228,8 @@ func TestResolveRobotMailCheckSincePrefersDeprecatedAliasWhenExplicitlySet(t *te
 		t.Fatalf("set cass-since: %v", err)
 	}
 
-	if got := resolveRobotMailCheckSince(cmd); got != cassSince {
-		t.Fatalf("resolveRobotMailCheckSince() = %q, want deprecated explicit value %q", got, cassSince)
+	if got := resolveRobotCASSSince(cmd); got != cassSince {
+		t.Fatalf("resolveRobotCASSSince() = %q, want deprecated explicit value %q", got, cassSince)
 	}
 }
 
@@ -5898,6 +5911,198 @@ func TestRobotProcessContractHelper(t *testing.T) {
 	os.Exit(0)
 }
 
+// startClaudePaneFixture creates a tmux session (on the package's isolated
+// server) holding one pane titled as an ntm Claude agent and running a long
+// sleep, and returns the session name and that pane, PID included.
+func startClaudePaneFixture(t *testing.T, prefix string) (string, tmux.Pane) {
+	t.Helper()
+	dir := t.TempDir()
+	session := fmt.Sprintf("%s%d", prefix, time.Now().UnixNano())
+	if err := tmux.CreateSession(session, dir); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.KillSession(session) })
+	paneID, err := tmux.DefaultClient.Run("new-window", "-d", "-t", session, "-c", dir, "-P", "-F", "#{pane_id}", "sleep 300")
+	if err != nil {
+		t.Fatalf("create agent window: %v", err)
+	}
+	paneID = strings.TrimSpace(paneID)
+	if err := tmux.SetPaneTitle(paneID, session+"__cc_1"); err != nil {
+		t.Fatalf("set pane title: %v", err)
+	}
+	panes, err := tmux.GetPanes(session)
+	if err != nil {
+		t.Fatalf("list panes: %v", err)
+	}
+	for _, pane := range panes {
+		if pane.ID == paneID {
+			if pane.PID <= 0 || pane.Type != tmux.AgentClaude {
+				t.Fatalf("agent pane fixture not attributable: %+v", pane)
+			}
+			return session, pane
+		}
+	}
+	t.Fatalf("agent pane %s absent from session topology: %+v", paneID, panes)
+	return "", tmux.Pane{}
+}
+
+// --robot-rano-stats end to end: the real CLI dispatch, config loading, tmux
+// topology, /proc PID attribution and rano adapter. Only the rano binary is a
+// fake, and it speaks upstream's real contract (rano 0.2.1,
+// github.com/Dicklesworthstone/rano@7f342a3d195dea97f083602274fd2758ff46c88e
+// src/main.rs): `--version` prints "rano 0.2.1", `status` exits 0, there is no
+// `stats` subcommand, and `export --format jsonl --sqlite DB --fields ...`
+// prints rows ordered by ts with alphabetical keys, NULL columns omitted and
+// whole-second UTC timestamps.
+func TestRobotRanoStatsReadsUpstreamExportThroughCLI(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+	session, pane := startClaudePaneFixture(t, "ntmranostats")
+
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	project := filepath.Join(root, "project")
+	bin := filepath.Join(root, "bin")
+	for _, dir := range []string{home, project, bin, filepath.Join(root, "rano")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	database := filepath.Join(root, "rano", "observer.sqlite")
+	if err := os.WriteFile(database, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	ts := func(ago time.Duration) string { return now.Add(-ago).Format(time.RFC3339) }
+	fixture := strings.Join([]string{
+		// Outside the 5m window: ntm applies the exact window itself.
+		fmt.Sprintf(`{"comm":"claude","event":"connect","pid":%d,"provider":"anthropic","ts":%q}`, pane.PID, ts(10*time.Minute)),
+		fmt.Sprintf(`{"comm":"claude","event":"connect","pid":%d,"provider":"anthropic","ts":%q}`, pane.PID, ts(90*time.Second)),
+		fmt.Sprintf(`{"comm":"claude","event":"connect","pid":%d,"provider":"unknown","ts":%q}`, pane.PID, ts(30*time.Second)),
+		// A close is not a second connection; a threshold alert has no pid.
+		fmt.Sprintf(`{"comm":"claude","event":"close","pid":%d,"provider":"anthropic","ts":%q}`, pane.PID, ts(20*time.Second)),
+		fmt.Sprintf(`{"comm":"","event":"alert","provider":"anthropic","ts":%q}`, ts(15*time.Second)),
+		// A process outside every agent pane is not attributed.
+		fmt.Sprintf(`{"comm":"curl","event":"connect","pid":%d,"provider":"unknown","ts":%q}`, os.Getpid(), ts(10*time.Second)),
+	}, "\n") + "\n"
+	fixturePath := filepath.Join(root, "export.jsonl")
+	if err := os.WriteFile(fixturePath, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeRano := `#!/bin/sh
+case "$1" in
+--version) echo "rano 0.2.1" ;;
+status) echo "0 active | anthropic:0 openai:0" ;;
+export)
+	printf '%s\n' "$@" > "$FAKE_RANO_ARGS"
+	if [ "$4" != "--sqlite" ] || [ ! -f "$5" ]; then echo "SQLite file not found: observer.sqlite" >&2; exit 1; fi
+	cat "$FAKE_RANO_EXPORT" ;;
+*) echo "Unexpected argument: $1" >&2; exit 1 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(bin, "rano"), []byte(fakeRano), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(t *testing.T, sqlitePath, argsLog string) (map[string]any, robot.RanoStatsOutput, int) {
+		t.Helper()
+		configPath := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(configPath, []byte(fmt.Sprintf("[integrations.rano]\nsqlite_path = %q\n", sqlitePath)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		rawArgs, err := json.Marshal([]string{"--config", configPath, "--robot-rano-stats", "--rano-window=5m"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(os.Args[0], "-test.run=^TestRobotProcessContractHelper$")
+		cmd.Dir = project
+		cmd.Env = envWithOverrides(os.Environ(),
+			"HOME="+home,
+			"XDG_CONFIG_HOME="+filepath.Join(home, ".config"),
+			"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"FAKE_RANO_ARGS="+argsLog,
+			"FAKE_RANO_EXPORT="+fixturePath,
+			"NTM_TEST_TMUX_ENV_OWNED=1",
+			"NTM_NO_COLOR=1",
+			"NTM_CONFIG=",
+			"NTM_ROBOT_FORMAT=",
+			"NTM_OUTPUT_FORMAT=",
+			"TOON_DEFAULT_FORMAT=",
+			"NTM_ROBOT_VERBOSITY=",
+			"NTM_ROBOT_CONTRACT_ARGS="+string(rawArgs),
+		)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		exitCode := 0
+		if err := cmd.Run(); err != nil {
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				t.Fatalf("run ntm --robot-rano-stats: %v", err)
+			}
+			exitCode = exitErr.ExitCode()
+		}
+		var raw map[string]any
+		var out robot.RanoStatsOutput
+		if err := json.Unmarshal(stdout.Bytes(), &raw); err != nil {
+			t.Fatalf("stdout is not one JSON document: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+		}
+		if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+			t.Fatalf("decode rano stats: %v", err)
+		}
+		return raw, out, exitCode
+	}
+
+	t.Run("recorded connections reach the agent pane", func(t *testing.T) {
+		argsLog := filepath.Join(t.TempDir(), "args")
+		raw, out, exitCode := run(t, database, argsLog)
+		if exitCode != 0 || !out.Success {
+			t.Fatalf("exit=%d output=%v", exitCode, raw)
+		}
+		got, ok := out.Panes[pane.ID]
+		if !ok {
+			t.Fatalf("agent pane %s (pid %d) missing from %v", pane.ID, pane.PID, raw)
+		}
+		if got.Session != session || got.ConnectionCount != 2 || got.LastConnection != ts(30*time.Second) ||
+			!reflect.DeepEqual(got.PIDs, []int{pane.PID}) ||
+			got.Providers["anthropic"].Connections != 1 || got.Providers["unknown"].Connections != 1 || len(got.Providers) != 2 {
+			t.Fatalf("pane stats = %+v", got)
+		}
+		if out.Total.ConnectionCount != 2 || out.Database != database || out.Measurement != "connection_events" {
+			t.Fatalf("totals/source = %+v database=%q measurement=%q", out.Total, out.Database, out.Measurement)
+		}
+		encoded, _ := json.Marshal(raw)
+		for _, unmeasured := range []string{`"request_count":`, `"bytes_in":`, `"bytes_out":`, `"last_request":`, `"bytes_sent":`} {
+			if strings.Contains(string(encoded), unmeasured) {
+				t.Fatalf("surface reports an unmeasured metric %s: %s", unmeasured, encoded)
+			}
+		}
+		logged, err := os.ReadFile(argsLog)
+		if err != nil {
+			t.Fatalf("rano export was never invoked: %v", err)
+		}
+		args := strings.Split(strings.TrimSpace(string(logged)), "\n")
+		if len(args) != 11 || !reflect.DeepEqual(args[:7], []string{"export", "--format", "jsonl", "--sqlite", database, "--fields", "ts,event,pid,comm,provider"}) ||
+			args[7] != "--since" || args[9] != "--until" {
+			t.Fatalf("rano export argv = %q", args)
+		}
+	})
+
+	t.Run("missing observer database is a missing dependency", func(t *testing.T) {
+		argsLog := filepath.Join(t.TempDir(), "args")
+		missing := filepath.Join(root, "rano", "never-recorded.sqlite")
+		raw, out, exitCode := run(t, missing, argsLog)
+		if exitCode != 1 || out.Success || out.ErrorCode != robot.ErrCodeDependencyMissing {
+			t.Fatalf("exit=%d output=%v; want exit 1 DEPENDENCY_MISSING", exitCode, raw)
+		}
+		if !strings.Contains(out.Error, missing) || out.Database != missing || len(out.Panes) != 0 || out.Measurement != "" {
+			t.Fatalf("missing database not reported honestly: %v", raw)
+		}
+		if _, err := os.Stat(argsLog); !os.IsNotExist(err) {
+			t.Fatalf("rano export ran without a database (stat err %v)", err)
+		}
+	})
+}
+
 func TestRobotProcessErrorContract(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping process-level robot contract integration in short mode")
@@ -5934,6 +6139,8 @@ func TestRobotProcessErrorContract(t *testing.T) {
 		{name: "robot send malformed verify render", args: []string{"--robot-send=proj", "--msg=work", "--verify-render=not-a-bool"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1},
 		{name: "robot send missing msg", args: []string{"--robot-send=proj"}, errorCode: robot.ErrCodeInvalidArgs, expectedExit: 1},
 		{name: "robot send empty msg", args: []string{"--robot-send=proj", "--msg="}, errorCode: robot.ErrCodeInvalidArgs, expectedExit: 1},
+		{name: "robot send rejects route strategy modifier", args: []string{"--robot-send=proj", "--msg=work", "--strategy=least-loaded"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1, expectedCommand: "robot-send", expectedHint: "--robot-route=SESSION"},
+		{name: "robot send rejects last-agent modifier", args: []string{"--robot-send=proj", "--msg=work", "--last-agent=%1"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1, expectedCommand: "robot-send", expectedHint: "--robot-route=SESSION"},
 		{name: "missing session", args: []string{"--robot-agent-names=ntm-robot-contract-missing-session"}, errorCode: robot.ErrCodeSessionNotFound, expectedExit: 1},
 		{name: "unknown docs topic", args: []string{"--robot-docs=not-a-topic"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1},
 		{name: "unknown docs topic forces json from toon", args: []string{"--robot-docs=not-a-topic", "--robot-format=toon"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1},
@@ -7773,5 +7980,81 @@ func TestRootVersionFlagRegistered(t *testing.T) {
 	}
 	if tmpl := rootCmd.VersionTemplate(); !strings.Contains(tmpl, "ntm version") {
 		t.Fatalf("version template %q does not match the 'ntm version' headline", tmpl)
+	}
+}
+
+// TestShouldInitializeRobotPersistenceForActivity pins that `ntm activity`
+// opens the runtime store: without it there is no watermark to make state_since
+// durable across one-shot invocations (ntm#301).
+func TestShouldInitializeRobotPersistenceForActivity(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+	os.Args = []string{"ntm", "activity", "agent-factory", "--json"}
+
+	cmd := &cobra.Command{Use: "activity"}
+	if !shouldInitializeRobotPersistence(cmd) {
+		t.Fatal("activity must initialize persistence for durable state_since")
+	}
+	if robotPersistenceRefreshesProjection(cmd) {
+		t.Fatal("activity must not pay for the bv/br projection refresh")
+	}
+	if !robotPersistenceRefreshesProjection(&cobra.Command{Use: "status"}) {
+		t.Fatal("other commands must keep the projection refresh")
+	}
+}
+
+// TestRobotSurfacesWithoutProjectionSkipRefresh: a tool-bridge surface skips
+// the projection refresh, also with a global modifier, while any other robot
+// surface in the invocation keeps it. Every exempt name must be a real root
+// flag, so a renamed flag cannot silently fall out of the list.
+func TestRobotSurfacesWithoutProjectionSkipRefresh(t *testing.T) {
+	for name := range robotSurfacesWithoutProjection {
+		if rootCmd.Flags().Lookup(name) == nil {
+			t.Errorf("robotSurfacesWithoutProjection names %q, which is not a root flag", name)
+		}
+	}
+
+	refreshes := func(args ...string) bool {
+		t.Helper()
+		cmd := &cobra.Command{Use: "ntm"}
+		cmd.Flags().Bool("robot-mail", false, "")
+		cmd.Flags().Bool("robot-status", false, "")
+		cmd.Flags().String("robot-format", "", "")
+		cmd.Flags().String("jfp-category", "", "")
+		if err := cmd.ParseFlags(args); err != nil {
+			t.Fatal(err)
+		}
+		return robotPersistenceRefreshesProjection(cmd)
+	}
+	for _, tc := range []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"--robot-mail"}, false},
+		{[]string{"--robot-mail", "--robot-format=toon", "--jfp-category=x"}, false},
+		{[]string{"--robot-status"}, true},
+		{[]string{"--robot-mail", "--robot-status"}, true},
+		{[]string{"--robot-format=toon"}, true},
+		{nil, true},
+	} {
+		if got := refreshes(tc.args...); got != tc.want {
+			t.Errorf("args %v: refreshes projection = %v, want %v", tc.args, got, tc.want)
+		}
+	}
+}
+
+// GH #333: --spawn-oc reaches the robot spawn engine with its count and model.
+func TestRobotSpawnOptionsFromFlagsCarriesOpencode(t *testing.T) {
+	resetFlags()
+	t.Cleanup(resetFlags)
+
+	robotSpawn = "oc-spawn"
+	robotSpawnOc = "2:opencode/space-bunny-free"
+	opts, err := robotSpawnOptionsFromFlags(nil, 30*time.Second, nil, true)
+	if err != nil {
+		t.Fatalf("robotSpawnOptionsFromFlags: %v", err)
+	}
+	if opts.OcCount != 2 || opts.OcModel != "opencode/space-bunny-free" {
+		t.Fatalf("oc options = count:%d model:%q, want 2 opencode/space-bunny-free", opts.OcCount, opts.OcModel)
 	}
 }

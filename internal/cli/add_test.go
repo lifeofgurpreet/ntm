@@ -19,6 +19,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/output"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/Dicklesworthstone/ntm/internal/spawnidentity"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
@@ -200,7 +201,7 @@ func TestAddPersistsAgentTypeAcrossWrapperTitleRewrite(t *testing.T) {
 		jsonOutput = oldJSONOutput
 	})
 	cfg = newTmuxIntegrationTestConfig(workDir)
-	cfg.Agents.Codex = testAgentCatCommandTemplate
+	cfg.Agents.Codex = testAgentCodexCommandTemplate
 	cfg.Checkpoints.Enabled = false
 	cfg.CASS.Context.Enabled = false
 	jsonOutput = false
@@ -233,6 +234,10 @@ func TestAddPersistsAgentTypeAcrossWrapperTitleRewrite(t *testing.T) {
 	if err := tmux.SetPaneTitle(codexPaneID, "caam | title replaced by wrapper"); err != nil {
 		t.Fatalf("rewrite added pane title: %v", err)
 	}
+	spec, err := tmux.ReadPaneLaunchSpecContext(t.Context(), codexPaneID)
+	if err != nil || spec == nil || spec.AgentType != tmux.AgentCodex || spec.Command == "" {
+		t.Fatalf("added launch specification lost after title rewrite: spec=%+v err=%v", spec, err)
+	}
 	panes, err = tmux.GetPanes(sessionName)
 	if err != nil {
 		t.Fatalf("GetPanes after title rewrite: %v", err)
@@ -243,6 +248,77 @@ func TestAddPersistsAgentTypeAcrossWrapperTitleRewrite(t *testing.T) {
 		}
 	}
 	t.Fatalf("added pane %s lost its durable Codex type after title rewrite: %+v", codexPaneID, panes)
+}
+
+// TestAddWaitsForAgentToReplaceShell is the ntm#358 regression guard. `ntm
+// add` waited for a stable agent process only for Grok and omp, so for every
+// other agent type it returned (and reconciled Agent Mail badges, which then
+// recorded "(exited)") while the pane's foreground was still the interactive
+// shell. The fake Codex agent here keeps the shell in the foreground for a few
+// seconds (the shell builtin `read -t` times out on an idle terminal) before
+// /bin/cat takes over, so without the wait executeAdd returns long before the
+// agent process exists.
+func TestAddWaitsForAgentToReplaceShell(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+
+	workDir := t.TempDir()
+	sessionName := fmt.Sprintf("ntm-test-add-wait-%d", time.Now().UnixNano())
+	if err := tmux.CreateSession(sessionName, workDir); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.KillSession(sessionName) })
+
+	oldCfg, oldJSONOutput := cfg, jsonOutput
+	t.Cleanup(func() {
+		cfg = oldCfg
+		jsonOutput = oldJSONOutput
+	})
+	cfg = newTmuxIntegrationTestConfig(workDir)
+	cfg.Agents.Codex = `{{if .Model}}: {{shellQuote .Model}} >/dev/null && {{end}}read -t 3 ntm_add_delay || /bin/cat`
+	cfg.Checkpoints.Enabled = false
+	cfg.CASS.Context.Enabled = false
+	jsonOutput = false
+
+	before, err := tmux.GetPanes(sessionName)
+	if err != nil {
+		t.Fatalf("GetPanes before add: %v", err)
+	}
+	existing := make(map[string]bool, len(before))
+	for _, pane := range before {
+		existing[pane.ID] = true
+	}
+
+	if err := executeAdd(t.Context(), AddOptions{
+		Session:       sessionName,
+		Agents:        AgentSpecs{{Type: AgentTypeCodex, Count: 1}},
+		NoCassContext: true,
+	}, false); err != nil {
+		t.Fatalf("executeAdd: %v", err)
+	}
+
+	// Observe immediately: whatever add left behind is what its badge
+	// reconciliation and any follow-up send saw.
+	panes, err := tmux.GetPanes(sessionName)
+	if err != nil {
+		t.Fatalf("GetPanes after add: %v", err)
+	}
+	var added *tmux.Pane
+	for i := range panes {
+		if !existing[panes[i].ID] {
+			added = &panes[i]
+			break
+		}
+	}
+	if added == nil {
+		t.Fatalf("added pane not found: before=%+v after=%+v", before, panes)
+	}
+	command := strings.TrimSpace(added.Command)
+	if command == "" || tmux.PaneCommandIsShell(command) {
+		t.Fatalf("executeAdd returned while pane %s still ran %q; it must wait until the agent process replaced the shell", added.ID, command)
+	}
+	if got := filepath.Base(command); got != "cat" {
+		t.Fatalf("added pane %s foreground = %q, want the fake agent (cat)", added.ID, got)
+	}
 }
 
 // TestAddThreadsReasoningEffort is the ntm#195 regression guard. The `add`
@@ -416,8 +492,8 @@ func TestAddRegistersAgentsWithAgentMail(t *testing.T) {
 	// The six fields registerSpawnedAgents needs to create (or reuse) an
 	// identity: anything missing here silently degrades the registration.
 	wantFields := map[string]bool{
-		"paneIndex": false, "paneID": false, "paneTitle": false,
-		"agentType": false, "model": false, "resolvedModel": false,
+		"PaneIndex": false, "PaneID": false, "PaneTitle": false,
+		"AgentType": false, "Model": false, "ResolvedModel": false,
 	}
 	ast.Inspect(executeAddDecl, func(node ast.Node) bool {
 		switch n := node.(type) {
@@ -426,8 +502,11 @@ func TestAddRegistersAgentsWithAgentMail(t *testing.T) {
 				registerCalls++
 			}
 		case *ast.CompositeLit:
-			ident, ok := n.Type.(*ast.Ident)
-			if !ok || ident.Name != "spawnedAgentInfo" {
+			sel, ok := n.Type.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Agent" {
+				return true
+			}
+			if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "spawnidentity" {
 				return true
 			}
 			for _, elt := range n.Elts {
@@ -452,7 +531,7 @@ func TestAddRegistersAgentsWithAgentMail(t *testing.T) {
 	}
 	for field, seen := range wantFields {
 		if !seen {
-			t.Errorf("executeAdd does not populate spawnedAgentInfo.%s for added panes", field)
+			t.Errorf("executeAdd does not populate spawnidentity.Agent.%s for added panes", field)
 		}
 	}
 }
@@ -464,7 +543,7 @@ func TestAddResponseCarriesAgentMailStatus(t *testing.T) {
 	data, err := json.Marshal(output.AddResponse{
 		TotalAdded: 1,
 		NewPanes:   []output.PaneResponse{{PaneID: "%42", Title: "proj__cc_2", Type: "cc"}},
-		AgentMail: &output.AgentMailSpawnStatus{
+		AgentMail: &spawnidentity.AgentMailSpawnStatus{
 			Available:         true,
 			ProjectRegistered: true,
 			AgentsRegistered:  1,

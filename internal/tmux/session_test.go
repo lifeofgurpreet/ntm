@@ -137,6 +137,90 @@ func TestPaneCommandIsShell(t *testing.T) {
 	}
 }
 
+// TestPaneAgentAlive covers the ntm#359 liveness rule against real processes:
+// a pane whose root process is the agent itself is alive without children,
+// while a shell root still needs a living child.
+func TestPaneAgentAlive(t *testing.T) {
+	startProcess := func(t *testing.T, name string, args ...string) *exec.Cmd {
+		t.Helper()
+		cmd := exec.CommandContext(t.Context(), name, args...)
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			t.Fatalf("stdin pipe for %s: %v", name, err)
+		}
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start %s: %v", name, err)
+		}
+		t.Cleanup(func() {
+			_ = stdin.Close()
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		})
+		return cmd
+	}
+
+	t.Run("agent as the pane's own process, no children", func(t *testing.T) {
+		agent := startProcess(t, "sleep", "30")
+		if !PaneAgentAlive(agent.Process.Pid) {
+			t.Fatalf("PaneAgentAlive(%d) = false for a live non-shell root process; between tool calls an agent has no children", agent.Process.Pid)
+		}
+	})
+
+	t.Run("shell root without a child is not a running agent", func(t *testing.T) {
+		// `read` is a builtin, so the shell waits on its stdin with no child.
+		shell := startProcess(t, "sh", "-c", "read line")
+		if PaneAgentAlive(shell.Process.Pid) {
+			t.Fatalf("PaneAgentAlive(%d) = true for a childless shell; an agent that exited back to its shell must read as dead", shell.Process.Pid)
+		}
+	})
+
+	t.Run("shell root with a living child", func(t *testing.T) {
+		// The trailing `:` keeps the shell from exec'ing sleep in its place.
+		shell := startProcess(t, "sh", "-c", "sleep 30; :")
+		deadline := time.Now().Add(5 * time.Second)
+		for !PaneAgentAlive(shell.Process.Pid) {
+			if time.Now().After(deadline) {
+				t.Fatalf("PaneAgentAlive(%d) stayed false for a shell running a child", shell.Process.Pid)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	})
+
+	t.Run("exited root process", func(t *testing.T) {
+		cmd := exec.CommandContext(t.Context(), "sleep", "0")
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("run sleep 0: %v", err)
+		}
+		if PaneAgentAlive(cmd.Process.Pid) {
+			t.Fatalf("PaneAgentAlive(%d) = true for a reaped process", cmd.Process.Pid)
+		}
+		if PaneAgentAlive(0) || PaneAgentAlive(-1) {
+			t.Fatal("PaneAgentAlive accepted a non-positive PID")
+		}
+	})
+}
+
+func TestRootProcessIsNonShell(t *testing.T) {
+	cases := []struct {
+		argv []string
+		want bool
+	}{
+		{argv: nil, want: false},
+		{argv: []string{""}, want: false},
+		{argv: []string{"-zsh"}, want: false},
+		{argv: []string{"/bin/bash", "-l"}, want: false},
+		{argv: []string{"fish"}, want: false},
+		{argv: []string{"claude", "--resume"}, want: true},
+		{argv: []string{"/usr/local/bin/node", "/opt/claude/cli.js"}, want: true},
+		{argv: []string{"muse-bin-1.4.10-R6427.1"}, want: true},
+	}
+	for _, tc := range cases {
+		if got := rootProcessIsNonShell(tc.argv); got != tc.want {
+			t.Errorf("rootProcessIsNonShell(%q) = %v, want %v", tc.argv, got, tc.want)
+		}
+	}
+}
+
 func TestValidatePaneLaunchBaseline(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -146,6 +230,7 @@ func TestValidatePaneLaunchBaseline(t *testing.T) {
 		{name: "empty observation", pane: Pane{ID: "%1"}},
 		{name: "shell", pane: Pane{ID: "%2", Command: "zsh"}},
 		{name: "shell path", pane: Pane{ID: "%3", Command: "/bin/bash"}},
+		{name: "starting (child has not exec'd the shell yet)", pane: Pane{ID: "%6", Command: "tmux"}},
 		{name: "occupied utility", pane: Pane{ID: "%4", Command: "sleep"}, wantErr: true},
 		{name: "occupied agent", pane: Pane{ID: "%5", Command: "/opt/bin/grok"}, wantErr: true},
 	}
@@ -162,13 +247,127 @@ func TestValidatePaneLaunchBaseline(t *testing.T) {
 			if err == nil {
 				t.Fatalf("ValidatePaneLaunchBaseline(%+v) error = nil, want occupied-pane rejection", test.pane)
 			}
-			for _, want := range []string{test.pane.ID, strings.TrimSpace(test.pane.Command), "pre-launch", "non-shell", "idle shell"} {
+			if !errors.Is(err, ErrPaneOccupied) {
+				t.Fatalf("ValidatePaneLaunchBaseline(%+v) error = %v, want wrapped ErrPaneOccupied", test.pane, err)
+			}
+			for _, want := range []string{test.pane.ID, strings.TrimSpace(test.pane.Command), "pre-launch", "non-shell", "free the pane"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Fatalf("ValidatePaneLaunchBaseline(%+v) error = %q, want %q", test.pane, err, want)
 				}
 			}
 		})
 	}
+}
+
+func TestValidatePaneLaunchBaselineLiveContextRefusesInsteadOfRetargeting(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("exact target became occupied after the batch preflight", func(t *testing.T) {
+		list := func(context.Context, string) ([]Pane, error) {
+			return []Pane{{ID: "%other", Command: "zsh"}, {ID: "%target", Command: "claude"}}, nil
+		}
+		err := validatePaneLaunchBaselineLiveContext(ctx, "project", "%target", list)
+		if err == nil || !errors.Is(err, ErrPaneOccupied) {
+			t.Fatalf("validatePaneLaunchBaselineLiveContext() error = %v, want occupied-pane rejection", err)
+		}
+		for _, want := range []string{"%target", `"claude"`} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("validatePaneLaunchBaselineLiveContext() error = %q, want %q", err, want)
+			}
+		}
+	})
+
+	t.Run("exact target is still an idle shell", func(t *testing.T) {
+		list := func(context.Context, string) ([]Pane, error) {
+			return []Pane{{ID: "%other", Command: "vim"}, {ID: "%target", Command: "/bin/zsh"}}, nil
+		}
+		if err := validatePaneLaunchBaselineLiveContext(ctx, "project", "%target", list); err != nil {
+			t.Fatalf("validatePaneLaunchBaselineLiveContext() error = %v", err)
+		}
+	})
+
+	t.Run("freshly created pane still shows tmux, then its shell", func(t *testing.T) {
+		// tmux reports its own binary as the pane command until the child execs
+		// the shell (~300 ms on Linux); the live check must wait, not refuse.
+		calls := 0
+		list := func(context.Context, string) ([]Pane, error) {
+			calls++
+			command := "tmux"
+			if calls >= 3 {
+				command = "zsh"
+			}
+			return []Pane{{ID: "%target", Command: command}}, nil
+		}
+		if err := validatePaneLaunchBaselineLiveContext(ctx, "project", "%target", list); err != nil {
+			t.Fatalf("validatePaneLaunchBaselineLiveContext() error = %v, want the launch to proceed once the shell appears", err)
+		}
+		if calls < 3 {
+			t.Fatalf("listPanes called %d time(s), want the check to re-observe until the shell appears", calls)
+		}
+	})
+
+	t.Run("pane that never leaves tmux is refused as a nested client after the settle window", func(t *testing.T) {
+		savedTimeout, savedPoll := paneLaunchSettleTimeout, paneLaunchSettlePoll
+		paneLaunchSettleTimeout, paneLaunchSettlePoll = 60*time.Millisecond, 5*time.Millisecond
+		defer func() { paneLaunchSettleTimeout, paneLaunchSettlePoll = savedTimeout, savedPoll }()
+		list := func(context.Context, string) ([]Pane, error) {
+			return []Pane{{ID: "%target", Command: "tmux"}}, nil
+		}
+		err := validatePaneLaunchBaselineLiveContext(ctx, "project", "%target", list)
+		if err == nil || !errors.Is(err, ErrPaneOccupied) {
+			t.Fatalf("validatePaneLaunchBaselineLiveContext() error = %v, want occupied-pane refusal after the starting timeout", err)
+		}
+		if !strings.Contains(err.Error(), "did not become a shell") {
+			t.Fatalf("validatePaneLaunchBaselineLiveContext() error = %q, want the starting-timeout wording", err)
+		}
+	})
+
+	t.Run("missing target is never replaced by another pane", func(t *testing.T) {
+		list := func(context.Context, string) ([]Pane, error) {
+			return []Pane{{ID: "%other", Command: "zsh"}}, nil
+		}
+		err := validatePaneLaunchBaselineLiveContext(ctx, "project", "%target", list)
+		if err == nil || !strings.Contains(err.Error(), "pane %target disappeared") {
+			t.Fatalf("validatePaneLaunchBaselineLiveContext() error = %v, want missing-pane refusal", err)
+		}
+	})
+
+	t.Run("unreadable topology fails closed", func(t *testing.T) {
+		list := func(context.Context, string) ([]Pane, error) {
+			return nil, errors.New("tmux unavailable")
+		}
+		err := validatePaneLaunchBaselineLiveContext(ctx, "project", "%target", list)
+		if err == nil || !strings.Contains(err.Error(), "tmux unavailable") {
+			t.Fatalf("validatePaneLaunchBaselineLiveContext() error = %v, want lister failure surfaced", err)
+		}
+	})
+
+	t.Run("canceled context is not a launch", func(t *testing.T) {
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		listed := false
+		list := func(context.Context, string) ([]Pane, error) {
+			listed = true
+			return []Pane{{ID: "%target", Command: "zsh"}}, nil
+		}
+		err := validatePaneLaunchBaselineLiveContext(canceled, "project", "%target", list)
+		if !errors.Is(err, context.Canceled) || listed {
+			t.Fatalf("validatePaneLaunchBaselineLiveContext(canceled) error = %v listed=%v, want cancellation before any read", err, listed)
+		}
+	})
+
+	t.Run("blank identifiers are refused", func(t *testing.T) {
+		list := func(context.Context, string) ([]Pane, error) { return nil, nil }
+		if err := validatePaneLaunchBaselineLiveContext(ctx, "", "%target", list); err == nil {
+			t.Fatal("blank session accepted")
+		}
+		if err := validatePaneLaunchBaselineLiveContext(ctx, "project", " ", list); err == nil {
+			t.Fatal("blank pane ID accepted")
+		}
+		if err := validatePaneLaunchBaselineLiveContext(ctx, "project", "%target", nil); err == nil {
+			t.Fatal("nil lister accepted")
+		}
+	})
 }
 
 func TestWaitForPaneProcessStartRequiresStableNonShellObservation(t *testing.T) {
@@ -269,6 +468,8 @@ func TestClassifySessionExistsResultUsesExactExitStatus(t *testing.T) {
 	wrappedExitTwo := fmt.Errorf("tmux has-session -t broken: %w: can't find session: broken", exitTwo)
 	noServer := fmt.Errorf("tmux has-session -t first: %w: no server running on /tmp/tmux-1000/default", exitOne)
 	noSocket := fmt.Errorf("tmux has-session -t first: %w: error connecting to /tmp/tmux-1000/default (No such file or directory)", exitOne)
+	// tmux 3.6 with exit-empty off: a live server holding no sessions at all.
+	emptyServer := fmt.Errorf("tmux has-session -t =absent: %w: no current target", exitOne)
 	permissionSocket := fmt.Errorf("tmux has-session -t private: %w: error connecting to /tmp/tmux-1000/default (Permission denied)", exitOne)
 	staleSocket := fmt.Errorf("tmux has-session -t stale: %w: error connecting to /tmp/tmux-1000/default (Connection refused)", exitOne)
 	remoteFailure := fmt.Errorf("ssh -- host tmux has-session -t absent: %w: can't find session: absent", exit255)
@@ -287,6 +488,7 @@ func TestClassifySessionExistsResultUsesExactExitStatus(t *testing.T) {
 		{name: "wrapped has-session exit one", err: wrappedExitOne},
 		{name: "first session without server", err: noServer},
 		{name: "first session without socket", err: noSocket},
+		{name: "live server with no sessions", err: emptyServer},
 		{name: "socket permission denied", err: permissionSocket, wantErr: true},
 		{name: "stale socket connection refused", err: staleSocket, wantErr: true},
 		{name: "exit two", err: exitTwo, wantErr: true},
@@ -410,6 +612,50 @@ func skipIfNoTmux(t *testing.T) {
 	}
 }
 
+// ntm spawn --privacy records its settings on the session, where every other
+// ntm process reads them back for as long as the session exists.
+func TestRealSessionPrivacyRoundTrip(t *testing.T) {
+	session := createTestSession(t)
+	ctx := context.Background()
+
+	read := func() (bool, bool, bool) {
+		t.Helper()
+		privacyMode, allowPersist, recorded, err := SessionPrivacyContext(ctx, session)
+		if err != nil {
+			t.Fatalf("SessionPrivacyContext: %v", err)
+		}
+		return privacyMode, allowPersist, recorded
+	}
+	if _, _, recorded := read(); recorded {
+		t.Fatal("a fresh session reported recorded privacy settings")
+	}
+	if err := SetSessionPrivacyContext(ctx, session, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if p, a, recorded := read(); !recorded || !p || a {
+		t.Fatalf("after --privacy: privacy=%v allow=%v recorded=%v", p, a, recorded)
+	}
+	if err := SetSessionPrivacyContext(ctx, session, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if p, a, recorded := read(); !recorded || !p || !a {
+		t.Fatalf("after --privacy --allow-persist: privacy=%v allow=%v recorded=%v", p, a, recorded)
+	}
+	if err := SetSessionPrivacyContext(ctx, session, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, recorded := read(); recorded {
+		t.Fatal("clearing the settings left them recorded")
+	}
+
+	if err := KillSession(session); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, recorded, err := SessionPrivacyContext(ctx, session); recorded || err != nil {
+		t.Fatalf("a killed session = recorded %v, err %v; want nothing recorded and no error", recorded, err)
+	}
+}
+
 func TestValidateSessionName(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -435,6 +681,81 @@ func TestValidateSessionName(t *testing.T) {
 			err := ValidateSessionName(tt.name)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateSessionName(%q) error = %v, wantErr %v", tt.name, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCreateSessionUsesReadableDetachedDimensions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell for the tmux transport")
+	}
+	root := t.TempDir()
+	tmuxPath := filepath.Join(root, "tmux")
+	script := `#!/bin/sh
+printf '%s\000' "$@" >> "$NTM_SESSION_SIZE_LOG"
+printf '\n' >> "$NTM_SESSION_SIZE_LOG"
+if [ "${1:-}" = "${NTM_SESSION_SIZE_FAIL:-}" ]; then
+  printf 'requested session failure\n' >&2
+  exit 81
+fi
+case "${1:-}" in
+  new-session|set-option) exit 0 ;;
+  *) exit 64 ;;
+esac
+`
+	if err := os.WriteFile(tmuxPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write tmux transport: %v", err)
+	}
+	t.Setenv("NTM_TMUX_BINARY", tmuxPath)
+
+	for _, tt := range []struct {
+		name         string
+		historyLimit int
+		useDefault   bool
+		failCommand  string
+		wantError    string
+	}{
+		{name: "default history", historyLimit: 50000, useDefault: true},
+		{name: "custom history", historyLimit: 1234},
+		{name: "tmux history default", historyLimit: 0},
+		{name: "creation failure", historyLimit: 50000, failCommand: "new-session", wantError: "requested session failure"},
+		{name: "history failure", historyLimit: 50000, failCommand: "set-option", wantError: `tmux session "detached-size" was created but setting history limit failed`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			logPath := filepath.Join(t.TempDir(), "commands")
+			t.Setenv("NTM_SESSION_SIZE_LOG", logPath)
+			t.Setenv("NTM_SESSION_SIZE_FAIL", tt.failCommand)
+			directory := filepath.Join(root, "project with spaces")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			client := NewClient("")
+			var err error
+			if tt.useDefault {
+				err = client.CreateSessionContext(ctx, "detached-size", directory)
+			} else {
+				err = client.CreateSessionWithHistoryLimitContext(ctx, "detached-size", directory, tt.historyLimit)
+			}
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("create detached session: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("create detached session error = %v, want %q", err, tt.wantError)
+			}
+
+			// Record argument boundaries and every command: the size must be set
+			// at creation, without freezing later resizes via window-size manual.
+			want := strings.Join([]string{"new-session", "-d", "-s", "detached-size", "-c", directory, "-x", "320", "-y", "100", ""}, "\x00") + "\n"
+			if tt.historyLimit > 0 && tt.failCommand != "new-session" {
+				want += strings.Join([]string{"set-option", "-t", "=detached-size:", "history-limit", fmt.Sprint(tt.historyLimit), ""}, "\x00") + "\n"
+			}
+			got, readErr := os.ReadFile(logPath)
+			if readErr != nil {
+				t.Fatalf("read tmux command log: %v", readErr)
+			}
+			if string(got) != want {
+				t.Fatalf("tmux commands = %q, want %q", got, want)
 			}
 		})
 	}
@@ -2699,14 +3020,14 @@ func TestAgentCLIDead(t *testing.T) {
 }
 
 // ntm-5p0b: the pre-send composer clear sequence is per-agent because the
-// same keys mean different things per TUI (double-Escape is history jump-back
-// in Claude Code; the triple-Escape ritual is codex doctrine from AP-16).
+// same keys mean different things per TUI. Escape pairs enter history in
+// Claude Code and current Codex, so Codex uses editing keys (GH#345).
 func TestComposerClearKeys_PerAgentSequences(t *testing.T) {
 	cases := []struct {
 		agent AgentType
 		want  []string
 	}{
-		{AgentCodex, []string{"Escape", "Escape", "Escape", "C-u"}},
+		{AgentCodex, []string{"C-e", "C-u"}},
 		{AgentClaude, []string{"Escape", "C-u"}},
 		{AgentGemini, []string{"C-u"}},
 		{AgentUser, []string{"C-u"}},
@@ -2740,9 +3061,9 @@ func TestComposerLineEmpty_BottomMostMarkerOnly(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			found, empty := composerLineEmpty(tc.capture, tc.marker, nil)
+			found, empty, _ := composerBlockEmpty(tc.capture, []string{tc.marker}, nil)
 			if found != tc.wantFound || empty != tc.wantEmpty {
-				t.Fatalf("composerLineEmpty = (found=%v, empty=%v), want (found=%v, empty=%v)", found, empty, tc.wantFound, tc.wantEmpty)
+				t.Fatalf("composerBlockEmpty = (found=%v, empty=%v), want (found=%v, empty=%v)", found, empty, tc.wantFound, tc.wantEmpty)
 			}
 		})
 	}
@@ -2754,16 +3075,16 @@ func TestComposerLineEmpty_BottomMostMarkerOnly(t *testing.T) {
 // verified clear on an idle pane would false-fail.
 func TestComposerLineEmpty_PlaceholderCountsAsEmpty(t *testing.T) {
 	capture := "chat\n❯ Try \"refactor <filepath>\"\n────\n"
-	found, empty := composerLineEmpty(capture, "❯", composerPlaceholderPrefixes(AgentClaude))
+	found, empty, _ := composerBlockEmpty(capture, []string{"❯"}, composerPlaceholderPrefixes(AgentClaude))
 	if !found || !empty {
 		t.Fatalf("claude placeholder: got (found=%v, empty=%v), want (true, true)", found, empty)
 	}
-	found, empty = composerLineEmpty("› Ask Codex to do anything\n", "›", composerPlaceholderPrefixes(AgentCodex))
+	found, empty, _ = composerBlockEmpty("› Ask Codex to do anything\n", []string{"›"}, composerPlaceholderPrefixes(AgentCodex))
 	if !found || !empty {
 		t.Fatalf("codex placeholder: got (found=%v, empty=%v), want (true, true)", found, empty)
 	}
 	// Real residue must still read as non-empty.
-	found, empty = composerLineEmpty("❯ Try harder next time, agent\n", "❯", composerPlaceholderPrefixes(AgentClaude))
+	found, empty, _ = composerBlockEmpty("❯ Try harder next time, agent\n", []string{"❯"}, composerPlaceholderPrefixes(AgentClaude))
 	if !found {
 		t.Fatalf("residue: marker not found")
 	}
@@ -2876,5 +3197,252 @@ func TestNewSendBufferNameUniqueUnderConcurrency(t *testing.T) {
 		if !strings.HasPrefix(name, prefix) {
 			t.Fatalf("buffer name %q missing PID prefix %q (cross-process uniqueness)", name, prefix)
 		}
+	}
+}
+
+// claudeComposerBox renders a bordered Claude Code composer around the given
+// rows, matching the frame shape a wrapped entry produces.
+func claudeComposerBox(rows ...string) string {
+	out := "⏺ Previous turn output\n\n╭──────────────────────────────────────────────╮\n"
+	for _, row := range rows {
+		out += "│ " + row + "  │\n"
+	}
+	out += "╰──────────────────────────────────────────────╯\n  ? for shortcuts\n"
+	return out
+}
+
+// TestComposerBlockEmptyCoversWrappedEntries is the ntm#300 regression: a
+// stranded Claude prompt long enough to wrap renders its tail on the rows BELOW
+// the marker, so a verifier that only reads the marker row calls a
+// half-cleared composer "empty" and lets the leftover text survive delivery.
+func TestComposerBlockEmptyCoversWrappedEntries(t *testing.T) {
+	markers := composerMarkersForAgent(AgentClaude)
+	placeholders := composerPlaceholderPrefixes(AgentClaude)
+
+	wrapped := claudeComposerBox(
+		"❯ this is a long stranded prompt that wrapped",
+		"  across several visual rows and is one entry",
+		"  that must be gone before delivery",
+	)
+	found, empty, text := composerBlockEmpty(wrapped, markers, placeholders)
+	if !found || empty {
+		t.Fatalf("wrapped entry: found=%v empty=%v, want found and not empty", found, empty)
+	}
+	if !strings.Contains(text, "across several visual rows") {
+		t.Fatalf("residual text lost the continuation rows: %q", text)
+	}
+
+	// The exact half-cleared shape the old single-row check accepted.
+	halfCleared := claudeComposerBox(
+		"❯ ",
+		"  across several visual rows and is one entry",
+	)
+	if _, empty, _ := composerBlockEmpty(halfCleared, markers, placeholders); empty {
+		t.Fatal("a composer whose marker row was cleared but whose continuation rows still hold text must NOT verify as empty")
+	}
+
+	// A genuinely empty composer stays empty.
+	if _, empty, _ := composerBlockEmpty(claudeComposerBox("❯ "), markers, placeholders); !empty {
+		t.Fatal("an empty bordered composer must verify as empty")
+	}
+	// Placeholder hint text counts as empty.
+	if _, empty, _ := composerBlockEmpty(claudeComposerBox(`❯ Try "fix the auth bug"`), markers, placeholders); !empty {
+		t.Fatal("TUI placeholder text must count as an empty composer")
+	}
+	// An unboxed marker line keeps the old single-row behavior.
+	if _, empty, _ := composerBlockEmpty("transcript\n❯ \n", markers, placeholders); !empty {
+		t.Fatal("an unboxed empty composer must verify as empty")
+	}
+	if _, empty, _ := composerBlockEmpty("transcript\n❯ stranded\n", markers, placeholders); empty {
+		t.Fatal("an unboxed composer holding text must not verify as empty")
+	}
+	// No marker at all is unverifiable, not empty.
+	if found, _, _ := composerBlockEmpty("no composer here\n", markers, placeholders); found {
+		t.Fatal("a capture with no marker must report found=false")
+	}
+}
+
+// TestInspectComposerReportsWrappedUnsubmittedInput pins that the
+// message-independent composer view sees a wrapped entry too, so
+// `unsubmitted_input` is true for exactly the panes --clear-input must handle.
+func TestInspectComposerReportsWrappedUnsubmittedInput(t *testing.T) {
+	state := InspectComposer(claudeComposerBox(
+		"❯ ",
+		"  a wrapped entry whose head row was cleared",
+	), AgentClaude)
+	if !state.MarkerVisible || !state.HoldsText {
+		t.Fatalf("InspectComposer(wrapped) = %+v, want MarkerVisible and HoldsText", state)
+	}
+	if state := InspectComposer(claudeComposerBox("❯ "), AgentClaude); !state.MarkerVisible || state.HoldsText {
+		t.Fatalf("InspectComposer(empty) = %+v, want MarkerVisible without HoldsText", state)
+	}
+}
+
+// TestComposerClearEscalationIsBoundedAndKeyOnly pins the escalation ladder
+// ntm#300 needs: the per-agent ritual, then end-of-entry + line-kill rounds,
+// then a measured backspace drain that depends on no editor binding at all.
+func TestComposerClearEscalationIsBoundedAndKeyOnly(t *testing.T) {
+	if composerClearMaxRounds < 2 {
+		t.Fatalf("composerClearMaxRounds = %d, want at least one escalation round", composerClearMaxRounds)
+	}
+	if got := composerClearEscalationKeys; len(got) != 2 || got[0] != "C-e" || got[1] != "C-u" {
+		t.Fatalf("composerClearEscalationKeys = %v, want [C-e C-u]", got)
+	}
+
+	if got := backspaceCount(""); got <= 0 {
+		t.Fatalf("backspaceCount(\"\") = %d, want a positive margin", got)
+	}
+	if got, want := backspaceCount("abcde"), len("abcde")+8; got != want {
+		t.Fatalf("backspaceCount = %d, want %d", got, want)
+	}
+	// Multi-byte runes count once each, not per byte.
+	if got, want := backspaceCount("héllo→"), 6+8; got != want {
+		t.Fatalf("backspaceCount(multibyte) = %d, want %d", got, want)
+	}
+	long := strings.Repeat("x", composerClearMaxBackspaces*2)
+	if got := backspaceCount(long); got != composerClearMaxBackspaces {
+		t.Fatalf("backspaceCount(long) = %d, want the cap %d", got, composerClearMaxBackspaces)
+	}
+}
+
+// TestComposerClearBlockerVocabularyIsDistinct pins that the typed reasons a
+// clear can report are distinct and non-empty except for "no blocker", so the
+// dispatch surface can render them without ambiguity (ntm#300).
+func TestComposerClearBlockerVocabularyIsDistinct(t *testing.T) {
+	if ComposerBlockerNone != "" {
+		t.Fatalf("ComposerBlockerNone = %q, want the empty string", ComposerBlockerNone)
+	}
+	seen := map[ComposerClearBlocker]bool{}
+	for _, blocker := range []ComposerClearBlocker{ComposerBlockerInput, ComposerBlockerQueued, ComposerBlockerModal} {
+		if blocker == ComposerBlockerNone {
+			t.Fatalf("blocker %q collides with ComposerBlockerNone", blocker)
+		}
+		if seen[blocker] {
+			t.Fatalf("duplicate blocker value %q", blocker)
+		}
+		seen[blocker] = true
+	}
+}
+
+func TestBorderedComposerPayloadSpansRows(t *testing.T) {
+	const message = "Refactor the dispatcher and run the tests."
+	cases := []struct {
+		name    string
+		capture string
+		message string
+		want    bool
+	}{
+		{"hard wrap inside word", claudeComposerBox("❯ Refactor the dispatch", "  er and run the tests."), message, true},
+		{"word boundary wrap", claudeComposerBox("❯ Refactor the dispatcher", "  and run the tests."), message, true},
+		{"numbered prompt", claudeComposerBox("❯ 1. Refactor the dispatch", "  er and run the tests."), "1. Refactor the dispatcher and run the tests.", true},
+		{"unicode prompt", claudeComposerBox("❯ Réparer le réparti", "  teur et exécuter tous les tests."), "Réparer le répartiteur et exécuter tous les tests.", true},
+		{"payload on continuation", claudeComposerBox("❯ ", "  Refactor the dispatch", "  er and run the tests."), message, true},
+		{"wrapped pasted marker", claudeComposerBox("❯ [Pas", "  ted text +12 lines]"), message, true},
+		{"wrong continuation", claudeComposerBox("❯ Refactor the dispatch", "  UNRELATED and run the tests."), message, false},
+		{"missing word boundary", claudeComposerBox("❯ Refactor the dispatch", "  erand run the tests."), message, false},
+		{"invented word boundary", claudeComposerBox("❯ Refactor the dis patcher", "  and run the tests."), message, false},
+		{"blank row interrupts prefix", claudeComposerBox("❯ Refactor the dispatch", "", "  er and run the tests."), message, false},
+		{"footer cannot finish prefix", claudeComposerBox("❯ Refactor the dispatch") + "er and run the tests.\n", message, false},
+		{"empty box cannot borrow footer", claudeComposerBox("❯ ") + message + "\n", message, false},
+		{"history above empty live box", claudeComposerBox("❯ Refactor the dispatch", "  er and run the tests.") + claudeComposerBox("❯ "), message, false},
+		{"invalid bytes are not replacement characters", claudeComposerBox("❯ Refactor � authentication and run the tests."), "Refactor \xff authentication and run the tests.", false},
+		{"unboxed wrapped behavior unchanged", "❯ Refactor the dispatch\ner and run the tests.\n", message, false},
+		{"unboxed single row unchanged", "❯ " + message + "\n", message, true},
+	}
+	providers := []struct {
+		name  string
+		holds func(string, string) bool
+	}{
+		{"claude", claudeComposerHoldsPayload},
+		{"grok", grokComposerHoldsPayload},
+	}
+	for _, provider := range providers {
+		t.Run(provider.name, func(t *testing.T) {
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					if got := provider.holds(tc.capture, tc.message); got != tc.want {
+						t.Fatalf("holds payload = %v, want %v\ncapture:\n%s", got, tc.want, tc.capture)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestVerifyBorderedComposerSubmissionRescuesWrappedPayload(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell fixture")
+	}
+	const message = "Refactor the dispatcher and run the tests."
+	const script = `#!/bin/sh
+set -eu
+case "$1" in
+  capture-pane)
+    if [ -f "$NTM_TEST_WRAPPED_COMPOSER_ROOT/submitted" ]; then
+      cat "$NTM_TEST_WRAPPED_COMPOSER_ROOT/empty"
+    else
+      cat "$NTM_TEST_WRAPPED_COMPOSER_ROOT/held"
+    fi
+    ;;
+  send-keys)
+    for key in "$@"; do :; done
+    printf '%s\n' "$key" >> "$NTM_TEST_WRAPPED_COMPOSER_ROOT/keys"
+    if [ "$key" = Enter ] && [ "$NTM_TEST_WRAPPED_COMPOSER_RELEASE" = 1 ]; then
+      : > "$NTM_TEST_WRAPPED_COMPOSER_ROOT/submitted"
+    fi
+    ;;
+  *) exit 9 ;;
+esac
+`
+	for _, provider := range []struct {
+		name     string
+		verify   func(*Client, context.Context, string, string, int) (bool, bool, error)
+		wantKeys string
+	}{
+		{"claude", (*Client).VerifyClaudeSubmissionContext, "Escape\nEnter\n"},
+		{"grok", (*Client).VerifyGrokSubmissionContext, "Enter\n"},
+	} {
+		t.Run(provider.name, func(t *testing.T) {
+			for _, outcome := range []struct {
+				name          string
+				release       string
+				wantConfirmed bool
+			}{
+				{"rescued", "1", true},
+				{"still stranded", "0", false},
+			} {
+				t.Run(outcome.name, func(t *testing.T) {
+					root := t.TempDir()
+					binary := filepath.Join(root, "tmux")
+					if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
+						t.Fatal(err)
+					}
+					for name, capture := range map[string]string{
+						"held":  claudeComposerBox("❯ Refactor the dispatch", "  er and run the tests."),
+						"empty": claudeComposerBox("❯ "),
+					} {
+						if err := os.WriteFile(filepath.Join(root, name), []byte(capture), 0o600); err != nil {
+							t.Fatal(err)
+						}
+					}
+					t.Setenv("NTM_TMUX_BINARY", binary)
+					t.Setenv("NTM_TEST_WRAPPED_COMPOSER_ROOT", root)
+					t.Setenv("NTM_TEST_WRAPPED_COMPOSER_RELEASE", outcome.release)
+					ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+					defer cancel()
+					confirmed, rescued, err := provider.verify(NewClient(""), ctx, "%1", message, 80)
+					if err != nil || confirmed != outcome.wantConfirmed || !rescued {
+						t.Fatalf("verification = (%v, %v, %v), want (%v, true, nil)", confirmed, rescued, err, outcome.wantConfirmed)
+					}
+					keys, err := os.ReadFile(filepath.Join(root, "keys"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if string(keys) != provider.wantKeys {
+						t.Fatalf("rescue keys = %q, want %q", keys, provider.wantKeys)
+					}
+				})
+			}
+		})
 	}
 }

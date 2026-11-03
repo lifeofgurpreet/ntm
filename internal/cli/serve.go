@@ -14,6 +14,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/integrations/pt"
+	"github.com/Dicklesworthstone/ntm/internal/redaction"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/serve"
 	"github.com/Dicklesworthstone/ntm/internal/state"
@@ -46,6 +47,7 @@ API Endpoints:
 Examples:
   ntm serve                              # Start on default port
   ntm serve --port 8080                  # Start on custom port
+  ntm serve --project-dir ./myproject    # Scope mail, beads, and jobs to a project
   ntm serve --host 0.0.0.0 --auth-mode api_key --api-key $KEY
   ntm serve --auth-mode oidc --oidc-issuer https://issuer --oidc-jwks-url https://issuer/.well-known/jwks.json`,
 		Args: cobra.NoArgs,
@@ -56,6 +58,9 @@ Examples:
 
 	cmd.Flags().StringVar(&opts.Host, "host", opts.Host, "HTTP bind host (default 127.0.0.1)")
 	cmd.Flags().IntVar(&opts.Port, "port", opts.Port, "HTTP server port")
+	cmd.Flags().StringVar(&opts.ProjectDir, "project-dir", "", "Server-wide project directory for mail, beads, and jobs (optional)")
+	cmd.Flags().IntVar(&opts.JobConcurrency, "job-concurrency", serve.DefaultJobConcurrency, "Maximum concurrent async jobs")
+	cmd.Flags().IntVar(&opts.JobQueueCapacity, "job-queue-capacity", serve.DefaultJobQueueCapacity, "Maximum waiting async jobs")
 	cmd.Flags().StringVar(&opts.AuthMode, "auth-mode", opts.AuthMode, "Auth mode: local|api_key|oidc|mtls")
 	cmd.Flags().StringVar(&opts.APIKey, "api-key", "", "API key for api_key auth mode")
 	cmd.Flags().StringVar(&opts.OIDCIssuer, "oidc-issuer", "", "OIDC issuer URL for oidc auth mode")
@@ -89,7 +94,8 @@ with the binary.
 
 Examples:
   ntm web                    # Dashboard + API on http://127.0.0.1:7337
-  ntm web --port 8080        # Custom port`,
+  ntm web --port 8080        # Custom port
+  ntm web --project-dir .    # Scope the dashboard and API to this project`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runServe(opts)
@@ -98,6 +104,9 @@ Examples:
 
 	cmd.Flags().StringVar(&opts.Host, "host", opts.Host, "HTTP bind host (default 127.0.0.1)")
 	cmd.Flags().IntVar(&opts.Port, "port", opts.Port, "HTTP server port")
+	cmd.Flags().StringVar(&opts.ProjectDir, "project-dir", "", "Server-wide project directory for mail, beads, and jobs (optional)")
+	cmd.Flags().IntVar(&opts.JobConcurrency, "job-concurrency", serve.DefaultJobConcurrency, "Maximum concurrent async jobs")
+	cmd.Flags().IntVar(&opts.JobQueueCapacity, "job-queue-capacity", serve.DefaultJobQueueCapacity, "Maximum waiting async jobs")
 	cmd.Flags().StringVar(&opts.AuthMode, "auth-mode", opts.AuthMode, "Auth mode: local|api_key|oidc|mtls")
 	cmd.Flags().StringVar(&opts.APIKey, "api-key", "", "API key for api_key auth mode")
 
@@ -105,10 +114,14 @@ Examples:
 }
 
 type serveOptions struct {
+	JobConcurrency   int
+	JobQueueCapacity int
+
 	Web              bool
 	Host             string
 	Port             int
 	PublicBaseURL    string
+	ProjectDir       string
 	AuthMode         string
 	APIKey           string
 	OIDCIssuer       string
@@ -120,7 +133,87 @@ type serveOptions struct {
 	CORSAllowOrigins []string
 }
 
+// serveStateMaintenance keeps serve's runtime state current and bounded until
+// ctx ends: the normalized projection refresh every refreshEvery, and a full
+// state-store GC (stale projections and source health, resolved incidents,
+// expired attention and audit rows, completed send operations, idle output
+// watermarks) at start and every gcEvery. Nothing else runs the full GC, so
+// without it those tables grow for as long as the state DB exists (bd-a25g6).
+func serveStateMaintenance(ctx context.Context, store *state.Store, refreshEvery, gcEvery time.Duration) {
+	collect := func() {
+		result, err := store.RunGC(state.RuntimeGCConfig{})
+		if err != nil {
+			slog.Warn("state store GC failed", "err", err)
+			return
+		}
+		slog.Debug("state store GC", "result", result)
+	}
+	collect()
+
+	refresh := time.NewTicker(refreshEvery)
+	defer refresh.Stop()
+	gc := time.NewTicker(gcEvery)
+	defer gc.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-refresh.C:
+			refreshCtx, refreshCancel := context.WithTimeout(ctx, 10*time.Second)
+			if err := robot.RefreshNormalizedProjection(refreshCtx, store, "", ""); err != nil {
+				slog.Warn("normalized projection refresh failed", "err", err)
+			}
+			refreshCancel()
+		case <-gc.C:
+			collect()
+		}
+	}
+}
+
+// startServeProcessTriage starts the process-triage health monitor when
+// [integrations.process_triage] is enabled and pt's passive watch is
+// available, publishing its classification changes and alerts to feed (the
+// durable attention feed). Robot agent-health readers in this process see its
+// states. It returns the monitor's stop function, or nil when not started.
+func startServeProcessTriage(cfg *config.Config, feed *robot.AttentionFeed) func() {
+	ptCfg := config.DefaultProcessTriageConfig()
+	ranoDatabase := config.DefaultRanoConfig().SQLitePath
+	if cfg != nil {
+		ptCfg = cfg.Integrations.ProcessTriage
+		ranoDatabase = cfg.Integrations.Rano.SQLitePath
+	}
+	if !ptCfg.Enabled {
+		return nil
+	}
+	monitor := pt.InitGlobalMonitor(&ptCfg,
+		pt.WithRanoDatabase(ranoDatabase),
+		pt.WithStateChangeCallback(func(change pt.ClassificationStateChange) {
+			if feed == nil {
+				return
+			}
+			feed.PublishPTStateChange(change)
+		}),
+		pt.WithAlertCallback(func(alert pt.Alert) {
+			if feed == nil {
+				return
+			}
+			feed.PublishPTAlert(alert)
+		}),
+	)
+	if err := monitor.Start(); err != nil {
+		slog.Warn("process triage monitor start failed", "err", err)
+		return nil
+	}
+	return monitor.Stop
+}
+
 func runServe(opts serveOptions) error {
+	// Reject an unusable project before opening state or starting background
+	// monitors, and pass one canonical identity to every project-scoped route.
+	projectDir, err := serve.ResolveProjectDir(opts.ProjectDir)
+	if err != nil {
+		return fmt.Errorf("invalid --project-dir: %w", err)
+	}
 	// Open state store
 	stateStore, err := state.Open("")
 	if err != nil {
@@ -138,33 +231,17 @@ func runServe(opts serveOptions) error {
 		robot.WithAttentionStore(stateStore),
 	))
 	feed := robot.GetAttentionFeed()
+	// Lifecycle events published in this process (agent and session events,
+	// assignment changes) reach the durable feed as well (bd-viwo4).
+	unsubscribeBus := feed.SubscribeEventBus(events.DefaultBus)
+	busEventsPersistedLive.Store(true)
+	defer func() {
+		drainEvents()
+		unsubscribeBus()
+	}()
 
-	ptCfg := config.DefaultProcessTriageConfig()
-	if cfg != nil {
-		ptCfg = cfg.Integrations.ProcessTriage
-	}
-	var ptMonitor *pt.HealthMonitor
-	if ptCfg.Enabled {
-		ptMonitor = pt.InitGlobalMonitor(&ptCfg,
-			pt.WithStateChangeCallback(func(change pt.ClassificationStateChange) {
-				if feed == nil {
-					return
-				}
-				feed.PublishPTStateChange(change)
-			}),
-			pt.WithAlertCallback(func(alert pt.Alert) {
-				if feed == nil {
-					return
-				}
-				feed.PublishPTAlert(alert)
-			}),
-		)
-		if err := ptMonitor.Start(); err != nil {
-			slog.Warn("process triage monitor start failed", "err", err)
-			ptMonitor = nil
-		} else {
-			defer ptMonitor.Stop()
-		}
+	if stopPT := startServeProcessTriage(cfg, feed); stopPT != nil {
+		defer stopPT()
 	}
 
 	mode, err := serve.ParseAuthMode(opts.AuthMode)
@@ -190,15 +267,35 @@ func runServe(opts serveOptions) error {
 		}()
 	}
 
+	// Scrub secrets/PII out of REST bodies and WebSocket frames when the operator
+	// configured a mode that is supposed to change content. `warn` — the shipped
+	// default — only logs findings, so honoring it here would add a regex scan to
+	// every HTTP response and every pane-output frame for every user while
+	// redacting nothing; root.go's write-time hooks already cover warn on the
+	// persistence surfaces. Leaving this nil reproduces the previous (always
+	// inert) behavior exactly.
+	var redactionCfg *serve.RedactionConfig
+	if cfg != nil {
+		libCfg := cfg.Redaction.ToRedactionLibConfig()
+		if libCfg.Mode == redaction.ModeRedact || libCfg.Mode == redaction.ModeBlock {
+			redactionCfg = &serve.RedactionConfig{Enabled: true, Config: libCfg}
+		}
+	}
+
 	serverCfg := serve.Config{
+		JobConcurrency:   opts.JobConcurrency,
+		JobQueueCapacity: opts.JobQueueCapacity,
+
 		Host:           opts.Host,
 		Port:           opts.Port,
 		PublicBaseURL:  opts.PublicBaseURL,
+		ProjectDir:     projectDir,
 		Version:        Version,
 		EventBus:       events.DefaultBus,
 		StateStore:     stateStore,
 		AllowedOrigins: opts.CORSAllowOrigins,
 		AuditStore:     auditStore,
+		Redaction:      redactionCfg,
 		Auth: serve.AuthConfig{
 			Mode:   mode,
 			APIKey: opts.APIKey,
@@ -226,7 +323,27 @@ func runServe(opts serveOptions) error {
 	}
 	// Create server with default event bus
 	srv := serve.New(serverCfg)
-	defer srv.Stop()
+	// API launches must honor the same selected policy as robot CLI launches,
+	// including an explicit --config/NTM_CONFIG and per-project safety overlays.
+	if err := srv.ConfigureSpawnPolicy(selectedConfigPath(), selectedConfigIsExplicit()); err != nil {
+		srv.Stop()
+		return fmt.Errorf("configure agent spawn policy: %w", err)
+	}
+	closeJobs, err := srv.RestoreJobHistory()
+	if err != nil {
+		srv.Stop()
+		return fmt.Errorf("restore asynchronous job history: %w", err)
+	}
+	defer func() {
+		// Stop accepting requests before draining job workers and relinquishing
+		// journal ownership. The state store outlives this cleanup.
+		srv.Stop()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		if err := closeJobs(shutdownCtx); err != nil {
+			slog.Warn("serve: asynchronous jobs still draining", "error", err)
+		}
+	}()
 
 	// Setup signal handling for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -238,23 +355,7 @@ func runServe(opts serveOptions) error {
 	}
 	refreshCancel()
 
-	go func() {
-		ticker := time.NewTicker(15 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				refreshCtx, refreshCancel := context.WithTimeout(ctx, 10*time.Second)
-				if err := robot.RefreshNormalizedProjection(refreshCtx, stateStore, "", ""); err != nil {
-					slog.Warn("normalized projection refresh failed", "err", err)
-				}
-				refreshCancel()
-			}
-		}
-	}()
+	go serveStateMaintenance(ctx, stateStore, 15*time.Second, time.Hour)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -281,6 +382,7 @@ func runServe(opts serveOptions) error {
 		"auth_mode", opts.AuthMode,
 		"tls_enabled", mode == serve.AuthModeMTLS,
 		"public_base_url", opts.PublicBaseURL,
+		"project_dir", projectDir,
 		"allowed_origins", len(opts.CORSAllowOrigins),
 	)
 	fmt.Printf("Starting NTM server on %s://%s:%d\n", scheme, opts.Host, opts.Port)

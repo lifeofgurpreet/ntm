@@ -2,6 +2,11 @@
 package serve
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"bytes"
+	"compress/gzip"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -20,17 +25,303 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/Dicklesworthstone/ntm/internal/checkpoint"
+	"github.com/Dicklesworthstone/ntm/internal/redaction"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
+
+// Match checkpoint import's expanded-entry and aggregate limits. The HTTP
+// disclosure boundary additionally bounds the exact compressed snapshot and
+// entry count before inspection; it never admits a scanned prefix as an archive.
+const (
+	checkpointDisclosureArchiveBytes = 64 << 20
+	checkpointDisclosureEntryBytes   = 100 << 20
+	checkpointDisclosureTotalBytes   = 1 << 30
+	checkpointDisclosureEntries      = 4096
+	checkpointDisclosureTarPadding   = 1 << 20
+)
+
+var (
+	errCheckpointDisclosureSensitive = errors.New("checkpoint archive contains sensitive content")
+	errCheckpointDisclosureLimit     = errors.New("checkpoint archive exceeds inspection limits")
+	errCheckpointDisclosureInvalid   = errors.New("checkpoint archive could not be safely inspected")
+)
+
+func (s *Server) checkpointDisclosureConfig() (redaction.Config, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.redactionCfg == nil || !s.redactionCfg.Enabled ||
+		(s.redactionCfg.Config.Mode != redaction.ModeRedact && s.redactionCfg.Config.Mode != redaction.ModeBlock) {
+		return redaction.Config{}, false
+	}
+	cfg := s.redactionCfg.Config.DeepCopy()
+	cfg.Mode = redaction.ModeBlock
+	return cfg, true
+}
+
+type checkpointDisclosureReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r checkpointDisclosureReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
+}
+
+// gzip.Reader's multistream mode exposes only the first member's header.
+// Iterate explicitly so later headers cannot hide secrets, while presenting
+// one decoded stream so credentials split between members remain detectable.
+type checkpointDisclosureGzip struct {
+	compressed *bytes.Reader
+	current    *gzip.Reader
+	scan       func([]byte) error
+	remaining  int64
+	members    int
+}
+
+func (r *checkpointDisclosureGzip) Read(p []byte) (int, error) {
+	for {
+		if r.current == nil {
+			if r.compressed.Len() == 0 {
+				if r.members == 0 {
+					return 0, errCheckpointDisclosureInvalid
+				}
+				return 0, io.EOF
+			}
+			if r.members >= checkpointDisclosureEntries {
+				return 0, errCheckpointDisclosureLimit
+			}
+			gz, err := gzip.NewReader(r.compressed)
+			if err != nil {
+				return 0, errCheckpointDisclosureInvalid
+			}
+			gz.Multistream(false)
+			for _, metadata := range [][]byte{[]byte(gz.Name), []byte(gz.Comment), gz.Extra} {
+				if err := r.scan(metadata); err != nil {
+					gz.Close()
+					return 0, err
+				}
+			}
+			r.current = gz
+			r.members++
+		}
+		n, err := r.current.Read(p)
+		r.remaining -= int64(n)
+		if r.remaining < 0 {
+			return n, errCheckpointDisclosureLimit
+		}
+		if err == io.EOF {
+			closeErr := r.current.Close()
+			r.current = nil
+			if closeErr != nil {
+				return n, errCheckpointDisclosureInvalid
+			}
+			if n != 0 {
+				return n, nil
+			}
+			continue
+		}
+		if err != nil {
+			return n, errCheckpointDisclosureInvalid
+		}
+		return n, nil
+	}
+}
+
+func (r *checkpointDisclosureGzip) Close() error {
+	if r.current != nil {
+		return r.current.Close()
+	}
+	return nil
+}
+
+// inspectCheckpointArchive checks the exact encoded snapshot used for export or
+// import. Recovery metadata and patches are executable state: rewriting them
+// could produce a valid archive that restores a different command or credential.
+// This boundary only refuses; explicit scrollback redaction remains the export
+// caller's separate choice. No source bytes or entry names escape in errors.
+func inspectCheckpointArchive(ctx context.Context, data []byte, format checkpoint.ExportFormat, cfg redaction.Config) error {
+	if len(data) > checkpointDisclosureArchiveBytes {
+		return errCheckpointDisclosureLimit
+	}
+	cfg.Mode = redaction.ModeBlock
+	// Share the budget across names, headers, entries and decoded gzip
+	// members: splitting content into many small entries cannot reset it.
+	scanner := redaction.NewScanner(cfg, redaction.DefaultScanLimits())
+	scan := func(data []byte) error {
+		if ctx.Err() != nil {
+			return errCheckpointDisclosureInvalid
+		}
+		result := scanner.ScanJSONAndRedact(string(data))
+		if result.LimitExceeded {
+			return errCheckpointDisclosureLimit
+		}
+		if result.Blocked {
+			return errCheckpointDisclosureSensitive
+		}
+		return nil
+	}
+	var expanded int64
+	readEntry := func(reader io.Reader) ([]byte, error) {
+		limit := min(int64(checkpointDisclosureEntryBytes), int64(checkpointDisclosureTotalBytes)-expanded)
+		if limit < 0 {
+			return nil, errCheckpointDisclosureLimit
+		}
+		entry, err := io.ReadAll(io.LimitReader(checkpointDisclosureReader{ctx: ctx, r: reader}, limit+1))
+		if int64(len(entry)) > limit {
+			return nil, errCheckpointDisclosureLimit
+		}
+		if err != nil {
+			if errors.Is(err, errCheckpointDisclosureSensitive) || errors.Is(err, errCheckpointDisclosureLimit) {
+				return nil, err
+			}
+			return nil, errCheckpointDisclosureInvalid
+		}
+		expanded += int64(len(entry))
+		return entry, nil
+	}
+	inspectEntry := func(name string, reader io.Reader) error {
+		if err := scan([]byte(name)); err != nil {
+			return err
+		}
+		entry, err := readEntry(reader)
+		if err != nil {
+			return err
+		}
+		// Scrollback is often itself gzip-compressed inside either archive
+		// format. Inspect its decoded bytes, including the gzip checksum/end.
+		if strings.EqualFold(filepath.Ext(name), ".gz") || bytes.HasPrefix(entry, []byte{0x1f, 0x8b}) {
+			gz := &checkpointDisclosureGzip{compressed: bytes.NewReader(entry), scan: scan, remaining: checkpointDisclosureEntryBytes}
+			decoded, readErr := readEntry(gz)
+			closeErr := gz.Close()
+			if readErr != nil {
+				return readErr
+			}
+			if closeErr != nil {
+				return errCheckpointDisclosureInvalid
+			}
+			return scan(decoded)
+		}
+		return scan(entry)
+	}
+
+	switch format {
+	case checkpoint.FormatZip:
+		archive, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			return errCheckpointDisclosureInvalid
+		}
+		if len(archive.File) > checkpointDisclosureEntries {
+			return errCheckpointDisclosureLimit
+		}
+		if err := scan([]byte(archive.Comment)); err != nil {
+			return err
+		}
+		for _, file := range archive.File {
+			if file.UncompressedSize64 > checkpointDisclosureEntryBytes ||
+				file.UncompressedSize64 > uint64(int64(checkpointDisclosureTotalBytes)-expanded) {
+				return errCheckpointDisclosureLimit
+			}
+			for _, metadata := range [][]byte{[]byte(file.Comment), file.Extra} {
+				if err := scan(metadata); err != nil {
+					return err
+				}
+			}
+			reader, err := file.Open()
+			if err != nil {
+				return errCheckpointDisclosureInvalid
+			}
+			inspectErr := inspectEntry(file.Name, reader)
+			closeErr := reader.Close()
+			if inspectErr != nil {
+				return inspectErr
+			}
+			if closeErr != nil {
+				return errCheckpointDisclosureInvalid
+			}
+		}
+	case checkpoint.FormatTarGz:
+		// Count the complete expanded tar stream, including PAX/GNU headers
+		// consumed internally by archive/tar rather than returned as entries.
+		gz := &checkpointDisclosureGzip{compressed: bytes.NewReader(data), scan: scan, remaining: checkpointDisclosureTotalBytes}
+		defer gz.Close()
+		archive := tar.NewReader(checkpointDisclosureReader{ctx: ctx, r: gz})
+		for count := 0; ; count++ {
+			header, err := archive.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				if errors.Is(err, errCheckpointDisclosureSensitive) || errors.Is(err, errCheckpointDisclosureLimit) {
+					return err
+				}
+				return errCheckpointDisclosureInvalid
+			}
+			if count >= checkpointDisclosureEntries || header.Size > checkpointDisclosureEntryBytes ||
+				header.Size > int64(checkpointDisclosureTotalBytes)-expanded {
+				return errCheckpointDisclosureLimit
+			}
+			// Only regular files and directory markers are checkpoint data.
+			if header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA && header.Typeflag != tar.TypeDir {
+				return errCheckpointDisclosureInvalid
+			}
+			for _, metadata := range []string{header.Uname, header.Gname, header.Linkname} {
+				if err := scan([]byte(metadata)); err != nil {
+					return err
+				}
+			}
+			for key, value := range header.PAXRecords {
+				if err := scan([]byte(key + "=" + value)); err != nil {
+					return err
+				}
+			}
+			if err := inspectEntry(header.Name, archive); err != nil {
+				return err
+			}
+		}
+		// Tar EOF occurs before the gzip trailer. Finish it and refuse trailing
+		// material instead of treating an unchecked suffix as inspected data.
+		padding, err := io.ReadAll(io.LimitReader(checkpointDisclosureReader{ctx: ctx, r: gz}, checkpointDisclosureTarPadding+1))
+		if len(padding) > checkpointDisclosureTarPadding {
+			return errCheckpointDisclosureLimit
+		}
+		if errors.Is(err, errCheckpointDisclosureSensitive) || errors.Is(err, errCheckpointDisclosureLimit) {
+			return err
+		}
+		if err != nil || len(bytes.Trim(padding, "\x00")) != 0 {
+			return errCheckpointDisclosureInvalid
+		}
+	default:
+		return errCheckpointDisclosureInvalid
+	}
+	return nil
+}
+
+func writeCheckpointDisclosureError(w http.ResponseWriter, err error, requestID string, importing bool) {
+	status, code := http.StatusUnprocessableEntity, "CHECKPOINT_SENSITIVE_CONTENT"
+	message := "checkpoint archive contains sensitive content; refused without changing checkpoint values"
+	if errors.Is(err, errCheckpointDisclosureLimit) {
+		code, message = "CHECKPOINT_INSPECTION_LIMIT", "checkpoint archive exceeds safe inspection limits; refused without changing checkpoint values"
+	} else if !errors.Is(err, errCheckpointDisclosureSensitive) {
+		status, code, message = http.StatusInternalServerError, ErrCodeInternalError, "failed to inspect checkpoint export"
+		if importing {
+			status, code, message = http.StatusBadRequest, ErrCodeBadRequest, "checkpoint archive could not be safely inspected"
+		}
+	}
+	writeErrorResponse(w, status, code, message, nil, requestID)
+}
 
 // Checkpoint API request/response types
 
 // CreateCheckpointRequest is the payload for creating a new checkpoint.
 type CreateCheckpointRequest struct {
-	Name            string `json:"name"`
-	Description     string `json:"description,omitempty"`
-	CaptureGit      *bool  `json:"capture_git,omitempty"`
-	ScrollbackLines *int   `json:"scrollback_lines,omitempty"`
+	Name             string `json:"name"`
+	Description      string `json:"description,omitempty"`
+	CaptureGit       *bool  `json:"capture_git,omitempty"`
+	IncludeUntracked bool   `json:"include_untracked,omitempty"`
+	ScrollbackLines  *int   `json:"scrollback_lines,omitempty"`
 }
 
 // CheckpointResponse represents a checkpoint in API responses.
@@ -49,13 +340,14 @@ type CheckpointResponse struct {
 
 // CheckpointGitResponse represents git state in checkpoint responses.
 type CheckpointGitResponse struct {
-	Branch         string `json:"branch"`
-	Commit         string `json:"commit"`
-	IsDirty        bool   `json:"is_dirty"`
-	StagedCount    int    `json:"staged_count,omitempty"`
-	UnstagedCount  int    `json:"unstaged_count,omitempty"`
-	UntrackedCount int    `json:"untracked_count,omitempty"`
-	HasPatch       bool   `json:"has_patch,omitempty"`
+	Branch            string `json:"branch"`
+	Commit            string `json:"commit"`
+	IsDirty           bool   `json:"is_dirty"`
+	StagedCount       int    `json:"staged_count,omitempty"`
+	UnstagedCount     int    `json:"unstaged_count,omitempty"`
+	UntrackedCount    int    `json:"untracked_count,omitempty"`
+	UntrackedCaptured int    `json:"untracked_captured,omitempty"`
+	HasPatch          bool   `json:"has_patch,omitempty"`
 }
 
 // CheckpointSessionSummary summarizes session state in checkpoint responses.
@@ -68,6 +360,7 @@ type CheckpointSessionSummary struct {
 
 // RestoreCheckpointRequest is the payload for restoring a checkpoint.
 type RestoreCheckpointRequest struct {
+	TargetSession   string `json:"target_session,omitempty"`
 	Force           bool   `json:"force,omitempty"`
 	SkipGitCheck    bool   `json:"skip_git_check,omitempty"`
 	InjectContext   bool   `json:"inject_context,omitempty"`
@@ -78,11 +371,15 @@ type RestoreCheckpointRequest struct {
 
 // RestoreCheckpointResponse is the response after restoring a checkpoint.
 type RestoreCheckpointResponse struct {
-	SessionName     string   `json:"session_name"`
-	PanesRestored   int      `json:"panes_restored"`
-	ContextInjected bool     `json:"context_injected"`
-	DryRun          bool     `json:"dry_run"`
-	Warnings        []string `json:"warnings,omitempty"`
+	SessionName          string   `json:"session_name"`
+	SourceSession        string   `json:"source_session"`
+	PanesRestored        int      `json:"panes_restored"`
+	ContextInjected      bool     `json:"context_injected"`
+	ContextPanesInjected int      `json:"context_panes_injected"`
+	DryRun               bool     `json:"dry_run"`
+	Warnings             []string `json:"warnings,omitempty"`
+	Stage                string   `json:"stage"`
+	Interrupted          bool     `json:"interrupted"`
 }
 
 // VerifyCheckpointResponse is the response from checkpoint verification.
@@ -90,7 +387,6 @@ type VerifyCheckpointResponse struct {
 	Valid            bool              `json:"valid"`
 	SchemaValid      bool              `json:"schema_valid"`
 	FilesPresent     bool              `json:"files_present"`
-	ChecksumsValid   bool              `json:"checksums_valid"`
 	ConsistencyValid bool              `json:"consistency_valid"`
 	Errors           []string          `json:"errors,omitempty"`
 	Warnings         []string          `json:"warnings,omitempty"`
@@ -269,17 +565,21 @@ func (s *Server) handleCreateCheckpoint(w http.ResponseWriter, r *http.Request) 
 	sessionName := chi.URLParam(r, "sessionName")
 	reqID := requestIDFromContext(r.Context())
 
-	// Check session exists
-	if !tmux.SessionExists(sessionName) {
-		writeErrorResponse(w, http.StatusNotFound, ErrCodeNotFound,
-			fmt.Sprintf("session %q does not exist", sessionName), nil, reqID)
-		return
-	}
-
 	var req CreateCheckpointRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
 		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest,
 			"invalid request body", nil, reqID)
+		return
+	}
+	if req.IncludeUntracked && req.CaptureGit != nil && !*req.CaptureGit {
+		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest,
+			"include_untracked requires capture_git", nil, reqID)
+		return
+	}
+	// Reject incompatible capture options before probing a live session.
+	if !tmux.SessionExists(sessionName) {
+		writeErrorResponse(w, http.StatusNotFound, ErrCodeNotFound,
+			fmt.Sprintf("session %q does not exist", sessionName), nil, reqID)
 		return
 	}
 
@@ -289,7 +589,7 @@ func (s *Server) handleCreateCheckpoint(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Build options
-	var opts []checkpoint.CheckpointOption
+	opts := []checkpoint.CheckpointOption{checkpoint.WithUntrackedCapture(req.IncludeUntracked)}
 	if req.Description != "" {
 		opts = append(opts, checkpoint.WithDescription(req.Description))
 	}
@@ -305,8 +605,15 @@ func (s *Server) handleCreateCheckpoint(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		log.Printf("REST: checkpoint create failed session=%s name=%s error=%v request_id=%s",
 			sessionName, req.Name, err, reqID)
+		var details map[string]interface{}
+		if cp != nil {
+			details = map[string]interface{}{
+				"checkpoint":      checkpointToResponse(cp, true),
+				"git_unavailable": checkpoint.DescribeGitUnavailable(cp),
+			}
+		}
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
-			"failed to create checkpoint", nil, reqID)
+			"failed to create checkpoint", details, reqID)
 		return
 	}
 
@@ -392,9 +699,28 @@ func (s *Server) handleRestoreCheckpoint(w http.ResponseWriter, r *http.Request)
 	reqID := requestIDFromContext(r.Context())
 
 	var req RestoreCheckpointRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil && err != io.EOF {
 		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest,
 			"invalid request body", nil, reqID)
+		return
+	}
+	if err := decoder.Decode(new(interface{})); err != io.EOF {
+		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest,
+			"request body must contain one JSON object", nil, reqID)
+		return
+	}
+	if req.TargetSession != "" {
+		if err := tmux.ValidateSessionName(req.TargetSession); err != nil {
+			writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest,
+				"invalid target_session: "+err.Error(), nil, reqID)
+			return
+		}
+	}
+	if req.ScrollbackLines < 0 {
+		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest,
+			"scrollback_lines must be non-negative", nil, reqID)
 		return
 	}
 
@@ -406,6 +732,7 @@ func (s *Server) handleRestoreCheckpoint(w http.ResponseWriter, r *http.Request)
 	}
 
 	opts := checkpoint.RestoreOptions{
+		TargetSession:   req.TargetSession,
 		Force:           req.Force,
 		SkipGitCheck:    req.SkipGitCheck,
 		InjectContext:   req.InjectContext,
@@ -414,14 +741,38 @@ func (s *Server) handleRestoreCheckpoint(w http.ResponseWriter, r *http.Request)
 		ScrollbackLines: req.ScrollbackLines,
 	}
 
-	result, err := restorer.RestoreFromCheckpoint(cp, opts)
+	result, err := restorer.RestoreFromCheckpointContext(r.Context(), cp, opts)
+	payload := map[string]interface{}{
+		"checkpoint_id":  cp.ID,
+		"source_session": sessionName,
+		"session_name":   sessionName,
+	}
+	if req.TargetSession != "" {
+		payload["session_name"] = req.TargetSession
+	}
+	if result != nil {
+		payload["session_name"] = result.SessionName
+		payload["panes_restored"] = result.PanesRestored
+		payload["context_injected"] = result.ContextInjected
+		payload["context_panes_injected"] = result.ContextPanesInjected
+		payload["dry_run"] = result.DryRun
+		payload["warnings"] = result.Warnings
+		payload["stage"] = result.Stage
+		payload["interrupted"] = result.Interrupted
+	}
 	if err != nil {
 		log.Printf("REST: checkpoint restore failed session=%s id=%s error=%v request_id=%s",
 			sessionName, checkpointID, err, reqID)
 
 		statusCode := http.StatusInternalServerError
 		errCode := ErrCodeInternalError
-		if errors.Is(err, checkpoint.ErrSessionExists) {
+		if errors.Is(err, context.DeadlineExceeded) {
+			statusCode = http.StatusGatewayTimeout
+			errCode = ErrCodeTimeout
+		} else if errors.Is(err, context.Canceled) {
+			statusCode = http.StatusRequestTimeout
+			errCode = "CANCELLED"
+		} else if errors.Is(err, checkpoint.ErrSessionExists) {
 			statusCode = http.StatusConflict
 			errCode = "SESSION_EXISTS"
 		} else if errors.Is(err, checkpoint.ErrDirectoryNotFound) || errors.Is(err, checkpoint.ErrWorkingDirInvalid) {
@@ -430,20 +781,14 @@ func (s *Server) handleRestoreCheckpoint(w http.ResponseWriter, r *http.Request)
 		}
 
 		writeErrorResponse(w, statusCode, errCode,
-			fmt.Sprintf("failed to restore checkpoint: %v", err), nil, reqID)
+			fmt.Sprintf("failed to restore checkpoint: %v", err), payload, reqID)
 		return
 	}
 
 	log.Printf("REST: checkpoint restored session=%s id=%s panes=%d dry_run=%v request_id=%s",
 		sessionName, checkpointID, result.PanesRestored, result.DryRun, reqID)
 
-	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-		"session_name":     result.SessionName,
-		"panes_restored":   result.PanesRestored,
-		"context_injected": result.ContextInjected,
-		"dry_run":          result.DryRun,
-		"warnings":         result.Warnings,
-	}, reqID)
+	writeSuccessResponse(w, http.StatusOK, payload, reqID)
 }
 
 // handleVerifyCheckpoint verifies checkpoint integrity.
@@ -469,7 +814,6 @@ func (s *Server) handleVerifyCheckpoint(w http.ResponseWriter, r *http.Request) 
 		"valid":             result.Valid,
 		"schema_valid":      result.SchemaValid,
 		"files_present":     result.FilesPresent,
-		"checksums_valid":   result.ChecksumsValid,
 		"consistency_valid": result.ConsistencyValid,
 		"errors":            result.Errors,
 		"warnings":          result.Warnings,
@@ -482,6 +826,7 @@ func (s *Server) handleExportCheckpoint(w http.ResponseWriter, r *http.Request) 
 	sessionName := chi.URLParam(r, "sessionName")
 	checkpointID := chi.URLParam(r, "checkpointId")
 	reqID := requestIDFromContext(r.Context())
+	disclosureCfg, protectArchive := s.checkpointDisclosureConfig()
 
 	// Validate before the name reaches a filesystem path or the
 	// Content-Disposition header. Sibling handlers validate here; export did
@@ -586,15 +931,67 @@ func (s *Server) handleExportCheckpoint(w http.ResponseWriter, r *http.Request) 
 
 	_, err = storage.Export(sessionName, checkpointID, tmpPath, opts)
 	if err != nil {
-		log.Printf("REST: checkpoint export failed session=%s id=%s error=%v request_id=%s",
-			sessionName, checkpointID, err, reqID)
+		if protectArchive {
+			// Export errors can contain sensitive artifact names before a
+			// completed archive is available for disclosure inspection.
+			log.Printf("REST: checkpoint export failed request_id=%s", reqID)
+		} else {
+			log.Printf("REST: checkpoint export failed session=%s id=%s error=%v request_id=%s",
+				sessionName, checkpointID, err, reqID)
+		}
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
 			"failed to export checkpoint", nil, reqID)
 		return
 	}
 
+	// Inspect the completed archive, including metadata and patches that the
+	// explicit scrollback-redaction option intentionally leaves unchanged.
+	// Keep the admitted snapshot for both wire forms: do not reopen mutable
+	// source artifacts after inspection or rewrite recovery values implicitly.
+	var admitted []byte
+	if protectArchive {
+		file, openErr := os.Open(tmpPath)
+		if openErr != nil {
+			writeCheckpointDisclosureError(w, errCheckpointDisclosureInvalid, reqID, false)
+			return
+		}
+		admitted, err = io.ReadAll(io.LimitReader(checkpointDisclosureReader{ctx: r.Context(), r: file}, checkpointDisclosureArchiveBytes+1))
+		closeErr := file.Close()
+		if len(admitted) > checkpointDisclosureArchiveBytes {
+			writeCheckpointDisclosureError(w, errCheckpointDisclosureLimit, reqID, false)
+			return
+		}
+		if err != nil || closeErr != nil {
+			writeCheckpointDisclosureError(w, errCheckpointDisclosureInvalid, reqID, false)
+			return
+		}
+		if err := inspectCheckpointArchive(r.Context(), admitted, exportFormat, disclosureCfg); err != nil {
+			writeCheckpointDisclosureError(w, err, reqID, false)
+			return
+		}
+	}
+
 	// Check if client wants download or inline response
 	if r.URL.Query().Get("download") == "true" || r.Header.Get("Accept") == "application/octet-stream" {
+		if protectArchive {
+			filename := fmt.Sprintf("%s_%s%s", sessionName, checkpointID, ext)
+			result := scanServerText(filename, disclosureCfg)
+			if result.LimitExceeded {
+				writeCheckpointDisclosureError(w, errCheckpointDisclosureLimit, reqID, false)
+				return
+			}
+			if result.Blocked {
+				writeCheckpointDisclosureError(w, errCheckpointDisclosureSensitive, reqID, false)
+				return
+			}
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+			w.Header().Set("Content-Length", strconv.Itoa(len(admitted)))
+			if _, err := w.Write(admitted); err != nil {
+				log.Print("REST: failed to write inspected checkpoint export")
+			}
+			return
+		}
 		f, err := os.Open(tmpPath)
 		if err != nil {
 			writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
@@ -621,11 +1018,14 @@ func (s *Server) handleExportCheckpoint(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Return base64-encoded data in JSON response
-	data, err := os.ReadFile(tmpPath)
-	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
-			"failed to read export file", nil, reqID)
-		return
+	data := admitted
+	if !protectArchive {
+		data, err = os.ReadFile(tmpPath)
+		if err != nil {
+			writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
+				"failed to read export file", nil, reqID)
+			return
+		}
 	}
 
 	contentType := "application/gzip"
@@ -636,18 +1036,59 @@ func (s *Server) handleExportCheckpoint(w http.ResponseWriter, r *http.Request) 
 	log.Printf("REST: checkpoint exported session=%s id=%s size=%d request_id=%s",
 		sessionName, checkpointID, len(data), reqID)
 
-	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
+	response := map[string]interface{}{
 		"filename":     fmt.Sprintf("%s_%s%s", sessionName, checkpointID, ext),
 		"size":         int64(len(data)),
 		"content_type": contentType,
 		"data":         base64.StdEncoding.EncodeToString(data),
-	}, reqID)
+	}
+	if protectArchive {
+		// Even an accidental/custom match in opaque base64 must not turn a
+		// valid JSON response into a silently corrupted recovery archive.
+		// Construct and inspect the exact final envelope before writing it.
+		response["success"] = true
+		response["timestamp"] = time.Now().UTC().Format(time.RFC3339)
+		if reqID != "" {
+			response["request_id"] = reqID
+		}
+		encoded, marshalErr := json.Marshal(response)
+		if marshalErr != nil {
+			writeCheckpointDisclosureError(w, errCheckpointDisclosureInvalid, reqID, false)
+			return
+		}
+		encoded = append(encoded, '\n')
+		result := scanServerJSON(string(encoded), disclosureCfg)
+		if result.LimitExceeded {
+			writeCheckpointDisclosureError(w, errCheckpointDisclosureLimit, reqID, false)
+			return
+		}
+		if result.Blocked {
+			writeCheckpointDisclosureError(w, errCheckpointDisclosureSensitive, reqID, false)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write(encoded); err != nil {
+			log.Print("REST: failed to write inspected checkpoint export")
+		}
+		return
+	}
+	writeSuccessResponse(w, http.StatusOK, response, reqID)
 }
 
 // handleImportCheckpoint imports a checkpoint from an archive.
 func (s *Server) handleImportCheckpoint(w http.ResponseWriter, r *http.Request) {
+	s.handleImportCheckpointWithImporter(w, r, checkpoint.NewStorage().Import)
+}
+
+// Keep the import dependency local to the request so publication failure tests
+// can exercise the HTTP contract without replacing process-wide filesystem ops.
+func (s *Server) handleImportCheckpointWithImporter(w http.ResponseWriter, r *http.Request,
+	importCheckpoint func(string, checkpoint.ImportOptions) (*checkpoint.Checkpoint, error),
+) {
 	sessionName := chi.URLParam(r, "sessionName")
 	reqID := requestIDFromContext(r.Context())
+	disclosureCfg, protectArchive := s.checkpointDisclosureConfig()
 
 	var req ImportCheckpointRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -674,6 +1115,20 @@ func (s *Server) handleImportCheckpoint(w http.ResponseWriter, r *http.Request) 
 	ext := ".tar.gz"
 	if len(archiveData) >= 4 && archiveData[0] == 'P' && archiveData[1] == 'K' {
 		ext = ".zip"
+	}
+
+	// JSON request admission cannot see through base64 and compression.
+	// Refuse sensitive recovery state before Import can publish or overwrite
+	// a checkpoint; never replace values that a later restore will execute.
+	if protectArchive {
+		format := checkpoint.FormatTarGz
+		if ext == ".zip" {
+			format = checkpoint.FormatZip
+		}
+		if err := inspectCheckpointArchive(r.Context(), archiveData, format, disclosureCfg); err != nil {
+			writeCheckpointDisclosureError(w, err, reqID, true)
+			return
+		}
 	}
 
 	// Write to temp file
@@ -715,7 +1170,6 @@ func (s *Server) handleImportCheckpoint(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	storage := checkpoint.NewStorage()
 	opts := checkpoint.ImportOptions{
 		TargetSession:   sessionName,
 		TargetDir:       req.TargetDir,
@@ -729,10 +1183,23 @@ func (s *Server) handleImportCheckpoint(w http.ResponseWriter, r *http.Request) 
 		opts.TargetSession = req.TargetSession
 	}
 
-	cp, err := storage.Import(tmpPath, opts)
+	cp, err := importCheckpoint(tmpPath, opts)
 	if err != nil {
-		log.Printf("REST: checkpoint import failed session=%s error=%v request_id=%s",
-			sessionName, err, reqID)
+		var publicationErr *checkpoint.ImportPublicationError
+		if errors.As(err, &publicationErr) {
+			// Import may already have replaced the public recovery state. This
+			// terminal result must survive a same-key retry, even though HTTP
+			// correctly reports that publication/finalization did not complete.
+			markIdempotencyResultRetained(r)
+			s.writeCheckpointImportPublicationError(w, r, cp, publicationErr)
+			return
+		}
+		if protectArchive {
+			log.Printf("REST: checkpoint import failed request_id=%s", reqID)
+		} else {
+			log.Printf("REST: checkpoint import failed session=%s error=%v request_id=%s",
+				sessionName, err, reqID)
+		}
 		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest,
 			"failed to import checkpoint", nil, reqID)
 		return
@@ -745,6 +1212,57 @@ func (s *Server) handleImportCheckpoint(w http.ResponseWriter, r *http.Request) 
 		"imported":   true,
 		"checkpoint": checkpointToResponse(cp, true),
 	}, reqID)
+}
+
+func (s *Server) writeCheckpointImportPublicationError(w http.ResponseWriter, r *http.Request,
+	cp *checkpoint.Checkpoint, publicationErr *checkpoint.ImportPublicationError,
+) {
+	reqID := requestIDFromContext(r.Context())
+	state := "unknown"
+	code := "CHECKPOINT_IMPORT_PUBLICATION_UNCERTAIN"
+	message := "checkpoint publication could not be confirmed; recovery state may have changed"
+	hint := "Inspect the destination checkpoint and retained recovery evidence before importing again. Publication failure does not establish that the previous checkpoint is unchanged."
+	if publicationErr.Published {
+		state = "published"
+		code = "CHECKPOINT_IMPORT_FINALIZATION_FAILED"
+		message = "checkpoint was published but finalization failed"
+		hint = "Inspect the published checkpoint and retained recovery evidence before importing again. Failed finalization does not undo publication."
+	}
+	details := map[string]interface{}{
+		"publication_state":     state,
+		"published":             publicationErr.Published,
+		"finalization_complete": false,
+		"inspection_required":   true,
+		"retry_safe":            false,
+		"hint":                  hint,
+	}
+	if cp != nil {
+		// A recovery reference must be exact or explicitly withheld. A
+		// placeholder ID could send a caller to the wrong checkpoint. Keep
+		// diagnostics safe even when ordinary body redaction is disabled,
+		// without exposing working directories, commands, or retained paths.
+		cfg := redaction.DefaultConfig()
+		s.mu.RLock()
+		if s.redactionCfg != nil {
+			cfg = s.redactionCfg.Config.DeepCopy()
+		}
+		s.mu.RUnlock()
+		reference := map[string]string{"id": cp.ID, "session_name": cp.SessionName}
+		encoded, _ := json.Marshal(reference) // A map of strings cannot fail.
+		cfg.Mode = redaction.ModeBlock
+		scanner := redaction.NewScanner(cfg, redaction.DefaultScanLimits())
+		structured := scanner.ScanJSONAndRedact(string(encoded))
+		plain := scanner.ScanAndRedact(cp.ID + "\n" + cp.SessionName)
+		if !structured.LimitExceeded && !structured.Blocked && !plain.LimitExceeded && !plain.Blocked {
+			details["checkpoint"] = reference
+		} else {
+			details["checkpoint_reference_withheld"] = true
+		}
+	}
+	// ImportPublicationError.Error includes filesystem paths and the original
+	// cause, which can contain credentials. Log only the classified outcome.
+	log.Printf("REST: checkpoint import publication incomplete state=%s request_id=%s", state, reqID)
+	writeErrorResponse(w, http.StatusInternalServerError, code, message, details, reqID)
 }
 
 // handleRollback performs a rollback to a checkpoint's git state.
@@ -808,25 +1326,56 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 		CheckpointName: cp.Name,
 		DryRun:         req.DryRun,
 	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	var plan *checkpoint.GitRollbackPlan
+	if !req.NoGit {
+		root, err := checkpoint.GitWorktreeRoot(ctx, workDir)
+		if err != nil {
+			writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, err.Error(), nil, reqID)
+			return
+		}
+		// Permission for a subdirectory does not authorize recovery in its
+		// parent repository. Check the actual mutation root as well.
+		root, err = s.resolveCheckpointWorkDir(root)
+		if err != nil {
+			writeErrorResponse(w, http.StatusForbidden, ErrCodeForbidden, err.Error(), nil, reqID)
+			return
+		}
+		plan, err = checkpoint.PrepareGitRollback(ctx, storage, cp, root)
+		if err != nil {
+			writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest,
+				fmt.Sprintf("rollback preflight failed; repository unchanged: %v", err), rollbackResponseToMap(resp), reqID)
+			return
+		}
+		workDir = plan.WorkDir
+		resp.Warnings = append(resp.Warnings, plan.Warnings...)
+	}
 
 	if req.DryRun {
 		// Just return what would happen
-		resp.Warnings = append(resp.Warnings,
-			fmt.Sprintf("would rollback to commit %s on branch %s", cp.Git.Commit[:8], cp.Git.Branch))
-		if !req.NoGit && cp.Git.IsDirty && !req.NoStash {
-			resp.Warnings = append(resp.Warnings, "would stash current changes")
+		if plan != nil {
+			resp.Warnings = append(resp.Warnings,
+				fmt.Sprintf("would rollback to commit %s on branch %s", plan.Commit[:8], cp.Git.Branch))
+			if !req.NoStash {
+				resp.Warnings = append(resp.Warnings, "would stash current changes if present, including untracked files")
+			}
+		} else {
+			resp.Warnings = append(resp.Warnings, "git recovery disabled")
 		}
 		writeSuccessResponse(w, http.StatusOK, rollbackResponseToMap(resp), reqID)
 		return
 	}
 
 	// Perform rollback
-	if !req.NoGit {
+	if plan != nil {
 		// Stash current changes if dirty and not skipped
 		if !req.NoStash {
 			stashRef, err := gitStashIfDirty(workDir)
 			if err != nil {
-				resp.Warnings = append(resp.Warnings, fmt.Sprintf("stash failed: %v", err))
+				writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
+					fmt.Sprintf("failed to stash current work; rollback stopped: %v", err), rollbackResponseToMap(resp), reqID)
+				return
 			} else if stashRef != "" {
 				resp.StashCreated = true
 				resp.StashRef = stashRef
@@ -834,24 +1383,19 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Checkout the checkpoint commit
-		if err := gitCheckout(workDir, cp.Git.Commit); err != nil {
+		if err := gitCheckout(workDir, plan.Commit); err != nil {
 			log.Printf("REST: rollback checkout failed session=%s commit=%s error=%v request_id=%s",
 				sessionName, cp.Git.Commit, err, reqID)
 			writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
-				"failed to checkout commit", nil, reqID)
+				"failed to checkout commit; inspect before retrying (any stash was preserved)", rollbackResponseToMap(resp), reqID)
 			return
 		}
 
-		// Apply git patch if available
-		if cp.HasGitPatch() {
-			patch, err := storage.LoadGitPatch(sessionName, cp.ID)
-			if err != nil {
-				resp.Warnings = append(resp.Warnings, fmt.Sprintf("patch load failed: %v", err))
-			} else if patch != "" {
-				if err := gitApplyPatch(workDir, patch); err != nil {
-					resp.Warnings = append(resp.Warnings, fmt.Sprintf("patch apply failed: %v", err))
-				}
-			}
+		if err := checkpoint.ApplyGitRollbackPatch(ctx, plan); err != nil {
+			resp.Warnings = append(resp.Warnings, "HEAD moved but patch restoration did not finish; inspect before retrying. Any stash was preserved.")
+			writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
+				fmt.Sprintf("rollback incomplete: %v", err), rollbackResponseToMap(resp), reqID)
+			return
 		}
 
 		resp.GitRestored = true
@@ -897,13 +1441,14 @@ func checkpointToResponse(cp *checkpoint.Checkpoint, includeDetails bool) Checkp
 	// Add git info if present
 	if cp.Git.Branch != "" {
 		resp.Git = &CheckpointGitResponse{
-			Branch:         cp.Git.Branch,
-			Commit:         cp.Git.Commit,
-			IsDirty:        cp.Git.IsDirty,
-			StagedCount:    cp.Git.StagedCount,
-			UnstagedCount:  cp.Git.UnstagedCount,
-			UntrackedCount: cp.Git.UntrackedCount,
-			HasPatch:       cp.HasGitPatch(),
+			Branch:            cp.Git.Branch,
+			Commit:            cp.Git.Commit,
+			IsDirty:           cp.Git.IsDirty,
+			StagedCount:       cp.Git.StagedCount,
+			UnstagedCount:     cp.Git.UnstagedCount,
+			UntrackedCount:    cp.Git.UntrackedCount,
+			UntrackedCaptured: cp.Git.UntrackedCaptured,
+			HasPatch:          cp.HasGitPatch(),
 		}
 	}
 
@@ -943,7 +1488,7 @@ func formatAge(d time.Duration) string {
 // gitStashIfDirty stashes changes if the working tree is dirty.
 func gitStashIfDirty(workDir string) (string, error) {
 	// Check if dirty
-	out, err := runGit(workDir, "status", "--porcelain")
+	out, err := runGit(workDir, "status", "--porcelain=v1", "--untracked-files=all")
 	if err != nil {
 		return "", err
 	}
@@ -953,27 +1498,21 @@ func gitStashIfDirty(workDir string) (string, error) {
 
 	// Stash changes
 	stashMsg := fmt.Sprintf("ntm-rollback-%s", time.Now().Format("20060102-150405"))
-	if _, err := runGit(workDir, "stash", "push", "-m", stashMsg); err != nil {
+	if _, err := runGit(workDir, "stash", "push", "--include-untracked", "-m", stashMsg); err != nil {
 		return "", err
 	}
 
-	return stashMsg, nil
+	ref, err := runGit(workDir, "rev-parse", "--verify", "refs/stash")
+	if err != nil {
+		return "", fmt.Errorf("stash command completed but its reference is unavailable; inspect before retrying: %w", err)
+	}
+	return strings.TrimSpace(ref), nil
 }
 
 // gitCheckout checks out a specific commit.
 func gitCheckout(workDir, ref string) error {
-	_, err := runGit(workDir, "checkout", ref)
+	_, err := runGit(workDir, "checkout", "--no-overwrite-ignore", ref)
 	return err
-}
-
-// gitApplyPatch applies patch content to a working tree.
-func gitApplyPatch(workDir, patch string) error {
-	cmd := exec.Command("git", "-C", workDir, "apply", "--3way", "-")
-	cmd.Stdin = strings.NewReader(patch)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git apply --3way: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
 }
 
 // runGit runs a git command and returns the output.

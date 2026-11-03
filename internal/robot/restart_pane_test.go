@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -13,9 +16,64 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/assignment"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	dispatchsvc "github.com/Dicklesworthstone/ntm/internal/dispatch"
+	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
+
+func TestRestartBeadCorruptionRecovery(t *testing.T) {
+	for _, corruptRead := range []string{"plan", "details"} {
+		for _, test := range []struct {
+			name     string
+			dryRun   bool
+			verified bool
+		}{
+			{name: "verified repair", verified: true},
+			{name: "dry run", dryRun: true, verified: true},
+			{name: "failed verification"},
+		} {
+			t.Run(corruptRead+"/"+test.name, func(t *testing.T) {
+				t.Setenv("HOME", t.TempDir())
+				w := newRobotRecoveryWorkspace(t, test.verified)
+				pane := tmux.Pane{ID: "%7", Index: 1, Title: "restart-corrupt__cod_1", Type: tmux.AgentCodex}
+				stores := 0
+				deps := restartPaneDeps(&RestartPaneDependencies{
+					LoadAssignmentPolicy:   func(string, string, bool) (*config.Config, error) { return config.Default(), nil },
+					FetchActionable:        w.actionable,
+					FetchBeadDetails:       bv.GetBeadAssignmentDetailsContext,
+					AssignmentLedgerExists: func(string) (bool, error) { return false, nil },
+					LoadStore: func(session string) (*assignment.AssignmentStore, error) {
+						stores++
+						return assignment.NewStore(session), nil
+					},
+					NewIdempotencyKey: func() (string, error) { return "restart-corruption-key", nil },
+					ListPanes:         func(context.Context, string) ([]tmux.Pane, error) { return []tmux.Pane{pane}, nil },
+				})
+				if corruptRead == "details" {
+					deps.FetchActionable = func(context.Context, string, int) ([]bv.TriageRecommendation, error) {
+						return []bv.TriageRecommendation{{ID: "bd-ctx", Title: "Add rate limiting middleware", Status: "open", Priority: 1}}, nil
+					}
+				}
+				preflight, err := preflightRestartBead(t.Context(), RestartPaneOptions{
+					Session: "restart-corrupt", Bead: "bd-ctx", ProjectDir: w.dir, DryRun: test.dryRun,
+				}, pane, deps)
+				if !test.dryRun && test.verified {
+					if err != nil || preflight == nil || preflight.Coordinator == nil || stores != 1 {
+						t.Fatalf("recovery did not prepare guarded assignment: %+v err=%v stores=%d", preflight, err, stores)
+					}
+				} else if err == nil || preflight != nil || stores != 0 {
+					t.Fatalf("unsafe preflight reached mutation preparation: %+v err=%v stores=%d", preflight, err, stores)
+				}
+				repairs := 1
+				if test.dryRun {
+					repairs = 0
+				}
+				w.assertPreserved(t, repairs)
+			})
+		}
+	}
+}
 
 func TestRestartPaneBeadPromptTemplate(t *testing.T) {
 	// Verify the template contains the expected placeholders
@@ -143,9 +201,9 @@ func TestPreflightRestartBeadOrdersPolicyPlanAndLiveEligibilityBeforeMutationPor
 		"plan:/authoritative/project",
 		"live:/authoritative/project:" + beadID,
 		"ledger-probe:" + session,
+		"pane-preflight:" + session,
 		"store:" + session,
 		"key",
-		"pane-preflight:" + session,
 	}
 	if fmt.Sprint(calls) != fmt.Sprint(wantCalls) {
 		t.Fatalf("preflight call order = %v, want %v", calls, wantCalls)
@@ -158,6 +216,152 @@ func TestPreflightRestartBeadOrdersPolicyPlanAndLiveEligibilityBeforeMutationPor
 	}
 	if !strings.Contains(preflight.Prompt, beadID) || !strings.Contains(preflight.Prompt, "Restart safely") {
 		t.Fatalf("restart prompt = %q", preflight.Prompt)
+	}
+}
+
+// The public robot envelope must make the same dispatch-policy decision for
+// preview and execution. A valid actual request reaches a deliberately refused
+// respawn boundary; no real pane or assignment is mutated by this fixture.
+func TestPrintRestartPaneBeadPreflightParity(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("recording tmux executable requires a POSIX shell")
+	}
+	secret := "gh" + "p_" + strings.Repeat("q", 40)
+	for _, test := range []struct {
+		name    string
+		title   string
+		prompt  string
+		blocked bool
+	}{
+		{name: "allowed", title: "Restart safely", prompt: "Continue the assigned work"},
+		{name: "blocked title", title: "Restart token=" + secret, blocked: true},
+		{name: "blocked prompt", title: "Restart safely", prompt: "Continue token=" + secret, blocked: true},
+	} {
+		for _, ledgerExists := range []bool{false, true} {
+			for _, dryRun := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/ledger=%t/dry-run=%t", test.name, ledgerExists, dryRun), func(t *testing.T) {
+					root := t.TempDir()
+					t.Setenv("HOME", root)
+					t.Setenv("NTM_RESTART_BEAD_PREFLIGHT_ROOT", root)
+					binary := filepath.Join(root, "tmux")
+					const script = `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$NTM_RESTART_BEAD_PREFLIGHT_ROOT/calls"
+case "$1" in
+  has-session) ;;
+  display-message)
+    case "$*" in
+      *@ntm_agent_type*) printf '[codex]\n' ;;
+      *pane_pid*) printf '2000000001\n' ;;
+      *) exit 74 ;;
+    esac
+    ;;
+  if-shell)
+    case "${6:-}" in
+      *respawn-pane*) : > "$NTM_RESTART_BEAD_PREFLIGHT_ROOT/mutation-boundary"; exit 71 ;;
+      *) exit 75 ;;
+    esac
+    ;;
+  *) exit 76 ;;
+esac
+`
+					if err := os.WriteFile(binary, []byte(script), 0700); err != nil {
+						t.Fatal(err)
+					}
+					t.Setenv("NTM_TMUX_BINARY", binary)
+					originalClient := tmux.DefaultClient
+					tmux.DefaultClient = tmux.NewClient("")
+					t.Cleanup(func() { tmux.DefaultClient = originalClient })
+					const session, beadID = "restart-policy", "ntm-restart-policy"
+					pane := tmux.Pane{ID: "%7", Index: 2, PID: 2000000001, Title: session + "__cod_1", Type: tmux.AgentCodex, Command: "bash"}
+					policy := config.Default()
+					policy.Redaction.Mode = "block"
+					store := assignment.NewStore(session)
+					var storeCalls, readOnlyStoreCalls, keyCalls, claimCalls, deliveryCalls int
+					deps := RestartPaneDependencies{
+						LoadAssignmentPolicy: func(string, string, bool) (*config.Config, error) { return policy, nil },
+						FetchActionable: func(context.Context, string, int) ([]bv.TriageRecommendation, error) {
+							return []bv.TriageRecommendation{{ID: beadID, Title: test.title, Status: "open"}}, nil
+						},
+						FetchBeadDetails: func(context.Context, string, string) (*bv.BeadAssignmentDetails, error) {
+							return &bv.BeadAssignmentDetails{ID: beadID, Title: test.title, Status: "open"}, nil
+						},
+						AssignmentLedgerExists: func(string) (bool, error) { return ledgerExists, nil },
+						LoadStore: func(string) (*assignment.AssignmentStore, error) {
+							storeCalls++
+							return store, nil
+						},
+						LoadStoreReadOnly: func(string) (*assignment.AssignmentStore, error) {
+							readOnlyStoreCalls++
+							return store, nil
+						},
+						NewIdempotencyKey: func() (string, error) { keyCalls++; return "restart-policy-key", nil },
+						ClaimBead: func(context.Context, string, string, string) (bv.BeadClaimResult, error) {
+							claimCalls++
+							return bv.BeadClaimResult{}, errors.New("unexpected claim")
+						},
+						DispatchDeliverer: dispatchsvc.DelivererFunc(func(context.Context, dispatchsvc.Delivery) error {
+							deliveryCalls++
+							return errors.New("unexpected delivery")
+						}),
+						ListPanes:      func(context.Context, string) ([]tmux.Pane, error) { return []tmux.Pane{pane}, nil },
+						LoadManifest:   func(string) (*resilience.SpawnManifest, error) { return nil, os.ErrNotExist },
+						ReadLaunchSpec: func(context.Context, string) (*tmux.AgentLaunchSpec, error) { return nil, nil },
+					}
+					encoded, terminalErr := captureStdout(t, func() error {
+						return PrintRestartPaneContext(t.Context(), RestartPaneOptions{
+							Session: session, Panes: []string{pane.ID}, Bead: beadID, Prompt: test.prompt,
+							ProjectDir: root, DryRun: dryRun, Config: policy, Deps: &deps,
+						})
+					})
+					var out RestartPaneOutput
+					if err := json.Unmarshal([]byte(encoded), &out); err != nil {
+						t.Fatalf("restart did not emit a valid robot envelope: %v", err)
+					}
+					calls, err := os.ReadFile(filepath.Join(root, "calls"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if strings.Contains(encoded+fmt.Sprint(terminalErr)+string(calls), secret) {
+						t.Fatal("blocked assignment content leaked into robot output, diagnostics, or tmux arguments")
+					}
+					_, boundaryErr := os.Stat(filepath.Join(root, "mutation-boundary"))
+					if boundaryErr != nil && !errors.Is(boundaryErr, os.ErrNotExist) {
+						t.Fatal(boundaryErr)
+					}
+					if test.blocked {
+						if out.Success || terminalErr == nil || out.ErrorCode != ErrCodeInvalidFlag || !strings.Contains(out.Error, "redaction") {
+							t.Fatalf("blocked assignment was not refused by dispatch preflight: success=%t code=%q error=%q", out.Success, out.ErrorCode, out.Error)
+						}
+						if len(out.WouldAffect) != 0 || !errors.Is(boundaryErr, os.ErrNotExist) {
+							t.Fatal("blocked assignment advertised recovery or reached respawn")
+						}
+					} else if dryRun {
+						if !out.Success || terminalErr != nil || !slices.Equal(out.WouldAffect, []string{"2"}) || !errors.Is(boundaryErr, os.ErrNotExist) {
+							t.Fatalf("allowed preview did not succeed without mutation: success=%t code=%q error=%q", out.Success, out.ErrorCode, out.Error)
+						}
+					} else if boundaryErr != nil || out.Success || terminalErr == nil {
+						t.Fatal("allowed actual restart did not reach the deliberately refused respawn boundary")
+					}
+					if out.DryRun != dryRun || len(out.Restarted) != 0 || out.PromptSent || claimCalls != 0 || deliveryCalls != 0 {
+						t.Fatal("preflight changed a pane, claimed work, or delivered a prompt")
+					}
+					wantStore, wantReadOnly, wantKey := 0, 0, 0
+					if dryRun && ledgerExists {
+						wantReadOnly = 1
+					}
+					if !dryRun && (ledgerExists || !test.blocked) {
+						wantStore = 1
+					}
+					if !dryRun && !test.blocked {
+						wantKey = 1
+					}
+					if storeCalls != wantStore || readOnlyStoreCalls != wantReadOnly || keyCalls != wantKey {
+						t.Fatalf("assignment side effects: store=%d read-only=%d key=%d, want %d/%d/%d", storeCalls, readOnlyStoreCalls, keyCalls, wantStore, wantReadOnly, wantKey)
+					}
+				})
+			}
+		}
 	}
 }
 
@@ -869,17 +1073,23 @@ func TestRestartPaneReadinessAndDelayHonorCancellation(t *testing.T) {
 		var captureCalls, childCalls int
 		ready, err := waitForPaneAgentReadyWithContext(
 			ctx, "%7", 1234, "codex", time.Minute, time.Second,
-			func(gotCtx context.Context, target string, lines int) (string, error) {
+			func(gotCtx context.Context, target string) (string, error) {
 				captureCalls++
-				if gotCtx != ctx || target != "%7" || lines != 50 {
-					t.Fatalf("capture context=%v target=%q lines=%d", gotCtx, target, lines)
+				if gotCtx != ctx || target != "%7" {
+					t.Fatalf("capture context=%v target=%q", gotCtx, target)
 				}
 				cancel()
 				return "", nil
 			},
-			func(int) bool { childCalls++; return true },
+			func(gotCtx context.Context, target string, shellPID int) (int, error) {
+				childCalls++
+				if gotCtx != ctx || target != "%7" || shellPID != 1234 {
+					t.Fatalf("foreground context=%v target=%q shellPID=%d", gotCtx, target, shellPID)
+				}
+				return 1235, nil
+			},
 		)
-		if ready || !errors.Is(err, context.Canceled) || captureCalls != 1 || childCalls != 0 {
+		if ready || !errors.Is(err, context.Canceled) || captureCalls != 1 || childCalls != 1 {
 			t.Fatalf("readiness ready=%t err=%v captureCalls=%d childCalls=%d", ready, err, captureCalls, childCalls)
 		}
 	})
@@ -1166,7 +1376,15 @@ func TestRelaunchRestartPaneAgentContextObservesReadyAgentAfterSenderReturnsCanc
 			}
 			return true, nil
 		},
-		func(pid int) bool { return mutated && pid == 100 },
+		func(gotCtx context.Context, target string, shellPID int) (int, error) {
+			if gotCtx.Err() != nil {
+				t.Fatalf("post-cancellation foreground context is canceled: %v", gotCtx.Err())
+			}
+			if mutated && target == "%1" && shellPID == 100 {
+				return 101, nil
+			}
+			return 0, nil
+		},
 	)
 	if !identitySet || !errors.Is(err, context.Canceled) || phase != "launch" || pidCalls != 2 {
 		t.Fatalf("relaunch error=%v phase=%q pidCalls=%d", err, phase, pidCalls)
@@ -1392,8 +1610,8 @@ func TestRestartAgentLaunchCommandNilConfigFallsBackToAlias(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		if got := restartAgentLaunchCommand(nil, tt.agentType, ""); got != tt.want {
-			t.Errorf("restartAgentLaunchCommand(nil, %q) = %q, want %q", tt.agentType, got, tt.want)
+		if got, err := restartAgentLaunchCommandWithOverride(nil, tt.agentType, "", restartLaunchOverride{}); err != nil || got != tt.want {
+			t.Errorf("restartAgentLaunchCommandWithOverride(nil, %q) = %q, %v, want %q", tt.agentType, got, err, tt.want)
 		}
 	}
 }
@@ -1401,8 +1619,8 @@ func TestRestartAgentLaunchCommandNilConfigFallsBackToAlias(t *testing.T) {
 // GH#251 phase 2: grok has its own canonical launch command — and it must be
 // the grok command, never a fallback to claude's alias.
 func TestRestartAgentLaunchCommandGrokUsesGrokCommand(t *testing.T) {
-	if got := restartAgentLaunchCommand(nil, "grok", ""); got != "grok --always-approve" {
-		t.Fatalf("restartAgentLaunchCommand(nil, grok) = %q, want %q", got, "grok --always-approve")
+	if got, err := restartAgentLaunchCommandWithOverride(nil, "grok", "", restartLaunchOverride{}); err != nil || got != "grok --always-approve" {
+		t.Fatalf("restartAgentLaunchCommandWithOverride(nil, grok) = %q, %v, want %q", got, err, "grok --always-approve")
 	}
 	if got := restartLaunchAlias("grok-build"); got != "grok --always-approve" {
 		t.Fatalf("restartLaunchAlias(grok-build) = %q, want %q", got, "grok --always-approve")
@@ -1414,15 +1632,15 @@ func TestRestartAgentLaunchCommandUsesConfiguredCommand(t *testing.T) {
 	cfg.Agents.Claude = "claude --dangerously-skip-permissions"
 	cfg.Agents.Codex = "codex --yolo"
 
-	if got := restartAgentLaunchCommand(cfg, "claude", ""); got != "claude --dangerously-skip-permissions" {
-		t.Errorf("restartAgentLaunchCommand(cfg, claude) = %q, want configured command", got)
+	if got, err := restartAgentLaunchCommandWithOverride(cfg, "claude", "", restartLaunchOverride{}); err != nil || got != "claude --dangerously-skip-permissions" {
+		t.Errorf("restartAgentLaunchCommandWithOverride(cfg, claude) = %q, %v, want configured command", got, err)
 	}
-	if got := restartAgentLaunchCommand(cfg, "codex", ""); got != "codex --yolo" {
-		t.Errorf("restartAgentLaunchCommand(cfg, codex) = %q, want configured command", got)
+	if got, err := restartAgentLaunchCommandWithOverride(cfg, "codex", "", restartLaunchOverride{}); err != nil || got != "codex --yolo" {
+		t.Errorf("restartAgentLaunchCommandWithOverride(cfg, codex) = %q, %v, want configured command", got, err)
 	}
 	// Unconfigured type falls back to the alias.
-	if got := restartAgentLaunchCommand(cfg, "gemini", ""); got != "gmi" {
-		t.Errorf("restartAgentLaunchCommand(cfg, gemini) = %q, want %q", got, "gmi")
+	if got, err := restartAgentLaunchCommandWithOverride(cfg, "gemini", "", restartLaunchOverride{}); err != nil || got != "gmi" {
+		t.Errorf("restartAgentLaunchCommandWithOverride(cfg, gemini) = %q, %v, want %q", got, err, "gmi")
 	}
 }
 
@@ -1432,8 +1650,8 @@ func TestRestartAgentLaunchCommandRendersTemplate(t *testing.T) {
 	// robot-spawn pattern (spawn.go getAgentCommands).
 	cfg.Agents.Claude = "claude {{.Model}}"
 
-	if got := restartAgentLaunchCommand(cfg, "claude", ""); got != "claude" {
-		t.Errorf("restartAgentLaunchCommand template render = %q, want %q", got, "claude")
+	if got, err := restartAgentLaunchCommandWithOverride(cfg, "claude", "", restartLaunchOverride{}); err != nil || got != "claude" {
+		t.Errorf("restartAgentLaunchCommandWithOverride template render = %q, %v, want %q", got, err, "claude")
 	}
 }
 
@@ -1441,8 +1659,8 @@ func TestRestartAgentLaunchCommandInvalidTemplateFallsBack(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Agents.Claude = "claude {{.Broken"
 
-	if got := restartAgentLaunchCommand(cfg, "claude", ""); got != "cc" {
-		t.Errorf("restartAgentLaunchCommand invalid template = %q, want fallback %q", got, "cc")
+	if got, err := restartAgentLaunchCommandWithOverride(cfg, "claude", "", restartLaunchOverride{}); err != nil || got != "cc" {
+		t.Errorf("restartAgentLaunchCommandWithOverride invalid template = %q, %v, want fallback %q", got, err, "cc")
 	}
 }
 
@@ -1450,8 +1668,8 @@ func TestRestartAgentLaunchCommandRejectsControlCharacters(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Agents.Claude = "claude\nrm -x"
 
-	if got := restartAgentLaunchCommand(cfg, "claude", ""); got != "cc" {
-		t.Errorf("restartAgentLaunchCommand control chars = %q, want fallback %q", got, "cc")
+	if got, err := restartAgentLaunchCommandWithOverride(cfg, "claude", "", restartLaunchOverride{}); err != nil || got != "cc" {
+		t.Errorf("restartAgentLaunchCommandWithOverride control chars = %q, %v, want fallback %q", got, err, "cc")
 	}
 }
 
@@ -1545,30 +1763,30 @@ func TestRestartAgentLaunchCommandPreservesModelPin(t *testing.T) {
 	cfg.Agents.Claude = "claude --dangerously-skip-permissions{{if .Model}} --model {{shellQuote .Model}}{{end}}"
 	cfg.Models.Claude = map[string]string{"opus": "claude-opus-4-6"}
 
-	got := restartAgentLaunchCommand(cfg, "claude", "opus")
+	got, err := restartAgentLaunchCommandWithOverride(cfg, "claude", "opus", restartLaunchOverride{})
 	want := "claude --dangerously-skip-permissions --model 'claude-opus-4-6'"
-	if got != want {
-		t.Errorf("restartAgentLaunchCommand(cfg, claude, opus) = %q, want %q", got, want)
+	if err != nil || got != want {
+		t.Errorf("restartAgentLaunchCommandWithOverride(cfg, claude, opus) = %q, %v, want %q", got, err, want)
 	}
 
 	// A full model name from the alias table is honored as-is (case-insensitive).
-	got = restartAgentLaunchCommand(cfg, "claude", "Claude-Opus-4-6")
-	if got != want {
-		t.Errorf("restartAgentLaunchCommand full-name variant = %q, want %q", got, want)
+	got, err = restartAgentLaunchCommandWithOverride(cfg, "claude", "Claude-Opus-4-6", restartLaunchOverride{})
+	if err != nil || got != want {
+		t.Errorf("restartAgentLaunchCommandWithOverride full-name variant = %q, %v, want %q", got, err, want)
 	}
 
 	// An unknown variant (e.g. a persona name in the same title slot) must
 	// not be guessed into a bogus --model value.
-	got = restartAgentLaunchCommand(cfg, "claude", "architect")
+	got, err = restartAgentLaunchCommandWithOverride(cfg, "claude", "architect", restartLaunchOverride{})
 	want = "claude --dangerously-skip-permissions"
-	if got != want {
-		t.Errorf("restartAgentLaunchCommand persona variant = %q, want %q", got, want)
+	if err != nil || got != want {
+		t.Errorf("restartAgentLaunchCommandWithOverride persona variant = %q, %v, want %q", got, err, want)
 	}
 
 	// No variant keeps the exact pre-#223 behavior.
-	got = restartAgentLaunchCommand(cfg, "claude", "")
-	if got != want {
-		t.Errorf("restartAgentLaunchCommand empty variant = %q, want %q", got, want)
+	got, err = restartAgentLaunchCommandWithOverride(cfg, "claude", "", restartLaunchOverride{})
+	if err != nil || got != want {
+		t.Errorf("restartAgentLaunchCommandWithOverride empty variant = %q, %v, want %q", got, err, want)
 	}
 }
 
@@ -1637,18 +1855,18 @@ func TestRestartAgentLaunchCommandWithOverride(t *testing.T) {
 		wantErr   string
 	}{
 		{
-			name:      "legacy codex config gets appended last-flag-wins override",
+			name:      "legacy codex config replaces scalar options",
 			agentType: "codex",
 			codexCmd:  legacyCodex,
 			override:  restartLaunchOverride{Model: "gpt-5.6-terra", Effort: "high"},
-			want:      []string{"-m gpt-5.6-sol", "-m 'gpt-5.6-terra'", "model_reasoning_effort='high'"},
+			want:      []string{"-m 'gpt-5.6-terra'", "model_reasoning_effort='high'"},
 		},
 		{
 			name:      "template codex config renders override directly",
 			agentType: "codex",
 			codexCmd:  templateCodex,
 			override:  restartLaunchOverride{Model: "gpt-5.6-terra", Effort: "high"},
-			want:      []string{"-m gpt-5.6-terra", "model_reasoning_effort=high"},
+			want:      []string{"-m 'gpt-5.6-terra'", "model_reasoning_effort='high'"},
 		},
 		{
 			name:      "claude legacy config appends --model/--effort",
@@ -1698,11 +1916,11 @@ func TestRestartAgentLaunchCommandWithOverride(t *testing.T) {
 					t.Errorf("command %q missing %q", got, want)
 				}
 			}
-			// last-flag-wins: the override model must come after the configured one.
-			if tc.override.Model != "" && strings.Contains(got, "-m gpt-5.6-sol") {
-				if strings.LastIndex(got, tc.override.Model) < strings.Index(got, "gpt-5.6-sol") {
-					t.Errorf("override model does not come after configured model: %q", got)
-				}
+			if tc.override.Model != "" && strings.Contains(got, "gpt-5.6-sol") {
+				t.Errorf("old model remained in override command: %q", got)
+			}
+			if tc.override.Model != "" && tc.agentType == "codex" && strings.Count(got, "-m ") != 1 {
+				t.Errorf("Codex scalar model flag must occur exactly once: %q", got)
 			}
 		})
 	}

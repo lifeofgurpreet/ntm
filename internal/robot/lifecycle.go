@@ -9,6 +9,7 @@ package robot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -73,6 +74,20 @@ const (
 	lifecycleRelaunchBoot  = 10 * time.Second
 	lifecycleChildPIDLimit = 16
 )
+
+var errRemoteAgentProcessOperations = errors.New("agent process inspection and control require local tmux; run this command directly on the tmux host without --ssh")
+
+const remoteAgentProcessOperationsHint = "Remote pane process IDs and sessions cannot be inspected or controlled through local process operations."
+
+// requireLocalAgentProcessOperations prevents remote pane PIDs, or a same-named
+// local session, from being mistaken for local process inspection or control.
+// Tmux-native exit and respawn operations do not require this restriction.
+func requireLocalAgentProcessOperations() error {
+	if tmux.DefaultClient.Remote != "" {
+		return errRemoteAgentProcessOperations
+	}
+	return nil
+}
 
 // resolveLifecycleTargets validates the session and resolves agent-pane
 // targets shared by both lifecycle verbs.
@@ -242,8 +257,13 @@ func waitForBareShell(ctx context.Context, session, paneID string, timeout time.
 }
 
 // sendExitChoreography sends the graceful double Ctrl+C with the per-CLI
-// timing window encapsulated.
-func sendExitChoreography(ctx context.Context, paneID string) error {
+// timing window encapsulated. omp gets its own sequence: its Ctrl+C clears
+// the draft rather than interrupting, so a double tap with text in the
+// composer would never quit.
+func sendExitChoreography(ctx context.Context, paneID string, agentType tmux.AgentType) error {
+	if agentType.Canonical() == tmux.AgentOmp {
+		return tmux.SendOmpExitContext(ctx, paneID)
+	}
 	if err := tmux.DefaultClient.SendInterrupt(paneID); err != nil {
 		return err
 	}
@@ -255,29 +275,93 @@ func sendExitChoreography(ctx context.Context, paneID string) error {
 	return tmux.DefaultClient.SendInterrupt(paneID)
 }
 
-// relaunchAgentCLI sends the configured launch command into the pane's shell
-// and verifies the foreground process leaves the bare shell.
-func relaunchAgentCLI(ctx context.Context, cfg *config.Config, session string, pane tmux.Pane, result *LifecyclePaneResult) {
-	resolvedType := restartPaneAgentType(pane)
-	launchCmd := restartAgentLaunchCommand(cfg, resolvedType, pane.Variant)
-	if strings.TrimSpace(launchCmd) == "" {
-		result.Detail = joinLifecycleDetail(result.Detail, "relaunch skipped: no launch command for agent type "+resolvedType)
+// prepareLifecycleRelaunch validates the entire batch before any quit or kill.
+// It shares the restart path's saved-command, dependency, and account checks.
+func prepareLifecycleRelaunch(ctx context.Context, session string, panes []tmux.Pane, multiWindow bool) (restartLaunchPlan, error) {
+	for _, pane := range panes {
+		if pane.PID <= 0 || pane.Dead || pane.IsServicePane() {
+			return restartLaunchPlan{}, fmt.Errorf("pane %s is not a live agent pane with a known shell PID", pane.ID)
+		}
+	}
+	cfg, err := config.Load(config.DefaultPath())
+	if err != nil {
+		return restartLaunchPlan{}, fmt.Errorf("load relaunch configuration: %w", err)
+	}
+	return prepareRestartLaunchPlan(ctx, session, panes, multiWindow, cfg, restartLaunchOverride{}, restartPaneDeps(nil), nil)
+}
+
+func lifecyclePaneIdentityMatches(original, refreshed tmux.Pane) bool {
+	return original.ID == refreshed.ID && original.PID > 0 && original.PID == refreshed.PID &&
+		original.Type.Canonical() == refreshed.Type.Canonical() && !refreshed.IsServicePane() && !refreshed.Dead
+}
+
+// verifyLifecycleRelaunchShell requires fresh evidence that the original pane
+// shell is idle. A stale exit result must not allow typing into another agent.
+func verifyLifecycleRelaunchShell(ctx context.Context, session string, pane tmux.Pane, result *LifecyclePaneResult) bool {
+	refreshed, lookup := refreshLifecyclePane(ctx, session, pane.ID)
+	if lookup != paneFound || !lifecyclePaneIdentityMatches(pane, refreshed) {
+		result.ShellPreserved = lookup == paneFound && pane.PID > 0 && refreshed.PID == pane.PID && !refreshed.Dead
+		result.VerificationFailed = lookup == paneLookupFailed || pane.PID <= 0
+		result.Detail = joinLifecycleDetail(result.Detail, "relaunch withheld: original agent pane identity could not be verified")
+		return false
+	}
+	if !refreshed.AgentCLIDead() {
+		result.Detail = joinLifecycleDetail(result.Detail, "relaunch withheld: pane is no longer at an idle shell")
+		return false
+	}
+	return true
+}
+
+// relaunchAgentCLI replays the preflighted command only after observing the
+// original pane back at a shell, recording that command before delivery.
+func relaunchAgentCLI(ctx context.Context, session string, pane tmux.Pane, plan restartLaunchPlan, result *LifecyclePaneResult) {
+	launchCmd, ok := plan.Commands[result.Pane]
+	spec, hasSpec := plan.Specs[result.Pane]
+	if !ok || !hasSpec || strings.TrimSpace(launchCmd) == "" {
+		result.Detail = joinLifecycleDetail(result.Detail, "relaunch withheld: preflighted launch specification is unavailable")
+		return
+	}
+	if !verifyLifecycleRelaunchShell(ctx, session, pane, result) {
+		return
+	}
+	if replay := plan.Replay[result.Pane]; replay != nil {
+		var err error
+		launchCmd, err = replay.Prepare(ctx, plan.Directories[result.Pane], session, plan.Indices[result.Pane])
+		if err == nil {
+			launchCmd, err = tmux.BuildPaneCommand(plan.Directories[result.Pane], launchCmd)
+		}
+		if err != nil {
+			result.Detail = joinLifecycleDetail(result.Detail, fmt.Sprintf("prepare saved relaunch failed: %v", err))
+			return
+		}
+		if !verifyLifecycleRelaunchShell(ctx, session, pane, result) {
+			return
+		}
+	}
+	if err := tmux.SetPaneLaunchSpecContext(ctx, pane.ID, spec); err != nil {
+		result.Detail = joinLifecycleDetail(result.Detail, fmt.Sprintf("record relaunch specification failed: %v", err))
 		return
 	}
 	if err := tmux.SendKeysContext(ctx, pane.ID, launchCmd, true); err != nil {
-		result.Detail = joinLifecycleDetail(result.Detail, fmt.Sprintf("relaunch send failed: %v", err))
+		// A tmux command error can contain the command's private arguments.
+		result.Detail = joinLifecycleDetail(result.Detail, "relaunch command delivery failed")
 		return
 	}
 	deadline := time.Now().Add(lifecycleRelaunchBoot)
 	for {
 		refreshed, lookup := refreshLifecyclePane(ctx, session, pane.ID)
-		if lookup == paneFound && !refreshed.AgentCLIDead() {
+		if lookup == paneFound && !lifecyclePaneIdentityMatches(pane, refreshed) {
+			result.ShellPreserved = pane.PID > 0 && refreshed.PID == pane.PID && !refreshed.Dead
+			result.Detail = joinLifecycleDetail(result.Detail, "relaunch could not be confirmed: agent pane identity changed")
+			return
+		}
+		if lookup == paneFound && strings.TrimSpace(refreshed.Command) != "" && !refreshed.AgentCLIDead() {
 			result.Relaunched = true
 			return
 		}
 		if time.Now().After(deadline) || ctx.Err() != nil {
 			result.Detail = joinLifecycleDetail(result.Detail,
-				fmt.Sprintf("relaunch sent (%s) but the agent CLI did not appear within %s", launchCmd, lifecycleRelaunchBoot))
+				fmt.Sprintf("relaunch sent but the agent CLI did not appear within %s", lifecycleRelaunchBoot))
 			return
 		}
 		time.Sleep(lifecyclePollInterval)
@@ -304,9 +388,14 @@ func GetExitCLI(ctx context.Context, opts LifecycleOptions) (*ExitCLIOutput, err
 		output.RobotResponse = *failure
 		return output, nil
 	}
-	var cfg *config.Config
+	var launchPlan restartLaunchPlan
 	if opts.Relaunch {
-		cfg, _ = config.Load(config.DefaultPath())
+		var err error
+		launchPlan, err = prepareLifecycleRelaunch(ctx, opts.Session, targets, multiWindow)
+		if err != nil {
+			output.RobotResponse = NewErrorResponse(err, ErrCodeInternalError, "Fix the saved launch specification or its dependencies before retrying; no agent was exited")
+			return output, nil
+		}
 	}
 	for _, pane := range targets {
 		result := LifecyclePaneResult{
@@ -322,7 +411,7 @@ func GetExitCLI(ctx context.Context, opts LifecycleOptions) (*ExitCLIOutput, err
 		} else {
 			exited := false
 			for attempt := 0; attempt < 2 && !exited; attempt++ {
-				if err := sendExitChoreography(ctx, pane.ID); err != nil {
+				if err := sendExitChoreography(ctx, pane.ID, tmux.AgentType(restartPaneAgentType(pane))); err != nil {
 					result.Detail = joinLifecycleDetail(result.Detail, fmt.Sprintf("exit keystrokes failed: %v", err))
 					break
 				}
@@ -346,7 +435,7 @@ func GetExitCLI(ctx context.Context, opts LifecycleOptions) (*ExitCLIOutput, err
 			}
 		}
 		if opts.Relaunch && result.Exited && result.ShellPreserved {
-			relaunchAgentCLI(ctx, cfg, opts.Session, pane, &result)
+			relaunchAgentCLI(ctx, opts.Session, pane, launchPlan, &result)
 		}
 		output.Results = append(output.Results, result)
 	}
@@ -367,14 +456,23 @@ func GetKillAgent(ctx context.Context, opts LifecycleOptions) (*KillAgentOutput,
 		Session:       strings.TrimSpace(opts.Session),
 		Results:       []LifecyclePaneResult{},
 	}
+	if err := requireLocalAgentProcessOperations(); err != nil {
+		output.RobotResponse = NewErrorResponse(err, ErrCodeInvalidFlag, remoteAgentProcessOperationsHint)
+		return output, nil
+	}
 	targets, multiWindow, failure := resolveLifecycleTargets(ctx, opts, "kill-agent")
 	if failure != nil {
 		output.RobotResponse = *failure
 		return output, nil
 	}
-	var cfg *config.Config
+	var launchPlan restartLaunchPlan
 	if opts.Relaunch {
-		cfg, _ = config.Load(config.DefaultPath())
+		var err error
+		launchPlan, err = prepareLifecycleRelaunch(ctx, opts.Session, targets, multiWindow)
+		if err != nil {
+			output.RobotResponse = NewErrorResponse(err, ErrCodeInternalError, "Fix the saved launch specification or its dependencies before retrying; no agent was killed")
+			return output, nil
+		}
 	}
 	for _, pane := range targets {
 		result := LifecyclePaneResult{
@@ -421,7 +519,7 @@ func GetKillAgent(ctx context.Context, opts LifecycleOptions) (*KillAgentOutput,
 			}
 		}
 		if opts.Relaunch && result.Exited && result.ShellPreserved {
-			relaunchAgentCLI(ctx, cfg, opts.Session, pane, &result)
+			relaunchAgentCLI(ctx, opts.Session, pane, launchPlan, &result)
 		}
 		output.Results = append(output.Results, result)
 	}

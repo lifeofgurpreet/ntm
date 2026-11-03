@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -120,7 +121,7 @@ type AccountRotator struct {
 	// pinnedAccounts maps a caam provider (e.g. "openai", "claude") to an
 	// operator-pinned account name. While a provider is pinned, automatic
 	// rotation (OnLimitHit) is refused unless ForceGlobalAuthClobber is set.
-	// Manual operator-initiated switches (SwitchToAccount) are not blocked.
+	// Manual operator-initiated switches (SwitchToAccountContext) are not blocked.
 	pinnedAccounts map[string]string
 
 	// codexHomeInspector, when set, reports the currently live Codex panes and
@@ -382,15 +383,22 @@ func (r *AccountRotator) IsAvailable() bool {
 	return true
 }
 
-// GetCurrentAccount returns the active account for a provider/agent type.
-func (r *AccountRotator) GetCurrentAccount(agentType string) (*AccountInfo, error) {
+// GetCurrentAccountContext resolves the active account within the caller's
+// lifetime, including when a resident recovery monitor is shutting down.
+func (r *AccountRotator) GetCurrentAccountContext(ctx context.Context, agentType string) (*AccountInfo, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("account query requires a context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if !r.IsAvailable() {
 		return nil, fmt.Errorf("caam CLI not available")
 	}
 
 	provider := normalizeProvider(agentType)
 
-	ctx, cancel := context.WithTimeout(context.Background(), r.CommandTimeout)
+	ctx, cancel := context.WithTimeout(ctx, r.CommandTimeout)
 	defer cancel()
 
 	stdout, stderr, err := r.runCaamCommand(ctx, "list", "--json")
@@ -408,12 +416,15 @@ func (r *AccountRotator) GetCurrentAccount(agentType string) (*AccountInfo, erro
 		return nil, fmt.Errorf("parse caam list: %w", err)
 	}
 
+	var current *AccountInfo
 	for _, acc := range accounts {
 		if acc.Provider != provider || !acc.Active {
 			continue
 		}
-
-		info := &AccountInfo{
+		if current != nil {
+			return nil, fmt.Errorf("multiple active accounts reported for provider %q", provider)
+		}
+		current = &AccountInfo{
 			Provider:      provider,
 			AccountName:   acc.ID,
 			Email:         acc.Email,
@@ -422,26 +433,29 @@ func (r *AccountRotator) GetCurrentAccount(agentType string) (*AccountInfo, erro
 			CooldownUntil: acc.CooldownUntil,
 		}
 
-		r.logger().Info("[AccountRotator] get_current",
-			"provider", provider,
-			"account", info.AccountName,
-		)
-
-		return info, nil
 	}
-
+	if current != nil {
+		r.logger().Info("[AccountRotator] get_current", "provider", provider, "account", current.AccountName)
+		return current, nil
+	}
 	return nil, fmt.Errorf("no active account found for provider %q", provider)
 }
 
-// ListAccounts returns all accounts for a provider/agent type.
-func (r *AccountRotator) ListAccounts(agentType string) ([]AccountInfo, error) {
+// ListAccountsContext is the cancellation-aware account inventory query.
+func (r *AccountRotator) ListAccountsContext(ctx context.Context, agentType string) ([]AccountInfo, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("account list requires a context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if !r.IsAvailable() {
 		return nil, fmt.Errorf("caam CLI not available")
 	}
 
 	provider := normalizeProvider(agentType)
 
-	ctx, cancel := context.WithTimeout(context.Background(), r.CommandTimeout)
+	ctx, cancel := context.WithTimeout(ctx, r.CommandTimeout)
 	defer cancel()
 
 	stdout, stderr, err := r.runCaamCommand(ctx, "list", "--json")
@@ -482,23 +496,6 @@ func (r *AccountRotator) ListAccounts(agentType string) ([]AccountInfo, error) {
 	return result, nil
 }
 
-// ListAvailableAccounts returns non-rate-limited accounts for a provider/agent type.
-func (r *AccountRotator) ListAvailableAccounts(agentType string) ([]AccountInfo, error) {
-	accounts, err := r.ListAccounts(agentType)
-	if err != nil {
-		return nil, err
-	}
-
-	available := make([]AccountInfo, 0, len(accounts))
-	for _, acc := range accounts {
-		if acc.RateLimited {
-			continue
-		}
-		available = append(available, acc)
-	}
-	return available, nil
-}
-
 func parseCAAMAccounts(output string) ([]tools.CAAMAccount, error) {
 	data := []byte(output)
 	if len(data) == 0 {
@@ -525,7 +522,8 @@ func parseCAAMAccounts(output string) ([]tools.CAAMAccount, error) {
 			Active bool   `json:"active"`
 			System bool   `json:"system"`
 			Health struct {
-				Status string `json:"status"`
+				Status       string `json:"status"`
+				LaunchUsable *bool  `json:"launch_usable"`
 			} `json:"health"`
 		} `json:"profiles"`
 	}
@@ -542,7 +540,7 @@ func parseCAAMAccounts(output string) ([]tools.CAAMAccount, error) {
 				Name:        profile.Name,
 				Provider:    ntmProviderName(profile.Tool),
 				Active:      profile.Active,
-				RateLimited: profile.Health.Status == "cooldown" || profile.Health.Status == "critical",
+				RateLimited: tools.CAAMProfileUnusable(profile.Health.Status, profile.Health.LaunchUsable, false),
 			})
 		}
 		return converted, nil
@@ -583,8 +581,24 @@ func validateCaamAccountOperand(name string) error {
 	return nil
 }
 
-// SwitchToAccount switches to a specific account.
-func (r *AccountRotator) SwitchToAccount(agentType, accountName string) (*RotationRecord, error) {
+// AccountActivationPreflight runs at the actual activation boundary, after the
+// rotator's current-account query. Automatic recovery uses it to reject stale
+// process, conversation, or account evidence immediately before mutation.
+type AccountActivationPreflight func(context.Context, *AccountInfo) error
+
+// SwitchToAccountContext activates a named account with caller cancellation.
+// A caller coordinating process recovery must independently observe the active
+// account afterward: cancellation can occur after the external mutation.
+func (r *AccountRotator) SwitchToAccountContext(ctx context.Context, agentType, accountName string, preflight ...AccountActivationPreflight) (*RotationRecord, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("account switch requires a context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(preflight) > 1 {
+		return nil, errors.New("account activation accepts one final preflight")
+	}
 	if !r.IsAvailable() {
 		return nil, fmt.Errorf("caam CLI not available")
 	}
@@ -595,10 +609,21 @@ func (r *AccountRotator) SwitchToAccount(agentType, accountName string) (*Rotati
 	provider := normalizeProvider(agentType)
 
 	// Get current account before switch
-	currentInfo, err := r.GetCurrentAccount(agentType)
+	currentInfo, err := r.GetCurrentAccountContext(ctx, agentType)
 	fromAccount := ""
 	if err == nil && currentInfo != nil {
 		fromAccount = currentInfo.AccountName
+	}
+	if len(preflight) == 1 && preflight[0] != nil {
+		if err != nil {
+			return nil, fmt.Errorf("current account before activation: %w", err)
+		}
+		if err := preflight[0](ctx, currentInfo); err != nil {
+			return nil, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	r.logger().Info("[AccountRotator] switch_to_start",
@@ -606,7 +631,7 @@ func (r *AccountRotator) SwitchToAccount(agentType, accountName string) (*Rotati
 		"from", fromAccount,
 		"to", accountName)
 
-	ctx, cancel := context.WithTimeout(context.Background(), r.CommandTimeout)
+	ctx, cancel := context.WithTimeout(ctx, r.CommandTimeout)
 	defer cancel()
 
 	start := time.Now()

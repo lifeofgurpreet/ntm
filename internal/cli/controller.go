@@ -14,63 +14,30 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/kernel"
 	"github.com/Dicklesworthstone/ntm/internal/output"
+	"github.com/Dicklesworthstone/ntm/internal/policy"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/swarm"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
-	"github.com/Dicklesworthstone/ntm/internal/util"
 )
-
-var controllerCreateDetachedWindow = func(ctx context.Context, session, directory string) (string, error) {
-	return tmux.DefaultClient.RunContext(ctx, newControllerWindowArgs(session, directory)...)
-}
-
-var controllerPaneCurrentDir = func(paneID string) (string, error) {
-	return tmux.DefaultClient.Run("display-message", "-p", "-t", tmux.ExactTarget(paneID), "#{pane_current_path}")
-}
-
-func newControllerWindowArgs(session, directory string) []string {
-	return []string{"new-window", "-d", "-t", tmux.TargetSession(session), "-c", directory, "-n", "ntm-controller", "-P", "-F", "#{pane_id}"}
-}
-
-func createDedicatedControllerPane(ctx context.Context, session, directory string, existing []tmux.Pane) (string, error) {
-	paneID, err := controllerCreateDetachedWindow(ctx, session, directory)
-	if err != nil {
-		return "", err
-	}
-	paneID = strings.TrimSpace(paneID)
-	if paneID == "" {
-		return "", fmt.Errorf("detached controller window returned no pane id")
-	}
-	for _, pane := range existing {
-		if pane.ID == paneID {
-			return "", fmt.Errorf("detached controller window returned existing pane id %s", paneID)
-		}
-	}
-	return paneID, nil
-}
 
 // ControllerInput is the kernel input for sessions.controller.
 type ControllerInput struct {
-	Session         string `json:"session"`
-	AgentType       string `json:"agent_type,omitempty"`
-	Model           string `json:"model,omitempty"`
-	ReasoningEffort string `json:"reasoning_effort,omitempty"`
-	PromptFile      string `json:"prompt_file,omitempty"`
-	NoPrompt        bool   `json:"no_prompt,omitempty"`
+	Session    string `json:"session"`
+	AgentType  string `json:"agent_type,omitempty"`
+	PromptFile string `json:"prompt_file,omitempty"`
+	NoPrompt   bool   `json:"no_prompt,omitempty"`
 }
 
 // ControllerResponse is the JSON output for the controller command.
 type ControllerResponse struct {
 	output.TimestampedResponse
-	Session         string `json:"session"`
-	PaneID          string `json:"pane_id"`
-	PaneIndex       int    `json:"pane_index"`
-	AgentType       string `json:"agent_type"`
-	Model           string `json:"model,omitempty"`
-	ReasoningEffort string `json:"reasoning_effort,omitempty"`
-	PromptUsed      string `json:"prompt_used,omitempty"`
-	AgentCount      int    `json:"agent_count"`
-	AgentList       string `json:"agent_list,omitempty"`
+	Session    string `json:"session"`
+	PaneID     string `json:"pane_id"`
+	PaneIndex  int    `json:"pane_index"`
+	AgentType  string `json:"agent_type"`
+	PromptUsed string `json:"prompt_used,omitempty"`
+	AgentCount int    `json:"agent_count"`
+	AgentList  string `json:"agent_list,omitempty"`
 }
 
 // Default controller prompt template
@@ -115,7 +82,7 @@ func init() {
 	// Register sessions.controller command
 	kernel.MustRegister(kernel.Command{
 		Name:        "sessions.controller",
-		Description: "Launch a dedicated controller agent in a detached window",
+		Description: "Launch a dedicated controller agent in pane 1",
 		Category:    "sessions",
 		Input: &kernel.SchemaRef{
 			Name: "ControllerInput",
@@ -168,15 +135,13 @@ func init() {
 
 func newControllerCmd() *cobra.Command {
 	var agentType string
-	var model string
-	var reasoningEffort string
 	var promptFile string
 	var noPrompt bool
 
 	cmd := &cobra.Command{
 		Use:   "controller <session>",
-		Short: "Launch a dedicated controller agent in a detached window",
-		Long: `Launch a controller agent in a new detached window of an existing session.
+		Short: "Launch a dedicated controller agent in pane 1",
+		Long: `Launch a controller agent in pane 1 of an existing session.
 
 The controller agent coordinates work among other agents in the session,
 prevents conflicts, and ensures quality.
@@ -187,7 +152,6 @@ You can customize the agent type and prompt as needed.
 Examples:
   ntm controller myproject                    # Default Claude controller
   ntm controller myproject --agent-type=cod   # Use Codex as controller
-  ntm controller myproject --agent-type=cod --model=gpt-5.6-sol --reasoning-effort=ultra
   ntm controller myproject --prompt=ctrl.txt  # Custom prompt from file
 
 The default prompt includes:
@@ -202,20 +166,16 @@ Custom prompt files support template variables:
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts := ControllerInput{
-				Session:         args[0],
-				AgentType:       agentType,
-				Model:           model,
-				ReasoningEffort: reasoningEffort,
-				PromptFile:      promptFile,
-				NoPrompt:        noPrompt,
+				Session:    args[0],
+				AgentType:  agentType,
+				PromptFile: promptFile,
+				NoPrompt:   noPrompt,
 			}
 			return runController(cmd.Context(), opts)
 		},
 	}
 
 	cmd.Flags().StringVar(&agentType, "agent-type", "cc", "Agent type: cc, cod, gmi, agy, cursor, windsurf|ws, aider, oc, or ollama")
-	cmd.Flags().StringVar(&model, "model", "", "Exact model for the controller agent")
-	cmd.Flags().StringVar(&reasoningEffort, "reasoning-effort", "", "Exact reasoning effort for the controller agent")
 	cmd.Flags().StringVar(&promptFile, "prompt", "", "Custom prompt file (supports template variables)")
 	cmd.Flags().BoolVar(&noPrompt, "no-prompt", false, "Skip sending initial prompt")
 	cmd.ValidArgsFunction = completeSessionArgs
@@ -241,12 +201,6 @@ func runController(ctx context.Context, opts ControllerInput) error {
 	fmt.Printf("✓ Controller agent launched in session '%s'\n", resp.Session)
 	fmt.Printf("  Pane: %d (%s)\n", resp.PaneIndex, resp.PaneID)
 	fmt.Printf("  Agent type: %s\n", resp.AgentType)
-	if resp.Model != "" {
-		fmt.Printf("  Model: %s\n", resp.Model)
-	}
-	if resp.ReasoningEffort != "" {
-		fmt.Printf("  Reasoning effort: %s\n", resp.ReasoningEffort)
-	}
 	if resp.PromptUsed != "" {
 		fmt.Printf("  Prompt: %s\n", resp.PromptUsed)
 	}
@@ -325,6 +279,9 @@ func buildControllerResponse(ctx context.Context, opts ControllerInput) (*Contro
 		// Mirror the spawn/add dispatch fallback so model injection works on
 		// restart too. See ntm#193.
 		agentCmdTemplate = opencodeCommandOrDefault(cfg.Agents.Opencode)
+	case "omp":
+		agentTypeFull = "omp"
+		agentCmdTemplate = config.OmpCommandOrDefault(cfg.Agents.Omp)
 	case "ollama":
 		agentTypeFull = "ollama"
 		agentCmdTemplate = cfg.Agents.Ollama
@@ -332,15 +289,29 @@ func buildControllerResponse(ctx context.Context, opts ControllerInput) (*Contro
 		return nil, fmt.Errorf("unknown agent type: %s", agentType)
 	}
 
-	dir, err := resolveControllerProjectDir(ctx, session, panes)
+	dir, err := resolveExplicitProjectDirForSessionContext(ctx, session)
 	if err != nil {
 		return nil, err
 	}
 
 	// Render the agent command template (fixes raw {{}} being sent to shell)
-	agentCmd, err := renderControllerAgentCommand(agentCmdTemplate, opts, agentType, agentTypeFull, session, dir)
+	vars := config.AgentTemplateVars{
+		AgentType:   agentType,
+		SessionName: session,
+		PaneIndex:   1,
+		ProjectDir:  dir,
+	}
+	if agentTypeFull == "claude" {
+		vars.ClaudeSettings = policy.ClaudeAgentLaunchSettings(cfg).Settings
+	}
+	agentCmd, err := config.GenerateAgentCommand(agentCmdTemplate, vars)
 	if err != nil {
 		return nil, fmt.Errorf("rendering agent command template: %w", err)
+	}
+	policy.LogClaudeHooksNotApplied("controller", agentCmd, vars.ClaudeSettings)
+	launchSpec, err := captureAgentLaunchSpec(AgentType(tmux.AgentType(agentTypeFull).Canonical()), agentCmd, "", "", "", "", "")
+	if err != nil {
+		return nil, fmt.Errorf("capture controller launch settings: %w", err)
 	}
 
 	// Per-pane Claude credential isolation (GH#237, bd-4tz2d). Every path that
@@ -356,22 +327,39 @@ func buildControllerResponse(ctx context.Context, opts ControllerInput) (*Contro
 		agentCmd = claudeEnv.ApplyToCommand(agentCmd)
 	}
 
-	// Always create a detached dedicated window and target only the pane ID
-	// returned by tmux. Pane indices repeat across windows; reusing "pane 1"
-	// can overwrite a running agent in an unrelated window.
-	targetPaneID, err := createDedicatedControllerPane(ctx, session, dir, panes)
-	if err != nil {
-		return nil, fmt.Errorf("creating detached controller window: %w", err)
+	// Find or create the controller pane. Pane 1 is only a candidate slot:
+	// pane indices repeat per window (a session GetPanes sweep can surface an
+	// index-1 pane from ANY window), and in a spawned session pane 1 is
+	// usually a RUNNING agent — retitling it and typing the launch command
+	// into it would hijack that agent's identity and inject the command as a
+	// prompt. Reuse pane 1 only when it is verifiably a plain shell pane in
+	// the session's first window; otherwise create a fresh pane.
+	var targetPaneID string
+	var targetPaneIndex int
+	reusable, pane1Found := controllerReusablePane(panes)
+	if pane1Found {
+		targetPaneID = reusable.ID
+		targetPaneIndex = reusable.Index
 	}
-	targetPaneIndex := 0
-	updatedPanes, err := tmux.GetPanes(session)
-	if err != nil {
-		return nil, fmt.Errorf("getting updated panes: %w", err)
-	}
-	for _, p := range updatedPanes {
-		if p.ID == targetPaneID {
-			targetPaneIndex = p.Index
-			break
+
+	if !pane1Found {
+		// Create a new pane which will become the controller pane
+		newPaneID, err := tmux.SplitWindow(session, dir)
+		if err != nil {
+			return nil, fmt.Errorf("creating controller pane: %w", err)
+		}
+		targetPaneID = newPaneID
+
+		// Get updated pane list to find the new pane's index
+		updatedPanes, err := tmux.GetPanes(session)
+		if err != nil {
+			return nil, fmt.Errorf("getting updated panes: %w", err)
+		}
+		for _, p := range updatedPanes {
+			if p.ID == newPaneID {
+				targetPaneIndex = p.Index
+				break
+			}
 		}
 	}
 
@@ -380,20 +368,9 @@ func buildControllerResponse(ctx context.Context, opts ControllerInput) (*Contro
 	if err := tmux.SetPaneAgentIdentity(targetPaneID, title, tmux.AgentType(agentTypeFull)); err != nil {
 		return nil, fmt.Errorf("setting controller pane identity: %w", err)
 	}
-
-	// Register and publish the controller's Agent Mail identity before its
-	// command starts. A controller begins using NTM's coordination surfaces
-	// immediately, so delaying this until after SendKeys creates the same
-	// boot-time identity race avoided by normal spawn (#255).
-	identityCoordinator := newSpawnIdentityCoordinator(dir, session)
-	identityCoordinator.prepareAgent(ctx, spawnedAgentInfo{
-		paneIndex: targetPaneIndex,
-		paneID:    targetPaneID,
-		paneTitle: title,
-		paneDir:   dir,
-		agentType: agentType,
-		model:     opts.Model,
-	})
+	if err := tmux.SetPaneLaunchSpecContext(ctx, targetPaneID, launchSpec); err != nil {
+		return nil, fmt.Errorf("record controller launch settings: %w", err)
+	}
 
 	// Launch the agent
 	if err := tmux.SendKeys(targetPaneID, agentCmd, true); err != nil {
@@ -424,65 +401,36 @@ func buildControllerResponse(ctx context.Context, opts ControllerInput) (*Contro
 		PaneID:              targetPaneID,
 		PaneIndex:           targetPaneIndex,
 		AgentType:           agentTypeFull,
-		Model:               strings.TrimSpace(opts.Model),
-		ReasoningEffort:     strings.TrimSpace(opts.ReasoningEffort),
 		PromptUsed:          promptUsed,
 		AgentCount:          agentCount,
 		AgentList:           strings.Join(agentList, "\n"),
 	}, nil
 }
 
-// resolveControllerProjectDir permits an intentionally mixed session only
-// when at least one live pane still proves the configured session checkout.
-// The dedicated controller is created in that checkout; unrelated utility
-// panes neither redefine the project nor become controller targets.
-func resolveControllerProjectDir(ctx context.Context, session string, panes []tmux.Pane) (string, error) {
-	activeCfg := cfg
-	if activeCfg == nil {
-		activeCfg = config.Default()
-	}
-	if activeCfg != nil {
-		configured := filepath.Clean(activeCfg.GetProjectDir(session))
-		if filepath.IsAbs(configured) && util.ProjectDirScore(configured) > 0 {
-			for _, pane := range panes {
-				paneDir, err := controllerPaneCurrentDir(pane.ID)
-				if err != nil {
-					continue
-				}
-				if same, _ := coordinatorProjectDirsMatch(ctx, configured, paneDir); same {
-					return configured, nil
-				}
-			}
+// controllerReusablePane picks the pane the controller may take over: pane 1
+// of the session's first window, and only when it is verifiably a plain shell
+// pane. It refuses agent-typed panes and panes running anything but a bare
+// shell — retitling a running agent's pane and typing the controller launch
+// command into it would hijack that agent's identity and inject the command
+// as a prompt.
+func controllerReusablePane(panes []tmux.Pane) (tmux.Pane, bool) {
+	lowestWindow := -1
+	for _, p := range panes {
+		if lowestWindow < 0 || p.WindowIndex < lowestWindow {
+			lowestWindow = p.WindowIndex
 		}
 	}
-	return resolveExplicitProjectDirForSessionContext(ctx, session)
-}
-
-func renderControllerAgentCommand(agentCmdTemplate string, opts ControllerInput, agentType, agentTypeFull, session, projectDir string) (string, error) {
-	model := strings.TrimSpace(opts.Model)
-	reasoningEffort := strings.TrimSpace(opts.ReasoningEffort)
-	agentCmd, err := config.GenerateAgentCommand(agentCmdTemplate, config.AgentTemplateVars{
-		AgentType:       agentType,
-		Model:           model,
-		ModelRequested:  model != "",
-		ReasoningEffort: reasoningEffort,
-		SessionName:     session,
-		PaneIndex:       1,
-		ProjectDir:      projectDir,
-	})
-	if err != nil {
-		return "", err
-	}
-	// A controller window is born inside the existing tmux server and does not
-	// reliably inherit arbitrary client variables. Freeze an explicitly supplied
-	// Codex profile into the one-shot pane command instead of falling back to the
-	// profile embedded in the user's agent template.
-	if agentTypeFull == "codex" {
-		if profile := strings.TrimSpace(os.Getenv("NTM_CODEX_PROFILE")); profile != "" {
-			agentCmd = "export NTM_CODEX_PROFILE=" + config.ShellQuote(profile) + "; " + agentCmd
+	for _, p := range panes {
+		if p.WindowIndex != lowestWindow || p.Index != 1 {
+			continue
 		}
+		canonical := p.Type.Canonical()
+		if (canonical == tmux.AgentUser || canonical == tmux.AgentUnknown || !canonical.IsValid()) && p.RunsBareShell() {
+			return p, true
+		}
+		return tmux.Pane{}, false
 	}
-	return agentCmd, nil
+	return tmux.Pane{}, false
 }
 
 func controllerAgentList(panes []tmux.Pane) ([]string, int) {
@@ -491,7 +439,7 @@ func controllerAgentList(panes []tmux.Pane) ([]string, int) {
 	for _, p := range panes {
 		canonical := p.Type.Canonical()
 		switch canonical {
-		case tmux.AgentClaude, tmux.AgentCodex, tmux.AgentGemini, tmux.AgentCursor, tmux.AgentWindsurf, tmux.AgentAider, tmux.AgentOpencode, tmux.AgentOllama:
+		case tmux.AgentClaude, tmux.AgentCodex, tmux.AgentGemini, tmux.AgentCursor, tmux.AgentWindsurf, tmux.AgentAider, tmux.AgentOpencode, tmux.AgentOmp, tmux.AgentOllama:
 			count++
 			list = append(list, fmt.Sprintf("- Pane %d: %s", p.Index, canonical))
 		}

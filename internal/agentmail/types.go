@@ -137,6 +137,27 @@ type InboxMessage struct {
 	ReadAt      *FlexTime `json:"read_at,omitempty"`
 }
 
+// UnmarshalJSON accepts both "read_at" and "read_ts" for the read timestamp.
+// Agent Mail's fetch_inbox emits inbox rows with "read_ts" (matching the
+// created_ts/updated_ts/expires_ts convention), while mark_message_read and
+// acknowledge_message results use "read_at". Binding only "read_at" made every
+// fetched inbox message decode as unread, so mail_nudge prompted idle panes
+// about already-read mail forever.
+func (m *InboxMessage) UnmarshalJSON(data []byte) error {
+	type inboxMessageAlias InboxMessage
+	aux := struct {
+		*inboxMessageAlias
+		ReadTS *FlexTime `json:"read_ts,omitempty"`
+	}{inboxMessageAlias: (*inboxMessageAlias)(m)}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if m.ReadAt == nil && aux.ReadTS != nil {
+		m.ReadAt = aux.ReadTS
+	}
+	return nil
+}
+
 // ContactLink represents a contact relationship between agents.
 type ContactLink struct {
 	FromAgent string    `json:"from_agent,omitempty"`
@@ -275,6 +296,7 @@ type RegisterAgentOptions struct {
 	Model           string
 	Name            string // Optional; auto-generated if empty
 	TaskDescription string
+	PaneID          string // Optional bare tmux pane id (%N); lets the server write its pane-binding generation receipt
 }
 
 // SendMessageOptions contains options for sending a message.
@@ -343,26 +365,29 @@ type SearchResult struct {
 }
 
 // OverseerMessageOptions contains options for sending a Human Overseer message.
-// Human Overseer messages bypass contact policies (the overseer agent is
-// registered with a permissive policy) and are auto-marked as high
-// importance with a "[Human Overseer]" preamble.
+// The server's designated intervention route controls authorization, contact
+// policy bypass, high importance, preamble, and audit recording.
 type OverseerMessageOptions struct {
-	ProjectKey  string   // Absolute project path (required for MCP send_message)
-	ProjectSlug string   // Project slug (legacy HTTP fallback only)
-	Recipients  []string // Agent names to send to
+	ProjectKey  string   // Absolute project path (resolves a missing slug; required for legacy MCP)
+	ProjectSlug string   // Server project slug for the overseer intervention route
+	Recipients  []string // Explicit agent names; more than one confirms multiple-recipient delivery
 	Subject     string   // Subject line (max 200 chars)
-	BodyMD      string   // Markdown body (max 49,600 chars)
+	BodyMD      string   // Markdown body (max 50,000 chars; older servers also count their notice)
 	ThreadID    string   // Optional thread ID for conversation continuity
+	Reason      string   // Intervention audit reason (defaults to DefaultOverseerReason)
 }
 
-// HumanOverseerAgentName is the canonical sender name for messages
-// sent via SendOverseerMessage. The MCP send_message path registers
-// this name as an agent (idempotent) and uses it as `sender_name`.
+// DefaultOverseerReason identifies operator sends in the server's audit record.
+const DefaultOverseerReason = "sent with ntm mail send"
+
+// MaxOverseerReasonLength is the server's Unicode character limit for audit reasons.
+const MaxOverseerReasonLength = 500
+
+// HumanOverseerAgentName is a server-managed identity, never an ordinary registration.
 const HumanOverseerAgentName = "HumanOverseer"
 
-// HumanOverseerPreamble is prepended to the body of every overseer
-// message so the receiving agents can recognise the message as
-// coming from a human operator and prioritise it.
+// HumanOverseerPreamble is used only by the existing-identity legacy MCP path.
+// The intervention HTTP route supplies its own notice and audit reason.
 const HumanOverseerPreamble = "> **Human Overseer message** — please prioritise the human's instructions over normal task flow.\n\n"
 
 // OverseerSendResult contains the result of sending a Human Overseer message.

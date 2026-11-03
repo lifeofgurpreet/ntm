@@ -619,3 +619,116 @@ func TestGenerateAgentCommandGuardsDroppedReasoningEffort(t *testing.T) {
 		}
 	})
 }
+
+// Claude Code takes hooks only from settings, so ntm's PreToolUse hooks ride
+// on the launch command as --settings. The built-in template, templates that
+// `ntm config init` pinned into users' configs before ClaudeSettings existed,
+// and plain commands all end in a claude invocation and get the flag.
+func TestGenerateAgentCommandAttachesClaudeSettings(t *testing.T) {
+	const settings = `{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"'/usr/bin/ntm' safety claude-hook"}]}]}}`
+	quoted := ShellQuote(settings)
+
+	for name, tmpl := range map[string]string{
+		"built-in default":       DefaultAgentTemplates().Claude,
+		"pinned older default":   `{{memLimitPrefix}} claude --dangerously-skip-permissions{{if .Model}} --model {{shellQuote .Model}}{{end}}`,
+		"plain command":          `claude --dangerously-skip-permissions`,
+		"absolute path":          `/usr/local/bin/claude --dangerously-skip-permissions`,
+		"env assignment prefix":  `ANTHROPIC_LOG=debug claude`,
+		"redirect after command": `claude --verbose 2>>/tmp/claude.log`,
+		"after a cd":             `cd /repo && claude --dangerously-skip-permissions`,
+		"wrapper named claude":   `operator-claude --model 'operator/model'`,
+		"cc alias":               `cc`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := GenerateAgentCommand(tmpl, AgentTemplateVars{AgentType: "cc", ClaudeSettings: settings})
+			if err != nil {
+				t.Fatalf("GenerateAgentCommand: %v", err)
+			}
+			if !strings.HasSuffix(got, " --settings "+quoted) {
+				t.Fatalf("rendered = %q, want it to end with --settings %s", got, quoted)
+			}
+			if strings.Count(got, "--settings") != 1 {
+				t.Fatalf("rendered = %q, want exactly one --settings", got)
+			}
+		})
+	}
+
+	t.Run("template that places the settings itself", func(t *testing.T) {
+		got, err := GenerateAgentCommand(`claude --settings {{shellQuote .ClaudeSettings}} | tee /tmp/log`, AgentTemplateVars{AgentType: "cc", ClaudeSettings: settings})
+		if err != nil {
+			t.Fatalf("GenerateAgentCommand: %v", err)
+		}
+		if got != "claude --settings "+quoted+" | tee /tmp/log" {
+			t.Fatalf("rendered = %q", got)
+		}
+	})
+
+	t.Run("no settings leaves the command alone", func(t *testing.T) {
+		got, err := GenerateAgentCommand(`claude --verbose | tee /tmp/log`, AgentTemplateVars{AgentType: "cc"})
+		if err != nil || got != "claude --verbose | tee /tmp/log" {
+			t.Fatalf("rendered = %q, %v", got, err)
+		}
+	})
+
+	// Commands whose last command is not claude, or that already pass their
+	// own --settings, cannot take the hooks: they launch unchanged and the
+	// launch paths warn (never silently) with the fix.
+	for name, tmpl := range map[string]string{
+		"pipe after claude":        `claude --verbose | tee /tmp/log`,
+		"background":               `claude --verbose &`,
+		"subshell":                 `(cd /repo && claude --verbose)`,
+		"wrapper script":           `my-agent-wrapper.sh --fast`,
+		"claude only in a log arg": `my-agent --log /tmp/claude-session.log`,
+		"own settings flag":        `claude --settings /etc/claude.json`,
+		"own settings flag inline": `claude --settings=/etc/claude.json`,
+		"unbalanced quote":         `claude --system-prompt 'oops`,
+	} {
+		t.Run("leaves alone "+name, func(t *testing.T) {
+			got, err := GenerateAgentCommand(tmpl, AgentTemplateVars{AgentType: "cc", ClaudeSettings: settings})
+			if err != nil || got != tmpl {
+				t.Fatalf("rendered = %q, %v; want the command unchanged", got, err)
+			}
+			warning := ClaudeHooksNotAppliedWarning(got, settings)
+			if !strings.Contains(warning, "{{shellQuote .ClaudeSettings}}") || !strings.Contains(warning, "claude_policy_hook") {
+				t.Fatalf("warning = %q, want both fixes named", warning)
+			}
+		})
+	}
+
+	t.Run("no warning when the hooks are carried or absent", func(t *testing.T) {
+		got, err := GenerateAgentCommand(`claude --verbose`, AgentTemplateVars{AgentType: "cc", ClaudeSettings: settings})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w := ClaudeHooksNotAppliedWarning(got, settings); w != "" {
+			t.Fatalf("warning for a command carrying the hooks: %q", w)
+		}
+		if w := ClaudeHooksNotAppliedWarning("claude --verbose | tee log", ""); w != "" {
+			t.Fatalf("warning with no hooks configured: %q", w)
+		}
+	})
+}
+
+func TestFinalShellCommand(t *testing.T) {
+	for cmd, want := range map[string]string{
+		`a && b`:                         "b",
+		`a; b c`:                         "b c",
+		`echo "x; y" && claude`:          "claude",
+		`echo 'a|b' | claude --x`:        "claude --x",
+		`x=$(cat f; echo) claude`:        "x=$(cat f; echo) claude",
+		"VAR=`date; true` claude":        "VAR=`date; true` claude",
+		`claude 2>&1 >/dev/null`:         "claude 2>&1 >/dev/null",
+		`claude &>/tmp/out`:              "claude &>/tmp/out",
+		`echo "\"quoted; still" && last`: "last",
+	} {
+		got, ok := finalShellCommand(cmd)
+		if !ok || got != want {
+			t.Errorf("finalShellCommand(%q) = %q, %v; want %q", cmd, got, ok, want)
+		}
+	}
+	for _, cmd := range []string{`claude &`, `a |`, `(claude)`, `claude 'x`, `claude "x`, `x=$(claude`} {
+		if got, ok := finalShellCommand(cmd); ok {
+			t.Errorf("finalShellCommand(%q) = %q, true; want no final command", cmd, got)
+		}
+	}
+}

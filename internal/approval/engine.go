@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -110,12 +112,33 @@ type RequestParams struct {
 	CorrelationID string        // Optional correlation ID for tracing
 	RequiresSLB   bool          // Whether two-person rule applies
 	ExpiresIn     time.Duration // Override default expiry (0 = use default)
+	ProjectDir    string        // SLB project directory (empty = current working directory)
 }
 
 // Request creates a new approval request.
 func (e *Engine) Request(ctx context.Context, params RequestParams) (*state.Approval, error) {
+	record, _, err := e.requestWithID(ctx, params, generateApprovalID(), false)
+	return record, err
+}
+
+// requestWithID lets an operation use a deterministic primary key. SQLite's
+// unique insert deduplicates admission requests across independent processes;
+// a retry receives the stored request and never resets its decision.
+func (e *Engine) requestWithID(ctx context.Context, params RequestParams, id string, reuse bool) (*state.Approval, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if reuse {
+		existing, err := e.store.GetApproval(id)
+		if err != nil {
+			return nil, false, err
+		}
+		if existing != nil {
+			return existing, false, nil
+		}
 	}
 
 	// Set expiry
@@ -126,7 +149,7 @@ func (e *Engine) Request(ctx context.Context, params RequestParams) (*state.Appr
 
 	now := time.Now().UTC()
 	approval := &state.Approval{
-		ID:            generateApprovalID(),
+		ID:            id,
 		Action:        params.Action,
 		Resource:      params.Resource,
 		Reason:        params.Reason,
@@ -138,23 +161,33 @@ func (e *Engine) Request(ctx context.Context, params RequestParams) (*state.Appr
 		Status:        state.ApprovalPending,
 	}
 
-	// If SLB is required and available, enqueue an SLB request first.
-	if params.RequiresSLB && e.config.EnableSLB {
-		slbID, err := e.enqueueSLBRequest(ctx, params)
-		if err != nil {
-			return nil, err
-		}
-		if slbID != "" && approval.CorrelationID == "" {
-			approval.CorrelationID = "slb:" + slbID
-		}
-	}
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	// Store the approval
+	// Persist admission before contacting SLB. Only the winner of this
+	// unique insert may enqueue; another process replaying the same request
+	// must not create a second external authorization. An interrupted mirror
+	// remains a native approval, never an invitation to resubmit blindly.
 	if err := e.store.CreateApproval(approval); err != nil {
-		return nil, fmt.Errorf("create approval: %w", err)
+		if reuse {
+			existing, readErr := e.store.GetApproval(id)
+			if readErr == nil && existing != nil {
+				return existing, false, nil
+			}
+		}
+		return nil, false, fmt.Errorf("create approval: %w", err)
+	}
+	if params.RequiresSLB && e.config.EnableSLB {
+		link, err := e.enqueueSLBRequest(ctx, params)
+		if err != nil {
+			return approval, true, err
+		}
+		if link != nil {
+			link.ApprovalID = approval.ID
+			if err := e.store.CreateApprovalSLBLink(ctx, *link); err != nil {
+				return approval, true, fmt.Errorf("approval %s was saved but its SLB request %s could not be linked; inspect before retrying: %w", approval.ID, link.RequestID, err)
+			}
+			if approval.CorrelationID == "" {
+				approval.CorrelationID = "slb:" + link.RequestID
+			}
+		}
 	}
 
 	// Emit event
@@ -170,24 +203,54 @@ func (e *Engine) Request(ctx context.Context, params RequestParams) (*state.Appr
 		e.notifyApprovalRequest(approval)
 	}
 
-	return approval, nil
+	return approval, true, nil
 }
 
-func (e *Engine) enqueueSLBRequest(ctx context.Context, params RequestParams) (string, error) {
+func (e *Engine) enqueueSLBRequest(ctx context.Context, params RequestParams) (*state.ApprovalSLBLink, error) {
 	adapter := tools.NewSLBAdapter()
 	if _, installed := adapter.Detect(); !installed {
-		return "", nil
+		return nil, nil
 	}
+
+	// slb files requests under an agent session; without one in the
+	// environment there is nothing to mirror into.
+	session := tools.SLBSessionFromEnv()
+	if session.ID == "" {
+		return nil, nil
+	}
+	projectDir := params.ProjectDir
+	if projectDir == "" {
+		var err error
+		projectDir, err = os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("resolve SLB working directory: %w", err)
+		}
+	}
+	projectDir, err := filepath.Abs(projectDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve SLB project: %w", err)
+	}
+	projectDir, err = filepath.EvalSymlinks(projectDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve SLB project identity: %w", err)
+	}
+	adapter.ProjectDir = projectDir
 
 	command := buildSLBCommand(params.Action, params.Resource)
-	raw, err := adapter.Request(ctx, command, params.Reason)
+	raw, err := adapter.Request(ctx, session, command, params.Reason)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		// Graceful fallback to internal approvals if SLB is unavailable or errors.
 		slog.Warn("SLB adapter request failed, falling back to internal approval", "error", err, "command", command)
-		return "", nil
+		return nil, nil
 	}
-
-	return parseSLBRequestID(raw), nil
+	requestID := parseSLBRequestID(raw)
+	if strings.TrimSpace(requestID) == "" || strings.TrimSpace(requestID) != requestID {
+		return nil, errors.New("SLB returned no exact request ID; native approval retained without automatic resubmission")
+	}
+	return &state.ApprovalSLBLink{RequestID: requestID, ProjectDir: projectDir}, nil
 }
 
 func buildSLBCommand(action, resource string) string {
@@ -206,14 +269,13 @@ func parseSLBRequestID(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
 	}
-	var payload map[string]interface{}
+	var payload struct {
+		RequestID string `json:"request_id"`
+	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return ""
 	}
-	if id, ok := payload["id"].(string); ok {
-		return id
-	}
-	return ""
+	return payload.RequestID
 }
 
 // Check returns the current status of an approval request.
@@ -233,7 +295,118 @@ func (e *Engine) Check(ctx context.Context, id string) (*state.Approval, error) 
 		}
 	}
 
+	// An approval mirrored into slb takes slb's decision once a reviewer has
+	// made one there.
+	if approval.Status == state.ApprovalPending && e.syncSLBDecision(ctx, approval) {
+		synced, err := e.store.GetApproval(id)
+		if err != nil {
+			return nil, fmt.Errorf("get approval: %w", err)
+		}
+		if synced != nil {
+			approval = synced
+		}
+	}
+
 	return approval, nil
+}
+
+// syncSLBDecision follows the persisted external link, not the operation's
+// correlation key or the checking process's cwd. Native Approve/Deny retain
+// authority over the allowed reviewer and the guarded final transition.
+func (e *Engine) syncSLBDecision(ctx context.Context, approval *state.Approval) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil || approval == nil || !approval.RequiresSLB || approval.Status != state.ApprovalPending {
+		return false
+	}
+	if !e.config.EnableSLB {
+		return false
+	}
+	link, err := e.store.GetApprovalSLBLink(ctx, approval.ID)
+	if err != nil || link == nil {
+		if err != nil {
+			slog.Warn("SLB linkage unavailable; approval stays pending", "approval", approval.ID, "error", err)
+		}
+		return false
+	}
+	requestID := link.RequestID
+	resolved, err := filepath.EvalSymlinks(link.ProjectDir)
+	if err != nil || resolved != link.ProjectDir {
+		slog.Warn("SLB project identity changed; approval stays pending", "approval", approval.ID, "slb_request", requestID)
+		return false
+	}
+	adapter := tools.NewSLBAdapter()
+	adapter.ProjectDir = link.ProjectDir
+	if _, installed := adapter.Detect(); !installed {
+		return false
+	}
+	status, err := adapter.RequestStatus(ctx, requestID)
+	if err != nil {
+		slog.Debug("slb status unavailable; approval stays pending", "approval", approval.ID, "slb_request", requestID, "error", err)
+		return false
+	}
+
+	if ctx.Err() != nil {
+		return false
+	}
+	if status != nil && status.Status != "approved" && status.Status != "rejected" {
+		return false
+	}
+	deciding, valid := slbDecisionReview(requestID, approval.RequestedBy, status)
+	if !valid {
+		slog.Warn("slb decision lacks bound reviewer evidence; approval stays pending", "approval", approval.ID, "slb_request", requestID)
+		return false
+	}
+	if status.Status == "approved" {
+		err = e.Approve(ctx, approval.ID, "slb:"+deciding.Reviewer)
+	} else {
+		err = e.Deny(ctx, approval.ID, "slb:"+deciding.Reviewer, deciding.Comments)
+	}
+	if err != nil {
+		slog.Warn("could not apply slb decision to approval", "approval", approval.ID, "slb_request", requestID, "slb_status", status.Status, "error", err)
+		return false
+	}
+	return true
+}
+
+// slbDecisionReview requires evidence for this exact external request. A
+// terminal status alone is not an approval, and an unknown review decision is
+// not a rejection. Preserve the adapter's review order, but never synthesize
+// an anonymous reviewer when the matching review is absent or malformed.
+func slbDecisionReview(requestID, requester string, status *tools.SLBRequestStatus) (tools.SLBReview, bool) {
+	if status == nil || requestID == "" || status.RequestID != requestID {
+		return tools.SLBReview{}, false
+	}
+	var decision string
+	switch status.Status {
+	case "approved":
+		decision = "approve"
+	case "rejected":
+		decision = "reject"
+	default:
+		return tools.SLBReview{}, false
+	}
+	var review tools.SLBReview
+	found := false
+	for _, candidate := range status.Reviews {
+		if candidate.Decision == decision {
+			review, found = candidate, true
+		}
+	}
+	if !found || strings.TrimSpace(review.Reviewer) == "" || strings.TrimSpace(review.Reviewer) != review.Reviewer {
+		return tools.SLBReview{}, false
+	}
+	// "slb:" is an audit-source prefix, not another human. A requester
+	// named alice cannot approve her own request by coming back as slb:alice.
+	if decision == "approve" {
+		requester = strings.TrimSpace(requester)
+		if requester == "" || review.Reviewer == requester || "slb:"+review.Reviewer == requester ||
+			strings.TrimPrefix(review.Reviewer, "slb:") == strings.TrimPrefix(requester, "slb:") {
+			return tools.SLBReview{}, false
+		}
+	}
+	return review, true
 }
 
 // Approve grants an approval request.
@@ -407,27 +580,6 @@ func (e *Engine) Consume(ctx context.Context, id string, consumerID string) erro
 		})
 	}
 	return nil
-}
-
-// LatestForCorrelation returns the most recent approval record carrying the
-// given correlation ID (operation key), or nil if none exists. A pending
-// record past its expiry is lazily transitioned to expired first, matching
-// Check/ListPending semantics.
-func (e *Engine) LatestForCorrelation(ctx context.Context, correlationID string) (*state.Approval, error) {
-	records, err := e.store.ListApprovalsByCorrelation(correlationID)
-	if err != nil {
-		return nil, fmt.Errorf("list approvals by correlation: %w", err)
-	}
-	if len(records) == 0 {
-		return nil, nil
-	}
-	latest := records[0]
-	if latest.Status == state.ApprovalPending && time.Now().After(latest.ExpiresAt) {
-		if err := e.expireApproval(&latest, time.Now().UTC()); err != nil {
-			return nil, err
-		}
-	}
-	return &latest, nil
 }
 
 // ListPending returns all pending approval requests.

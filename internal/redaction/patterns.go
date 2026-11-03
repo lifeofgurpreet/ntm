@@ -1,10 +1,12 @@
 package redaction
 
 import (
+	"encoding/json"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 const (
@@ -34,6 +36,41 @@ type pattern struct {
 	regex            *regexp.Regexp
 	priority         int // higher priority patterns take precedence
 	requiredLiterals []literalRequirement
+	builtin          bool
+	// Standalone credentials protect their complete match when a more specific
+	// provider overlaps only part of it. User patterns never receive this tag.
+	protectWholeMatch bool
+	// reject, when set, drops a regex match that is known not to be a
+	// credential (for example the shell's PWD= working-directory variable).
+	// Only built-in patterns carry one; user ExtraPatterns never do.
+	reject func(input string, start, end int) bool
+}
+
+// builtinMatchRejecters maps a built-in category to a post-match filter
+// that removes known non-credential shapes the regex cannot exclude on
+// its own (Go's RE2 has no look-behind).
+var builtinMatchRejecters = map[Category]func(input string, start, end int) bool{
+	CategoryPassword:      rejectNonCredentialPassword,
+	CategoryAWSSecretKey:  rejectJSONCredentialValue(40, 40, "/+="),
+	CategoryGenericAPIKey: rejectJSONCredentialValue(16, 0, "_-"),
+	CategoryGenericSecret: rejectJSONCredentialValue(16, 0, "/+=_-"),
+}
+
+var privateKeyBlockPattern = buildPrivateKeyBlockPattern()
+
+func buildPrivateKeyBlockPattern() string {
+	var alternatives []string
+	for _, kind := range []string{"PRIVATE KEY", "RSA PRIVATE KEY", "DSA PRIVATE KEY", "EC PRIVATE KEY", "OPENSSH PRIVATE KEY", "ENCRYPTED PRIVATE KEY"} {
+		// Repeating each literal label enforces matching BEGIN/END kinds without
+		// backreferences. Restricted body lines cannot cross another PEM header
+		// or neighboring quoted fields while searching for a footer.
+		alternatives = append(alternatives,
+			`-----BEGIN `+kind+`-----[\t ]*\r?\n`+
+				`(?:[\t ]*[A-Za-z0-9_-]+[\t ]*:[^\r\n]*\r?\n)*(?:\r?\n)?`+
+				`(?:[A-Za-z0-9+/=\t ]*\r?\n)+`+
+				`-----END `+kind+`-----`)
+	}
+	return strings.Join(alternatives, "|")
 }
 
 // defaultPatterns contains all built-in detection patterns.
@@ -57,21 +94,69 @@ var defaultPatterns = []patternDef{
 	{CategoryAWSAccessKey, `AKIA[0-9A-Z]{16}`, 90, []literalRequirement{{anyOf: []string{"AKIA"}}}},
 	{CategoryAWSAccessKey, `ASIA[0-9A-Z]{16}`, 90, []literalRequirement{{anyOf: []string{"ASIA"}}}},
 	{CategoryAWSSecretKey, `(?i)(aws_secret|secret_access_key|secret_key)\s*[=:]\s*["']?[a-zA-Z0-9/+=]{40}["']?`, 90, []literalRequirement{{anyOf: []string{"aws_secret", "secret_access_key", "secret_key"}, ignoreCase: true}}},
+	{CategoryAWSSecretKey, jsonCredentialPattern(`(?:[a-z0-9_]+_)?(?:aws_secret|secret_access_key|secret_key)`), 90, []literalRequirement{{anyOf: []string{"aws_secret", "secret_access_key", "secret_key"}, ignoreCase: true}}},
 
 	// Authentication tokens
 	{CategoryJWT, `eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]+`, 85, []literalRequirement{{anyOf: []string{"eyJ"}}}},
 	{CategoryBearerToken, `(?i)bearer\s+[a-zA-Z0-9._-]{20,}`, 80, []literalRequirement{{anyOf: []string{"bearer"}, ignoreCase: true}}},
 
 	// Private keys
-	{CategoryPrivateKey, `-----BEGIN\s+(RSA\s+|DSA\s+|EC\s+|OPENSSH\s+)?PRIVATE KEY-----`, 95, []literalRequirement{{anyOf: []string{"private key"}, ignoreCase: true}}},
+	{CategoryPrivateKey, privateKeyBlockPattern, 95, []literalRequirement{{anyOf: []string{"private key"}, ignoreCase: true}}},
+	{CategoryPrivateKey, `-----BEGIN\s+(RSA\s+|DSA\s+|EC\s+|OPENSSH\s+|ENCRYPTED\s+)?PRIVATE KEY-----`, 95, []literalRequirement{{anyOf: []string{"private key"}, ignoreCase: true}}},
 
 	// Database URLs with credentials
-	{CategoryDatabaseURL, `(?i)(postgres|mysql|mongodb|redis)://[^:]+:[^@]+@[^\s]+`, 85, []literalRequirement{{anyOf: []string{"postgres://", "mysql://", "mongodb://", "redis://"}, ignoreCase: true}}},
+	{CategoryDatabaseURL, `(?i)(postgres|mysql|mongodb|redis)://[^:"]+:[^@"]+@[^\s"]+`, 85, []literalRequirement{{anyOf: []string{"postgres://", "mysql://", "mongodb://", "redis://"}, ignoreCase: true}}},
 
 	// Generic patterns (lower priority)
 	{CategoryPassword, `(?i)(password|passwd|pwd)\s*[=:]\s*["']?[^\s"']{8,}["']?`, 50, []literalRequirement{{anyOf: []string{"password", "passwd", "pwd"}, ignoreCase: true}}},
+	{CategoryPassword, jsonCredentialPattern(`(?:(?:[a-z0-9_]+_)?(?:password|passwd|pwd)|oldpwd)`), 50, []literalRequirement{{anyOf: []string{"password", "passwd", "pwd"}, ignoreCase: true}}},
 	{CategoryGenericAPIKey, `(?i)([a-z_]*api[_]?key)\s*[=:]\s*["']?[a-zA-Z0-9_-]{16,}["']?`, 40, []literalRequirement{{anyOf: []string{"api_key", "apikey"}, ignoreCase: true}}},
+	{CategoryGenericAPIKey, jsonCredentialPattern(`[a-z_]*api_?key`), 40, []literalRequirement{{anyOf: []string{"api_key", "apikey"}, ignoreCase: true}}},
 	{CategoryGenericSecret, `(?i)(secret|private[_]?key|token)\s*[=:]\s*["']?[a-zA-Z0-9/+=_-]{16,}["']?`, 30, []literalRequirement{{anyOf: []string{"secret", "private_key", "privatekey", "token"}, ignoreCase: true}}},
+	{CategoryGenericSecret, jsonCredentialPattern(`(?:[a-z0-9_]+_)?(?:secret|private_?key|token)`), 30, []literalRequirement{{anyOf: []string{"secret", "private_key", "privatekey", "token"}, ignoreCase: true}}},
+}
+
+// jsonCredentialPattern matches a complete quoted key and string value without
+// consuming adjacent fields. Escape pairs must stay inside the value so an
+// escaped quote cannot leave a secret suffix unredacted. The category's rejecter
+// validates the decoded value; keeping this separate from bare assignments also
+// avoids treating JSON punctuation or non-string fields as credential content.
+func jsonCredentialPattern(key string) string {
+	return `(?i)"` + key + `"\s*:\s*"(?:\\.|[^"\\\r\n])*"`
+}
+
+func decodeJSONCredentialValue(m string) (string, bool) {
+	sep := strings.IndexByte(m, ':')
+	if sep < 0 {
+		return "", false
+	}
+	var value string
+	if err := json.Unmarshal([]byte(m[sep+1:]), &value); err != nil {
+		return "", false
+	}
+	return value, true
+}
+
+// rejectJSONCredentialValue preserves the existing length and alphabet rules
+// for generic/AWS credentials, applied to the complete decoded JSON string.
+// Ordinary assignment matches do not start with a quote and are unchanged.
+func rejectJSONCredentialValue(minLength, maxLength int, punctuation string) func(string, int, int) bool {
+	return func(input string, start, end int) bool {
+		if start < 0 || end > len(input) || start >= end || input[start] != '"' {
+			return false
+		}
+		value, ok := decodeJSONCredentialValue(input[start:end])
+		if !ok || len(value) < minLength || (maxLength > 0 && len(value) > maxLength) {
+			return true
+		}
+		for _, c := range value {
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || strings.ContainsRune(punctuation, c) {
+				continue
+			}
+			return true
+		}
+		return false
+	}
 }
 
 // compiledPatterns holds the compiled regex patterns.
@@ -90,11 +175,21 @@ func compilePatterns() {
 				// Pattern compilation errors should be caught during development.
 				continue
 			}
+			protectWholeMatch := true
+			switch def.category {
+			case CategoryPassword, CategoryAWSSecretKey, CategoryGenericAPIKey, CategoryGenericSecret, CategoryBearerToken:
+				protectWholeMatch = false
+			case CategoryPrivateKey:
+				protectWholeMatch = def.pattern == privateKeyBlockPattern
+			}
 			compiledPatterns = append(compiledPatterns, pattern{
-				category:         def.category,
-				regex:            re,
-				priority:         def.priority,
-				requiredLiterals: normalizeLiteralRequirements(def.requiredLiterals),
+				category:          def.category,
+				regex:             re,
+				priority:          def.priority,
+				requiredLiterals:  normalizeLiteralRequirements(def.requiredLiterals),
+				builtin:           true,
+				protectWholeMatch: protectWholeMatch,
+				reject:            builtinMatchRejecters[def.category],
 			})
 		}
 		// Sort by priority (descending) for deterministic matching.
@@ -263,4 +358,97 @@ func (p pattern) passesLiteralPrefilter(input string, lowerInput *string, lowerR
 		}
 	}
 	return true
+}
+
+// rejectNonCredentialPassword reports whether a PASSWORD-pattern match at
+// input[start:end] is a known non-credential:
+//
+//   - the shell's PWD / OLDPWD working-directory variables (or a lowercase
+//     pwd key) whose value is a filesystem path or a shell expansion, such
+//     as `PWD=/home/user/project` from `env` output. Keys that merely end
+//     in PWD (MYSQL_PWD, DB_PWD) and non-path values (ODBC `Pwd=secret;`)
+//     are still reported.
+//   - a value that is only a redaction placeholder: `<set>`, `<redacted>`
+//     (also JSON-escaped as \u003c...\u003e), or a run of `*`.
+func rejectNonCredentialPassword(input string, start, end int) bool {
+	if start < 0 || end > len(input) || start >= end {
+		return false
+	}
+	m := input[start:end]
+	sep := strings.IndexAny(m, "=:")
+	if sep < 0 {
+		return false
+	}
+	key := strings.Trim(strings.TrimSpace(m[:sep]), `"`)
+	value := strings.Trim(strings.TrimSpace(m[sep+1:]), `"'`)
+	if m[0] == '"' {
+		var ok bool
+		value, ok = decodeJSONCredentialValue(m)
+		if !ok || utf8.RuneCountInString(value) < 8 {
+			return true
+		}
+	}
+
+	if isPasswordPlaceholderValue(value) {
+		return true
+	}
+
+	// Extend the key left over identifier characters so OLDPWD and
+	// MYSQL_PWD are seen whole (the regex match starts at "PWD").
+	identStart := start
+	for identStart > 0 && isIdentByte(input[identStart-1]) {
+		identStart--
+	}
+	ident := strings.ToLower(input[identStart:start] + key)
+	if ident != "pwd" && ident != "oldpwd" {
+		return false
+	}
+	return looksLikePathOrExpansion(value)
+}
+
+func isIdentByte(b byte) bool {
+	return b == '_' || (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+func looksLikePathOrExpansion(v string) bool {
+	if v == "" {
+		return false
+	}
+	switch v[0] {
+	case '/', '~', '$':
+		return true
+	case '.':
+		return strings.HasPrefix(v, "./") || strings.HasPrefix(v, "../")
+	}
+	// Windows drive path: C:\ or C:/
+	if len(v) >= 3 && v[1] == ':' && (v[2] == '\\' || v[2] == '/') {
+		c := v[0] | 0x20
+		return c >= 'a' && c <= 'z'
+	}
+	return false
+}
+
+func isPasswordPlaceholderValue(v string) bool {
+	v = strings.TrimRight(v, ",;")
+	if v == "" {
+		return false
+	}
+	if strings.Trim(v, "*") == "" {
+		return true
+	}
+	lower := strings.ToLower(v)
+	for _, open := range []string{"<", "\\u003c"} {
+		closeTok := ">"
+		if open != "<" {
+			closeTok = "\\u003e"
+		}
+		if strings.HasPrefix(lower, open) && strings.HasSuffix(lower, closeTok) {
+			inner := lower[len(open) : len(lower)-len(closeTok)]
+			switch inner {
+			case "set", "redacted", "hidden", "password", "secret":
+				return true
+			}
+		}
+	}
+	return false
 }

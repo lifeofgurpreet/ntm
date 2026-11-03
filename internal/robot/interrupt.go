@@ -4,13 +4,16 @@ package robot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	dispatchsvc "github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
+	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
@@ -34,6 +37,10 @@ type InterruptOutput struct {
 	TimedOut       bool                 `json:"timed_out"`
 	DryRun         bool                 `json:"dry_run,omitempty"`
 	WouldAffect    []string             `json:"would_affect,omitempty"`
+
+	// Operation is the durable idempotent-operation receipt, present when
+	// the caller supplied an operation ID (--op-id / Idempotency-Key).
+	Operation *OperationInfo `json:"operation,omitempty"`
 }
 
 // PaneState captures the state of a pane before interruption
@@ -58,6 +65,7 @@ type InterruptOptions struct {
 	Session        string   // Target session name
 	Message        string   // Message to send after interrupt (optional)
 	Panes          []string // Specific pane indices to interrupt (empty = all agents)
+	AgentTypes     []string // Only interrupt panes of these agent types (aliases accepted; empty = any type)
 	All            bool     // Include all panes (including user)
 	Force          bool     // Send Ctrl+C even if agent appears idle
 	NoWait         bool     // Don't wait for ready state after interrupt
@@ -66,8 +74,13 @@ type InterruptOptions struct {
 	DryRun         bool     // Preview mode: show what would happen without executing
 	RequestID      string   // External request identifier for REST parity
 	CorrelationID  string   // Correlation identifier for tracing request/outcome/verification
-	IdempotencyKey string   // Idempotency key when provided by an upstream caller
+	IdempotencyKey string   // Durable operation ID (--op-id / REST Idempotency-Key), claimed before any pane is touched
 	Redaction      redaction.Config
+	// MessageGuard checks a follow-up against the resolved physical targets
+	// before any interrupt key or durable operation claim. Control-only
+	// interrupts do not dispatch a message and do not invoke this guard. The
+	// ready subset is checked again immediately before follow-up delivery.
+	MessageGuard func(context.Context, string, []tmux.Pane) error `json:"-"`
 }
 
 // GetInterrupt sends Ctrl+C to panes and optionally a follow-up message, returning the result.
@@ -80,6 +93,13 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 		opts.PollMs = 300 // Default 300ms poll interval
 	}
 	trace := normalizeActuationTrace(opts.RequestID, opts.CorrelationID, opts.IdempotencyKey)
+	inputMessage := opts.Message
+	// The operation binding digests the caller's INPUT follow-up message, so
+	// it is computed before redaction rewrites opts.Message below.
+	var operationBinding string
+	if trace.IdempotencyKey != "" && !opts.DryRun {
+		operationBinding = interruptOperationBindingHash(opts)
+	}
 
 	interruptedAt := time.Now().UTC()
 	output := &InterruptOutput{
@@ -94,18 +114,6 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 		Failed:         []InterruptError{},
 		TimeoutMs:      opts.TimeoutMs,
 		TimedOut:       false,
-	}
-	if !opts.DryRun {
-		// A bare Ctrl-C and this command's optional follow-up Dispatch do not
-		// currently enter the authenticated send receipt transaction. Retire the
-		// mutation instead of allowing a partial provenance bypass.
-		output.RobotResponse = NewErrorResponse(
-			fmt.Errorf("robot interrupt is retired pending authenticated receipt admission"),
-			ErrCodeReceiptProvenanceRequired,
-			"Use a guarded authenticated agent send; bare interrupts are unavailable",
-		)
-		output.CompletedAt = time.Now().UTC()
-		return finalizeTerminalInterruptActuation(trace, opts, nil, output), nil
 	}
 
 	if interruptMessageBlocked(&opts, output) {
@@ -148,7 +156,7 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 	// Topology-aware keys (#172): on a multi-window session every key is the
 	// canonical "window.pane" address so panes never collapse onto one entry.
 	multiWindow := paneSessionIsMultiWindow(panes)
-	targetPanes, err := resolveInterruptTargets(panes, opts.Panes, opts.All)
+	targetPanes, err := resolveInterruptTargets(panes, opts.Panes, opts.All, opts.AgentTypes)
 	if err != nil {
 		output.RobotResponse = NewErrorResponse(
 			err,
@@ -186,6 +194,26 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 		output.CompletedAt = time.Now().UTC()
 		return finalizeTerminalInterruptActuation(trace, opts, targetKeys, output), nil
 	}
+	// The follow-up message is an arbitrary payload like any send: vet it
+	// before interrupting anything, against the agent types it will reach.
+	if opts.Message != "" {
+		guardPanes := make([]tmux.Pane, len(targetPanes))
+		for i, pane := range targetPanes {
+			guardPanes[i] = pane
+			guardPanes[i].Type = interruptPaneTMUXAgentType(pane)
+		}
+		if opts.MessageGuard != nil {
+			if err := opts.MessageGuard(context.Background(), opts.Message, append([]tmux.Pane(nil), guardPanes...)); err != nil {
+				return nil, fmt.Errorf("message policy check: %w", err)
+			}
+		}
+		if resp, _, err := checkSendCommandGuard(context.Background(), opts.Message, opts.Session, guardPanes); err != nil {
+			output.RobotResponse = resp
+			output.Failed = append(output.Failed, InterruptError{Pane: "guard", Reason: err.Error()})
+			output.CompletedAt = time.Now().UTC()
+			return finalizeTerminalInterruptActuation(trace, opts, targetKeys, output), nil
+		}
+	}
 
 	// Capture previous state for each pane before interrupting
 	for _, pane := range targetPanes {
@@ -209,9 +237,51 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 		return output, nil
 	}
 
+	// Durable idempotent operation claim (protocol shared with --robot-send,
+	// operation_idempotency.go). It happens after every preflight check and
+	// BEFORE the first interrupt key or follow-up message, so an identical
+	// retry after a caller timeout replays the recorded outcome instead of
+	// interrupting the agents — and delivering the new task — a second time.
+	// Everything past the claim may touch panes, so the outcome is always
+	// recorded as terminal rather than released.
+	if trace.IdempotencyKey != "" {
+		claim := claimRobotOperation(operationClaimRequest{
+			Kind:        state.OperationKindInterrupt,
+			OperationID: trace.IdempotencyKey,
+			Session:     opts.Session,
+			BindingHash: operationBinding,
+			Payload:     opts.Message,
+			Targets:     targetKeys,
+		})
+		switch claim.Verdict {
+		case operationRefused:
+			output.RobotResponse = claim.Response
+			output.Operation = claim.Info
+			output.CompletedAt = time.Now().UTC()
+			return finalizeTerminalInterruptActuation(trace, opts, targetKeys, output), nil
+		case operationReplay:
+			if err := applyReplayedInterruptOutcome(output, claim.Record); err != nil {
+				output.RobotResponse = NewErrorResponse(err, ErrCodeInternalError, "Stored interrupt outcome could not be decoded")
+				output.CompletedAt = time.Now().UTC()
+			}
+			return finalizeTerminalInterruptActuation(trace, opts, targetKeys, output), nil
+		}
+		if err := claim.Owned.start(opts.Message, targetKeys); err != nil {
+			output.RobotResponse = operationStartErrorResponse(err)
+			if warning := claim.Owned.release(); warning != "" {
+				output.Warnings = append(output.Warnings, warning)
+			}
+			output.CompletedAt = time.Now().UTC()
+			return finalizeTerminalInterruptActuation(trace, opts, targetKeys, output), nil
+		}
+		output.Operation = operationInfoFromRecord(claim.Owned.record, false)
+		defer completeInterruptOperation(claim.Owned, targetKeys, opts.Message != "", output)
+	}
+
 	publishInterruptActuationRequest(trace, opts, targetKeys)
 
-	// Send Ctrl+C to all targets
+	// Send each target its agent's interrupt key (Ctrl+C; Escape for omp,
+	// where Ctrl+C only clears the draft and a double press quits omp).
 	for _, pane := range targetPanes {
 		paneKey := paneTargetKey(pane, multiWindow)
 		prevState := output.PreviousStates[paneKey]
@@ -223,11 +293,12 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 			continue
 		}
 
-		err := tmux.SendInterrupt(pane.ID)
+		agentType := interruptPaneTMUXAgentType(pane)
+		err := tmux.SendInterruptForAgent(pane.ID, agentType)
 		if err != nil {
 			output.Failed = append(output.Failed, InterruptError{
 				Pane:   paneKey,
-				Reason: fmt.Sprintf("failed to send Ctrl+C: %v", err),
+				Reason: fmt.Sprintf("failed to send %s: %v", tmux.InterruptKeyLabel(agentType), err),
 			})
 		} else {
 			output.Interrupted = append(output.Interrupted, paneKey)
@@ -344,14 +415,17 @@ func GetInterrupt(opts InterruptOptions) (*InterruptOutput, error) {
 				dispatchPanes[i].Tags = append([]string(nil), pane.Tags...)
 				dispatchPanes[i].Type = interruptPaneTMUXAgentType(pane)
 			}
-			service, _, serviceErr := newRobotDispatchService(opts.Redaction, nil, nil)
+			service, _, serviceErr := newRobotDispatchService(opts.Redaction, guardedRobotMessageDeliverer(opts.MessageGuard), nil)
 			if serviceErr != nil {
 				output.Failed = append(output.Failed, InterruptError{Pane: "dispatch", Reason: fmt.Sprintf("failed to initialize message dispatch: %v", serviceErr)})
 			} else {
-				sendOpts := SendOptions{Session: opts.Session, Message: opts.Message}
+				// Apply final-message policy to the original input, as in the
+				// preflight above. Re-scanning opts.Message would redact the
+				// replacement markers again and change the frozen payload.
+				sendOpts := SendOptions{Session: opts.Session, Message: inputMessage}
 				prepared, prepareErr := service.Prepare(
 					context.Background(),
-					robotPreparedDispatchRequest(dispatchPanes, messageTargets, sendOpts, opts.Message, true),
+					robotPreparedDispatchRequest(dispatchPanes, messageTargets, sendOpts, inputMessage, true),
 				)
 				if prepareErr != nil {
 					output.RobotResponse = robotDispatchPrepareErrorResponse(prepareErr)
@@ -482,25 +556,251 @@ func PrintInterrupt(opts InterruptOptions) error {
 	return encodeTerminalRobotOutput(output, output.RobotResponse, "robot interrupt failed")
 }
 
-func resolveInterruptTargets(panes []tmux.Pane, selectors []string, all bool) ([]tmux.Pane, error) {
-	if len(selectors) > 0 {
-		return tmux.ResolvePaneSelectors(panes, selectors, false)
-	}
-	var targetPanes []tmux.Pane
-	for _, pane := range panes {
-		if !all {
-			agentType := interruptPaneAgentType(pane)
-			if pane.Index == 0 && agentType == "unknown" {
-				continue
-			}
-			if agentType == "user" {
-				continue
-			}
-		}
+// interruptOperationBindingHash binds an idempotent interrupt to the
+// caller's canonical COMMAND spec: actuation kind, session, pane selectors,
+// --all, --force, the --type filter, and a digest of the caller's INPUT
+// follow-up message (before redaction).
+//
+// As with sends, the selector — not the resolved pane list — is bound, so a
+// byte-identical retry replays even when pane topology changed between
+// attempts; selector lists are canonicalized (trimmed, sorted). Wait
+// behavior (--no-wait, --timeout) is deliberately not bound: it shapes how
+// long the caller waits for closed-loop verification, and a caller retrying
+// after a timeout commonly lengthens it.
+//
+// Unlike sends, the kind is the first hashed field: interrupt bindings have
+// no pre-kind history to stay compatible with.
+func interruptOperationBindingHash(opts InterruptOptions) string {
+	b := newOperationBindingHasher()
+	b.field(state.OperationKindInterrupt)
+	b.field(opts.Session)
+	b.list(opts.Panes)
+	b.field(strconv.FormatBool(opts.All))
+	b.field(strconv.FormatBool(opts.Force))
+	b.list(normalizedAgentTypeFilter(opts.AgentTypes))
+	inputSHA, _ := operationPayloadDigest(opts.Message)
+	b.field(inputSHA)
+	return b.sum()
+}
 
-		targetPanes = append(targetPanes, pane)
+// interruptOperationOutcome is the durable outcome record of a completed
+// idempotent interrupt, replayed verbatim to identical retries. Pane output
+// captured into previous_states is deliberately NOT persisted (last_output
+// is blanked): the receipt store keeps digests and states, never pane
+// contents.
+type interruptOperationOutcome struct {
+	Success        bool                 `json:"success"`
+	Error          string               `json:"error,omitempty"`
+	ErrorCode      string               `json:"error_code,omitempty"`
+	InterruptedAt  time.Time            `json:"interrupted_at"`
+	CompletedAt    time.Time            `json:"completed_at"`
+	Method         string               `json:"method"`
+	Targets        []string             `json:"targets"`
+	Interrupted    []string             `json:"interrupted"`
+	PreviousStates map[string]PaneState `json:"previous_states"`
+	ReadyForInput  []string             `json:"ready_for_input"`
+	Failed         []InterruptError     `json:"failed"`
+	MessageSent    bool                 `json:"message_sent"`
+	MessagePreview string               `json:"message_preview,omitempty"`
+	TimedOut       bool                 `json:"timed_out"`
+	Admissions     []OperationAdmission `json:"admissions"`
+}
+
+// admissionsFromInterruptOutput derives per-target admission states for a
+// finished interrupt: rejected when any action against the target failed
+// (interrupt key or follow-up message), submitted when the target accepted
+// the interrupt key or — already ready, so not interrupted — the follow-up
+// message, and not_attempted when the target was already ready and nothing
+// was submitted to it.
+func admissionsFromInterruptOutput(targets []string, messageRequested bool, output *InterruptOutput) []OperationAdmission {
+	if output == nil {
+		return nil
 	}
-	return targetPanes, nil
+	interrupted := make(map[string]bool, len(output.Interrupted))
+	for _, target := range output.Interrupted {
+		interrupted[target] = true
+	}
+	ready := make(map[string]bool, len(output.ReadyForInput))
+	for _, target := range output.ReadyForInput {
+		ready[target] = true
+	}
+	failures := make(map[string]string, len(output.Failed))
+	for _, failure := range output.Failed {
+		if previous, seen := failures[failure.Pane]; seen {
+			failures[failure.Pane] = previous + "; " + failure.Reason
+			continue
+		}
+		failures[failure.Pane] = failure.Reason
+	}
+
+	admissions := make([]OperationAdmission, 0, len(targets))
+	for _, target := range targets {
+		switch reason, failed := failures[target]; {
+		case failed:
+			admissions = append(admissions, OperationAdmission{Target: target, State: AdmissionRejected, Error: reason})
+		case interrupted[target], messageRequested && output.MessageSent && ready[target]:
+			admissions = append(admissions, OperationAdmission{Target: target, State: AdmissionSubmitted})
+		default:
+			admissions = append(admissions, OperationAdmission{Target: target, State: AdmissionNotAttempted})
+		}
+	}
+	return admissions
+}
+
+// completeInterruptOperation persists the terminal outcome of a claimed
+// interrupt and attaches the operation info to the output. Best-effort: a
+// persistence failure surfaces as a warning rather than failing an
+// interrupt that already happened.
+func completeInterruptOperation(op *durableOperation, targets []string, messageRequested bool, output *InterruptOutput) {
+	admissions := admissionsFromInterruptOutput(targets, messageRequested, output)
+	recordedStates := make(map[string]PaneState, len(output.PreviousStates))
+	for key, paneState := range output.PreviousStates {
+		paneState.LastOutput = ""
+		recordedStates[key] = paneState
+	}
+	info, warning := op.complete(interruptOperationOutcome{
+		Success:        output.Success,
+		Error:          output.Error,
+		ErrorCode:      output.ErrorCode,
+		InterruptedAt:  output.InterruptedAt,
+		CompletedAt:    output.CompletedAt,
+		Method:         output.Method,
+		Targets:        targets,
+		Interrupted:    output.Interrupted,
+		PreviousStates: recordedStates,
+		ReadyForInput:  output.ReadyForInput,
+		Failed:         output.Failed,
+		MessageSent:    output.MessageSent,
+		MessagePreview: output.Message,
+		TimedOut:       output.TimedOut,
+		Admissions:     admissions,
+	}, admissions)
+	if warning != "" {
+		output.Warnings = append(output.Warnings, warning)
+		return
+	}
+	output.Operation = info
+}
+
+// applyReplayedInterruptOutcome restores a stored outcome onto a fresh
+// InterruptOutput so an identical retry observes the original result without
+// sending a second interrupt key or follow-up message.
+func applyReplayedInterruptOutcome(output *InterruptOutput, op *state.SendOperation) error {
+	var outcome interruptOperationOutcome
+	if err := json.Unmarshal([]byte(op.OutcomeJSON), &outcome); err != nil {
+		return fmt.Errorf("decode stored interrupt outcome: %w", err)
+	}
+	output.Success = outcome.Success
+	output.Error = outcome.Error
+	output.ErrorCode = outcome.ErrorCode
+	output.InterruptedAt = outcome.InterruptedAt
+	output.CompletedAt = outcome.CompletedAt
+	if outcome.Method != "" {
+		output.Method = outcome.Method
+	}
+	output.Interrupted = nonNilStrings(outcome.Interrupted)
+	output.PreviousStates = outcome.PreviousStates
+	if output.PreviousStates == nil {
+		output.PreviousStates = map[string]PaneState{}
+	}
+	output.ReadyForInput = nonNilStrings(outcome.ReadyForInput)
+	output.Failed = outcome.Failed
+	if output.Failed == nil {
+		output.Failed = []InterruptError{}
+	}
+	output.MessageSent = outcome.MessageSent
+	if outcome.MessagePreview != "" {
+		output.Message = outcome.MessagePreview
+	}
+	output.TimedOut = outcome.TimedOut
+	output.Operation = replayedOperationInfo(op, outcome.Admissions)
+	// A replayed failure (including a verification timeout) is terminal for
+	// THIS operation ID: interrupt keys and the follow-up message may already
+	// have landed, so the retry semantics the caller opted into forbid a
+	// second attempt under the same ID.
+	if !outcome.Success && output.Hint == "" {
+		output.Hint = "recorded outcome replayed without re-interrupting; use a new operation ID to interrupt again"
+	}
+	return nil
+}
+
+func nonNilStrings(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
+}
+
+// InterruptReceiptOutcome is the recorded terminal result of a completed
+// interrupt operation as exposed by receipt queries.
+type InterruptReceiptOutcome struct {
+	Success       bool             `json:"success"`
+	InterruptedAt time.Time        `json:"interrupted_at"`
+	CompletedAt   time.Time        `json:"completed_at"`
+	Method        string           `json:"method"`
+	Targets       []string         `json:"targets"`
+	Interrupted   []string         `json:"interrupted"`
+	ReadyForInput []string         `json:"ready_for_input"`
+	Failed        []InterruptError `json:"failed"`
+	MessageSent   bool             `json:"message_sent"`
+	TimedOut      bool             `json:"timed_out"`
+	Error         string           `json:"error,omitempty"`
+	ErrorCode     string           `json:"error_code,omitempty"`
+}
+
+func interruptReceiptOutcomeFromJSON(outcomeJSON string) (*InterruptReceiptOutcome, error) {
+	var outcome interruptOperationOutcome
+	if err := json.Unmarshal([]byte(outcomeJSON), &outcome); err != nil {
+		return nil, fmt.Errorf("decode stored interrupt outcome: %w", err)
+	}
+	failed := outcome.Failed
+	if failed == nil {
+		failed = []InterruptError{}
+	}
+	return &InterruptReceiptOutcome{
+		Success:       outcome.Success,
+		InterruptedAt: outcome.InterruptedAt,
+		CompletedAt:   outcome.CompletedAt,
+		Method:        outcome.Method,
+		Targets:       nonNilStrings(outcome.Targets),
+		Interrupted:   nonNilStrings(outcome.Interrupted),
+		ReadyForInput: nonNilStrings(outcome.ReadyForInput),
+		Failed:        failed,
+		MessageSent:   outcome.MessageSent,
+		TimedOut:      outcome.TimedOut,
+		Error:         outcome.Error,
+		ErrorCode:     outcome.ErrorCode,
+	}, nil
+}
+
+// resolveInterruptTargets picks the panes an interrupt actuates: the explicit
+// selectors when given, otherwise every agent pane (every pane with all).
+// A non-empty agentTypes list then keeps only panes of those types, so
+// --type narrows either set the way it does for --robot-send.
+func resolveInterruptTargets(panes []tmux.Pane, selectors []string, all bool, agentTypes []string) ([]tmux.Pane, error) {
+	var targetPanes []tmux.Pane
+	if len(selectors) > 0 {
+		resolved, err := tmux.ResolvePaneSelectors(panes, selectors, false)
+		if err != nil {
+			return nil, err
+		}
+		targetPanes = resolved
+	} else {
+		for _, pane := range panes {
+			if !all {
+				agentType := interruptPaneAgentType(pane)
+				if pane.Index == 0 && agentType == "unknown" {
+					continue
+				}
+				if agentType == "user" {
+					continue
+				}
+			}
+
+			targetPanes = append(targetPanes, pane)
+		}
+	}
+	return keepPanesOfAgentTypes(targetPanes, agentTypes, interruptPaneAgentType), nil
 }
 
 func unavailableRobotPaneObservation(pane tmux.Pane, observationError string, observedAt time.Time) status.PaneObservation {
@@ -540,7 +840,7 @@ func interruptPaneStateFromObservation(observation status.PaneObservation, agent
 
 	cleanOutput := stripANSI(observation.RawOutput)
 	shortAgentType := translateAgentTypeForStatus(agentType)
-	result.LastOutput = getLastMeaningfulOutput(splitLines(cleanOutput), 200, shortAgentType)
+	result.LastOutput = status.LastMeaningfulOutputLines(splitLines(cleanOutput), shortAgentType, 200)
 	result.State = determineState(observation.RawOutput, agentType)
 	switch observation.Current.Status.State {
 	case status.StateWorking:
@@ -573,53 +873,8 @@ type interruptMessageTarget struct {
 	AgentType tmux.AgentType
 }
 
-// getLastMeaningfulOutput extracts the last meaningful output lines up to maxLen chars
-func getLastMeaningfulOutput(lines []string, maxLen int, agentType string) string {
-	// Guard against invalid maxLen values that would cause slice panic
-	if maxLen < 4 {
-		if maxLen <= 0 {
-			return ""
-		}
-		// Too small for ellipsis, just truncate without it
-		var meaningful []string
-		totalLen := 0
-		for i := len(lines) - 1; i >= 0 && totalLen < maxLen; i-- {
-			line := strings.TrimSpace(lines[i])
-			if line == "" || status.IsPromptLine(line, agentType) {
-				continue
-			}
-			meaningful = append([]string{line}, meaningful...)
-			totalLen += len(line) + 1
-		}
-		result := strings.Join(meaningful, "\n")
-		if len(result) > maxLen {
-			return result[:maxLen]
-		}
-		return result
-	}
-
-	var meaningful []string
-	totalLen := 0
-
-	// Work backwards through lines
-	for i := len(lines) - 1; i >= 0 && totalLen < maxLen; i-- {
-		line := strings.TrimSpace(lines[i])
-		if line == "" {
-			continue
-		}
-
-		// Skip pure prompt lines
-		if status.IsPromptLine(line, agentType) {
-			continue
-		}
-
-		meaningful = append([]string{line}, meaningful...)
-		totalLen += len(line) + 1
-	}
-
-	result := strings.Join(meaningful, "\n")
-	if len(result) > maxLen {
-		return result[:maxLen-3] + "..."
-	}
-	return result
-}
+// The private last-meaningful-output extractor that used to live here was
+// subsumed by status.LastMeaningfulOutputLines (ORI: one reachable
+// implementation). It only skipped blank and prompt lines, so it shared the
+// dashboard's blind spot for the composer box and status line (ntm#322); the
+// shared helper strips those too.

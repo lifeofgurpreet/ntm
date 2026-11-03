@@ -299,6 +299,13 @@ func TestMailCheckValidationErrorRetainsCanonicalFilters(t *testing.T) {
 
 func TestGetMailCheck_DefaultsZeroLimit(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Availability is probed with a cheap liveness GET before any MCP tool
+		// call (ntm#295); answer it like a live server.
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
 		var req agentmail.JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("failed to decode request: %v", err)
@@ -370,6 +377,13 @@ func TestGetMailCheck_DefaultsZeroLimit(t *testing.T) {
 func TestGetMailCheck_HasMoreUsesOverfetch(t *testing.T) {
 	fetchLimits := []int{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Availability is probed with a cheap liveness GET before any MCP tool
+		// call (ntm#295); answer it like a live server.
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
 		var req agentmail.JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("failed to decode request: %v", err)
@@ -452,6 +466,13 @@ func TestGetMailCheck_UsesFullInboxWindowForCounts(t *testing.T) {
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Availability is probed with a cheap liveness GET before any MCP tool
+		// call (ntm#295); answer it like a live server.
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
 		var req agentmail.JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("failed to decode request: %v", err)
@@ -557,6 +578,13 @@ func TestGetMailCheck_AggregatesProjectAgentsWhenAgentOmitted(t *testing.T) {
 	const wantSince = "2026-01-01T00:00:00Z"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Availability is probed with a cheap liveness GET before any MCP tool
+		// call (ntm#295); answer it like a live server.
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
 		var req agentmail.JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("failed to decode request: %v", err)
@@ -588,11 +616,11 @@ func TestGetMailCheck_AggregatesProjectAgentsWhenAgentOmitted(t *testing.T) {
 				case "BlueLake":
 					result = json.RawMessage(`{"result":[
 						{"id":1,"subject":"Shared","from":"Alice","created_ts":"2026-01-02T00:00:00Z","importance":"normal","ack_required":false,"kind":"to","body_md":"shared body"},
-						{"id":2,"subject":"Blue only","from":"Bob","created_ts":"2026-01-03T00:00:00Z","importance":"urgent","ack_required":true,"kind":"to","body_md":"blue body","read_at":"2026-01-03T01:00:00Z"}
+						{"id":2,"subject":"Blue only","from":"Bob","created_ts":"2026-01-03T00:00:00Z","importance":"urgent","ack_required":true,"kind":"to","body_md":"blue body","read_ts":"2026-01-03T01:00:00Z"}
 					]}`)
 				case "GreenStone":
 					result = json.RawMessage(`{"result":[
-						{"id":1,"subject":"Shared","from":"Alice","created_ts":"2026-01-02T00:00:00Z","importance":"normal","ack_required":false,"kind":"to","body_md":"shared body","read_at":"2026-01-02T01:00:00Z"},
+						{"id":1,"subject":"Shared","from":"Alice","created_ts":"2026-01-02T00:00:00Z","importance":"normal","ack_required":false,"kind":"to","body_md":"shared body","read_ts":"2026-01-02T01:00:00Z"},
 						{"id":3,"subject":"Green only","from":"Carol","created_ts":"2026-01-01T00:00:00Z","importance":"normal","ack_required":false,"kind":"to","body_md":"green body"}
 					]}`)
 				default:
@@ -666,6 +694,13 @@ func TestGetMailCheck_BackfillsWhenThreadFilterNeedsOlderMatches(t *testing.T) {
 	fetchLimits := []int{}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Availability is probed with a cheap liveness GET before any MCP tool
+		// call (ntm#295); answer it like a live server.
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
 		var req agentmail.JSONRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("failed to decode request: %v", err)
@@ -778,3 +813,57 @@ func TestMailCheckAgentHintsOmitEmpty(t *testing.T) {
 
 // Note: contains() and containsHelper() are defined in diagnose_test.go
 // and are reused here since we're in the same package
+
+// TestGetMailCheckUsesInjectedConfiguredClient: the CLI hands GetMailCheck its
+// fully configured Agent Mail client (config-file URL, bearer token, hydrated
+// registration tokens). The check must run against that client — proven here
+// by a server that rejects any call without the configured bearer token —
+// rather than constructing a fresh environment-only client.
+func TestGetMailCheckUsesInjectedConfiguredClient(t *testing.T) {
+	const token = "configured-mail-check-token"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Availability is probed with a cheap liveness GET before any MCP tool
+		// call (ntm#295); answer it like a live server.
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer "+token {
+			t.Errorf("Authorization = %q, want configured bearer token", got)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var req agentmail.JSONRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		params, _ := req.Params.(map[string]interface{})
+		switch params["name"] {
+		case "health_check":
+			_ = json.NewEncoder(w).Encode(agentmail.JSONRPCResponse{
+				JSONRPC: "2.0", ID: req.ID, Result: json.RawMessage(`{"status":"ok"}`),
+			})
+		case "fetch_inbox":
+			_ = json.NewEncoder(w).Encode(agentmail.JSONRPCResponse{
+				JSONRPC: "2.0", ID: req.ID, Result: json.RawMessage(`{"result":[]}`),
+			})
+		default:
+			t.Errorf("unexpected Agent Mail tool %v", params["name"])
+		}
+	}))
+	defer server.Close()
+
+	output, err := GetMailCheck(MailCheckOptions{
+		Client:  agentmail.NewClient(agentmail.WithBaseURL(server.URL), agentmail.WithToken(token)),
+		Project: "/repos/example/project",
+		Agent:   "BlueLake",
+	})
+	if err != nil {
+		t.Fatalf("GetMailCheck: %v", err)
+	}
+	if !output.Success {
+		t.Fatalf("GetMailCheck success=false error=%q", output.Error)
+	}
+}

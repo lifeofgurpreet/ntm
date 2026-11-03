@@ -11,7 +11,10 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +22,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/spawnidentity"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -93,12 +97,12 @@ func TestSpawnIdentityCoordinator_LiveHolderKeepsItsName(t *testing.T) {
 		{ID: "%9", PID: 999, Title: session + "__cc_1"},
 	}, nil)
 
-	coordinator := newSpawnIdentityCoordinator(projectKey, session)
-	coordinator.prepareAgent(context.Background(), spawnedAgentInfo{
-		paneIndex: 2, paneID: "%9", paneTitle: session + "__cc_1", agentType: "cc", model: "opus",
+	coordinator := newSpawnIdentityCoordinator(projectKey, session, false)
+	coordinator.PrepareAgent(context.Background(), spawnidentity.Agent{
+		PaneIndex: 2, PaneID: "%9", PaneTitle: session + "__cc_1", AgentType: "cc", Model: "opus",
 	})
 
-	status := coordinator.finalStatus()
+	status := coordinator.Status()
 	if status == nil || status.AgentsRegistered != 1 || status.AgentMap["%9"] != "BraveFalcon" {
 		t.Fatalf("status = %+v, want a fresh BraveFalcon for %%9", status)
 	}
@@ -128,8 +132,10 @@ func TestSpawnIdentityCoordinator_LiveHolderKeepsItsName(t *testing.T) {
 }
 
 // TestSpawnIdentityCoordinator_DeadHolderIsReused keeps the #69 contract:
-// after the holder of a title died, a same-session respawn gets its name
-// back without a server round-trip, and the binding moves to the new pane.
+// after the holder of a title died, a same-session respawn gets its name back
+// and the binding moves to the new pane. One best-effort register_agent
+// re-binds the reused name to the new pane generation server-side; reuse
+// itself never depends on that call succeeding.
 func TestSpawnIdentityCoordinator_DeadHolderIsReused(t *testing.T) {
 	isolateIdentityDirs(t)
 	srv, calledTools := fakeSpawnMailServer(t, "BraveFalcon")
@@ -141,17 +147,17 @@ func TestSpawnIdentityCoordinator_DeadHolderIsReused(t *testing.T) {
 	// %5 is gone; %9 is the respawned pane.
 	stubPaneProbe(t, []tmux.Pane{{ID: "%9", PID: 999, Title: session + "__cc_1"}}, nil)
 
-	coordinator := newSpawnIdentityCoordinator(projectKey, session)
-	coordinator.prepareAgent(context.Background(), spawnedAgentInfo{
-		paneIndex: 1, paneID: "%9", paneTitle: session + "__cc_1", agentType: "cc",
+	coordinator := newSpawnIdentityCoordinator(projectKey, session, false)
+	coordinator.PrepareAgent(context.Background(), spawnidentity.Agent{
+		PaneIndex: 1, PaneID: "%9", PaneTitle: session + "__cc_1", AgentType: "cc",
 	})
 
-	status := coordinator.finalStatus()
+	status := coordinator.Status()
 	if status == nil || status.AgentsRegistered != 1 || status.AgentMap["%9"] != "OldTenant" {
 		t.Fatalf("status = %+v, want OldTenant reused for %%9", status)
 	}
-	if creates := countCreates(calledTools()); creates != 0 {
-		t.Fatalf("identity creations = %d, want 0 (dead slot must be reused)", creates)
+	if creates := countCreates(calledTools()); creates != 1 {
+		t.Fatalf("identity registrations = %d, want exactly 1 (the pane-binding refresh; the dead slot's name must be reused, not recreated)", creates)
 	}
 	if got := readIdentity(t, projectKey, "%9"); got != "OldTenant" {
 		t.Fatalf("identity file for %%9 = %q, want OldTenant", got)
@@ -184,16 +190,44 @@ func TestSpawnIdentityCoordinator_RecycledPaneIDIsDead(t *testing.T) {
 		{ID: "%9", PID: 999, Title: session + "__cc_1"},
 	}, nil)
 
-	coordinator := newSpawnIdentityCoordinator(projectKey, session)
-	coordinator.prepareAgent(context.Background(), spawnedAgentInfo{
-		paneIndex: 1, paneID: "%9", paneTitle: session + "__cc_1", agentType: "cc",
+	coordinator := newSpawnIdentityCoordinator(projectKey, session, false)
+	coordinator.PrepareAgent(context.Background(), spawnidentity.Agent{
+		PaneIndex: 1, PaneID: "%9", PaneTitle: session + "__cc_1", AgentType: "cc",
 	})
 
-	if status := coordinator.finalStatus(); status == nil || status.AgentMap["%9"] != "OldTenant" {
+	if status := coordinator.Status(); status == nil || status.AgentMap["%9"] != "OldTenant" {
 		t.Fatalf("status = %+v, want OldTenant recovered from the dead %%5 binding", status)
 	}
-	if creates := countCreates(calledTools()); creates != 0 {
-		t.Fatalf("identity creations = %d, want 0", creates)
+	if creates := countCreates(calledTools()); creates != 1 {
+		t.Fatalf("identity registrations = %d, want exactly 1 pane-binding refresh for the reused name", creates)
+	}
+}
+
+// TestSpawnIdentityCoordinator_ReuseSurvivesFailedBindingRefresh: the reuse
+// path's server re-registration is strictly best-effort — when the server
+// rejects it, the pane still gets its recovered name (the #69 offline-reuse
+// contract).
+func TestSpawnIdentityCoordinator_ReuseSurvivesFailedBindingRefresh(t *testing.T) {
+	isolateIdentityDirs(t)
+	srv := failingRegistrationMailServer(t)
+	enableFakeAgentMail(t, srv.URL)
+
+	projectKey := t.TempDir()
+	session := "spawn_identity_reuse_offline"
+	seedRegistry(t, session, projectKey, session+"__cc_1", "%5", "OldTenant", 111)
+	stubPaneProbe(t, []tmux.Pane{{ID: "%9", PID: 999, Title: session + "__cc_1"}}, nil)
+
+	coordinator := newSpawnIdentityCoordinator(projectKey, session, false)
+	coordinator.PrepareAgent(context.Background(), spawnidentity.Agent{
+		PaneIndex: 1, PaneID: "%9", PaneTitle: session + "__cc_1", AgentType: "cc",
+	})
+
+	status := coordinator.Status()
+	if status == nil || status.AgentsRegistered != 1 || status.AgentMap["%9"] != "OldTenant" {
+		t.Fatalf("status = %+v, want OldTenant reused despite failed binding refresh", status)
+	}
+	if got := readIdentity(t, projectKey, "%9"); got != "OldTenant" {
+		t.Fatalf("identity file for %%9 = %q, want OldTenant", got)
 	}
 }
 
@@ -210,12 +244,12 @@ func TestSpawnIdentityCoordinator_UnobservableLivenessNeverShares(t *testing.T) 
 	seedRegistry(t, session, projectKey, session+"__cc_1", "%5", "OldTenant", 111)
 	stubPaneProbe(t, nil, errors.New("tmux unreachable"))
 
-	coordinator := newSpawnIdentityCoordinator(projectKey, session)
-	coordinator.prepareAgent(context.Background(), spawnedAgentInfo{
-		paneIndex: 1, paneID: "%9", paneTitle: session + "__cc_1", agentType: "cc",
+	coordinator := newSpawnIdentityCoordinator(projectKey, session, false)
+	coordinator.PrepareAgent(context.Background(), spawnidentity.Agent{
+		PaneIndex: 1, PaneID: "%9", PaneTitle: session + "__cc_1", AgentType: "cc",
 	})
 
-	if status := coordinator.finalStatus(); status == nil || status.AgentMap["%9"] != "BraveFalcon" {
+	if status := coordinator.Status(); status == nil || status.AgentMap["%9"] != "BraveFalcon" {
 		t.Fatalf("status = %+v, want a fresh identity when liveness is unobservable", status)
 	}
 	if creates := countCreates(calledTools()); creates != 1 {
@@ -242,9 +276,9 @@ func TestSpawnIdentityCoordinator_WorktreePanePublishesUnderBothKeys(t *testing.
 	session := "spawn_identity_worktree"
 	stubPaneProbe(t, []tmux.Pane{{ID: "%3", PID: 333, Title: session + "__cc_1"}}, nil)
 
-	coordinator := newSpawnIdentityCoordinator(projectKey, session)
-	coordinator.prepareAgent(context.Background(), spawnedAgentInfo{
-		paneIndex: 1, paneID: "%3", paneTitle: session + "__cc_1", agentType: "cc", paneDir: worktree,
+	coordinator := newSpawnIdentityCoordinator(projectKey, session, false)
+	coordinator.PrepareAgent(context.Background(), spawnidentity.Agent{
+		PaneIndex: 1, PaneID: "%3", PaneTitle: session + "__cc_1", AgentType: "cc", PaneDir: worktree,
 	})
 
 	if got := readIdentity(t, projectKey, "%3"); got != "BraveFalcon" {
@@ -267,9 +301,9 @@ func TestSpawnIdentityCoordinator_WorktreePanePublishesUnderBothKeys(t *testing.
 	}
 
 	// A plain (non-worktree) pane publishes only under the session key.
-	plain := newSpawnIdentityCoordinator(projectKey, session)
-	plain.prepareAgent(context.Background(), spawnedAgentInfo{
-		paneIndex: 2, paneID: "%4", paneTitle: session + "__cc_2", agentType: "cc",
+	plain := newSpawnIdentityCoordinator(projectKey, session, false)
+	plain.PrepareAgent(context.Background(), spawnidentity.Agent{
+		PaneIndex: 2, PaneID: "%4", PaneTitle: session + "__cc_2", AgentType: "cc",
 	})
 	if got := readIdentity(t, projectKey, "%4"); got != "BraveFalcon" {
 		t.Fatalf("plain pane identity under session key = %q", got)
@@ -300,7 +334,50 @@ func TestSpawnWorktreeInjectsAgentMailProject(t *testing.T) {
 	if !strings.Contains(body, `opts.PaneEnv["AGENT_MAIL_PROJECT"]`) {
 		t.Fatal("spawn must defer to an explicit --pane-env AGENT_MAIL_PROJECT value")
 	}
-	if !strings.Contains(body, `paneDir:`) {
-		t.Fatal("spawn must hand the pane's launch directory to prepareAgent so worktree identities publish under both keys")
+	if !strings.Contains(body, `PaneDir:`) {
+		t.Fatal("spawn must hand the pane's launch directory to PrepareAgent so worktree identities publish under both keys")
 	}
 }
+
+// failingRegistrationMailServer answers health_check and ensure_project but
+// rejects every registration call, simulating a reachable server that refuses
+// the best-effort pane-binding refresh.
+func failingRegistrationMailServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     interface{} `json:"id"`
+			Method string      `json:"method"`
+			Params struct {
+				Name string `json:"name"`
+			} `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		var result interface{}
+		switch req.Params.Name {
+		case "health_check":
+			result = map[string]interface{}{"status": "ok"}
+		case "ensure_project":
+			result = map[string]interface{}{"id": 1, "slug": "proj", "human_key": "proj"}
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"jsonrpc": "2.0", "id": req.ID,
+				"error": map[string]interface{}{"code": -32000, "message": "registration refused"},
+			})
+			return
+		}
+		raw, _ := json.Marshal(result)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"jsonrpc": "2.0", "id": req.ID, "result": json.RawMessage(raw),
+		})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// The publishIdentity receipt-preservation tests moved with the coordinator
+// to internal/spawnidentity (coordinator_test.go there).

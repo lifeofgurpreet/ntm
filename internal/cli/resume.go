@@ -16,6 +16,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	dispatchsvc "github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/handoff"
+	"github.com/Dicklesworthstone/ntm/internal/plugins"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	sessionpkg "github.com/Dicklesworthstone/ntm/internal/session"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -73,15 +74,18 @@ type ResumeInjectInfo struct {
 
 func newResumeCmd() *cobra.Command {
 	var (
-		fromPath string
-		spawn    bool
-		inject   bool
-		dryRun   bool
-		ccCount  int
-		codCount int
-		gmiCount int
-		agyCount int
+		fromPath    string
+		spawn       bool
+		inject      bool
+		dryRun      bool
+		ccCount     int
+		codCount    int
+		gmiCount    int
+		agyCount    int
+		ompCount    int
+		pluginSpecs AgentSpecs
 	)
+	pluginMap := make(map[string]plugins.AgentPlugin)
 
 	cmd := &cobra.Command{
 		Use:   "resume [session]",
@@ -106,7 +110,7 @@ Examples:
 			}
 			effectiveJSON := IsJSONOutput()
 			err := runResume(cmd, sessionName, fromPath, spawn, inject, dryRun,
-				ccCount, codCount, gmiCount, agyCount, effectiveJSON)
+				resumeSpawnCounts{CC: ccCount, Cod: codCount, Gmi: gmiCount, Agy: agyCount, Omp: ompCount, Plugins: pluginSpecs, PluginMap: pluginMap}, effectiveJSON)
 			return outputResumeCommandError(cmd, resumeAction(spawn, inject), effectiveJSON, err)
 		},
 	}
@@ -119,12 +123,62 @@ Examples:
 	cmd.Flags().IntVar(&codCount, "cod", 0, "Number of Codex agents to spawn (requires --spawn)")
 	cmd.Flags().IntVar(&gmiCount, "gmi", 0, "Number of Gemini agents to spawn (requires --spawn)")
 	cmd.Flags().IntVar(&agyCount, "agy", 0, "Number of Antigravity agents to spawn (requires --spawn)")
+	cmd.Flags().IntVar(&ompCount, "omp", 0, "Number of Oh My Pi (omp) agents to spawn (requires --spawn)")
+	// Pin the same plugin configuration used to register spawn selectors.
+	// Pi is a separate plugin from the built-in omp agent.
+	for _, p := range registerAgentPluginTypes(pluginAgentsDirForArgs(os.Args[1:])) {
+		registerPluginAgentFlags(cmd, p, &pluginSpecs)
+		pluginMap[p.Name] = p
+	}
 
 	return cmd
 }
 
+// resumeSpawnCounts carries the per-type agent counts for `resume --spawn`.
+type resumeSpawnCounts struct {
+	CC, Cod, Gmi, Agy, Omp int
+	Plugins                AgentSpecs
+	PluginMap              map[string]plugins.AgentPlugin
+}
+
+func (c resumeSpawnCounts) total() int {
+	total := c.CC + c.Cod + c.Gmi + c.Agy + c.Omp
+	for _, spec := range c.Plugins {
+		total += spec.Count
+	}
+	return total
+}
+
+func (c resumeSpawnCounts) spawnOptions(sessionName, projectDir string) SpawnOptions {
+	opts := SpawnOptions{
+		Session:            sessionName,
+		ProjectDirOverride: projectDir,
+		CCCount:            c.CC,
+		CodCount:           c.Cod,
+		GmiCount:           c.Gmi,
+		AgyCount:           c.Agy,
+		OmpCount:           c.Omp,
+		UserPane:           true,
+		NoHooks:            true,
+		PluginMap:          c.PluginMap,
+	}
+	if len(c.Plugins) > 0 {
+		// Explicit agents bypass spawn's legacy count expansion. Retain all
+		// built-ins alongside each plugin's model and reasoning effort.
+		specs := AgentSpecs{
+			{Type: AgentTypeClaude, Count: c.CC},
+			{Type: AgentTypeCodex, Count: c.Cod},
+			{Type: AgentTypeGemini, Count: c.Gmi},
+			{Type: AgentTypeAntigravity, Count: c.Agy},
+			{Type: AgentTypeOmp, Count: c.Omp},
+		}
+		opts.Agents = append(specs, c.Plugins...).Flatten()
+	}
+	return opts
+}
+
 func runResume(cmd *cobra.Command, sessionName, fromPath string, spawn, inject, dryRun bool,
-	ccCount, codCount, gmiCount, agyCount int, jsonFormat bool) error {
+	counts resumeSpawnCounts, jsonFormat bool) error {
 
 	// Check global JSON flag
 	if IsJSONOutput() {
@@ -274,7 +328,7 @@ func runResume(cmd *cobra.Command, sessionName, fromPath string, spawn, inject, 
 			}
 		}
 		return spawnWithHandoff(cmd, sessionName, h, path, handoffInfo,
-			ccCount, codCount, gmiCount, agyCount, projectDir, jsonFormat)
+			counts, projectDir, jsonFormat)
 	}
 
 	if inject {
@@ -341,22 +395,22 @@ func displayHandoff(cmd *cobra.Command, h *handoff.Handoff, path string, age tim
 }
 
 func spawnWithHandoff(cmd *cobra.Command, sessionName string, h *handoff.Handoff, path string,
-	info *ResumeHandoffInfo, ccCount, codCount, gmiCount, agyCount int, projectDir string, jsonFormat bool) error {
+	info *ResumeHandoffInfo, counts resumeSpawnCounts, projectDir string, jsonFormat bool) error {
 
 	if !jsonFormat {
 		slog.Info("spawning with handoff",
 			"session", sessionName,
-			"cc", ccCount,
-			"cod", codCount,
-			"gmi", gmiCount,
-			"agy", agyCount,
+			"cc", counts.CC,
+			"cod", counts.Cod,
+			"gmi", counts.Gmi,
+			"agy", counts.Agy,
+			"omp", counts.Omp,
 		)
 	}
 
 	// Validate counts
-	totalAgents := ccCount + codCount + gmiCount + agyCount
-	if totalAgents == 0 {
-		return fmt.Errorf("--spawn requires at least one agent count (--cc, --cod, --gmi, or --agy)")
+	if counts.total() == 0 {
+		return fmt.Errorf("--spawn requires at least one agent count (--cc, --cod, --gmi, --agy, --omp, or a plugin agent flag)")
 	}
 
 	// Format context for injection
@@ -371,16 +425,7 @@ func spawnWithHandoff(cmd *cobra.Command, sessionName string, h *handoff.Handoff
 		return fmt.Errorf("session %q already exists; use --inject to add context to existing session", sessionName)
 	}
 
-	opts := SpawnOptions{
-		Session:            sessionName,
-		ProjectDirOverride: projectDir,
-		CCCount:            ccCount,
-		CodCount:           codCount,
-		GmiCount:           gmiCount,
-		AgyCount:           agyCount,
-		UserPane:           true,
-		NoHooks:            true,
-	}
+	opts := counts.spawnOptions(sessionName, projectDir)
 
 	spawnFn := resumeSpawnLifecycle(jsonFormat)
 	if err := spawnFn(cmd.Context(), opts); err != nil {
@@ -410,7 +455,7 @@ func spawnWithHandoff(cmd *cobra.Command, sessionName string, h *handoff.Handoff
 	var dispatchErr error
 	agentPanes := resumeAgentPanes(panes)
 	if len(agentPanes) == 0 {
-		failedCount = totalAgents
+		failedCount = counts.total()
 		dispatchErr = errors.New("no agent panes found after spawn; handoff context was not delivered")
 	} else {
 		service, serviceErr := dispatchsvc.NewService(dispatchsvc.Ports{

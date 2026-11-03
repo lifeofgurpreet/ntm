@@ -39,6 +39,63 @@ type WatermarkStore interface {
 // WatermarkTypeVelocity is the watermark type used for velocity tracker baselines.
 const WatermarkTypeVelocity = "velocity"
 
+// WatermarkTypeActivityState is the watermark type that records when a pane
+// entered the activity state it is currently in. A StateClassifier is
+// per-process state, so a one-shot `ntm activity` always reported a state that
+// had "just" started; the watermark is what makes state age survive separate
+// invocations.
+const WatermarkTypeActivityState = "activity_state"
+
+// ObserveActivityState reconciles one classified pane state against its durable
+// watermark and returns the time that state was first observed.
+//
+// scope must identify a single pane LIFETIME — session, tmux pane ID, and the
+// pane's PID — so a recycled tmux pane ID cannot inherit the age of whatever
+// ran there before.
+//
+// A nil store degrades to the observation time. Store errors are returned so a
+// caller can fall back to its in-process classifier result instead of failing
+// an otherwise healthy query; the returned time is always usable.
+func ObserveActivityState(store WatermarkStore, scope string, activityState AgentState, observedAt time.Time) (time.Time, error) {
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
+	observedAt = observedAt.UTC()
+	if store == nil {
+		return observedAt, nil
+	}
+
+	previous, err := store.GetWatermark(WatermarkTypeActivityState, scope)
+	if err != nil {
+		return observedAt, err
+	}
+	// Same state as last time, with a watermark that is not in the future:
+	// keep the original entry time so duration grows across invocations.
+	if previous != nil &&
+		previous.Consumer == string(activityState) &&
+		previous.LastTs != nil &&
+		!previous.LastTs.After(observedAt) {
+		return previous.LastTs.UTC(), nil
+	}
+
+	createdAt := observedAt
+	if previous != nil && !previous.CreatedAt.IsZero() {
+		createdAt = previous.CreatedAt
+	}
+	stateSince := observedAt
+	if err := store.SetWatermark(&state.OutputWatermark{
+		WatermarkType: WatermarkTypeActivityState,
+		Scope:         scope,
+		LastTs:        &stateSince,
+		Consumer:      string(activityState),
+		CreatedAt:     createdAt,
+		UpdatedAt:     observedAt,
+	}); err != nil {
+		return observedAt, err
+	}
+	return stateSince, nil
+}
+
 // VelocitySample represents a single velocity measurement at a point in time.
 type VelocitySample struct {
 	Timestamp  time.Time `json:"timestamp"`
@@ -510,6 +567,12 @@ type OutputSequenceInfo struct {
 	Epoch     string `json:"epoch"`
 	Sequence  int64  `json:"sequence"`
 	ChangedAt string `json:"changed_at,omitempty"`
+
+	// advanced records whether THIS observation moved the sequence, i.e. the
+	// pane tail differs from what the previous observer (possibly another
+	// process) saw. Internal: it feeds the status classifier's output
+	// evidence (#288) and is not part of the wire schema.
+	advanced bool
 }
 
 // outputSeqScope builds the durable watermark scope for a pane. The tmux
@@ -601,6 +664,7 @@ func advanceOutputSequence(store WatermarkStore, scope, contentHash string, obse
 	}
 	info.Sequence = wm.LastCursor
 	info.ChangedAt = changedAt.Format(time.RFC3339)
+	info.advanced = true
 	return info, nil
 }
 
@@ -688,6 +752,11 @@ type AgentActivity struct {
 
 	// RateLimited indicates the agent has hit provider rate limits.
 	RateLimited bool `json:"rate_limited,omitempty"`
+
+	// Composer work is independent of output activity: a waiting agent can
+	// still hold an unsent draft or an already queued follow-up.
+	UnsubmittedInput bool `json:"unsubmitted_input,omitempty"`
+	QueuedMessages   bool `json:"queued_messages,omitempty"`
 }
 
 // StateClassifier combines velocity and pattern signals to classify agent state.
@@ -696,6 +765,7 @@ type StateClassifier struct {
 	patternLibrary     *PatternLibrary
 	agentType          string
 	paneWidth          int
+	paneHeight         int
 	stallThreshold     time.Duration
 	hysteresisDuration time.Duration
 
@@ -718,7 +788,12 @@ type ClassifierConfig struct {
 	AgentType string
 	// PaneWidth is the real tmux pane width; used to widen the live tail
 	// window on narrow panes (bd-eeifh). Zero keeps the calibrated budget.
-	PaneWidth          int
+	PaneWidth int
+	// PaneHeight is the real tmux pane height. When set, transient state
+	// markers are classified from the pane's VISIBLE screen only: a capture
+	// includes scrollback, so on a short pane a spinner that scrolled off
+	// hours ago otherwise stays inside the "live tail" forever.
+	PaneHeight         int
 	StallThreshold     time.Duration
 	HysteresisDuration time.Duration
 	PatternLibrary     *PatternLibrary
@@ -757,6 +832,7 @@ func NewStateClassifier(paneID string, cfg *ClassifierConfig) *StateClassifier {
 		patternLibrary:     patternLib,
 		agentType:          cfg.AgentType,
 		paneWidth:          cfg.PaneWidth,
+		paneHeight:         cfg.PaneHeight,
 		stallThreshold:     stallThreshold,
 		hysteresisDuration: hysteresis,
 		currentState:       StateUnknown,
@@ -823,10 +899,24 @@ func (sc *StateClassifier) classifyInternal(sample *VelocitySample) (*AgentActiv
 	// stale "failed" or "api error" text high in scrollback must not pin a
 	// pane to ERROR after its TUI has visibly moved on. Fresh errors inside
 	// the live tail still classify as ERROR.
-	liveContent := lastNLines(content, util.WidthAdaptiveTailLines(sc.paneWidth, liveThinkingWindowLines))
+	// The live window can never be larger than what is actually on screen:
+	// capture-pane returns scrollback too, so a fixed tail on a short pane
+	// keeps a long-gone spinner permanently "live".
+	visibleContent := content
+	if sc.paneHeight > 0 {
+		visibleContent = util.GetLastNLines(content, sc.paneHeight)
+	}
+	liveContent := lastNLines(visibleContent, util.WidthAdaptiveTailLines(sc.paneWidth, liveThinkingWindowLines))
 	liveMatches := sc.patternLibrary.Match(liveContent, sc.agentType)
 	effectiveMatches := filterThinkingToLive(matches, liveMatches)
 	effectiveMatches = filterErrorToLiveWithCurrentSignal(effectiveMatches, liveMatches)
+	effectiveMatches = filterClaudeToolOutputErrors(effectiveMatches, visibleContent, sc.agentType, sc.paneWidth)
+	effectiveMatches = reconcileClaudeLiveness(effectiveMatches, visibleContent, sc.agentType, sc.paneWidth)
+	for _, m := range effectiveMatches {
+		if m.Pattern == claudeFinishedTurnPattern {
+			detectedPatterns = append(detectedPatterns, m.Pattern)
+		}
+	}
 
 	// Calculate proposed state and confidence
 	proposedState, confidence, trigger := sc.classifyState(velocity, effectiveMatches)
@@ -845,6 +935,7 @@ func (sc *StateClassifier) classifyInternal(sample *VelocitySample) (*AgentActiv
 	// `DetectedPatterns` deliberately keeps the unfiltered view because it
 	// is an observability surface, not a state predicate.
 	rateLimited := isRateLimitPatternMatch(effectiveMatches)
+	composer := tmux.InspectComposer(visibleContent, tmux.AgentType(sc.agentType))
 
 	// Build result
 	activity := &AgentActivity{
@@ -858,6 +949,8 @@ func (sc *StateClassifier) classifyInternal(sample *VelocitySample) (*AgentActiv
 		StateHistory:     sc.getHistoryCopy(),
 		LastOutput:       sc.velocityTracker.LastOutputTime(),
 		RateLimited:      rateLimited,
+		UnsubmittedInput: composer.HoldsText,
+		QueuedMessages:   composer.QueuedMessages,
 	}
 
 	return activity, nil
@@ -879,6 +972,68 @@ var rateLimitPatternNames = map[string]bool{
 // known rate-limit pattern.  This bridges the gap between the generic
 // CategoryError classification and the explicit RateLimited flag that wait
 // conditions and health surfaces depend on.
+// filterClaudeToolOutputErrors drops error matches from a Claude pane whose
+// newest turn marker is a live spinner or a completed turn. Claude prints its
+// own tool results inline ("⎿  Error: Exit code 1", compiler and test output),
+// and the generic error patterns cannot tell those from the agent failing; the
+// ordering-aware turn parser can. Rate-limit banners are kept: they are the
+// provider talking, and their own live-window rules decide them.
+func filterClaudeToolOutputErrors(matches []PatternMatch, content, agentType string, paneWidth int) []PatternMatch {
+	if normalizeAgentType(agentType) != "claude" {
+		return matches
+	}
+	switch agent.DetectClaudeTurnState(content, paneWidth) {
+	case agent.ClaudeTurnWorking, agent.ClaudeTurnEnded:
+	default:
+		return matches
+	}
+	out := make([]PatternMatch, 0, len(matches))
+	for _, m := range matches {
+		if m.Category == CategoryError && !rateLimitPatternNames[m.Pattern] {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// claudeFinishedTurnPattern names the idle evidence reconcileClaudeLiveness
+// contributes for a Claude pane at its input box after a finished turn.
+const claudeFinishedTurnPattern = "claude_finished_turn"
+
+// reconcileClaudeLiveness makes a Claude pane's activity agree with the
+// ordering-aware liveness rule dispatch already trusts (IsLiveBusy defers to
+// agent.ClaudeActivelyWorking). Without it, idle Claude panes classified
+// UNKNOWN, or THINKING on a stale spinner frame, while --robot-is-working
+// called them idle.
+//
+// Thinking matches are dropped only on positive evidence that the turn is
+// over: a completion line is Claude's newest marker, which Claude prints only
+// after the turn ends. Absent that, generic thinking evidence stays, so an
+// unrecognized spinner variant still fails closed as busy. The finished-turn
+// layouts the generic prompt pattern misses (the input box holding queued
+// text, the "⏵⏵" footer) count as idle evidence whenever no live spinner is
+// Claude's newest marker, the gating ClaudeIdlePromptShowing requires.
+func reconcileClaudeLiveness(matches []PatternMatch, content, agentType string, paneWidth int) []PatternMatch {
+	if normalizeAgentType(agentType) != "claude" || agent.ClaudeActivelyWorking(content, paneWidth) {
+		return matches
+	}
+	turnEnded := agent.DetectClaudeTurnState(content, paneWidth) == agent.ClaudeTurnEnded
+	out := make([]PatternMatch, 0, len(matches)+1)
+	hasIdle := false
+	for _, m := range matches {
+		if m.Category == CategoryThinking && turnEnded {
+			continue
+		}
+		hasIdle = hasIdle || m.Category == CategoryIdle
+		out = append(out, m)
+	}
+	if !hasIdle && agent.ClaudeIdlePromptShowing(content) {
+		out = append(out, PatternMatch{Pattern: claudeFinishedTurnPattern, Category: CategoryIdle, State: StateWaiting})
+	}
+	return out
+}
+
 func isRateLimitPatternMatch(matches []PatternMatch) bool {
 	for _, m := range matches {
 		if rateLimitPatternNames[m.Pattern] {
@@ -928,6 +1083,12 @@ func IsLiveBusy(scrollback string, agentType string, paneWidth int) bool {
 	if normalizeAgentType(agentType) == "claude" {
 		return agent.ClaudeActivelyWorking(scrollback, paneWidth)
 	}
+	// omp: the composer-anchored structural parser is the single source of
+	// truth (spinner+timer, Esc-hint line, pending steering), shared with the
+	// parser, status, and delivery layers.
+	if normalizeAgentType(agentType) == "omp" {
+		return agent.OmpActivelyWorking(scrollback, paneWidth)
+	}
 
 	live := lastNLines(scrollback, util.WidthAdaptiveTailLines(paneWidth, liveThinkingWindowLines))
 	if live == "" {
@@ -942,11 +1103,21 @@ func IsLiveBusy(scrollback string, agentType string, paneWidth int) bool {
 // not apply it to user or unknown panes where ordinary shell output can match.
 // paneWidth is the real tmux pane width (bd-eeifh); pass 0 when unknown.
 func isAIAgentLiveBusy(scrollback, agentType string, paneWidth int) bool {
-	canonicalType := agent.AgentType(agentType).Canonical()
-	if !canonicalType.IsValid() || canonicalType == agent.AgentTypeUser || canonicalType == agent.AgentTypeUnknown {
+	if !isAIAgentPaneType(agentType) {
 		return false
 	}
-	return IsLiveBusy(scrollback, string(canonicalType), paneWidth)
+	return IsLiveBusy(scrollback, string(agent.AgentType(agentType).Canonical()), paneWidth)
+}
+
+// isAIAgentPaneType reports whether agentType names an AI agent pane: a
+// built-in agent type or a registered agent plugin (ntm#260). User, unknown
+// and unrecognized types are not agent panes.
+func isAIAgentPaneType(agentType string) bool {
+	canonicalType := agent.AgentType(agentType).Canonical()
+	if canonicalType == agent.AgentTypeUser || canonicalType == agent.AgentTypeUnknown {
+		return false
+	}
+	return canonicalType.IsValid() || agent.IsPluginType(canonicalType)
 }
 
 // lastNLines returns the last n non-empty-slice lines of s, preserving
@@ -1105,7 +1276,14 @@ func isAuthoritativeLiveWorkPattern(name string) bool {
 		"codex_thinking_bullet",
 		"agy_esc_cancel",
 		"grok_spinner_phase",
-		"grok_esc_cancel":
+		"grok_esc_cancel",
+		"omp_status_timer",
+		"omp_esc_hint",
+		"omp_steering",
+		"omp_subagents",
+		// A plugin's declared Working patterns are, by contract, chrome its
+		// TUI renders only while a turn is in flight (ntm#260).
+		pluginWorkingPattern:
 		return true
 	default:
 		return false
@@ -1277,6 +1455,13 @@ func (sc *StateClassifier) SetAgentType(agentType string) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	sc.agentType = agentType
+}
+
+func (sc *StateClassifier) setPaneDimensions(width, height int) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.paneWidth = width
+	sc.paneHeight = height
 }
 
 // GetStateHistory returns the state transition history.

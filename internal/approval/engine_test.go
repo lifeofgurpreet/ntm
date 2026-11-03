@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/state"
+	"github.com/Dicklesworthstone/ntm/internal/tools"
 )
 
 func setupTestStore(t *testing.T) *state.Store {
@@ -35,6 +37,99 @@ func setupTestStore(t *testing.T) *state.Store {
 	})
 
 	return store
+}
+
+// TestRequestMirrorsToInstalledSLB files SLB-required approvals in a temp slb
+// project and checks that a requester session in the environment is what
+// makes the engine mirror them into slb.
+func TestRequestMirrorsToInstalledSLB(t *testing.T) {
+	if _, err := exec.LookPath("slb"); err != nil {
+		t.Skip("slb not installed")
+	}
+	store := setupTestStore(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Chdir(t.TempDir())
+	if out, err := exec.Command("slb", "init", "--json").CombinedOutput(); err != nil {
+		t.Fatalf("slb init: %v\n%s", err, out)
+	}
+	raw, err := exec.Command("slb", "session", "start", "--agent", "requester", "--program", "ntm-test", "--model", "test", "--json").Output()
+	var session struct {
+		SessionID string `json:"session_id"`
+	}
+	if err != nil || json.Unmarshal(raw, &session) != nil || session.SessionID == "" {
+		t.Fatalf("slb session start: %s, %v", raw, err)
+	}
+
+	engine := New(store, nil, nil, DefaultConfig())
+	ctx := context.Background()
+	request := func(resource string) *state.Approval {
+		t.Helper()
+		approval, err := engine.Request(ctx, RequestParams{
+			Action: "force_release", Resource: resource, Reason: "holder is stale",
+			RequestedBy: "alice", RequiresSLB: true,
+		})
+		if err != nil {
+			t.Fatalf("Request(%s): %v", resource, err)
+		}
+		return approval
+	}
+
+	t.Setenv("SLB_SESSION_ID", "")
+	if plain := request("internal/a.go"); plain.CorrelationID != "" {
+		t.Fatalf("without an slb session the approval was correlated to %q", plain.CorrelationID)
+	}
+
+	t.Setenv("SLB_SESSION_ID", session.SessionID)
+	mirrored := request("internal/b.go")
+	requestID, ok := strings.CutPrefix(mirrored.CorrelationID, "slb:")
+	if !ok || requestID == "" {
+		t.Fatalf("CorrelationID = %q, want slb:<request_id>", mirrored.CorrelationID)
+	}
+	raw, err = exec.Command("slb", "pending", "--json").Output()
+	var pending []struct {
+		RequestID string `json:"request_id"`
+		Command   string `json:"command"`
+	}
+	if err != nil || json.Unmarshal(raw, &pending) != nil {
+		t.Fatalf("slb pending: %s, %v", raw, err)
+	}
+	if len(pending) != 1 || pending[0].RequestID != requestID || pending[0].Command != "ntm approval: force_release internal/b.go" {
+		t.Fatalf("slb pending = %+v, want only request %s for internal/b.go", pending, requestID)
+	}
+
+	// A decision a reviewer makes in slb flows back into the ntm approval.
+	raw, err = exec.Command("slb", "session", "start", "--agent", "reviewer", "--program", "ntm-test", "--model", "test", "--json").Output()
+	var reviewer tools.SLBSession
+	var started map[string]any
+	if err != nil || json.Unmarshal(raw, &started) != nil {
+		t.Fatalf("slb session start (reviewer): %s, %v", raw, err)
+	}
+	reviewer.ID, _ = started["session_id"].(string)
+	reviewer.Key, _ = started["session_key"].(string)
+	review := func(verb, slbRequest string, extra ...string) {
+		t.Helper()
+		args := append([]string{verb, "--json", "--session-id", reviewer.ID, "--session-key", reviewer.Key}, extra...)
+		if out, err := exec.Command("slb", append(args, "--", slbRequest)...).CombinedOutput(); err != nil {
+			t.Fatalf("slb %s: %v\n%s", verb, err, out)
+		}
+	}
+
+	if checked, err := engine.Check(ctx, mirrored.ID); err != nil || checked.Status != state.ApprovalPending {
+		t.Fatalf("before any slb review: %+v, %v; want pending", checked, err)
+	}
+	review("approve", requestID)
+	approved, err := engine.Check(ctx, mirrored.ID)
+	if err != nil || approved.Status != state.ApprovalApproved || approved.ApprovedBy != "slb:reviewer" {
+		t.Fatalf("after slb approve: %+v, %v; want approved by slb:reviewer", approved, err)
+	}
+
+	rejected := request("internal/c.go")
+	rejectedRequest, _ := strings.CutPrefix(rejected.CorrelationID, "slb:")
+	review("reject", rejectedRequest, "--reason", "holder is still active")
+	denied, err := engine.Check(ctx, rejected.ID)
+	if err != nil || denied.Status != state.ApprovalDenied || denied.DeniedReason != "holder is still active" {
+		t.Fatalf("after slb reject: %+v, %v; want denied with the reviewer's reason", denied, err)
+	}
 }
 
 func TestNewEngine(t *testing.T) {
@@ -475,9 +570,10 @@ func TestParseSLBRequestID(t *testing.T) {
 	}{
 		{"empty", nil, ""},
 		{"empty bytes", json.RawMessage{}, ""},
-		{"valid id", json.RawMessage(`{"id":"req-123"}`), "req-123"},
+		{"valid request_id", json.RawMessage(`{"request_id":"a04e0596-845a-48fe-8e6f-1b88c8698b31","status":"pending"}`), "a04e0596-845a-48fe-8e6f-1b88c8698b31"},
+		{"bare id is not slb's key", json.RawMessage(`{"id":"req-123"}`), ""},
 		{"no id field", json.RawMessage(`{"status":"pending"}`), ""},
-		{"id not string", json.RawMessage(`{"id":42}`), ""},
+		{"id not string", json.RawMessage(`{"request_id":42}`), ""},
 		{"invalid json", json.RawMessage(`{invalid}`), ""},
 	}
 

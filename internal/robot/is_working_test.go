@@ -3,7 +3,12 @@ package robot
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +16,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
 func TestDefaultIsWorkingOptions(t *testing.T) {
@@ -62,6 +68,203 @@ func TestGetIsWorkingCanceledContextReturnsTimeoutWithoutObservation(t *testing.
 	}
 	if out == nil || out.Success || out.ErrorCode != ErrCodeTimeout || !strings.Contains(strings.ToLower(out.Error), "canceled") {
 		t.Fatalf("canceled is-working output=%+v", out)
+	}
+}
+
+// Exercise the public JSON surface with two Antigravity panes sharing one
+// active window. Every invocation creates a fresh observer, matching a robot
+// polling loop: the idle verdict cannot depend on prior capture history.
+func TestPrintIsWorkingAntigravityIdleWithBusySibling(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("deterministic tmux transport requires a POSIX shell")
+	}
+	const transport = `#!/bin/sh
+set -eu
+case "$1" in
+  -V) printf 'tmux 3.6a\n' ;;
+  has-session) ;;
+  list-panes) printf '%s\n' "$NTM_AGY_TEST_PANES" ;;
+  capture-pane)
+    target=
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = -t ]; then shift; target="$1"; break; fi
+      shift
+    done
+    case "$target" in
+      %1) printf '%s\n' "$NTM_AGY_TEST_IDLE" ;;
+      %2) printf '%s\n' "$NTM_AGY_TEST_WORKING" ;;
+      *) printf 'unexpected capture target: %s\n' "$target" >&2; exit 1 ;;
+    esac
+    ;;
+  *) printf 'unexpected tmux command: %s\n' "$*" >&2; exit 1 ;;
+esac
+`
+	binary := filepath.Join(t.TempDir(), "tmux")
+	if err := os.WriteFile(binary, []byte(transport), 0o700); err != nil {
+		t.Fatalf("write tmux transport: %v", err)
+	}
+	t.Setenv("NTM_TMUX_BINARY", binary)
+	t.Setenv("NTM_AGY_TEST_IDLE", "Implemented the requested change.\n──────────────────────────────────────────────────\n>\n──────────────────────────────────────────────────\n? for shortcuts")
+	t.Setenv("NTM_AGY_TEST_WORKING", "Inspecting the project.\n──────────────────────────────────────────────────\n>\n──────────────────────────────────────────────────\nesc to cancel")
+	originalFormat := GetOutputFormat()
+	SetOutputFormat(FormatJSON)
+	t.Cleanup(func() { SetOutputFormat(originalFormat) })
+
+	for range 2 {
+		activity := strconv.FormatInt(time.Now().Unix(), 10)
+		rows := make([]string, 0, 2)
+		for index := 1; index <= 2; index++ {
+			rows = append(rows, strings.Join([]string{
+				fmt.Sprintf("%%%d", index), strconv.Itoa(index), fmt.Sprintf("s__agy_%d", index),
+				"agy", "160", "40", "0", activity, strconv.Itoa(os.Getpid()), "0", "agy", "", "", "0",
+			}, tmux.FieldSeparator))
+		}
+		t.Setenv("NTM_AGY_TEST_PANES", strings.Join(rows, "\n"))
+		stdout, err := captureStdout(t, func() error {
+			return PrintIsWorking(t.Context(), IsWorkingOptions{Session: "s", LinesCaptured: 100})
+		})
+		if err != nil {
+			t.Fatalf("PrintIsWorking() error = %v; stdout = %q", err, stdout)
+		}
+		var output IsWorkingOutput
+		if err := json.Unmarshal([]byte(stdout), &output); err != nil {
+			t.Fatalf("PrintIsWorking() did not emit one JSON document: %v; stdout = %q", err, stdout)
+		}
+		if !output.Success || output.Summary.TotalPanes != 2 || output.Summary.IdleCount != 1 || output.Summary.WorkingCount != 1 {
+			t.Fatalf("unexpected work-state summary: %+v", output)
+		}
+		idle, ok := output.Panes["1"]
+		if !ok || idle.AgentType != "agy" || !idle.IsIdle || idle.IsWorking || !idle.SafeToDispatch || idle.Recommendation != string(agent.RecommendSafeToRestart) {
+			t.Fatalf("idle agy pane in a busy window = %+v, want dispatchable idle", idle)
+		}
+		if idle.ObservationState != "idle" || idle.ObservationFreshness != "fresh" {
+			t.Fatalf("idle agy observation = %q/%q, want idle/fresh", idle.ObservationState, idle.ObservationFreshness)
+		}
+		working, ok := output.Panes["2"]
+		if !ok || !working.IsWorking || working.IsIdle || working.SafeToDispatch || working.Recommendation != string(agent.RecommendDoNotInterrupt) {
+			t.Fatalf("working agy sibling = %+v, want protected active work", working)
+		}
+	}
+}
+
+// A short pane's historical markers must not override the canonical visible
+// frame, and a final parser or modal blocker must veto SafeToDispatch even
+// when the canonical observation recognizes idle composer chrome.
+func TestPrintIsWorkingUsesVisibleFrameAndFinalDispatchVerdict(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("deterministic tmux transport requires a POSIX shell")
+	}
+	const transport = `#!/bin/sh
+set -eu
+case "$1" in
+  -V) printf 'tmux 3.6a\n' ;;
+  has-session) ;;
+  list-panes) printf '%s\n' "$NTM_WORK_FRAME_PANES" ;;
+  capture-pane) printf '%s\n' "$NTM_WORK_FRAME_CAPTURE" ;;
+  *) printf 'unexpected tmux command: %s\n' "$*" >&2; exit 1 ;;
+esac
+`
+	binary := filepath.Join(t.TempDir(), "tmux")
+	if err := os.WriteFile(binary, []byte(transport), 0o700); err != nil {
+		t.Fatalf("write tmux transport: %v", err)
+	}
+	t.Setenv("NTM_TMUX_BINARY", binary)
+	originalFormat := GetOutputFormat()
+	SetOutputFormat(FormatJSON)
+	t.Cleanup(func() { SetOutputFormat(originalFormat) })
+
+	const codexIdle = "› Ask Codex to do anything\n47% context left\n? for shortcuts"
+	const agyIdle = ">\n──────────────────────────────────────────────────\n? for shortcuts"
+	const codexBusy = "• Working (12s • esc to interrupt)\n" + codexIdle
+	const agyBusy = ">\n──────────────────────────────────────────────────\nesc to cancel"
+	for _, tc := range []struct {
+		name            string
+		agentType       string
+		height          int
+		capture         string
+		wantWorking     bool
+		wantIdle        bool
+		wantLimited     bool
+		wantDispatch    bool
+		wantObservation string
+		wantRecommend   string
+	}{
+		{
+			name: "codex spinner above viewport", agentType: "cod", height: 3, capture: codexBusy,
+			wantIdle: true, wantDispatch: true, wantObservation: "idle", wantRecommend: string(agent.RecommendSafeToRestart),
+		},
+		{
+			name: "codex spinner inside viewport", agentType: "cod", height: 4, capture: codexBusy,
+			wantWorking: true, wantObservation: "working", wantRecommend: string(agent.RecommendDoNotInterrupt),
+		},
+		{
+			name: "unknown height retains busy evidence", agentType: "cod", height: 0, capture: codexBusy,
+			wantWorking: true, wantObservation: "working", wantRecommend: string(agent.RecommendDoNotInterrupt),
+		},
+		{
+			name: "antigravity cancel hint above viewport", agentType: "agy", height: 3, capture: "esc to cancel\n" + agyIdle,
+			wantIdle: true, wantDispatch: true, wantObservation: "idle", wantRecommend: string(agent.RecommendSafeToRestart),
+		},
+		{
+			name: "antigravity cancel hint inside viewport", agentType: "agy", height: 3, capture: agyBusy,
+			wantWorking: true, wantObservation: "working", wantRecommend: string(agent.RecommendDoNotInterrupt),
+		},
+		{
+			name: "rate limit above viewport", agentType: "cod", height: 3, capture: "Rate limit exceeded\n" + codexIdle,
+			wantIdle: true, wantDispatch: true, wantObservation: "idle", wantRecommend: string(agent.RecommendSafeToRestart),
+		},
+		{
+			name: "visible rate limit vetoes idle observation", agentType: "cod", height: 4, capture: "Rate limit exceeded\n" + codexIdle,
+			wantLimited: true, wantObservation: "idle", wantRecommend: string(agent.RecommendRateLimitedWait),
+		},
+		{
+			name: "interactive gate above viewport", agentType: "agy", height: 3, capture: "Do you trust the contents of this project?\n" + agyIdle,
+			wantIdle: true, wantDispatch: true, wantObservation: "idle", wantRecommend: string(agent.RecommendSafeToRestart),
+		},
+		{
+			name: "visible interactive gate vetoes idle observation", agentType: "agy", height: 4, capture: "Do you trust the contents of this project?\n" + agyIdle,
+			wantObservation: "idle", wantRecommend: "MANUAL_INTERVENTION",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("NTM_WORK_FRAME_CAPTURE", tc.capture)
+			t.Setenv("NTM_WORK_FRAME_PANES", strings.Join([]string{
+				"%1", "1", "s__" + tc.agentType + "_1", tc.agentType, "160", strconv.Itoa(tc.height), "0",
+				strconv.FormatInt(time.Now().Unix(), 10), strconv.Itoa(os.Getpid()), "0", tc.agentType, "", "", "0",
+			}, tmux.FieldSeparator))
+			stdout, err := captureStdout(t, func() error {
+				return PrintIsWorking(t.Context(), IsWorkingOptions{Session: "s", LinesCaptured: 100, Verbose: true})
+			})
+			if err != nil {
+				t.Fatalf("PrintIsWorking() error = %v; stdout = %q", err, stdout)
+			}
+			var output IsWorkingOutput
+			if err := json.Unmarshal([]byte(stdout), &output); err != nil {
+				t.Fatalf("PrintIsWorking() did not emit one JSON document: %v; stdout = %q", err, stdout)
+			}
+			if !output.Success || output.Summary.TotalPanes != 1 {
+				t.Fatalf("unexpected work-state response: %+v", output)
+			}
+			pane, ok := output.Panes["1"]
+			if !ok || pane.AgentType != tc.agentType || pane.IsWorking != tc.wantWorking ||
+				pane.IsIdle != tc.wantIdle || pane.IsRateLimited != tc.wantLimited ||
+				pane.SafeToDispatch != tc.wantDispatch || pane.Recommendation != tc.wantRecommend ||
+				pane.ObservationState != tc.wantObservation || pane.ObservationFreshness != "fresh" {
+				t.Fatalf("work-state verdict = %+v; want working=%v idle=%v limited=%v dispatch=%v observation=%s recommendation=%s",
+					pane, tc.wantWorking, tc.wantIdle, tc.wantLimited, tc.wantDispatch, tc.wantObservation, tc.wantRecommend)
+			}
+			if pane.RawSample != tc.capture {
+				t.Fatalf("verbose diagnostic lost full capture: got %q, want %q", pane.RawSample, tc.capture)
+			}
+			if got := output.Summary.ByRecommendation[tc.wantRecommend]; len(got) != 1 || got[0] != "1" {
+				t.Fatalf("summary recommendations = %v, want pane 1 in %s", output.Summary.ByRecommendation, tc.wantRecommend)
+			}
+			if (output.Summary.WorkingCount == 1) != tc.wantWorking ||
+				(output.Summary.IdleCount == 1) != tc.wantIdle ||
+				(output.Summary.RateLimitedCount == 1) != tc.wantLimited {
+				t.Fatalf("summary contradicts final pane verdict: %+v", output.Summary)
+			}
+		})
 	}
 }
 
@@ -780,6 +983,105 @@ func TestSelectIsWorkingPanes_SingleWindowDefaultSkipsControlPane(t *testing.T) 
 		if gotTargets[i] != w {
 			t.Fatalf("target[%d] = %q, want %q (all: %v)", i, gotTargets[i], w, gotTargets)
 		}
+	}
+}
+
+// adoptedOmpSwarmSession mirrors the live adopted frankengraphdb swarm: one
+// window, pane-base-index 1, no user pane, every pane recorded as omp by
+// `ntm adopt --omp=1-8` (@ntm_agent_type), one of them showing a title omp set
+// for itself.
+func adoptedOmpSwarmSession() []tmux.Pane {
+	panes := make([]tmux.Pane, 0, 8)
+	for i := 1; i <= 8; i++ {
+		title := fmt.Sprintf("frankengraphdb__omp_%d", i)
+		if i == 4 {
+			title = "π ⠙ Bulk Ingestion API Implementation Task"
+		}
+		panes = append(panes, tmux.Pane{ID: fmt.Sprintf("%%%d", i+2), WindowIndex: 1, Index: i, Title: title, Command: "omp", Type: tmux.AgentOmp})
+	}
+	return panes
+}
+
+// TestSelectIsWorkingPanes_AdoptedSessionWithoutUserPaneKeepsPaneOne is the
+// regression for the live report: --robot-is-working (and every surface built
+// on it: --robot-agent-health, --robot-smart-restart) silently dropped pane 1
+// of an adopted all-agent session because the lowest-index pane was assumed to
+// be the control pane.
+func TestSelectIsWorkingPanes_AdoptedSessionWithoutUserPaneKeepsPaneOne(t *testing.T) {
+	sel := selectIsWorkingPanes("frankengraphdb", adoptedOmpSwarmSession(), nil)
+	targets := selectedTargets(sel)
+	if len(sel) != 8 || targets[0] != "frankengraphdb:1.1" {
+		t.Fatalf("adopted all-agent session selected %v, want all 8 panes including 1.1", targets)
+	}
+
+	// A real user pane at the lowest index is still skipped, recorded or not.
+	withUser := append([]tmux.Pane{{ID: "%2", WindowIndex: 1, Index: 1, Title: "frankengraphdb__user", Command: "zsh", Type: tmux.AgentUser}},
+		adoptedOmpSwarmSession()...)
+	for i := 1; i < len(withUser); i++ {
+		withUser[i].Index++
+	}
+	if sel := selectIsWorkingPanes("frankengraphdb", withUser, nil); len(sel) != 8 || selectedTargets(sel)[0] != "frankengraphdb:1.2" {
+		t.Fatalf("user-pane session selected %v, want the 8 agents without pane 1", selectedTargets(sel))
+	}
+
+	if got := defaultMonitorPaneIndices(adoptedOmpSwarmSession()); len(got) != 8 || got[0] != 1 {
+		t.Fatalf("--robot-monitor default panes = %v, want 1..8", got)
+	}
+}
+
+// TestGetIsWorking_LiveAdoptedSessionIncludesPaneOne drives the real tmux path
+// (list-panes → @ntm_agent_type → default selection) on a pane-base-index 1
+// session whose panes were all recorded as agents, with no user pane.
+func TestGetIsWorking_LiveAdoptedSessionIncludesPaneOne(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+	session := fmt.Sprintf("ntm-adopted-no-user-%d", time.Now().UnixNano())
+	if err := tmux.CreateSession(session, ""); err != nil {
+		t.Fatalf("create tmux session: %v", err)
+	}
+	defer tmux.KillSession(session)
+	if _, err := tmux.DefaultClient.Run("set-option", "-t", session, "pane-base-index", "1"); err != nil {
+		t.Fatalf("set pane-base-index: %v", err)
+	}
+	if _, err := tmux.DefaultClient.Run("respawn-pane", "-k", "-t", tmux.SessionPaneTarget(session)); err != nil {
+		t.Fatalf("respawn first pane under pane-base-index 1: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := tmux.DefaultClient.Run("split-window", "-d", "-t", session); err != nil {
+			t.Fatalf("split: %v", err)
+		}
+	}
+	panes, err := tmux.GetPanes(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pane := range panes {
+		if err := tmux.DefaultClient.SetPaneAgentType(pane.ID, tmux.AgentOmp); err != nil {
+			t.Fatalf("record omp on %s: %v", pane.ID, err)
+		}
+	}
+	panes, err = tmux.GetPanes(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minIdx := panes[0].Index
+	for _, pane := range panes {
+		if pane.Type != tmux.AgentOmp {
+			t.Fatalf("pane %s type = %q, want recorded omp", pane.ID, pane.Type)
+		}
+		if pane.Index < minIdx {
+			minIdx = pane.Index
+		}
+	}
+
+	out, err := GetIsWorking(t.Context(), IsWorkingOptions{Session: session, LinesCaptured: 20})
+	if err != nil || !out.Success {
+		t.Fatalf("GetIsWorking = (%+v, %v)", out, err)
+	}
+	if out.Summary.TotalPanes != len(panes) {
+		t.Fatalf("total_panes = %d (requested %v), want all %d recorded agent panes", out.Summary.TotalPanes, out.Query.PanesRequested, len(panes))
+	}
+	if _, ok := out.Panes[strconv.Itoa(minIdx)]; !ok {
+		t.Fatalf("lowest-index pane %d missing from %v", minIdx, out.Query.PanesRequested)
 	}
 }
 

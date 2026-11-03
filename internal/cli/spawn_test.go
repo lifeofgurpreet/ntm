@@ -3,9 +3,11 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,12 +19,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agentsession"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
-	"github.com/Dicklesworthstone/ntm/internal/cm"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/plugins"
+	"github.com/Dicklesworthstone/ntm/internal/privacy"
 	"github.com/Dicklesworthstone/ntm/internal/resilience"
+	"github.com/Dicklesworthstone/ntm/internal/session"
+	"github.com/Dicklesworthstone/ntm/internal/shellword"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
@@ -107,6 +112,64 @@ func TestSpawnPaneEnvExpansionAndValidation(t *testing.T) {
 	}
 	if err := validateSpawnPaneEnv(map[string]string{"GOOD": "bad\x00value"}); err == nil {
 		t.Fatal("validateSpawnPaneEnv accepted NUL value")
+	}
+}
+
+func TestCaptureAgentLaunchSpecPreservesPreparedPersonaAndExcludesEnvironmentValues(t *testing.T) {
+	oldCfg := cfg
+	t.Cleanup(func() { cfg = oldCfg })
+	cfg = config.Default()
+	cfg.Agents.ClaudeIsolateCredentials = true
+	launchDir := t.TempDir()
+	t.Chdir(launchDir)
+	cfg.Agents.ClaudeTokenFile = "token-reference"
+	tokenPath := filepath.Join(launchDir, cfg.Agents.ClaudeTokenFile)
+	if err := os.WriteFile(tokenPath, []byte("token-value-not-persisted"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SHALLOW_PROFILE", "creation-profile")
+	promptPath := filepath.Join(t.TempDir(), "prepared.md")
+	prompt := []byte("You are the architect.\nProject: /work/rendered-project\n")
+	if err := os.WriteFile(promptPath, prompt, 0600); err != nil {
+		t.Fatal(err)
+	}
+	command := `claude --model 'custom/model' --effort 'high' --append-system-prompt-file ` + tmux.ShellQuote(promptPath)
+	spec, err := captureAgentLaunchSpec(AgentTypeClaude, command, "custom/model", "architect", "architect", "high", promptPath,
+		map[string]string{"API_TOKEN": "must-not-persist", "CUSTOM_PROFILE": "also-private"},
+		map[string]string{"API_TOKEN": "override-not-persisted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Command != command || spec.Model != "custom/model" || spec.Persona != "architect" || spec.ReasoningEffort != "high" || spec.CAAMProfile != "creation-profile" {
+		t.Fatalf("resolved launch settings lost: %+v", spec)
+	}
+	wantDigest := fmt.Sprintf("%x", sha256.Sum256(prompt))
+	if spec.SystemPromptFile != promptPath || spec.SystemPromptSHA256 != wantDigest {
+		t.Fatalf("prepared prompt identity lost: %+v", spec)
+	}
+	if !spec.ClaudeIsolateCredentials || spec.ClaudeTokenFile != tokenPath {
+		t.Fatalf("isolation policy lost: %+v", spec)
+	}
+	t.Chdir(t.TempDir())
+	if data, err := os.ReadFile(spec.ClaudeTokenFile); err != nil || string(data) != "token-value-not-persisted" {
+		t.Fatalf("saved token reference changed with working directory: %q (%v)", data, err)
+	}
+	if strings.Join(spec.OmittedEnv, ",") != "API_TOKEN,CUSTOM_PROFILE" {
+		t.Fatalf("omitted environment keys=%v", spec.OmittedEnv)
+	}
+	data, err := json.Marshal(spec)
+	if err != nil || strings.Contains(string(data), "must-not-persist") || strings.Contains(string(data), "also-private") || strings.Contains(string(data), "override-not-persisted") || strings.Contains(string(data), "token-value-not-persisted") {
+		t.Fatalf("injected environment values leaked: %s (%v)", data, err)
+	}
+	if err := spec.Validate(tmux.AgentClaude); err != nil {
+		t.Fatalf("incomplete launch must remain capturable: %v", err)
+	}
+	if err := spec.ValidateReplay(tmux.AgentClaude); err == nil {
+		t.Fatal("replay silently discarded supplied environment")
+	}
+	cfg.Agents.ClaudeTokenFile = tokenPath
+	if _, err := captureAgentLaunchSpec(AgentTypeClaude, command, "", "", "architect", "", filepath.Join(t.TempDir(), "missing.md")); err == nil {
+		t.Fatal("missing prepared persona prompt accepted")
 	}
 }
 
@@ -651,44 +714,84 @@ func TestValidateSpawnPaneCapacity(t *testing.T) {
 	}
 }
 
-func TestValidateSpawnGrokPaneBaselinesPreflightsCompleteAssignment(t *testing.T) {
+func TestValidateSpawnPaneBaselinesPreflightsCompleteAssignment(t *testing.T) {
 	agents := []FlatAgent{
 		{Type: AgentTypeClaude, Index: 1},
 		{Type: AgentTypeGrok, Index: 1},
 	}
+
+	// #291: an existing session pane that is already running a process (an
+	// agent CLI, `cat`, an editor) must refuse a launch for EVERY agent type,
+	// not only Grok; send-keys would otherwise type the launch line into it.
+	t.Run("occupied first target refuses the batch for a non-Grok agent", func(t *testing.T) {
+		panes := []tmux.Pane{
+			{ID: "%occupied", Index: 0, Command: "cat"},
+			{ID: "%idle", Index: 1, Command: "zsh"},
+		}
+		err := validateSpawnPaneBaselines(context.Background(), "ntm-unit-no-such-session", panes, 0, agents)
+		if err == nil {
+			t.Fatal("validateSpawnPaneBaselines() error = nil, want occupied Claude pane rejected")
+		}
+		if !errors.Is(err, tmux.ErrPaneOccupied) {
+			t.Fatalf("validateSpawnPaneBaselines() error = %v, want wrapped tmux.ErrPaneOccupied", err)
+		}
+		for _, want := range []string{"cc agent 1", "%occupied", `"cat"`, "non-shell", "ntm add"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("validateSpawnPaneBaselines() error = %q, want %q", err, want)
+			}
+		}
+	})
+
+	t.Run("live agent in a reused pane is refused", func(t *testing.T) {
+		panes := []tmux.Pane{
+			{ID: "%live", Index: 0, Command: "claude"},
+			{ID: "%idle", Index: 1, Command: "zsh"},
+		}
+		err := validateSpawnPaneBaselines(context.Background(), "ntm-unit-no-such-session", panes, 0, []FlatAgent{{Type: AgentTypeCodex, Index: 1}})
+		if err == nil || !errors.Is(err, tmux.ErrPaneOccupied) {
+			t.Fatalf("validateSpawnPaneBaselines() error = %v, want occupied-pane rejection", err)
+		}
+	})
 
 	t.Run("late occupied Grok target rejects mixed batch", func(t *testing.T) {
 		panes := []tmux.Pane{
 			{ID: "%idle", Index: 0, Command: "zsh"},
 			{ID: "%occupied", Index: 1, Command: "sleep"},
 		}
-		err := validateSpawnGrokPaneBaselines(panes, 0, agents)
+		err := validateSpawnPaneBaselines(context.Background(), "ntm-unit-no-such-session", panes, 0, agents)
 		if err == nil {
-			t.Fatal("validateSpawnGrokPaneBaselines() error = nil")
+			t.Fatal("validateSpawnPaneBaselines() error = nil")
 		}
-		for _, want := range []string{"Grok Build agent 1", "%occupied", "sleep", "non-shell"} {
+		for _, want := range []string{"grok agent 1", "%occupied", "sleep", "non-shell"} {
 			if !strings.Contains(err.Error(), want) {
-				t.Fatalf("validateSpawnGrokPaneBaselines() error = %q, want %q", err, want)
+				t.Fatalf("validateSpawnPaneBaselines() error = %q, want %q", err, want)
 			}
 		}
 	})
 
-	t.Run("user pane offset reaches assigned Grok shell", func(t *testing.T) {
+	t.Run("user pane offset reaches assigned shells", func(t *testing.T) {
 		panes := []tmux.Pane{
-			{ID: "%user", Index: 0, Command: "zsh"},
+			{ID: "%user", Index: 0, Command: "vim"}, // the reserved user pane may be busy
 			{ID: "%claude", Index: 1, Command: "bash"},
 			{ID: "%grok", Index: 2, Command: "fish"},
 		}
-		if err := validateSpawnGrokPaneBaselines(panes, 1, agents); err != nil {
-			t.Fatalf("validateSpawnGrokPaneBaselines() error = %v", err)
+		if err := validateSpawnPaneBaselines(context.Background(), "ntm-unit-no-such-session", panes, 1, agents); err != nil {
+			t.Fatalf("validateSpawnPaneBaselines() error = %v", err)
 		}
 	})
 
-	t.Run("missing assigned Grok pane fails closed", func(t *testing.T) {
+	t.Run("empty observation is left to the post-launch stability wait", func(t *testing.T) {
+		panes := []tmux.Pane{{ID: "%fresh", Index: 0}}
+		if err := validateSpawnPaneBaselines(context.Background(), "ntm-unit-no-such-session", panes, 0, agents[:1]); err != nil {
+			t.Fatalf("validateSpawnPaneBaselines() error = %v", err)
+		}
+	})
+
+	t.Run("missing assigned pane fails closed", func(t *testing.T) {
 		panes := []tmux.Pane{{ID: "%claude", Index: 0, Command: "zsh"}}
-		err := validateSpawnGrokPaneBaselines(panes, 0, agents)
-		if err == nil || !strings.Contains(err.Error(), "no assigned pane for Grok Build agent 1 at offset 1") {
-			t.Fatalf("validateSpawnGrokPaneBaselines() error = %v", err)
+		err := validateSpawnPaneBaselines(context.Background(), "ntm-unit-no-such-session", panes, 0, agents)
+		if err == nil || !strings.Contains(err.Error(), "no assigned pane for grok agent 1 at offset 1") {
+			t.Fatalf("validateSpawnPaneBaselines() error = %v", err)
 		}
 	})
 }
@@ -921,7 +1024,7 @@ func TestSpawnSessionLogic(t *testing.T) {
 	// Override templates to avoid dependency on actual agent binaries while
 	// remaining compatible with explicit model overrides under test.
 	cfg.Agents.Claude = testAgentCatCommandTemplate
-	cfg.Agents.Codex = testAgentCatCommandTemplate
+	cfg.Agents.Codex = testAgentCodexCommandTemplate
 	cfg.Agents.Gemini = testAgentCatCommandTemplate
 
 	// Unique session name
@@ -1004,6 +1107,10 @@ func TestSpawnSessionLogic(t *testing.T) {
 	}
 	if !foundClaude {
 		t.Fatalf("spawned pane %s lost its durable Claude type after title rewrite: %+v", claudePaneID, panes)
+	}
+	spec, err := tmux.ReadPaneLaunchSpecContext(t.Context(), claudePaneID)
+	if err != nil || spec == nil || spec.Model != agents[0].Model || spec.AgentType != tmux.AgentClaude || strings.Contains(spec.Command, "NTM_SPAWN_") {
+		t.Fatalf("spawned launch specification lost or retained runtime environment: spec=%+v err=%v", spec, err)
 	}
 
 	// Verify project directory creation
@@ -1490,185 +1597,45 @@ func TestSpawnSessionLogic_Ollama(t *testing.T) {
 	}
 }
 
-// bd-3f53: Tests for getMemoryContext and formatMemoryContext
-
-func TestFormatMemoryContext_Nil(t *testing.T) {
-
-	result := formatMemoryContext(nil)
-	if result != "" {
-		t.Errorf("formatMemoryContext(nil) = %q, want empty string", result)
+// `ntm spawn --privacy` only bound the spawn process: SpawnOptions.PrivacyMode
+// reached nothing, so `ntm send` and every other writer kept persisting the
+// session. Spawn now records the settings on the session (the call below is
+// the one spawn makes), and every ntm process installs tmuxSessionPrivacy
+// (root.go), so a real writer in a fresh manager refuses the session.
+func TestSpawnPrivacyBindsOtherProcessWriters(t *testing.T) {
+	if !tmux.IsInstalled() {
+		t.Skip("tmux not installed")
 	}
-}
-
-func TestFormatMemoryContext_EmptyResult(t *testing.T) {
-
-	result := formatMemoryContext(&cm.CLIContextResponse{
-		Success:         true,
-		Task:            "test task",
-		RelevantBullets: []cm.Rule{},
-		AntiPatterns:    []cm.Rule{},
-	})
-	if result != "" {
-		t.Errorf("formatMemoryContext(empty) = %q, want empty string", result)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	ctx := context.Background()
+	private := fmt.Sprintf("ntm_privacy_%d", time.Now().UnixNano())
+	ordinary := private + "_open"
+	for _, name := range []string{private, ordinary} {
+		if err := tmux.CreateSession(name, t.TempDir()); err != nil {
+			t.Fatalf("CreateSession(%s): %v", name, err)
+		}
+		t.Cleanup(func() { _ = tmux.KillSession(name) })
 	}
-}
-
-func TestFormatMemoryContext_RulesOnly(t *testing.T) {
-
-	resp := &cm.CLIContextResponse{
-		Success: true,
-		Task:    "test task",
-		RelevantBullets: []cm.Rule{
-			{ID: "b-8f3a2c", Content: "Always use structured logging with log/slog", Category: "best-practice"},
-			{ID: "b-4e1d7b", Content: "Database migrations must be idempotent", Category: "database"},
-		},
-		AntiPatterns: []cm.Rule{},
+	if err := tmux.SetSessionPrivacyContext(ctx, private, true, false); err != nil {
+		t.Fatal(err)
 	}
 
-	result := formatMemoryContext(resp)
+	original := privacy.GetDefaultManager()
+	t.Cleanup(func() { privacy.SetDefaultManager(original) })
+	privacy.SetDefaultManager(privacy.New(config.DefaultPrivacyConfig()).WithSessionLookup(tmuxSessionPrivacy))
 
-	// Check header
-	if !strings.Contains(result, "# Project Memory from Past Sessions") {
-		t.Error("missing main header")
+	for _, name := range []string{private, ordinary} {
+		if err := session.SavePrompt(session.PromptEntry{Session: name, Content: "deploy key is hunter2", Source: "cli"}); err != nil {
+			t.Fatalf("SavePrompt(%s): %v", name, err)
+		}
 	}
-
-	// Check rules section
-	if !strings.Contains(result, "## Key Rules for This Project") {
-		t.Error("missing Key Rules section header")
+	if history, err := session.LoadPromptHistory(private); err != nil || len(history.Prompts) != 0 {
+		t.Fatalf("private session persisted prompts: %+v, %v", history, err)
 	}
-
-	// Check rule formatting
-	if !strings.Contains(result, "[b-8f3a2c] Always use structured logging with log/slog") {
-		t.Error("missing first rule")
+	if history, err := session.LoadPromptHistory(ordinary); err != nil || len(history.Prompts) != 1 {
+		t.Fatalf("ordinary session prompts = %+v, %v; want the one prompt persisted", history, err)
 	}
-	if !strings.Contains(result, "[b-4e1d7b] Database migrations must be idempotent") {
-		t.Error("missing second rule")
-	}
-
-	// Should NOT have anti-patterns section
-	if strings.Contains(result, "## Anti-Patterns to Avoid") {
-		t.Error("should not have Anti-Patterns section when empty")
-	}
-}
-
-func TestFormatMemoryContext_AntiPatternsOnly(t *testing.T) {
-
-	resp := &cm.CLIContextResponse{
-		Success:         true,
-		Task:            "test task",
-		RelevantBullets: []cm.Rule{},
-		AntiPatterns: []cm.Rule{
-			{ID: "b-7d3e8c", Content: "Don't add backwards-compatibility shims", Category: "anti-pattern"},
-		},
-	}
-
-	result := formatMemoryContext(resp)
-
-	// Check header
-	if !strings.Contains(result, "# Project Memory from Past Sessions") {
-		t.Error("missing main header")
-	}
-
-	// Should NOT have rules section
-	if strings.Contains(result, "## Key Rules for This Project") {
-		t.Error("should not have Key Rules section when empty")
-	}
-
-	// Check anti-patterns section
-	if !strings.Contains(result, "## Anti-Patterns to Avoid") {
-		t.Error("missing Anti-Patterns section header")
-	}
-	if !strings.Contains(result, "[b-7d3e8c] Don't add backwards-compatibility shims") {
-		t.Error("missing anti-pattern")
-	}
-}
-
-func TestFormatMemoryContext_BothSections(t *testing.T) {
-
-	resp := &cm.CLIContextResponse{
-		Success: true,
-		Task:    "test task",
-		RelevantBullets: []cm.Rule{
-			{ID: "b-rule1", Content: "Use Go 1.25 features", Category: "best-practice"},
-		},
-		AntiPatterns: []cm.Rule{
-			{ID: "b-anti1", Content: "Avoid using deprecated APIs", Category: "anti-pattern"},
-		},
-	}
-
-	result := formatMemoryContext(resp)
-
-	// Check both sections present
-	if !strings.Contains(result, "## Key Rules for This Project") {
-		t.Error("missing Key Rules section")
-	}
-	if !strings.Contains(result, "## Anti-Patterns to Avoid") {
-		t.Error("missing Anti-Patterns section")
-	}
-
-	// Check both items present
-	if !strings.Contains(result, "[b-rule1]") {
-		t.Error("missing rule ID")
-	}
-	if !strings.Contains(result, "[b-anti1]") {
-		t.Error("missing anti-pattern ID")
-	}
-
-	// Check order: rules should come before anti-patterns
-	rulesIdx := strings.Index(result, "## Key Rules")
-	antiIdx := strings.Index(result, "## Anti-Patterns")
-	if rulesIdx > antiIdx {
-		t.Error("Key Rules should appear before Anti-Patterns")
-	}
-}
-
-func TestGetMemoryContext_ConfigDisabled(t *testing.T) {
-
-	// Save and restore global config
-	oldCfg := cfg
-	defer func() { cfg = oldCfg }()
-
-	// Create config with CM memories disabled
-	cfg = config.Default()
-	cfg.SessionRecovery.IncludeCMMemories = false
-
-	result := getMemoryContext("test-project", "test task")
-	if result != "" {
-		t.Errorf("getMemoryContext with disabled config = %q, want empty string", result)
-	}
-}
-
-func TestGetMemoryContext_NilConfig(t *testing.T) {
-
-	// Save and restore global config
-	oldCfg := cfg
-	defer func() { cfg = oldCfg }()
-
-	cfg = nil
-
-	result := getMemoryContext("test-project", "test task")
-	if result != "" {
-		t.Errorf("getMemoryContext with nil config = %q, want empty string", result)
-	}
-}
-
-func TestGetMemoryContext_EmptyTask(t *testing.T) {
-	t.Setenv("PATH", t.TempDir())
-
-	// Save and restore global config
-	oldCfg := cfg
-	defer func() { cfg = oldCfg }()
-
-	cfg = config.Default()
-	cfg.SessionRecovery.IncludeCMMemories = true
-
-	// This test verifies the function handles empty task gracefully
-	// Even if CM is not installed, it should return empty string without error
-	result := getMemoryContext("test-project", "")
-
-	// Result should be empty (CM likely not installed in test environment)
-	// but the function should not panic
-	_ = result // Just verify no panic
 }
 
 func TestLegacySpawnTotalAgentCount_IncludesModernTypes(t *testing.T) {
@@ -2041,5 +2008,196 @@ func TestWizardLaunchAgentSpecs_RecipeAndTemplateSelectionsDeferCounts(t *testin
 	}
 	if wizardDeferredSelection(SpawnWizardResult{CCCount: 1}) {
 		t.Fatal("wizardDeferredSelection(manual) = true, want false")
+	}
+}
+
+// runPiPaneFixture runs in a copy of this test executable named pi. It accepts
+// real launch arguments and closes the JSONL file after writing, as pi does
+// between appends. Discovery therefore must identify each process by its
+// pinned selector rather than an open descriptor or newest-file guess.
+func runPiPaneFixture() int {
+	id, path := "", ""
+	for i := 1; i+1 < len(os.Args); i++ {
+		switch os.Args[i] {
+		case "--session-id":
+			i++
+			id = os.Args[i]
+		case "--session":
+			i++
+			path = os.Args[i]
+		}
+	}
+	cwd, err := os.Getwd()
+	if err != nil || id == "" && path == "" {
+		return 1
+	}
+	if path == "" {
+		path = filepath.Join(os.Getenv("PI_CODING_AGENT_SESSION_DIR"), id+".jsonl")
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		header, marshalErr := json.Marshal(map[string]any{
+			"type": "session", "version": 3, "id": id, "cwd": cwd,
+			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+		})
+		if marshalErr != nil || os.WriteFile(path, append(header, '\n'), 0600) != nil {
+			return 1
+		}
+	} else if err != nil {
+		return 1
+	}
+	fmt.Printf("Ready for work.\n────────────────────────────────────────────────\n\n────────────────────────────────────────────────\n%s\n↑0 ↓0 $0.00 (0.0%%) · test-model\n", cwd)
+	_, err = io.Copy(io.Discard, os.Stdin)
+	if err != nil {
+		return 1
+	}
+	return 0
+}
+
+func TestPiManagedSpawnAndAddPreserveDistinctSessionBindings(t *testing.T) {
+	testutil.RequireTmuxThrottled(t)
+	root := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(root, "data"))
+	t.Setenv("NTM_PI_PANE_FIXTURE", "1")
+	store := filepath.Join(root, "sessions")
+	t.Setenv("PI_CODING_AGENT_SESSION_DIR", store)
+	t.Setenv("PI_CODING_AGENT_DIR", "")
+	pluginDir := filepath.Join(root, "config", "ntm", "agents")
+	for _, dir := range []string{store, pluginDir} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pi := filepath.Join(root, "pi")
+	if err := os.Symlink(binary, pi); err != nil {
+		t.Fatal(err)
+	}
+	baseCommand := pi + " --model provider/test --thinking high"
+	preset := fmt.Sprintf("[agent]\nname = 'pi'\ncommand = %q\n[agent.readiness]\nidle_patterns = ['^\\s*─{4,}\\s*$']\n", baseCommand)
+	if err := os.WriteFile(filepath.Join(pluginDir, "pi.toml"), []byte(preset), 0600); err != nil {
+		t.Fatal(err)
+	}
+	registerAgentPluginTypes(pluginDir)
+	oldCfg, oldJSON := cfg, jsonOutput
+	t.Cleanup(func() { cfg, jsonOutput = oldCfg, oldJSON })
+	cfg = newTmuxIntegrationTestConfig(root)
+	cfg.Agents.Omp = "/bin/cat"
+	cfg.Checkpoints.Enabled = false
+	jsonOutput = true
+	for _, source := range []string{"flags", "workflow"} {
+		t.Run(source, func(t *testing.T) {
+			name := fmt.Sprintf("ntm-pi-%s-%d", source, time.Now().UnixNano())
+			project := filepath.Join(root, name)
+			if err := os.MkdirAll(filepath.Join(project, ".ntm", "workflows"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Chdir(project)
+			t.Cleanup(func() { _ = tmux.KillSession(name) })
+			args := []string{name, "--pi=2", "--omp=1", "--no-hooks", "--no-cass-context", "--no-recovery"}
+			if source == "workflow" {
+				workflow := "name = 'pi-team'\ncoordination = 'parallel'\n[[agents]]\nprofile = 'pi'\nrole = 'worker'\ncount = 2\n[[agents]]\nprofile = 'omp'\nrole = 'reviewer'\ncount = 1\n"
+				if err := os.WriteFile(filepath.Join(project, ".ntm", "workflows", "pi-team.toml"), []byte(workflow), 0600); err != nil {
+					t.Fatal(err)
+				}
+				args = []string{name, "--template=pi-team", "--no-hooks", "--no-cass-context", "--no-recovery"}
+			}
+			cmd := newSpawnCmd()
+			cmd.SetArgs(args)
+			cmd.SetContext(t.Context())
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("spawn pi panes: %v", err)
+			}
+			add := newAddCmd()
+			add.SetArgs([]string{name, "--pi=1", "--no-cass-context"})
+			add.SetContext(t.Context())
+			if err := add.Execute(); err != nil {
+				t.Fatalf("add pi pane: %v", err)
+			}
+			var captured *session.SessionState
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				captured, err = session.Capture(name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				bound := 0
+				for _, pane := range captured.Panes {
+					if pane.AgentType == "pi" && pane.HasFreshSessionBinding() {
+						bound++
+					}
+				}
+				if bound == 3 {
+					break
+				}
+				time.Sleep(25 * time.Millisecond)
+			}
+			seen := make(map[string]bool)
+			ompCount := 0
+			for _, pane := range captured.Panes {
+				if pane.AgentType == "omp" {
+					ompCount++
+					if pane.LaunchSpec == nil || pane.LaunchSpec.Command != "/bin/cat" {
+						t.Fatalf("omp launch was changed: %+v", pane.LaunchSpec)
+					}
+					continue
+				}
+				if pane.AgentType == "user" {
+					continue
+				}
+				if pane.AgentType != "pi" || !pane.HasFreshSessionBinding() || pane.SessionSource != agentsession.DiscoverySourceProcessTree {
+					t.Fatalf("spawned pane lacks exact live pi binding: %+v", pane)
+				}
+				if seen[pane.SessionID] || pane.LaunchSpec == nil || !strings.HasPrefix(pane.LaunchSpec.Command, baseCommand+" --session-id ") {
+					t.Fatalf("pi identity is duplicated or absent from launch metadata: %+v", pane)
+				}
+				seen[pane.SessionID] = true
+				words, err := shellword.Literal(pane.LaunchSpec.Command)
+				if err != nil || words[len(words)-1].Value != pane.SessionID {
+					t.Fatalf("live pi header differs from recorded launch: %+v, %v", pane, err)
+				}
+				path, err := agentsession.ResolvePiResumeSession(t.Context(), pane.SessionID, pane.LaunchSpec.Command, project, pane.SessionFile)
+				if err != nil || path != filepath.Join(store, pane.SessionID+".jsonl") {
+					t.Fatalf("pi binding cannot resume its own transcript: %q, %v", path, err)
+				}
+			}
+			if len(seen) != 3 || ompCount != 1 {
+				t.Fatalf("spawn/add produced pi=%d omp=%d, want pi=3 omp=1", len(seen), ompCount)
+			}
+			if _, err := session.Save(captured, session.SaveOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			ambientStore := t.TempDir()
+			for id := range seen {
+				contents, err := os.ReadFile(filepath.Join(store, id+".jsonl"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(ambientStore, id+".jsonl"), contents, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("PI_CODING_AGENT_SESSION_DIR", ambientStore)
+			loaded, err := session.Load(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, pane := range loaded.Panes {
+				if pane.AgentType != "pi" {
+					continue
+				}
+				if !seen[pane.SessionID] || !pane.HasFreshSessionBinding() || pane.LaunchSpec == nil {
+					t.Fatalf("saved pi pane lost its exact binding: %+v", pane)
+				}
+				path, err := agentsession.ResolvePiResumeSession(t.Context(), pane.SessionID, pane.LaunchSpec.Command, project, pane.SessionFile)
+				if err != nil || path != filepath.Join(store, pane.SessionID+".jsonl") {
+					t.Fatalf("loaded pi pane switched to another environment's transcript: %q, %v", path, err)
+				}
+			}
+		})
 	}
 }

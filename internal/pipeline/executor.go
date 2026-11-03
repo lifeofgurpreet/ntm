@@ -5,10 +5,10 @@ package pipeline
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
 	"log/slog"
 	"maps"
 	"math"
@@ -22,9 +22,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/status"
-	"github.com/Dicklesworthstone/ntm/internal/util"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 // dispatchLogSeq is a process-local sequence counter that breaks ties when
@@ -39,6 +40,95 @@ var dispatchLogSeq uint64
 // (bd-zfdjd.7)
 var commandHeartbeatInterval = 30 * time.Second
 
+// commandStartedTestHookKey carries an optional func(pid int) in the step
+// context. executeCommand calls it after cmd.Start and before the launch
+// journal records the running process, so tests can deterministically fail
+// that post-start save. Production contexts never carry it.
+type commandStartedTestHookKey struct{}
+
+// A scheduler joins its foreground workers before finishing, but wait:none
+// commands can still own processes after their launch acknowledgements return.
+// Retain the native cancellation contexts until those cleanup workers finish.
+// Explicit cancellation remains immediate; only normal scope exit is deferred.
+type commandCancellationScopeKey struct{}
+
+type commandCancellationScope struct {
+	parent   *commandCancellationScope
+	cancel   context.CancelFunc
+	mu       sync.Mutex
+	retained int
+	finished bool
+	drained  chan struct{}
+}
+
+func withCommandCancellationScope(ctx context.Context, cancel context.CancelFunc) (context.Context, context.CancelFunc) {
+	parent, _ := ctx.Value(commandCancellationScopeKey{}).(*commandCancellationScope)
+	scope := &commandCancellationScope{parent: parent, cancel: cancel}
+	return context.WithValue(ctx, commandCancellationScopeKey{}, scope), scope.finish
+}
+
+func (scope *commandCancellationScope) finish() {
+	scope.mu.Lock()
+	scope.finished = true
+	cancel := scope.retained == 0
+	scope.mu.Unlock()
+	if cancel {
+		scope.cancel()
+	}
+}
+
+// wait joins this scope's cleanup workers after its foreground scheduler has
+// stopped admitting commands. Caller cancellation hands control back to normal
+// finalization so it can checkpoint cancellation before its final cleanup join.
+// Returning from supervision does not imply that every receipt is settled.
+func (scope *commandCancellationScope) wait(ctx context.Context) {
+	scope.mu.Lock()
+	if scope.retained == 0 {
+		scope.mu.Unlock()
+		return
+	}
+	if scope.drained == nil {
+		scope.drained = make(chan struct{})
+	}
+	drained := scope.drained
+	scope.mu.Unlock()
+	select {
+	case <-drained:
+	case <-ctx.Done():
+	}
+}
+
+// Retain every enclosing scheduler and timeout scope before returning a
+// background launch. Keeping the original context chain preserves values,
+// cancellation causes, and container deadlines without reparenting processes.
+func retainCommandCancellationScopes(ctx context.Context) context.CancelFunc {
+	var scopes []*commandCancellationScope
+	for scope, _ := ctx.Value(commandCancellationScopeKey{}).(*commandCancellationScope); scope != nil; scope = scope.parent {
+		scope.mu.Lock()
+		scope.retained++
+		scope.mu.Unlock()
+		scopes = append(scopes, scope)
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			for _, scope := range scopes {
+				scope.mu.Lock()
+				scope.retained--
+				if scope.retained == 0 && scope.drained != nil {
+					close(scope.drained)
+					scope.drained = nil
+				}
+				cancel := scope.finished && scope.retained == 0
+				scope.mu.Unlock()
+				if cancel {
+					scope.cancel()
+				}
+			}
+		})
+	}
+}
+
 // ExecutorConfig configures the executor behavior
 type ExecutorConfig struct {
 	Session          string        // Required: tmux session name
@@ -51,6 +141,12 @@ type ExecutorConfig struct {
 	Verbose          bool          // Enable verbose logging
 	RunID            string        // Optional: pre-generated run ID (if empty, one is generated)
 	BeadQueryRunBr   func(ctx context.Context, args []string) ([]byte, error)
+
+	// PaneLockWait bounds how long a dispatch waits for ANOTHER ntm process to
+	// release the target pane before failing the step as not-dispatched
+	// (ntm#324). Zero uses DefaultPaneLockWait. Requires ProjectDir: the
+	// cross-process lock lives under its .ntm state directory.
+	PaneLockWait time.Duration
 
 	// StartFromStep, when non-empty, instructs Run() to mark every transitive
 	// dependency of this step as StatusSkipped and begin actual execution at
@@ -109,11 +205,24 @@ type Executor struct {
 	// return cancels those commands and joins their workers so callers never
 	// observe state while cancellation persistence is still writing to disk.
 	backgroundCommandWG sync.WaitGroup
+	// Unsettled cleanup, an explicit timeout, or a background execution failure
+	// cannot authorize success merely because a WaitNone launch returned.
+	// Protected by stateMu and reset per attempt.
+	backgroundCommandErrors map[string]error
+
+	// Selector capture reservations are derived from durable receipts. Only
+	// these attempt-local owners may release capacity while another selector
+	// waits; interrupted starting receipts are never treated as live workers.
+	// Both fields are protected by stateMu.
+	selectorOutputActive map[string]selectorOutputReservation
+	selectorOutputWake   chan struct{}
+	stepAdmissionAttempt *stepAdmissionAttempt // Protected by stateMu; reset per attempt.
 
 	// persistMu serializes snapshot-and-save transactions. Multiple workers may
 	// checkpoint concurrently; without this lock an older snapshot whose fsync
 	// finishes last can overwrite a newer state revision on disk.
-	persistMu sync.Mutex
+	persistMu     sync.Mutex
+	checkpointErr error // First save failure in this attempt; protected by persistMu.
 
 	// adjudicatorHistory records the order in which rotate_adjudicator picked
 	// adjudicator panes during this run. Each entry is the chosen pane ID;
@@ -140,6 +249,17 @@ type Executor struct {
 	paneLocks  map[string]chan struct{}
 
 	mailClients agentMailClientCache
+
+	// Renewal and explicit release share one owner so a heartbeat cannot
+	// extend a lease while its authored cleanup is settling. The heartbeat
+	// lives only for this execution attempt, including its post-pipeline work.
+	reservationMu         sync.Mutex
+	reservationWG         sync.WaitGroup
+	reservationWake       chan struct{}
+	reservationStop       chan struct{}
+	reservationStopOnce   sync.Once
+	reservationFinalCheck bool  // Captured attempt intent, not its all-done final state.
+	reservationFailure    error // Protected by stateMu; sticky within an attempt.
 }
 
 // acquirePaneLock serializes the full dispatch window against a tmux pane.
@@ -198,9 +318,19 @@ func (e *Executor) SetTmuxClient(client TmuxClient) {
 	e.resetPaneMetadataLoader()
 }
 
+// SetDetector swaps the agent-state detector backing completion waits.
+// Tests use this to drive waitForIdle without a live tmux server; a nil
+// detector restores the default.
+func (e *Executor) SetDetector(detector status.Detector) {
+	if detector == nil {
+		detector = status.NewDetector()
+	}
+	e.detector = detector
+}
+
 func (e *Executor) tmuxClient() TmuxClient {
 	if e.tmux == nil {
-		e.tmux = realTmuxClient{}
+		return realTmuxClient{}
 	}
 	return e.tmux
 }
@@ -214,6 +344,7 @@ func (e *Executor) SetNotifier(n *Notifier) {
 // Returns the final execution state and any fatal error.
 // Progress events are sent to the provided channel if non-nil.
 func (e *Executor) Run(ctx context.Context, workflow *Workflow, vars map[string]interface{}, progress chan<- ProgressEvent) (*ExecutionState, error) {
+	e.resetCheckpointFailure()
 	// Create cancellable context
 	ctx, cancel := context.WithCancel(ctx)
 	e.cancelFn = cancel
@@ -237,20 +368,29 @@ func (e *Executor) Run(ctx context.Context, workflow *Workflow, vars map[string]
 	}
 
 	e.stateMu.Lock()
+	e.backgroundCommandErrors = nil
+	e.resetSelectorOutputBudgetLocked()
+	e.stepAdmissionAttempt = &stepAdmissionAttempt{}
+	e.reservationFailure = nil
+	e.reservationWake = make(chan struct{}, 1)
+	e.reservationStop = make(chan struct{})
+	e.reservationStopOnce = sync.Once{}
+	e.reservationFinalCheck = false
 	e.state = &ExecutionState{
-		RunID:         runID,
-		WorkflowID:    workflow.Name,
-		WorkflowFile:  e.config.WorkflowFile,
-		Session:       e.config.Session,
-		Status:        StatusRunning,
-		StartedAt:     time.Now(),
-		UpdatedAt:     time.Now(),
-		Steps:         make(map[string]StepResult),
-		Variables:     make(map[string]interface{}),
-		Errors:        []ExecutionError{},
-		ForeachState:  make(map[string]ForeachIterationState),
-		ParallelState: make(map[string]ParallelGroupState),
-		InFlightSteps: make(map[string]InFlightStepState),
+		RunID:                    runID,
+		WorkflowID:               workflow.Name,
+		WorkflowFile:             e.config.WorkflowFile,
+		Session:                  e.config.Session,
+		Status:                   StatusRunning,
+		StartedAt:                time.Now(),
+		UpdatedAt:                time.Now(),
+		Steps:                    make(map[string]StepResult),
+		Variables:                make(map[string]interface{}),
+		Errors:                   []ExecutionError{},
+		ForeachState:             make(map[string]ForeachIterationState),
+		ParallelState:            make(map[string]ParallelGroupState),
+		InFlightSteps:            make(map[string]InFlightStepState),
+		CommandEvaluationVersion: commandEvaluationVersion,
 	}
 	e.progress = progress
 	e.stateMu.Unlock()
@@ -272,8 +412,7 @@ func (e *Executor) Run(ctx context.Context, workflow *Workflow, vars map[string]
 			Fatal:     true,
 		})
 		e.stateMu.Unlock()
-		e.persistState()
-		return e.state, err
+		return e.state, errors.Join(err, e.persistState())
 	}
 	e.varMu.Lock()
 	e.state.Variables = preparedVars
@@ -282,8 +421,15 @@ func (e *Executor) Run(ctx context.Context, workflow *Workflow, vars map[string]
 	e.defaults = workflow.Defaults
 	e.limits = workflow.Settings.Limits.EffectiveLimits()
 	e.resetPaneMetadataLoader()
+	if err := e.validateStepDefinitionCapacity(workflow); err != nil {
+		e.state.Status = StatusFailed
+		e.state.FinishedAt = time.Now()
+		return e.state, errors.Join(err, e.persistState())
+	}
 
-	e.persistState()
+	if err := e.persistState(); err != nil {
+		return e.state, err
+	}
 
 	// Build dependency graph
 	e.graph = NewDependencyGraph(workflow)
@@ -299,10 +445,17 @@ func (e *Executor) Run(ctx context.Context, workflow *Workflow, vars map[string]
 			})
 		}
 		e.stateMu.Unlock()
-		e.persistState()
-		return e.state, fmt.Errorf("workflow has dependency errors: %v", errors[0])
+		return e.state, joinCheckpointError(fmt.Errorf("workflow has dependency errors: %v", errors[0]), e.persistState())
 	}
 
+	if err := e.admitWorkflowRoots(ctx, workflow); err != nil {
+		if ctx.Err() != nil && errors.Is(err, ctx.Err()) && e.checkpointFailure() == nil {
+			return e.finishExecution(ctx, workflow, err)
+		}
+		e.state.Status = StatusFailed
+		e.state.FinishedAt = time.Now()
+		return e.state, errors.Join(err, e.persistState())
+	}
 	if err := e.applyStartFrom(workflow); err != nil {
 		e.stateMu.Lock()
 		e.state.Status = StatusFailed
@@ -313,60 +466,30 @@ func (e *Executor) Run(ctx context.Context, workflow *Workflow, vars map[string]
 			Fatal:     true,
 		})
 		e.stateMu.Unlock()
-		e.persistState()
-		return e.state, err
+		return e.state, errors.Join(err, e.persistState())
 	}
 
 	// Emit start event
 	e.emitProgress("workflow_start", "", workflowProgressMessage("Starting workflow", workflow), 0)
 
 	// Execute steps in dependency order
+	stopProtection := e.startReservationProtection(ctx, workflow)
+	defer stopProtection()
 	err = e.executeWorkflow(ctx, workflow)
 
-	// bd-w6nth.5: post_pipeline_steps run after the main step graph
-	// completes regardless of outcome (success, failure, or non-cancel
-	// error). Failures inside post-steps are recorded but do not flip the
-	// final pipeline status; cleanup, notifications, and hand-off
-	// dispatches must run even when the main pipeline failed.
-	if ctx.Err() == nil {
-		e.runPostPipelineSteps(ctx, workflow)
-		// bd-3uqce: declared-output stat() pass after post-pipeline steps so
-		// any artifacts written by cleanup/handoff steps are still picked up.
-		e.validateDeclaredOutputs(workflow)
-	}
-
-	// Finalize state
-	if err != nil {
-		if ctx.Err() != nil {
-			e.finalizeCancelledWorkflow(ctx, workflow)
-		} else {
-			e.stateMu.Lock()
-			e.state.FinishedAt = time.Now()
-			e.state.UpdatedAt = time.Now()
-			e.state.Status = StatusFailed
-			e.sendNotification(ctx, workflow, NotifyFailed)
-			e.stateMu.Unlock()
-		}
-		e.emitProgress("workflow_error", "", err.Error(), e.calculateProgress())
-	} else {
-		e.stateMu.Lock()
-		e.state.FinishedAt = time.Now()
-		e.state.UpdatedAt = time.Now()
-		e.state.Status = StatusCompleted
-		e.sendNotification(ctx, workflow, NotifyCompleted)
-		e.stateMu.Unlock()
-		e.emitProgress("workflow_complete", "", "Workflow completed successfully", 1.0)
-	}
-
-	e.persistState()
-
-	return e.state, err
+	return e.finishExecution(ctx, workflow, err)
 }
 
 // Resume continues execution from a previously persisted state.
 func (e *Executor) Resume(ctx context.Context, workflow *Workflow, prior *ExecutionState, progress chan<- ProgressEvent) (*ExecutionState, error) {
 	if prior == nil {
 		return nil, fmt.Errorf("resume state is nil")
+	}
+	if e.config.ResumeOptions.MaxSelectorOutputBytesTotal < 0 {
+		return prior, fmt.Errorf("max_selector_output_bytes_total must not be negative")
+	}
+	if e.config.ResumeOptions.MaxStepCountTotal < 0 || e.config.ResumeOptions.MaxMaterializedStepNodes < 0 {
+		return prior, fmt.Errorf("max_step_count_total and max_materialized_step_nodes must not be negative")
 	}
 
 	// bd-0wzkc: reject resume of state captured for a different workflow.
@@ -380,6 +503,7 @@ func (e *Executor) Resume(ctx context.Context, workflow *Workflow, prior *Execut
 		return nil, fmt.Errorf("resume state %q was captured for workflow %q but target workflow is %q", prior.RunID, prior.WorkflowID, workflow.Name)
 	}
 
+	e.resetCheckpointFailure()
 	// Create cancellable context
 	ctx, cancel := context.WithCancel(ctx)
 	e.cancelFn = cancel
@@ -397,6 +521,14 @@ func (e *Executor) Resume(ctx context.Context, workflow *Workflow, prior *Execut
 	}()
 
 	e.stateMu.Lock()
+	e.backgroundCommandErrors = nil
+	e.resetSelectorOutputBudgetLocked()
+	e.stepAdmissionAttempt = &stepAdmissionAttempt{}
+	e.reservationFailure = nil
+	e.reservationWake = make(chan struct{}, 1)
+	e.reservationStop = make(chan struct{})
+	e.reservationStopOnce = sync.Once{}
+	e.reservationFinalCheck = false
 	e.state = prior
 	if e.state.Steps == nil {
 		e.state.Steps = make(map[string]StepResult)
@@ -441,7 +573,10 @@ func (e *Executor) Resume(ctx context.Context, workflow *Workflow, prior *Execut
 
 	e.progress = progress
 	e.defaults = workflow.Defaults
-	e.limits = workflow.Settings.Limits.EffectiveLimits()
+	e.limits = resumeAttemptLimits(workflow.Settings.Limits, e.config.ResumeOptions)
+	if err := e.validateStepDefinitionCapacity(workflow); err != nil {
+		return prior, err
+	}
 
 	// Build dependency graph
 	e.graph = NewDependencyGraph(workflow)
@@ -457,11 +592,30 @@ func (e *Executor) Resume(ctx context.Context, workflow *Workflow, prior *Execut
 			})
 		}
 		e.stateMu.Unlock()
-		e.persistState()
-		return e.state, fmt.Errorf("workflow has dependency errors: %v", errors[0])
+		return e.state, joinCheckpointError(fmt.Errorf("workflow has dependency errors: %v", errors[0]), e.persistState())
 	}
 
-	if err := e.applyResumeOptions(workflow, e.config.ResumeOptions); err != nil {
+	resumeErr := e.verifyReservationResume(ctx, workflow, e.config.ResumeOptions)
+	if resumeErr != nil && ctx.Err() != nil && errors.Is(resumeErr, ctx.Err()) {
+		// Cancellation during read-only lease admission is a cancelled
+		// attempt, not failed protection. Run authored cleanup with the
+		// original receipts intact; do not reset or prune their identities.
+		// Concrete ownership and unknown-outcome errors do not match ctx.Err.
+		e.stateMu.Lock()
+		admissionErr := e.seedStepAdmissionsLocked(workflow, e.graph)
+		e.stateMu.Unlock()
+		if admissionErr != nil {
+			return e.state, errors.Join(resumeErr, admissionErr)
+		}
+		if err := e.admitFinalizationRoots(context.WithoutCancel(ctx), workflow); err != nil {
+			return e.state, errors.Join(resumeErr, err)
+		}
+		return e.finishExecution(ctx, workflow, resumeErr)
+	}
+	if resumeErr == nil {
+		resumeErr = e.applyResumeOptions(workflow, e.config.ResumeOptions)
+	}
+	if err := resumeErr; err != nil {
 		e.stateMu.Lock()
 		e.state.Status = StatusFailed
 		e.state.Errors = append(e.state.Errors, ExecutionError{
@@ -482,9 +636,24 @@ func (e *Executor) Resume(ctx context.Context, workflow *Workflow, prior *Execut
 		return e.state, err
 	}
 
+	// Validate and restore retained output bindings before changing attempt
+	// timestamps or persisting. Rejected receipt evidence must not refresh
+	// checkpoint age, advance the graph, or authorize downstream effects.
+	if err := e.applyResumeState(); err != nil {
+		return e.state, fmt.Errorf("restore resume outputs: %w", err)
+	}
+	if err := e.admitWorkflowRoots(ctx, workflow); err != nil {
+		if ctx.Err() != nil && errors.Is(err, ctx.Err()) && e.checkpointFailure() == nil {
+			return e.finishExecution(ctx, workflow, err)
+		}
+		// This attempt has not dispatched work. An admission checkpoint
+		// failure must not start authored cleanup as a side effect.
+		return e.state, err
+	}
+
 	// bd-05l02: now that resume validation has accepted the prior state,
 	// transition it to "running" and backfill StartedAt for runs that
-	// never recorded one. applyResumeState writes step results;
+	// never recorded one. applyResumeState has restored step results;
 	// persistState refreshes LastCheckpointAt as part of normal checkpointing.
 	e.stateMu.Lock()
 	if e.state.StartedAt.IsZero() {
@@ -497,41 +666,20 @@ func (e *Executor) Resume(ctx context.Context, workflow *Workflow, prior *Execut
 	e.state.CurrentStep = ""
 	e.stateMu.Unlock()
 
-	e.applyResumeState()
-	e.persistState()
+	e.resetPostPipelineForMainAttempt(workflow)
+	if err := e.persistState(); err != nil {
+		return e.state, err
+	}
 
 	// Emit start event
 	e.emitProgress("workflow_start", "", workflowProgressMessage("Resuming workflow", workflow), e.calculateProgress())
 
 	// Execute steps in dependency order
+	stopProtection := e.startReservationProtection(ctx, workflow)
+	defer stopProtection()
 	err := e.executeWorkflow(ctx, workflow)
 
-	// Finalize state
-	if err != nil {
-		if ctx.Err() != nil {
-			e.finalizeCancelledWorkflow(ctx, workflow)
-		} else {
-			e.stateMu.Lock()
-			e.state.FinishedAt = time.Now()
-			e.state.UpdatedAt = time.Now()
-			e.state.Status = StatusFailed
-			e.sendNotification(ctx, workflow, NotifyFailed)
-			e.stateMu.Unlock()
-		}
-		e.emitProgress("workflow_error", "", err.Error(), e.calculateProgress())
-	} else {
-		e.stateMu.Lock()
-		e.state.FinishedAt = time.Now()
-		e.state.UpdatedAt = time.Now()
-		e.state.Status = StatusCompleted
-		e.sendNotification(ctx, workflow, NotifyCompleted)
-		e.stateMu.Unlock()
-		e.emitProgress("workflow_complete", "", "Workflow completed successfully", 1.0)
-	}
-
-	e.persistState()
-
-	return e.state, err
+	return e.finishExecution(ctx, workflow, err)
 }
 
 func (e *Executor) finalizeCancelledWorkflow(ctx context.Context, workflow *Workflow) {
@@ -554,6 +702,13 @@ func (e *Executor) finalizeCancelledWorkflow(ctx context.Context, workflow *Work
 	e.stateMu.Unlock()
 	e.persistState()
 
+	// Main sidecars retain their resources through graceful shutdown and
+	// receipt persistence. Join their supervision before authored cleanup can
+	// release those resources. An unresolved receipt still remains unresolved;
+	// it does not suppress the independently bounded best-effort cleanup.
+	e.Cancel()
+	e.backgroundCommandWG.Wait()
+
 	e.runOnCancelSteps(workflow)
 
 	finishedAt := time.Now()
@@ -566,7 +721,6 @@ func (e *Executor) finalizeCancelledWorkflow(ctx context.Context, workflow *Work
 	e.state.UpdatedAt = finishedAt
 	e.state.CurrentStep = ""
 	e.stateMu.Unlock()
-	e.sendNotification(ctx, workflow, NotifyCancelled)
 }
 
 func (e *Executor) runOnCancelSteps(workflow *Workflow) {
@@ -596,9 +750,13 @@ func (e *Executor) runOnCancelSteps(workflow *Workflow) {
 		e.state.UpdatedAt = time.Now()
 		e.stateMu.Unlock()
 
-		stepCtx, stepCancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		cleanupCtx := context.WithValue(finalizationContext(context.Background()), checkpointCleanupKey{}, true)
+		stepCtx, stepCancel := context.WithTimeout(cleanupCtx, cleanupTimeout)
 		result := e.executeStep(stepCtx, &step, &cleanupWorkflow)
 		stepCancel()
+		if !e.runtimeIDAdmitted(step.ID) {
+			continue
+		}
 		if result.FinishedAt.IsZero() {
 			result.FinishedAt = time.Now()
 		}
@@ -707,9 +865,11 @@ func (e *Executor) executeWorkflow(ctx context.Context, workflow *Workflow) erro
 
 	// stepCtx cancels in-flight siblings on fatal errors (fail / fail_fast /
 	// retry-exhausted) without tearing down the workflow ctx used by
-	// post-pipeline steps and finalization.
+	// post-pipeline steps and finalization. Normal main-phase completion
+	// retains sidecars until finalization cancels and joins their workers.
 	stepCtx, cancelSteps := context.WithCancel(ctx)
-	defer cancelSteps()
+	stepCtx, finishSteps := withCommandCancellationScope(stepCtx, cancelSteps)
+	defer finishSteps()
 
 	type stepDone struct {
 		stepID string
@@ -725,6 +885,9 @@ func (e *Executor) executeWorkflow(ctx context.Context, workflow *Workflow) erro
 	// state, and applies on_error semantics. A non-nil return is fatal.
 	finishStep := func(d stepDone) error {
 		stepID, step, result := d.stepID, d.step, d.result
+		if !e.runtimeIDAdmitted(stepID) {
+			return fmt.Errorf("runtime step %q was refused before admission", stepID)
+		}
 
 		e.stateMu.Lock()
 		e.state.Steps[stepID] = result
@@ -761,7 +924,9 @@ func (e *Executor) executeWorkflow(ctx context.Context, workflow *Workflow) erro
 		e.stateMu.Lock()
 		e.state.UpdatedAt = time.Now()
 		e.stateMu.Unlock()
-		e.persistState()
+		if err := e.persistState(); err != nil {
+			return err
+		}
 
 		// Mark skipped steps as failed ONLY if skipped due to failed dependencies.
 		// This ensures transitive dependents are also skipped (A fails -> B skipped -> C skipped).
@@ -770,6 +935,9 @@ func (e *Executor) executeWorkflow(ctx context.Context, workflow *Workflow) erro
 			_ = e.graph.MarkFailed(stepID)
 		}
 
+		if err := e.stepAdmissionFailure(ctx); err != nil {
+			return err
+		}
 		// Handle failure based on error action
 		if result.Status == StatusFailed {
 			// Mark step as failed in dependency graph
@@ -896,20 +1064,51 @@ scheduler:
 		waitOne()
 	}
 
+	if fatalErr != nil {
+		cancelSteps()
+		// Fatal main failures have requested sidecar cancellation. Finish
+		// supervision before post hooks release resources still used
+		// by TERM handlers. Healthy runs retain sidecars through post hooks.
+		// Use the live workflow context so actual cancellation can proceed
+		// to its existing checkpoint-before-join path without another
+		// WaitGroup waiter racing commands started by authored cleanup.
+		stepCtx.Value(commandCancellationScopeKey{}).(*commandCancellationScope).wait(ctx)
+	}
 	return fatalErr
 }
 
 // executeStep runs a single step with retry logic
 func (e *Executor) executeStep(ctx context.Context, step *Step, workflow *Workflow) StepResult {
+	if err := e.admitRuntimeIDs(ctx, []string{step.ID}); err != nil {
+		return stepAdmissionResult(step, err)
+	}
+	// Releasing an already-expired lease is valid cleanup. Its own identity
+	// check owns admission. Reset this marker for every child so success or
+	// recovery hooks cannot inherit a release parent's exemption.
+	ctx = context.WithValue(ctx, reservationReleaseKey{}, step.FileReservationRelease != nil)
 	result := StepResult{
 		StepID:    step.ID,
 		Status:    StatusPending,
 		StartedAt: time.Now(),
 		Attempts:  0,
 	}
+	if e.stopBeforeDispatch(ctx, &result) {
+		if result.Status == StatusCancelled {
+			// No kind executor has run. Preserve that affirmative evidence
+			// without weakening resume's independent launch-receipt checks.
+			result.SkipKind = SkipKindCancelledBeforeDispatch
+		}
+		return result
+	}
 	e.markStepInFlight(step.ID, stepKind(step), -1)
 	e.persistState()
 	defer e.clearStepInFlight(step.ID)
+	if e.stopBeforeDispatch(ctx, &result) {
+		if result.Status == StatusCancelled {
+			result.SkipKind = SkipKindCancelledBeforeDispatch
+		}
+		return result
+	}
 
 	// Check for failed dependencies (in CONTINUE mode, skip steps with failed deps)
 	if e.graph.HasFailedDependency(step.ID) {
@@ -974,24 +1173,55 @@ func (e *Executor) executeStep(ctx context.Context, step *Step, workflow *Workfl
 
 		// Execute the step
 		stepResult := e.executeStepOnce(ctx, step, workflow)
+		startedAttempts := attempt
+		if stepResult.Status == StatusCancelled && stepResult.SkipKind == SkipKindCancelledBeforeDispatch {
+			// This attempt never entered its kind executor. Keep any
+			// earlier attempts visible to the missing-receipt fence.
+			startedAttempts--
+		}
+		if findStepAdmissionError(stepResult.Error) != nil {
+			stepResult.Attempts = startedAttempts
+			return stepResult
+		}
+		if err := e.stepAdmissionFailure(ctx); err != nil {
+			// A sibling or descendant can exhaust capacity after this body
+			// finishes. Preserve its original completion/uncertainty evidence;
+			// the sticky attempt error stops scheduling and fails the run.
+			stepResult.Attempts = startedAttempts
+			if stepResult.Status == StatusCompleted && len(step.OnSuccess) > 0 {
+				return stepAdmissionExecutionFailure(stepResult, err)
+			}
+			return stepResult
+		}
 
 		if stepResult.Status == StatusCompleted {
 			result = stepResult
 			result.Attempts = attempt
 			result.FinishedAt = time.Now()
+			if e.hasUnresolvedCommandExecutionForOutcome(step, &result) || e.hasUnresolvedCommandEvaluation(step) {
+				return unsettledProcessStepFailure(result, fmt.Errorf("%w for %q", errStepProcessUnsettled, step.ID))
+			}
+			// Publish canonical outputs before success hooks for every kind.
+			// Named output_var merging remains the containing scheduler's job.
+			e.varMu.Lock()
+			StoreStepOutput(e.state, step.ID, result.Output, result.ParsedData)
+			e.varMu.Unlock()
 			e.emitProgress("step_complete", step.ID,
 				stepProgressMessage("Step completed", step, ""), e.calculateProgress())
 			// bd-w6nth.7: run OnSuccess steps after a successful parent.
-			// Failures here are logged but do NOT flip the parent's
-			// Status (matching post_pipeline_steps semantics). Depth is
-			// tracked in ctx so recursive OnSuccess chains can be capped.
-			e.runOnSuccessSteps(ctx, step, workflow)
+			// Ordinary hook failures are logged without changing its status.
+			// Capacity refusal keeps the original effect receipt and leaves
+			// the parent resumable so its pending hooks can finish later.
+			// Context depth bounds recursive OnSuccess chains.
+			if err := e.runOnSuccessSteps(ctx, step, workflow); err != nil {
+				return successHookExecutionFailure(result, err)
+			}
 			return result
 		}
 
 		if stepResult.Status == StatusCancelled {
 			result = stepResult
-			result.Attempts = attempt
+			result.Attempts = startedAttempts
 			if result.FinishedAt.IsZero() {
 				result.FinishedAt = time.Now()
 			}
@@ -1013,6 +1243,38 @@ func (e *Executor) executeStep(ctx context.Context, step *Step, workflow *Workfl
 		// metadata survive retry exhaustion and on_failure recovery.
 		result = stepResult
 		result.Attempts = attempt
+		if e.hasUnresolvedCommandEvaluation(step) || e.hasAcceptedCommandEvaluationFailure(step) {
+			// Selector uncertainty also fences its containers. An operator's
+			// accepted final failure cannot change through another automatic
+			// attempt; proceed directly to the normal failure policy.
+			break
+		}
+		if delivery, ok := e.loadAgentDelivery(step.ID); ok && delivery.Status == agentDeliverySending {
+			// A transport error is not proof of non-delivery. Automatic retry
+			// cannot resolve this uncertainty by submitting the request again.
+			break
+		}
+		if _, pending := e.pendingOnFailureDelivery(step); pending {
+			// Recovery already crossed the delivery boundary for this failure.
+			// Re-enter it without spending retries on the original command.
+			break
+		}
+		if command, ok := e.loadCommandExecution(step.ID); ok && (command.Status != commandExecutionSettled || command.ResolutionAction != "") {
+			// No retry may start another process while the original command
+			// group has an unresolved outcome, or replace an operator's explicit
+			// final outcome. Normal failure policy still handles that result.
+			break
+		}
+		if send, ok := e.loadMailSend(step.ID); ok && send.Status != mailSendRejected {
+			// A lost response or output parsing failure cannot authorize a
+			// second message carrying the same work to the recipient.
+			break
+		}
+		if reservation, ok := e.loadReservationStep(step.ID); ok && reservation.Status != reservationRejected {
+			// Partial grants, unresolved mutations, and parsing failures are
+			// not permission to acquire new leases or repeat broad releases.
+			break
+		}
 
 		if attempt < maxAttempts {
 			// Wait before retry
@@ -1050,7 +1312,10 @@ func (e *Executor) executeStep(ctx context.Context, step *Step, workflow *Workfl
 }
 
 func (e *Executor) finalizeFailedStep(ctx context.Context, step *Step, workflow *Workflow, result StepResult) StepResult {
-	if result.Status != StatusFailed {
+	if result.Status != StatusFailed || findStepAdmissionError(result.Error) != nil {
+		return result
+	}
+	if e.stopBeforeDispatch(ctx, &result) {
 		return result
 	}
 
@@ -1072,10 +1337,20 @@ func (e *Executor) finalizeFailedStep(ctx context.Context, step *Step, workflow 
 
 // executeStepOnce executes a step once without retry logic
 func (e *Executor) executeStepOnce(ctx context.Context, step *Step, workflow *Workflow) StepResult {
+	// Routing may resolve pane expressions in place. Keep the immutable step
+	// definition intact so recovery validates the same request before routing.
+	copy := *step
+	step = &copy
 	result := StepResult{
 		StepID:    step.ID,
 		Status:    StatusRunning,
 		StartedAt: time.Now(),
+	}
+	if e.stopBeforeDispatch(ctx, &result) {
+		if result.Status == StatusCancelled {
+			result.SkipKind = SkipKindCancelledBeforeDispatch
+		}
+		return result
 	}
 
 	// Keep composite steps inside executeStep's retry/failure tail.
@@ -1117,6 +1392,15 @@ func (e *Executor) executeStepOnce(ctx context.Context, step *Step, workflow *Wo
 	// rather than tmux pane dispatch.
 	if step.hasMailStep() {
 		return e.executeMailStep(ctx, step)
+	}
+	stepHash, err := agentStepHash(step)
+	if err != nil {
+		result.Status = StatusFailed
+		result.Error = stepRuntimeError(step, StepKindPrompt, "recovery", err.Error(), "inspect the saved step definition", "")
+		return result
+	}
+	if delivery, recorded := e.loadAgentDelivery(step.ID); recorded && delivery.Status != agentDeliveryNotSent && !e.config.DryRun {
+		return e.executeAgentDelivery(ctx, step, workflow, StepKindPrompt, stepHash, "", "", "")
 	}
 
 	// bd-2xka8: bind pane metadata for the step's tmux pane before
@@ -1181,128 +1465,7 @@ func (e *Executor) executeStepOnce(ctx context.Context, step *Step, workflow *Wo
 		return result
 	}
 
-	// Serialize the whole dispatch window (capture → paste → wait → capture)
-	// against other steps targeting the same pane (bd-jio7h).
-	releasePane, err := e.acquirePaneLock(ctx, paneID)
-	if err != nil {
-		result.Status = StatusCancelled
-		result.SkipReason = "cancelled while waiting for pane"
-		result.SkipKind = SkipKindCancelled
-		result.FinishedAt = time.Now()
-		return result
-	}
-	defer releasePane()
-
-	// Capture state before sending
-	beforeOutput, _ := e.tmuxClient().CapturePaneOutput(paneID, 2000)
-
-	// Send prompt
-	if err := e.tmuxClient().PasteKeys(paneID, prompt, true); err != nil {
-		result.Status = StatusFailed
-		result.Error = &StepError{
-			Type:      "send",
-			Message:   fmt.Sprintf("failed to send prompt: %v", err),
-			Timestamp: time.Now(),
-		}
-		return result
-	}
-
-	// Handle wait condition
-	waitCondition := step.Wait
-	if waitCondition == "" {
-		waitCondition = WaitCompletion
-	}
-
-	// Calculate step timeout
-	timeout := e.config.DefaultTimeout
-	if step.Timeout.Duration > 0 {
-		timeout = step.Timeout.Duration
-	}
-
-	switch waitCondition {
-	case WaitNone:
-		// Fire and forget
-		result.Status = StatusCompleted
-		result.FinishedAt = time.Now()
-		return result
-
-	case WaitTime:
-		// Just wait for timeout
-		select {
-		case <-ctx.Done():
-			result.Status = StatusCancelled
-			result.FinishedAt = time.Now()
-			return result
-		case <-time.After(timeout):
-			result.Status = StatusCompleted
-			result.FinishedAt = time.Now()
-		}
-
-	case WaitCompletion, WaitIdle:
-		// Wait for agent to return to idle
-		if err := e.waitForIdle(ctx, paneID, timeout); err != nil {
-			if ctx.Err() != nil {
-				result.Status = StatusCancelled
-			} else {
-				result.Status = StatusFailed
-				result.Error = &StepError{
-					Type:       "timeout",
-					Message:    fmt.Sprintf("timeout waiting for completion: %v", err),
-					PaneOutput: e.captureErrorContext(paneID, 50),
-					AgentState: e.detectAgentState(paneID),
-					Timestamp:  time.Now(),
-				}
-				// ntm#213: idle detection is heuristic and can miss a
-				// finished TUI turn entirely, timing out even though the
-				// agent's answer is sitting in the pane. Salvage the
-				// before/after diff so the response isn't dropped — the
-				// step still fails, but downstream consumers (retries,
-				// ignore_errors flows, humans debugging) get the output.
-				if after, capErr := e.tmuxClient().CapturePaneOutput(paneID, 2000); capErr == nil {
-					result.Output = util.ExtractNewOutput(beforeOutput, after)
-				}
-			}
-			result.FinishedAt = time.Now()
-			return result
-		}
-	}
-
-	// Capture output
-	afterOutput, err := e.tmuxClient().CapturePaneOutput(paneID, 2000)
-	if err != nil {
-		result.Status = StatusFailed
-		result.Error = &StepError{
-			Type:      "capture",
-			Message:   fmt.Sprintf("failed to capture output: %v", err),
-			Timestamp: time.Now(),
-		}
-		return result
-	}
-
-	result.Output = util.ExtractNewOutput(beforeOutput, afterOutput)
-
-	// Parse output if configured
-	if step.OutputVar != "" && step.OutputParse.Type != "" && step.OutputParse.Type != "none" {
-		parsed, err := e.parseOutput(result.Output, step.OutputParse)
-		if err != nil {
-			// Non-fatal - just warn
-			e.stateMu.Lock()
-			e.state.Errors = append(e.state.Errors, ExecutionError{
-				StepID:    step.ID,
-				Type:      "parse",
-				Message:   fmt.Sprintf("failed to parse output: %v", err),
-				Timestamp: time.Now(),
-				Fatal:     false,
-			})
-			e.stateMu.Unlock()
-		} else {
-			result.ParsedData = parsed
-		}
-	}
-
-	result.Status = StatusCompleted
-	result.FinishedAt = time.Now()
-	return result
+	return e.executeAgentDelivery(ctx, step, workflow, StepKindPrompt, stepHash, prompt, paneID, agentType)
 }
 
 func stepRuntimeError(step *Step, kind, typ, reason, hint, details string) *StepError {
@@ -1327,13 +1490,98 @@ func stepRuntimeError(step *Step, kind, typ, reason, hint, details string) *Step
 }
 
 // executeCommand runs a shell command step via /bin/sh -c.
-func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Workflow) StepResult {
-	result := StepResult{
+func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Workflow) (result StepResult) {
+	result = StepResult{
 		StepID:    step.ID,
 		Status:    StatusRunning,
 		StartedAt: time.Now(),
 		AgentType: "command",
 	}
+	stepHash, err := commandDefinitionHash(step)
+	if err != nil {
+		result.Status, result.FinishedAt = StatusFailed, time.Now()
+		result.Error = stepRuntimeError(step, StepKindCommand, "recovery", err.Error(), "inspect the command definition", "")
+		return result
+	}
+	if prior, ok := e.loadCommandExecution(step.ID); ok && !e.config.DryRun {
+		if err := validateCommandExecution(step.ID, prior); err != nil {
+			result.Status, result.FinishedAt = StatusFailed, time.Now()
+			result.Error = stepRuntimeError(step, StepKindCommand, "recovery", err.Error(), "inspect the saved command execution", "")
+			return result
+		}
+		if prior.StepHash != stepHash {
+			result.Status, result.FinishedAt = StatusFailed, time.Now()
+			result.Error = stepRuntimeError(step, StepKindCommand, "recovery", "saved command execution belongs to a different step definition", "use an explicit reset before changing a previously dispatched command", "")
+			return result
+		}
+		if prior.Status != commandExecutionSettled {
+			result.Status, result.FinishedAt = StatusFailed, time.Now()
+			result.Error = stepRuntimeError(step, StepKindCommand, "execution_unknown", uncertainCommandExecutionError(step.ID, prior.ProcessID).Error(), "inspect the saved command execution before deliberately replaying it", "")
+			return result
+		}
+		if prior.ResolutionAction != "" {
+			// The journal retains the operator's exact unparsed bytes. Interpret
+			// them only after the canonical materialized StepHash check above;
+			// never let an accepted nonzero exit fall through to command launch.
+			e.stateMu.RLock()
+			_, identityErr := commandExecutionRecoveryEntry(e.state, prior)
+			e.stateMu.RUnlock()
+			if identityErr != nil {
+				result.Status, result.FinishedAt = StatusFailed, time.Now()
+				result.Error = stepRuntimeError(step, StepKindCommand, "recovery", identityErr.Error(), "inspect the immutable command decision", "")
+				return result
+			}
+			result = prior.Result
+			result.Output = strings.TrimSpace(result.Output)
+			if prior.ResolutionExitCode != 0 {
+				result.Error = commandExitStepError(step, prior.ResolutionExitCode)
+				return result
+			}
+			return e.completeCommandResult(step, result)
+		}
+		if prior.Result.Status == StatusCompleted && !prior.Result.RerunOnResume {
+			return prior.Result
+		}
+		if (!prior.Background || prior.ProcessID == 0) && prior.Result.Status == StatusFailed {
+			if delivery, pending := e.pendingOnFailureDelivery(step); pending {
+				if err := e.validateOnFailureDelivery(ctx, step, delivery); err != nil {
+					result.Status, result.FinishedAt = StatusFailed, time.Now()
+					result.Error = stepRuntimeError(step, StepKindCommand, "recovery", err.Error(), "restore the original failure recovery inputs or explicitly reset its replay scope", "")
+					return result
+				}
+				return prior.Result
+			}
+		}
+	} else if !e.config.DryRun {
+		if delivery, exists := e.loadAgentDelivery(onFailureStepID(step.ID)); exists && delivery.Status != agentDeliveryNotSent {
+			result.Status, result.FinishedAt = StatusFailed, time.Now()
+			result.Error = stepRuntimeError(step, StepKindCommand, "recovery", "failure recovery has lost its original command receipt", "restore the original command receipt or explicitly reset its replay scope", "")
+			return result
+		}
+	}
+
+	// Substitution and validation can fail before a launch intent exists. If
+	// this live failure can dispatch a fallback, retain exact proof that this
+	// attempt started no process before recovery crosses its delivery boundary.
+	// Never infer that proof later from an unbound scheduler result.
+	prelaunch := true
+	defer func() {
+		if !prelaunch || e.config.DryRun || len(step.OnFailure.Fallback) == 0 || result.Status != StatusFailed || result.Error == nil {
+			return
+		}
+		switch result.Error.Type {
+		case "substitution", "validation", "limit":
+		default:
+			return
+		}
+		record := CommandExecutionState{
+			Version: commandExecutionVersion, StepID: step.ID, StepHash: stepHash,
+			Status: commandExecutionSettled, StartedAt: result.StartedAt, SettledAt: time.Now(), Result: result,
+		}
+		if err := e.saveCommandExecution(record); err != nil {
+			result.Error = stepRuntimeError(step, StepKindCommand, "checkpoint", err.Error(), "restore durable storage before recovering the failed command", "")
+		}
+	}()
 
 	// bd-2xka8: bind pane metadata before substitution so ${pane.X} in the
 	// command body or args resolves against the step's configured pane.
@@ -1380,7 +1628,7 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 	}
 
 	// bd-6xlxl: run pipeline substitution over Args string values so
-	// `${vars.x}`, `${env.X}`, `${steps.s.output}`, etc. resolve before they
+	// `${vars.x}`, `${env.X}`, `${steps.X.output}`, etc. resolve before they
 	// are exported as environment variables. Without this, args:
 	// {TOKEN: "${env.API_TOKEN}"} ships the literal text instead of the
 	// runtime value.
@@ -1405,6 +1653,7 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 		result.FinishedAt = time.Now()
 		return result
 	}
+	prelaunch = false
 
 	if e.config.DryRun {
 		// bd-ziavr: surface the substituted Stdin payload alongside the
@@ -1438,11 +1687,16 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 	if step.Timeout.Duration > 0 {
 		timeout = step.Timeout.Duration
 	}
-	cmdCtx, cmdCancel := context.WithTimeout(ctx, timeout)
-	defer cmdCancel()
+	timeoutCause := fmt.Errorf("command step %q timed out after %s: %w", step.ID, timeout, context.DeadlineExceeded)
+	cmdCtx, cmdCancel := context.WithTimeoutCause(ctx, timeout, timeoutCause)
+	cancelCommandContext := true
+	defer func() {
+		if cancelCommandContext {
+			cmdCancel()
+		}
+	}()
 
 	cmd := exec.Command("/bin/sh", "-c", expandedCmd)
-	configureCommandProcessGroup(cmd)
 
 	if e.config.ProjectDir != "" {
 		cmd.Dir = e.config.ProjectDir
@@ -1475,12 +1729,55 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 	if expandedStdin != "" {
 		cmd.Stdin = strings.NewReader(expandedStdin)
 	}
+	configureCommandProcessGroup(cmd)
 
 	waitCondition := step.Wait
 	if waitCondition == "" {
 		waitCondition = WaitCompletion
 	}
 
+	record := CommandExecutionState{
+		Version: commandExecutionVersion, StepID: step.ID, StepHash: stepHash,
+		Status: commandExecutionStarting, Background: waitCondition == WaitNone,
+		StartedAt: result.StartedAt,
+	}
+	// Explicit bounded on_cancel cleanup is allowed after storage failure
+	// (checkpointCleanupKey). Preserve that existing best-effort release path;
+	// ordinary command dispatch always requires a durable launch intent.
+	cleanupAfterCheckpointFailure, _ := ctx.Value(checkpointCleanupKey{}).(bool)
+	journalCommand := !(cleanupAfterCheckpointFailure && e.checkpointFailure() != nil)
+	if journalCommand {
+		if err := e.saveCommandExecution(record); err != nil {
+			result.Status, result.FinishedAt = StatusFailed, time.Now()
+			result.Error = stepRuntimeError(step, StepKindCommand, "checkpoint", err.Error(), "restore durable storage before retrying", "")
+			return result
+		}
+	}
+	// Before Start there can be no command process. After Start only the
+	// owned process-group waiter can prove settlement. Persist that proof
+	// before executeStep clears scheduler bookkeeping or another worker saves.
+	commandSettled := true
+	commandCleanupReturned := false
+	defer func() {
+		if !journalCommand || (!commandSettled && !commandCleanupReturned) {
+			return
+		}
+		record.Result = result
+		if commandSettled {
+			record.Status, record.SettledAt = commandExecutionSettled, time.Now()
+		} else {
+			// Supervision ended, but termination was not proved. Persist the
+			// actual failure without leaving a misleading running receipt or
+			// granting the replay permission carried only by settled receipts.
+			record.Status, record.SettledAt = commandExecutionUnresolved, time.Time{}
+		}
+		// A failed save stops the workflow through its sticky checkpoint error,
+		// while retaining the actual command outcome in the returned state.
+		_ = e.saveCommandExecution(record)
+	}()
+	if e.stopBeforeDispatch(cmdCtx, &result) {
+		return result
+	}
 	if err := cmd.Start(); err != nil {
 		result.Status = StatusFailed
 		result.Error = stepRuntimeError(step, "command", "command",
@@ -1495,15 +1792,138 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 		)
 		return result
 	}
+	commandSettled = false
+	record.Status, record.ProcessID = commandExecutionRunning, cmd.Process.Pid
+	if hook, _ := ctx.Value(commandStartedTestHookKey{}).(func(int)); hook != nil {
+		hook(cmd.Process.Pid)
+	}
+	if journalCommand {
+		if err := e.saveCommandExecution(record); err != nil {
+			// The sticky checkpoint failure has already cancelled the run,
+			// so stop the owned group. The command may nevertheless have
+			// finished (or written partial output) before storage failed:
+			// keep its capture as in-memory evidence, as the settled path
+			// does when its final save fails.
+			cmdCancel()
+			cleanup := waitCommandWithProcessGroupCleanup(cmdCtx, cmd)
+			commandSettled = cleanup.Settled
+			commandCleanupReturned = true
+			result.Output = e.capturedCommandOutput(step, stdoutBuf, stderrBuf)
+			result.Status, result.FinishedAt = StatusFailed, time.Now()
+			cleanupErr := cleanup.Err
+			if !cleanup.Settled {
+				cleanupErr = errors.Join(cleanupErr, uncertainCommandExecutionError(step.ID, record.ProcessID))
+			}
+			var details string
+			if cleanupErr != nil {
+				details = cleanupErr.Error()
+			}
+			result.Error = stepRuntimeError(step, StepKindCommand, "checkpoint", err.Error(), "inspect the command group and restore durable storage before retrying", details)
+			return result
+		}
+	}
 
 	if waitCondition == WaitNone {
 		startedAt := result.StartedAt
 		stepID := step.ID
 		workflowName := workflow.Name
+		backgroundRecord := record
+		backgroundCtx, backgroundCancel := ctx, context.CancelFunc(func() {})
+		if step.Timeout.Duration > 0 {
+			// An explicit limit belongs to the command's whole lifetime,
+			// including its asynchronous group cleanup. Transfer the cancel
+			// function so the synchronous launch acknowledgement cannot stop
+			// the process. Unbounded sidecars retain the run lifetime instead
+			// of inheriting the configured foreground default.
+			backgroundCtx, backgroundCancel = cmdCtx, cmdCancel
+			cancelCommandContext = false
+		}
+		releaseScopes := retainCommandCancellationScopes(backgroundCtx)
 		e.backgroundCommandWG.Add(1)
 		go func() {
 			defer e.backgroundCommandWG.Done()
-			cleanup := waitCommandWithProcessGroupCleanup(ctx, cmd)
+			defer releaseScopes()
+			defer backgroundCancel()
+			cleanup := waitCommandWithProcessGroupCleanup(backgroundCtx, cmd)
+			// A later workflow cancellation must not erase the deadline that
+			// actually stopped this command. Natural completion is still a
+			// success if its deadline fires only after the waiter returned.
+			// An enclosing container deadline also owns the retained sidecar
+			// lifetime after that container's foreground work has completed.
+			deadlineCause := context.Cause(backgroundCtx)
+			timedOut := cleanup.Cancelled && errors.Is(deadlineCause, context.DeadlineExceeded)
+			cleanupErr := cleanup.Err
+			if !cleanup.Settled {
+				// Keep the launch receipt unresolved and also carry the
+				// cleanup failure into the workflow's terminal outcome. A
+				// detached child can still act after this worker returns.
+				cleanupErr = errors.Join(cleanupErr, uncertainCommandExecutionError(stepID, backgroundRecord.ProcessID))
+			}
+			if timedOut {
+				cleanupErr = errors.Join(deadlineCause, cleanupErr)
+			}
+			// Expected workflow shutdown can stop a healthy sidecar. A natural
+			// failure, including one observed before shutdown began signalling,
+			// must still reach the terminal outcome without retrying background
+			// work or changing the already-published launch acknowledgement.
+			if !cleanup.Settled || timedOut || (!cleanup.Cancelled && cleanup.Err != nil) || cleanup.ExitBeforeSignalErr != nil {
+				backgroundErr := cleanupErr
+				if cleanup.Settled && !timedOut && cleanup.ExitBeforeSignalErr != nil {
+					// Routine workflow shutdown must not attach its cancellation
+					// sentinel to a proven earlier execution failure. The receipt
+					// below still preserves every cleanup diagnostic.
+					backgroundErr = cleanup.ExitBeforeSignalErr
+				}
+				e.stateMu.Lock()
+				if e.backgroundCommandErrors == nil {
+					e.backgroundCommandErrors = make(map[string]error)
+				}
+				e.backgroundCommandErrors[stepID] = backgroundErr
+				e.stateMu.Unlock()
+			}
+			if journalCommand {
+				finished := time.Now()
+				backgroundRecord.Status, backgroundRecord.SettledAt = commandExecutionSettled, finished
+				backgroundRecord.Result = StepResult{StepID: stepID, AgentType: "command", Status: StatusCompleted, StartedAt: startedAt, FinishedAt: finished}
+				if !cleanup.Settled {
+					backgroundRecord.Status, backgroundRecord.SettledAt = commandExecutionUnresolved, time.Time{}
+				}
+				if cleanup.Cancelled || cleanupErr != nil {
+					backgroundRecord.Result.Status = StatusFailed
+					errorType := "command"
+					reason := "background command cleanup failed"
+					hint := "inspect the command execution before resuming"
+					if !cleanup.Settled {
+						errorType = "execution_unknown"
+					}
+					if cleanup.Cancelled && cleanup.ExitBeforeSignalErr == nil {
+						backgroundRecord.Result.Status = StatusCancelled
+						errorType = "cancelled"
+						if cleanupErr == nil {
+							cleanupErr = context.Canceled
+						}
+					}
+					if timedOut {
+						backgroundRecord.Result.Status = StatusFailed
+						errorType = "timeout"
+						reason = "background command exceeded an enclosing execution deadline"
+						hint = "inspect the enclosing workflow or container timeout"
+						if deadlineCause == timeoutCause {
+							reason = fmt.Sprintf("background command timed out after %s", timeout)
+							hint = "increase step.timeout or reduce command runtime"
+						}
+						if !cleanup.Settled {
+							hint = "inspect the command group before resuming; settlement is uncertain even though its timeout elapsed"
+						}
+					}
+					backgroundStep := &Step{ID: stepID}
+					backgroundRecord.Result.Output = e.capturedCommandOutput(backgroundStep, stdoutBuf, stderrBuf)
+					backgroundRecord.Result.Error = stepRuntimeError(backgroundStep, StepKindCommand, errorType,
+						reason, hint, cleanupErr.Error())
+					backgroundRecord.Result.RerunOnResume = cleanup.Settled
+				}
+				_ = e.saveCommandExecution(backgroundRecord) // Sticky checkpoint failure cancels the run.
+			}
 			if !cleanup.Cancelled {
 				return
 			}
@@ -1515,6 +1935,7 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 				FieldDurationMS, time.Since(startedAt).Milliseconds(),
 				"bytes_captured", stdoutBuf.Len(),
 				FieldSignalSent, cleanup.SignalSent,
+				"timed_out", timedOut,
 			)
 			// bd-yrnue: the synchronous return below recorded StatusCompleted,
 			// but the background process has now been killed by cancellation
@@ -1565,6 +1986,8 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 	}()
 
 	cleanup := waitCommandWithProcessGroupCleanup(cmdCtx, cmd)
+	commandSettled = cleanup.Settled
+	commandCleanupReturned = true
 	close(heartbeatDone)
 	// bd-48ckr: wait for the heartbeat goroutine to fully exit before
 	// returning so test-injected mutations (commandHeartbeatInterval,
@@ -1572,8 +1995,10 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 	// final select-loop iteration.
 	<-heartbeatExited
 	waitErr := cleanup.Err
+	if !cleanup.Settled {
+		waitErr = errors.Join(waitErr, uncertainCommandExecutionError(step.ID, record.ProcessID))
+	}
 
-	output := strings.TrimSpace(stdoutBuf.String())
 	if cleanup.Cancelled {
 		slog.Warn(EventCommandCancelled,
 			"run_id", e.state.RunID,
@@ -1585,24 +2010,7 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 			FieldSignalSent, cleanup.SignalSent,
 		)
 	}
-	if stdoutBuf.Truncated() {
-		slog.Warn("command stdout truncated",
-			"run_id", e.state.RunID,
-			"step_id", step.ID,
-			"bytes_total", stdoutBuf.Total(),
-			"limit", e.limits.MaxCommandStdoutBytes,
-		)
-		output += fmt.Sprintf("\n[TRUNCATED at %d bytes]", e.limits.MaxCommandStdoutBytes)
-	}
-	if stderrBuf != nil && stderrBuf.Truncated() {
-		slog.Warn("command stderr truncated",
-			"run_id", e.state.RunID,
-			"step_id", step.ID,
-			"bytes_total", stderrBuf.Total(),
-			"limit", e.limits.MaxCommandStderrBytes,
-		)
-	}
-	result.Output = output
+	result.Output = e.capturedCommandOutput(step, stdoutBuf, stderrBuf)
 
 	if waitErr != nil {
 		if ctx.Err() != nil {
@@ -1616,7 +2024,7 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 			result.Error = stepRuntimeError(step, "command", errorType,
 				reason,
 				"retry the run if cancellation was not intentional",
-				"")
+				waitErr.Error())
 			result.FinishedAt = time.Now()
 			return result
 		}
@@ -1625,7 +2033,7 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 			result.Error = stepRuntimeError(step, "command", "timeout",
 				fmt.Sprintf("timed out after %s", timeout),
 				"increase step.timeout or reduce command runtime",
-				"")
+				waitErr.Error())
 			slog.Warn("command step timed out",
 				"run_id", e.state.RunID,
 				"step_id", step.ID,
@@ -1635,12 +2043,14 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 			return result
 		}
 		var exitErr *exec.ExitError
-		if errors.As(waitErr, &exitErr) {
+		if !cleanup.Settled {
 			result.Status = StatusFailed
-			result.Error = stepRuntimeError(step, "command", "exit",
-				fmt.Sprintf("exit_code=%d", exitErr.ExitCode()),
-				"inspect stdout/stderr and command arguments",
-				fmt.Sprintf("exit_code=%d", exitErr.ExitCode()))
+			result.Error = stepRuntimeError(step, StepKindCommand, "execution_unknown",
+				"command cleanup could not verify settlement",
+				"inspect the command group and its effects before deliberately replaying it", waitErr.Error())
+		} else if errors.As(waitErr, &exitErr) {
+			result.Status = StatusFailed
+			result.Error = commandExitStepError(step, exitErr.ExitCode())
 			slog.Warn("command step exited non-zero",
 				"run_id", e.state.RunID,
 				"step_id", step.ID,
@@ -1662,8 +2072,52 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 		return result
 	}
 
-	if step.OutputVar != "" && step.OutputParse.Type != "" && step.OutputParse.Type != "none" {
-		parsed, err := e.parseOutput(output, step.OutputParse)
+	result = e.completeCommandResult(step, result)
+	result.FinishedAt = time.Now()
+	slog.Info("command step completed",
+		"run_id", e.state.RunID,
+		"step_id", step.ID,
+	)
+	return result
+}
+
+// capturedCommandOutput returns a started command's trimmed stdout capture
+// (stderr too when merged), marking and logging capture truncation. Callers
+// read it after the command's wait and group cleanup have returned, so it
+// holds everything the command wrote before it was stopped.
+func (e *Executor) capturedCommandOutput(step *Step, stdoutBuf, stderrBuf *cappedWriter) string {
+	output := strings.TrimSpace(stdoutBuf.String())
+	if stdoutBuf.Truncated() {
+		slog.Warn("command stdout truncated",
+			"run_id", e.state.RunID,
+			"step_id", step.ID,
+			"bytes_total", stdoutBuf.Total(),
+			"limit", e.limits.MaxCommandStdoutBytes,
+		)
+		output += fmt.Sprintf("\n[TRUNCATED at %d bytes]", e.limits.MaxCommandStdoutBytes)
+	}
+	if stderrBuf != nil && stderrBuf.Truncated() {
+		slog.Warn("command stderr truncated",
+			"run_id", e.state.RunID,
+			"step_id", step.ID,
+			"bytes_total", stderrBuf.Total(),
+			"limit", e.limits.MaxCommandStderrBytes,
+		)
+	}
+	return output
+}
+
+func commandExitStepError(step *Step, exitCode int) *StepError {
+	return stepRuntimeError(step, StepKindCommand, "exit", fmt.Sprintf("exit_code=%d", exitCode),
+		"inspect stdout/stderr and command arguments", fmt.Sprintf("exit_code=%d", exitCode))
+}
+
+// Live execution and operator recovery use the same output parser and warning
+// policy. The caller retains its original execution or observation timestamps;
+// the scheduler remains responsible for publishing named and dependent outputs.
+func (e *Executor) completeCommandResult(step *Step, result StepResult) StepResult {
+	if step.OutputParse.Type != "" && step.OutputParse.Type != "none" {
+		parsed, err := e.parseOutput(result.Output, step.OutputParse)
 		if err != nil {
 			e.stateMu.Lock()
 			e.state.Errors = append(e.state.Errors, ExecutionError{
@@ -1680,11 +2134,6 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 	}
 
 	result.Status = StatusCompleted
-	result.FinishedAt = time.Now()
-	slog.Info("command step completed",
-		"run_id", e.state.RunID,
-		"step_id", step.ID,
-	)
 	return result
 }
 
@@ -1692,11 +2141,22 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 // step Params/Args, validates declared placeholders, and dispatches the
 // rendered text to a pane. Wait/timeout behavior mirrors the prompt path.
 func (e *Executor) executeTemplate(ctx context.Context, step *Step, workflow *Workflow) StepResult {
+	copy := *step
+	step = &copy
 	result := StepResult{
 		StepID:    step.ID,
 		Status:    StatusRunning,
 		StartedAt: time.Now(),
 		AgentType: "template",
+	}
+	stepHash, err := agentStepHash(step)
+	if err != nil {
+		result.Status = StatusFailed
+		result.Error = stepRuntimeError(step, StepKindTemplate, "recovery", err.Error(), "inspect the saved step definition", "")
+		return result
+	}
+	if delivery, recorded := e.loadAgentDelivery(step.ID); recorded && delivery.Status != agentDeliveryNotSent && !e.config.DryRun {
+		return e.executeAgentDelivery(ctx, step, workflow, StepKindTemplate, stepHash, "", "", "")
 	}
 
 	// bd-2xka8: bind pane metadata before rendering+substitution so
@@ -1807,119 +2267,7 @@ func (e *Executor) executeTemplate(ctx context.Context, step *Step, workflow *Wo
 		})
 	}
 
-	// Serialize the whole dispatch window against other steps targeting the
-	// same pane (bd-jio7h).
-	releasePane, err := e.acquirePaneLock(ctx, paneID)
-	if err != nil {
-		return e.markTemplateCancelled(&result, step, workflow, paneID, err.Error())
-	}
-	defer releasePane()
-
-	beforeOutput, _ := e.tmuxClient().CapturePaneOutput(paneID, 2000)
-
-	if ctx.Err() != nil {
-		return e.markTemplateCancelled(&result, step, workflow, paneID, ctx.Err().Error())
-	}
-
-	if err := e.tmuxClient().PasteKeys(paneID, rendered, true); err != nil {
-		if ctx.Err() != nil {
-			return e.markTemplateCancelled(&result, step, workflow, paneID, ctx.Err().Error())
-		}
-		result.Status = StatusFailed
-		result.Error = stepRuntimeError(step, "template", "send",
-			fmt.Sprintf("failed to send rendered template: %v", err),
-			"check that the target tmux pane still exists and accepts input",
-			err.Error())
-		result.FinishedAt = time.Now()
-		return result
-	}
-
-	waitCondition := step.Wait
-	if waitCondition == "" {
-		waitCondition = WaitCompletion
-	}
-
-	timeout := e.config.DefaultTimeout
-	if step.Timeout.Duration > 0 {
-		timeout = step.Timeout.Duration
-	}
-
-	switch waitCondition {
-	case WaitNone:
-		result.Status = StatusCompleted
-		result.FinishedAt = time.Now()
-		return result
-
-	case WaitTime:
-		select {
-		case <-ctx.Done():
-			return e.markTemplateCancelled(&result, step, workflow, paneID, ctx.Err().Error())
-		case <-time.After(timeout):
-			result.Status = StatusCompleted
-			result.FinishedAt = time.Now()
-		}
-
-	case WaitCompletion, WaitIdle:
-		if err := e.waitForIdle(ctx, paneID, timeout); err != nil {
-			if ctx.Err() != nil {
-				return e.markTemplateCancelled(&result, step, workflow, paneID, ctx.Err().Error())
-			} else {
-				result.Status = StatusFailed
-				result.Error = stepRuntimeError(step, "template", "timeout",
-					fmt.Sprintf("timeout waiting for completion: %v", err),
-					"increase step.timeout or change wait mode",
-					err.Error())
-				result.Error.PaneOutput = e.captureErrorContext(paneID, 50)
-				result.Error.AgentState = e.detectAgentState(paneID)
-				// ntm#213: salvage the visible response on timeout (see the
-				// prompt-step WaitCompletion branch for rationale).
-				if after, capErr := e.tmuxClient().CapturePaneOutput(paneID, 2000); capErr == nil {
-					result.Output = util.ExtractNewOutput(beforeOutput, after)
-				}
-			}
-			result.FinishedAt = time.Now()
-			return result
-		}
-	}
-
-	afterOutput, err := e.tmuxClient().CapturePaneOutput(paneID, 2000)
-	if err != nil {
-		result.Status = StatusFailed
-		result.Error = stepRuntimeError(step, "template", "capture",
-			fmt.Sprintf("failed to capture output: %v", err),
-			"check that the target tmux pane still exists",
-			err.Error())
-		result.FinishedAt = time.Now()
-		return result
-	}
-
-	result.Output = util.ExtractNewOutput(beforeOutput, afterOutput)
-
-	if step.OutputVar != "" && step.OutputParse.Type != "" && step.OutputParse.Type != "none" {
-		parsed, err := e.parseOutput(result.Output, step.OutputParse)
-		if err != nil {
-			e.stateMu.Lock()
-			e.state.Errors = append(e.state.Errors, ExecutionError{
-				StepID:    step.ID,
-				Type:      "parse",
-				Message:   fmt.Sprintf("failed to parse output: %v", err),
-				Timestamp: time.Now(),
-				Fatal:     false,
-			})
-			e.stateMu.Unlock()
-		} else {
-			result.ParsedData = parsed
-		}
-	}
-
-	result.Status = StatusCompleted
-	result.FinishedAt = time.Now()
-	slog.Info("template step completed",
-		"run_id", e.state.RunID,
-		"step_id", step.ID,
-		"pane_id", paneID,
-	)
-	return result
+	return e.executeAgentDelivery(ctx, step, workflow, StepKindTemplate, stepHash, rendered, paneID, agentType)
 }
 
 func (e *Executor) markTemplateCancelled(result *StepResult, step *Step, workflow *Workflow, paneID string, reason string) StepResult {
@@ -1943,6 +2291,459 @@ func (e *Executor) markTemplateCancelled(result *StepResult, step *Step, workflo
 		FieldDurationMS, result.FinishedAt.Sub(result.StartedAt).Milliseconds(),
 	)
 	return *result
+}
+
+// executeAgentDelivery is the shared prompt/template delivery lifecycle. The
+// journal outlives InFlightSteps: cancellation stops observation, not the agent
+// process in tmux, and ordinary recovery must never submit that work again.
+func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflow *Workflow, kind, stepHash, prompt, paneID, agentType string) StepResult {
+	result := StepResult{StepID: step.ID, Status: StatusRunning, StartedAt: time.Now(), PaneUsed: paneID, AgentType: agentType}
+	fail := func(typ string, err error) StepResult {
+		result.FinishedAt = time.Now()
+		if checkpointErr := e.checkpointFailure(); checkpointErr != nil {
+			err, typ = errors.Join(err, checkpointErr), "checkpoint"
+		} else if ctx.Err() != nil {
+			if kind == StepKindTemplate {
+				return e.markTemplateCancelled(&result, step, workflow, result.PaneUsed, ctx.Err().Error())
+			}
+			result.Status, result.SkipKind, result.SkipReason = StatusCancelled, SkipKindCancelled, ctx.Err().Error()
+			return result
+		}
+		result.Status = StatusFailed
+		hint := "inspect the original pane and saved delivery before an intentional --mode=restart-failed or reset"
+		if receipt, ok := e.loadAgentDelivery(step.ID); ok && receipt.Status == agentDeliverySending {
+			hint = fmt.Sprintf("inspect the original pane and ntm pipeline recover %s; explicitly accept the exact receipt if delivery is confirmed, then resume without sending again", e.config.RunID)
+		}
+		if typ == "not_dispatched" {
+			hint = "restore the live agent composer and retry or resume normally; no prompt was sent"
+		}
+		result.Error = stepRuntimeError(step, kind, typ, err.Error(), hint, err.Error())
+		// A failed send or an expired wait leaves its evidence in the pane:
+		// what the agent last printed and whether it reads idle or busy. Keep
+		// it with the error so status and the API can show why after the pane
+		// has moved on.
+		if typ == "send" || typ == "timeout" {
+			result.Error.PaneOutput = e.captureErrorContext(result.PaneUsed, 50)
+			result.Error.AgentState = e.detectAgentState(result.PaneUsed)
+		}
+		return result
+	}
+	record, recorded := e.loadAgentDelivery(step.ID)
+	if recorded {
+		result.PaneUsed, result.AgentType, result.StartedAt = record.PaneID, record.AgentType, record.StartedAt
+		if record.Version != agentDeliveryVersion || record.StepID != step.ID || record.Kind != kind || record.StepHash != stepHash || record.Session != e.config.Session {
+			return fail("recovery", errors.New("saved agent delivery does not match this step, session, or definition; refusing to replay"))
+		}
+		if record.Endpoint != e.agentDeliveryEndpoint() {
+			return fail("recovery", fmt.Errorf("saved agent delivery belongs to tmux endpoint %q, not %q; refusing to redirect it", record.Endpoint, e.agentDeliveryEndpoint()))
+		}
+		if record.Status == agentDeliverySending {
+			return fail("delivery_unknown", errors.New("agent prompt delivery outcome is unknown; ordinary resume and automatic retry will not submit it again"))
+		}
+		if record.Status != agentDeliveryNotSent && record.Status != agentDeliveryDelivered && record.Status != agentDeliveryCompleted {
+			return fail("recovery", fmt.Errorf("invalid saved agent delivery status %q", record.Status))
+		}
+		result.Output = record.Output
+		if record.Status == agentDeliveryCompleted {
+			return e.completedAgentDelivery(step, result, record.CompletedAt)
+		}
+		if record.Status == agentDeliveryNotSent {
+			// The previous owner durably proved that it sent no prompt bytes.
+			// The prompt/template adapter has rendered a fresh attempt; keep
+			// its selected target instead of treating unsent work as delivered.
+			recorded = false
+			result.PaneUsed, result.AgentType, result.StartedAt = paneID, agentType, time.Now()
+		} else {
+			paneID, agentType = record.PaneID, record.AgentType
+		}
+	}
+
+	release, err := e.acquirePaneLockCrossProcess(ctx, paneID)
+	if err != nil {
+		applyPaneLockFailure(&result, paneID, err)
+		return result
+	}
+	defer release()
+	if e.stopBeforeDispatch(ctx, &result) {
+		return result
+	}
+	if !recorded {
+		endpoint := e.agentDeliveryEndpoint()
+		pane, err := e.agentDeliveryPane(ctx, paneID, 0, endpoint)
+		if err != nil {
+			return fail("recovery", err)
+		}
+		if agentType == "" {
+			agentType = "unknown"
+		}
+		sum := sha256.Sum256([]byte(prompt))
+		normalizedPrompt := status.NormalizeAgentEcho(prompt)
+		echoSum := sha256.Sum256([]byte(normalizedPrompt))
+		echoLength := len(normalizedPrompt)
+		if echoLength > agentDeliveryMaxCaptureBytes {
+			// A prompt larger than the capture window cannot provide a
+			// complete repaint anchor, but retains ordinary delivery behavior.
+			echoLength = 0
+		}
+		var piEcho status.PromptEchoFingerprint
+		piEchoSupported := true
+		if strings.EqualFold(strings.TrimSpace(agentType), "pi") && step.Wait != WaitNone {
+			piEcho, _, piEchoSupported = status.PiPromptEcho(prompt)
+		}
+		record = AgentDeliveryState{
+			Version: agentDeliveryVersion, StepID: step.ID, Kind: kind,
+			Session: e.config.Session, Endpoint: endpoint, PaneID: paneID, PanePID: pane.PID,
+			AgentType: agentType, StepHash: stepHash, PromptHash: hex.EncodeToString(sum[:]),
+			PromptEchoHash:   hex.EncodeToString(echoSum[:]),
+			PromptEchoLength: echoLength,
+			PiPromptEchoHash: piEcho.Hash, PiPromptEchoLength: piEcho.Length,
+			Status: agentDeliveryNotSent, StartedAt: time.Now(),
+		}
+		// Preserve positive non-delivery evidence before the preflight. An
+		// unfinished step with no receipt is intentionally unsafe to replay,
+		// while this phase can be retried or resumed after a pane recovers.
+		if err := e.saveAgentDelivery(record); err != nil {
+			return fail("checkpoint", err)
+		}
+		if !piEchoSupported {
+			return fail("not_dispatched", errors.New("pi prompt contains Markdown whose rendered echo cannot be attributed safely; simplify the prompt before retrying"))
+		}
+		if err := e.tmuxClient().PrepareDelivery(ctx, pane, agentType); err != nil {
+			return fail("not_dispatched", err)
+		}
+		record.BeforeOutput, err = e.captureAgentDelivery(ctx, record)
+		if err != nil {
+			return fail("capture", err)
+		}
+		// Write the uncertain attempt before transport. A failed save, paste,
+		// or submission verifier never authorizes a second automatic send.
+		record.Status = agentDeliverySending
+		if err := e.saveAgentDelivery(record); err != nil {
+			return fail("checkpoint", err)
+		}
+		// The intent write can take time. Refresh the last pre-transport
+		// boundary so output from an earlier turn during preparation is excluded.
+		boundary, err := e.captureAgentDelivery(ctx, record)
+		if err != nil {
+			return fail("capture", err)
+		}
+		if boundary != record.BeforeOutput {
+			record.BeforeOutput = boundary
+			if err := e.saveAgentDelivery(record); err != nil {
+				return fail("checkpoint", err)
+			}
+		}
+		if e.stopBeforeDispatch(ctx, &result) {
+			return result
+		}
+		pane, err = e.agentDeliveryPane(ctx, record.PaneID, record.PanePID, record.Endpoint)
+		if err != nil {
+			return fail("recovery", err)
+		}
+		// Storage and boundary capture can outlast the original ready frame.
+		// Check the shared gate again at the final paste boundary. Only a
+		// guaranteed pre-actuation refusal may release this exact unsent
+		// intent; every transport or verification failure remains uncertain.
+		if err := e.tmuxClient().PrepareDelivery(ctx, pane, agentType); err != nil {
+			if !dispatch.IsGuaranteedNoDeliveryActuation(err) {
+				return fail("delivery_unknown", fmt.Errorf("delivery preflight did not prove non-actuation: %w", err))
+			}
+			if err := e.markAgentDeliveryNotSent(record); err != nil {
+				return fail("checkpoint", err)
+			}
+			return fail("not_dispatched", err)
+		}
+		// Readiness itself captures the pane. Recheck the original process
+		// and endpoint after those external calls so a respawn or client
+		// switch during the gate cannot redirect a durably addressed send.
+		pane, err = e.agentDeliveryPane(ctx, record.PaneID, record.PanePID, record.Endpoint)
+		if err != nil {
+			return fail("recovery", err)
+		}
+		if err := dispatch.RefuseDeadAgentPane(pane); err != nil {
+			if err := e.markAgentDeliveryNotSent(record); err != nil {
+				return fail("checkpoint", err)
+			}
+			return fail("not_dispatched", err)
+		}
+		if e.stopBeforeDispatch(ctx, &result) {
+			return result
+		}
+		if err := e.tmuxClient().PasteKeys(paneID, prompt, true); err != nil {
+			return fail("send", fmt.Errorf("failed to send prompt; delivery outcome is unknown: %w", err))
+		}
+		if err := e.confirmSubmission(ctx, paneID, prompt, agentType); err != nil {
+			return fail("send", fmt.Errorf("%s; delivery outcome is unknown", submissionFailureMessage(err)))
+		}
+		if _, err := e.agentDeliveryPane(ctx, record.PaneID, record.PanePID, record.Endpoint); err != nil {
+			return fail("recovery", err)
+		}
+		record.Status, record.DeliveredAt = agentDeliveryDelivered, time.Now()
+		if err := e.saveAgentDelivery(record); err != nil {
+			return fail("checkpoint", err)
+		}
+	}
+	result.PaneUsed, result.AgentType, result.StartedAt = record.PaneID, record.AgentType, record.StartedAt
+	collect := func() (bool, error) {
+		current, err := e.captureAgentDelivery(ctx, record)
+		if errors.Is(err, errIncompleteAgentCapture) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		next, ready, err := observeAgentDelivery(record, current)
+		if err != nil {
+			return false, err
+		}
+		if next.BeforeOutput != record.BeforeOutput || next.Output != record.Output {
+			if err := e.saveAgentDelivery(next); err != nil {
+				return false, err
+			}
+		}
+		record = next
+		result.Output = record.Output
+		return ready, nil
+	}
+	wait := step.Wait
+	if wait == "" {
+		wait = WaitCompletion
+	}
+	timeout := e.config.DefaultTimeout
+	if step.Timeout.Duration > 0 {
+		timeout = step.Timeout.Duration
+	}
+	switch wait {
+	case WaitNone:
+		// Submission itself fulfills this explicit fire-and-forget contract.
+		// Do not turn the immediate prompt echo into a response or wait for one.
+	case WaitTime:
+		remaining := time.Until(record.DeliveredAt.Add(timeout))
+		if remaining > 0 {
+			timer := time.NewTimer(remaining)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return fail("cancelled", ctx.Err())
+			case <-timer.C:
+			}
+		}
+		if _, err := collect(); err != nil {
+			return fail("capture", err)
+		}
+	case WaitCompletion, WaitIdle:
+		deadline := time.Now().Add(timeout)
+		remaining := timeout
+		for {
+			if err := e.waitForIdle(ctx, paneID, remaining, collect); err != nil {
+				// Preserve partial output even when the deadline precedes the first
+				// idle poll. Cancellation never starts a new uncancelled capture.
+				if ctx.Err() == nil && e.checkpointFailure() == nil {
+					if _, captureErr := collect(); captureErr != nil {
+						err = errors.Join(err, captureErr)
+					}
+				}
+				return fail("timeout", fmt.Errorf("waiting for the original agent delivery: %w", err))
+			}
+			if !strings.EqualFold(strings.TrimSpace(record.AgentType), "pi") {
+				break
+			}
+			// The last idle observation can itself race a pi redraw. Require
+			// one more complete, attributed frame before persisting success;
+			// a partial frame must earn another idle streak within the same
+			// original deadline, rather than extending the caller's timeout.
+			ready, err := collect()
+			if err != nil {
+				return fail("capture", err)
+			}
+			if ready {
+				break
+			}
+			remaining = time.Until(deadline)
+		}
+	}
+	// Preserve completion before releasing pane ownership or returning to the
+	// containing foreach/parallel scheduler, which may checkpoint later.
+	record.Status, record.CompletedAt, record.BeforeOutput = agentDeliveryCompleted, time.Now(), ""
+	if err := e.saveAgentDelivery(record); err != nil {
+		return fail("checkpoint", err)
+	}
+	return e.completedAgentDelivery(step, result, record.CompletedAt)
+}
+
+func (e *Executor) completedAgentDelivery(step *Step, result StepResult, finished time.Time) StepResult {
+	if step.Wait != WaitNone && step.OutputParse.Type != "" && step.OutputParse.Type != "none" {
+		parsed, err := e.parseOutput(result.Output, step.OutputParse)
+		if err != nil {
+			e.stateMu.Lock()
+			e.state.Errors = append(e.state.Errors, ExecutionError{StepID: step.ID, Type: "parse", Message: fmt.Sprintf("failed to parse output: %v", err), Timestamp: time.Now()})
+			e.stateMu.Unlock()
+		} else {
+			result.ParsedData = parsed
+		}
+	}
+	result.Status, result.FinishedAt = StatusCompleted, finished
+	return result
+}
+
+func (e *Executor) agentDeliveryEndpoint() string {
+	if client, ok := e.tmuxClient().(interface{ Endpoint() string }); ok {
+		return client.Endpoint()
+	}
+	return "local"
+}
+
+func (e *Executor) agentDeliveryPane(ctx context.Context, paneID string, expectedPID int, endpoint string) (tmux.Pane, error) {
+	if err := ctx.Err(); err != nil {
+		return tmux.Pane{}, err
+	}
+	if e.agentDeliveryEndpoint() != endpoint {
+		return tmux.Pane{}, fmt.Errorf("tmux endpoint changed from %q; refusing to redirect saved delivery", endpoint)
+	}
+	var panes []tmux.Pane
+	var err error
+	if client, ok := e.tmuxClient().(interface {
+		GetPanesContext(context.Context, string) ([]tmux.Pane, error)
+	}); ok {
+		panes, err = client.GetPanesContext(ctx, e.config.Session)
+	} else {
+		panes, err = e.tmuxClient().GetPanes(e.config.Session)
+	}
+	if err != nil {
+		return tmux.Pane{}, err
+	}
+	var found *tmux.Pane
+	for _, pane := range panes {
+		if pane.ID == paneID {
+			if found != nil {
+				return tmux.Pane{}, fmt.Errorf("agent pane %s has ambiguous membership", paneID)
+			}
+			copy := pane
+			found = &copy
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return tmux.Pane{}, err
+	}
+	if e.agentDeliveryEndpoint() != endpoint {
+		return tmux.Pane{}, fmt.Errorf("tmux endpoint changed from %q while observing saved delivery", endpoint)
+	}
+	if found == nil || found.Dead || found.PID <= 0 || (expectedPID > 0 && found.PID != expectedPID) {
+		return tmux.Pane{}, fmt.Errorf("agent pane %s changed process lifetime or is unavailable; refusing to redirect its saved delivery", paneID)
+	}
+	return *found, nil
+}
+
+var errIncompleteAgentCapture = errors.New("pi composer is incomplete or unrecognized; a complete response frame is required")
+
+func (e *Executor) captureAgentDelivery(ctx context.Context, record AgentDeliveryState) (string, error) {
+	if _, err := e.agentDeliveryPane(ctx, record.PaneID, record.PanePID, record.Endpoint); err != nil {
+		return "", err
+	}
+	var output string
+	var err error
+	if client, ok := e.tmuxClient().(interface {
+		CapturePaneOutputContext(context.Context, string, int) (string, error)
+	}); ok {
+		output, err = client.CapturePaneOutputContext(ctx, record.PaneID, 2000)
+	} else {
+		output, err = e.tmuxClient().CapturePaneOutput(record.PaneID, 2000)
+	}
+	if err != nil {
+		return "", err
+	}
+	if len(output) > agentDeliveryMaxCaptureBytes {
+		return "", fmt.Errorf("agent pane %s exceeds the %d-byte capture limit", record.PaneID, agentDeliveryMaxCaptureBytes)
+	}
+	if _, err := e.agentDeliveryPane(ctx, record.PaneID, record.PanePID, record.Endpoint); err != nil {
+		return "", err
+	}
+	transcript, complete := status.AgentResponseTranscript(output, record.AgentType)
+	if !complete {
+		return "", errIncompleteAgentCapture
+	}
+	return strings.TrimRight(transcript, "\n"), nil
+}
+
+// observeAgentDelivery keeps evidence collection identical for durable and
+// shorthand pipelines. A pi redraw may temporarily hide an old boundary, but
+// it is never itself a response and never authorizes replacing partial output.
+func observeAgentDelivery(record AgentDeliveryState, current string) (AgentDeliveryState, bool, error) {
+	isPi := strings.EqualFold(strings.TrimSpace(record.AgentType), "pi")
+	piEcho := status.PromptEchoFingerprint{Hash: record.PiPromptEchoHash, Length: record.PiPromptEchoLength}
+	if isPi && (piEcho.Hash == "" || piEcho.Length <= 0) {
+		return record, false, errors.New("saved pi delivery lacks rendered prompt identity; inspect the original pane before an intentional restart")
+	}
+	if isPi && (strings.TrimSpace(current) == "" || (len(current) < len(record.BeforeOutput) && strings.HasPrefix(record.BeforeOutput, current))) {
+		// A blank or partly redrawn old frame cannot erase the durable
+		// boundary or make prior output eligible for idle completion.
+		return record, false, nil
+	}
+	delta, err := agentDeliveryNewOutput(record.BeforeOutput, current)
+	output := record.Output
+	if isPi && record.BeforeOutput == "" && output == "" {
+		// A chrome-only initial capture has no transcript boundary. Startup
+		// text appearing on the next frame is not itself an answer; wait for
+		// the confirmed request's echo before attributing that new screen.
+		recovered, ok := status.RecoverPiRepaint("", current, record.PromptEchoHash, record.PromptEchoLength, piEcho)
+		if !ok {
+			return record, false, nil
+		}
+		delta = recovered
+	}
+	if err != nil && isPi {
+		previous := status.NormalizeAgentEcho(output)
+		if previous == "" || status.MatchesAgentEcho(output, record.PromptEchoHash, record.PromptEchoLength, piEcho) {
+			before := record.BeforeOutput
+			if output != "" {
+				// The echo may have appeared before pi cleared its old
+				// history. Remove only our already-attributed suffix when
+				// checking that this prompt was absent before submission.
+				if !strings.HasSuffix(before, output) {
+					return record, false, err
+				}
+				before = strings.TrimSuffix(before, output)
+			}
+			if recovered, ok := status.RecoverPiRepaint(before, current, record.PromptEchoHash, record.PromptEchoLength, piEcho); ok {
+				delta, output, err = recovered, "", nil
+			}
+		}
+	}
+	if err != nil {
+		return record, false, err
+	}
+	if len(output)+len(delta) > agentDeliveryMaxOutputBytes {
+		return record, false, fmt.Errorf("agent response exceeds the %d-byte recovery evidence limit", agentDeliveryMaxOutputBytes)
+	}
+	record.BeforeOutput, record.Output = current, output+delta
+	response := status.NormalizeAgentEcho(record.Output)
+	echo := sha256.Sum256([]byte(response))
+	echoOnly := hex.EncodeToString(echo[:]) == record.PromptEchoHash
+	if isPi {
+		// Even an append can contain a transformed or partly wrapped prompt.
+		// A different whole-screen hash is not evidence of an answer. Require
+		// one complete current echo and actual text after its last line.
+		_, end, anchored := status.UniqueAgentEchoSpan(record.Output, record.PromptEchoHash, record.PromptEchoLength, piEcho)
+		return record, anchored && strings.TrimSpace(record.Output[end:]) != "", nil
+	}
+	return record, response != "" && !echoOnly, nil
+}
+
+// A retained complete-line overlap supports normal scrollback rollover.
+// A replacement screen is not evidence that the original request completed.
+func agentDeliveryNewOutput(before, after string) (string, error) {
+	if strings.HasPrefix(after, before) {
+		return after[len(before):], nil
+	}
+	for i := 0; i < len(before); i++ {
+		if before[i] == '\n' && i+1 < len(before) {
+			suffix := before[i+1:]
+			if strings.TrimSpace(suffix) != "" && strings.HasPrefix(after, suffix) {
+				return after[len(suffix):], nil
+			}
+		}
+	}
+	return "", errors.New("saved agent output boundary is no longer visible; inspect the original pane before an intentional restart")
 }
 
 // resolveTemplatePath resolves a template reference to an absolute file path.
@@ -2093,128 +2894,36 @@ func (e *Executor) executeParallel(ctx context.Context, step *Step, workflow *Wo
 	if step.Timeout.Duration > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, step.Timeout.Duration)
-		defer cancel()
+		var finish context.CancelFunc
+		ctx, finish = withCommandCancellationScope(ctx, cancel)
+		defer finish()
 	}
-
-	// Create cancellable context for fail_fast mode
-	parallelCtx, cancelParallel := context.WithCancel(ctx)
-	defer cancelParallel()
 
 	e.emitProgress("parallel_start", step.ID,
 		stepProgressMessage("Starting parallel group", step, fmt.Sprintf("%d steps, on_error=%s", len(step.Parallel.Steps), onError)),
 		e.calculateProgress())
-	e.beginParallelState(step.ID, len(step.Parallel.Steps))
-	e.persistState()
-
-	var wg sync.WaitGroup
-	results := make([]StepResult, len(step.Parallel.Steps))
-	var mu sync.Mutex
-	var firstError error
-	var cancelled bool
-	var completionOrder []string
-
-	// Track used panes to coordinate agent selection
-	usedPanes := make(map[string]bool)
-	var panesMu sync.Mutex
-
-	// bd-dmjn3: substep concurrency is sourced from
-	// limits.substep_parallel_max (default DefaultSubstepParallelMax=8)
-	// so workflows with large parallel blocks can opt into a higher fan-out
-	// without patching the constant.
-	substepLimit := e.limits.SubstepParallelMax
-	if substepLimit <= 0 {
-		substepLimit = DefaultSubstepParallelMax
-	}
-	sem := make(chan struct{}, substepLimit)
-
-	for i, pStep := range step.Parallel.Steps {
-		pStep.ID = scopedChildStepID(step.ID, pStep.ID, i+1)
-
-		// bd-qbymk: when resuming a parallel group whose parent never
-		// completed but some children did persist completed StepResults,
-		// applyResumeState retains those entries. Re-dispatching them here
-		// would duplicate side effects (re-run commands, re-prompt agents)
-		// against an already-finished substep. Adopt the persisted result
-		// instead so resume honors the parallel-progress contract.
-		e.stateMu.RLock()
-		existing, hasExisting := e.state.Steps[pStep.ID]
-		e.stateMu.RUnlock()
-		if hasExisting && !shouldRerunStep(existing) && existing.Status == StatusCompleted {
-			// bd-vlqhu: results[i] is per-iteration (each iteration owns a
-			// distinct slice index, so no mutex needed for the write
-			// alone). completionOrder is no longer appended during the run
-			// — it is built deterministically after wg.Wait by sorting on
-			// FinishedAt, so adopted-on-resume entries sort by their
-			// recorded prior-run timestamp instead of interleaving
-			// non-deterministically with goroutine appends from concurrent
-			// children that are still running.
-			results[i] = existing
-			e.markParallelSubstepFinished(step.ID, pStep.ID, existing.Status)
-			continue
+	results, scheduleErr := e.runParallelChildren(ctx, step, workflow, onError)
+	if scheduleErr != nil {
+		// Dependency/recovery validation and checkpoint failures must not
+		// be hidden by the group's on_error: continue policy.
+		result.Status = StatusFailed
+		result.FinishedAt = time.Now()
+		errorType := "parallel_dependency"
+		if isStepAdmissionError(scheduleErr) {
+			errorType = "step_limit"
+		} else if errors.Is(scheduleErr, ErrCheckpointFailed) {
+			errorType = "checkpoint"
+		} else if errors.Is(scheduleErr, context.DeadlineExceeded) {
+			errorType = "parallel_timeout"
+		} else if errors.Is(scheduleErr, context.Canceled) {
+			result.Status = StatusCancelled
+			result.SkipKind = SkipKindCancelled
+			result.SkipReason = scheduleErr.Error()
+			errorType = "parallel_cancelled"
 		}
-
-		wg.Add(1)
-		go func(idx int, ps Step) {
-			defer wg.Done()
-
-			// Check if already cancelled (fail_fast mode)
-			select {
-			case <-parallelCtx.Done():
-				mu.Lock()
-				results[idx] = StepResult{
-					StepID:     ps.ID,
-					Status:     StatusCancelled,
-					StartedAt:  time.Now(),
-					FinishedAt: time.Now(),
-					SkipReason: "cancelled due to parallel group failure",
-					SkipKind:   SkipKindCancelled,
-				}
-				e.stateMu.Lock()
-				e.state.Steps[ps.ID] = results[idx]
-				e.state.UpdatedAt = time.Now()
-				e.stateMu.Unlock()
-				mu.Unlock()
-				e.markParallelSubstepFinished(step.ID, ps.ID, StatusCancelled)
-				e.persistState()
-				return
-			case sem <- struct{}{}: // Acquire token
-				// Continue execution
-			}
-			defer func() { <-sem }() // Release token
-
-			// Execute the step with pane coordination
-			e.markParallelSubstepStarted(step.ID, ps.ID)
-			e.persistState()
-			pResult := e.executeParallelStep(parallelCtx, &ps, workflow, usedPanes, &panesMu)
-
-			// bd-vlqhu: completionOrder is no longer appended live — see
-			// the post-wg.Wait reconstruction below. The mutex still
-			// guards firstError / cancelled writes plus the e.state.Steps
-			// mutation paired with persistState.
-			mu.Lock()
-			results[idx] = pResult
-			e.stateMu.Lock()
-			e.state.Steps[ps.ID] = pResult
-			e.state.UpdatedAt = time.Now()
-			e.stateMu.Unlock()
-
-			// Handle fail_fast: cancel remaining steps on first error
-			if pResult.Status == StatusFailed && onError == ErrorActionFailFast {
-				if firstError == nil {
-					firstError = fmt.Errorf("step %s failed", ps.ID)
-					cancelled = true
-					cancelParallel()
-				}
-			}
-			mu.Unlock()
-
-			e.markParallelSubstepFinished(step.ID, ps.ID, pResult.Status)
-			e.persistState()
-		}(i, pStep)
+		result.Error = &StepError{Type: errorType, Message: scheduleErr.Error(), Timestamp: result.FinishedAt}
+		return result
 	}
-
-	wg.Wait()
-	e.completeParallelState(step.ID)
 
 	// bd-vlqhu: build completionOrder deterministically from FinishedAt
 	// timestamps now that all goroutines have settled. Live appending
@@ -2225,7 +2934,7 @@ func (e *Executor) executeParallel(ctx context.Context, step *Step, workflow *Wo
 	// FinishedAt ordering with substep-index tie-breaker gives the same
 	// "last finished" semantics deterministically. Substeps with an empty
 	// StepID (never dispatched, e.g. early fail_fast cancel) are skipped.
-	completionOrder = buildParallelCompletionOrder(results)
+	completionOrder := buildParallelCompletionOrder(results)
 
 	// Aggregate results
 	completed := 0
@@ -2237,6 +2946,10 @@ func (e *Executor) executeParallel(ctx context.Context, step *Step, workflow *Wo
 			completed++
 		case StatusFailed:
 			failed++
+		case StatusSkipped:
+			if r.SkipKind == SkipKindFailedDependency {
+				failed++
+			}
 		case StatusCancelled:
 			cancelledCount++
 		}
@@ -2256,17 +2969,30 @@ func (e *Executor) executeParallel(ctx context.Context, step *Step, workflow *Wo
 	}
 	result.ParsedData = groupOutputs
 	e.storeParallelOutputVars(step, results, completionOrder)
+	for _, child := range results {
+		if cause := findStepAdmissionError(child.Error); cause != nil {
+			// A refused descendant is unfinished work. Continue may handle
+			// ordinary failures, but cannot checkpoint this container complete.
+			result.Status = StatusFailed
+			result.Error = aggregateParallelErrors(results, len(results))
+			if result.Error == nil {
+				return stepAdmissionExecutionFailure(result, &stepAdmissionPropagationError{message: cause.Message})
+			}
+			result.Error.Type = "step_limit"
+			return result
+		}
+	}
 
 	// Determine final status based on error mode and results.
 	//
 	// bd-v4u1i: handle external context.Canceled (e.g. Ctrl-C, parent workflow
 	// cancel) and per-substep StatusCancelled separately from the failure
 	// branch so a cancelled run does not get persisted as StatusCompleted.
-	// Order matters: timeout takes precedence over generic cancel; failure
-	// branch takes precedence over cancel-only because failed children are a
-	// stronger signal than the parent context being torn down after them.
+	// A failed child remains a failure in fail/fail_fast mode. Continue can
+	// tolerate failures, but cannot convert cancellation or an expired group
+	// deadline into completion merely because another child failed first.
 	switch {
-	case failed > 0 || cancelled:
+	case failed > 0 && (onError != ErrorActionContinue || (ctx.Err() == nil && cancelledCount == 0)):
 		aggregatedErr := aggregateParallelErrors(results, len(results))
 		switch onError {
 		case ErrorActionContinue:
@@ -2349,318 +3075,37 @@ func (e *Executor) executeLoop(ctx context.Context, step *Step, workflow *Workfl
 	if len(loopResult.Collected) > 0 {
 		result.ParsedData = loopResult.Collected
 	}
+	if cause := findStepAdmissionError(result.Error); cause != nil {
+		return stepAdmissionExecutionFailure(result, &stepAdmissionPropagationError{message: cause.Message})
+	}
 
 	return result
 }
 
-// executeParallelStep executes a single step within a parallel group,
-// coordinating agent selection to avoid using the same agent for multiple parallel steps.
-// Note: Nested parallel steps and loops are not supported.
+// parallelPaneSelection pins a direct parallel child's routing decision across
+// retries. The shared usedPanes set spreads automatic selections across agents;
+// explicit pane targets still win. A success hook or nested body has a different
+// step ID and must not accidentally inherit its parent's pinned target.
+type parallelPaneSelectionKey struct{}
+
+type parallelPaneSelection struct {
+	stepID    string
+	usedPanes map[string]bool
+	panesMu   *sync.Mutex
+	once      sync.Once
+	paneID    string
+	agentType string
+	err       error
+}
+
+// executeParallelStep uses the canonical step executor for every child kind.
+// Only routing coordination is parallel-specific: commands, queries, mail,
+// templates and nested containers must not enter a second prompt-only engine.
+// Pane locks are acquired by the actual dispatch and released before success
+// hooks, which may legitimately target the same pane as their parent.
 func (e *Executor) executeParallelStep(ctx context.Context, step *Step, workflow *Workflow, usedPanes map[string]bool, panesMu *sync.Mutex) StepResult {
-	result := StepResult{
-		StepID:    step.ID,
-		Status:    StatusRunning,
-		StartedAt: time.Now(),
-	}
-	e.markStepInFlight(step.ID, "parallel_step", -1)
-	e.persistState()
-	defer e.clearStepInFlight(step.ID)
-
-	// Check for unsupported nested structures
-	if len(step.Parallel.Steps) > 0 || step.Loop != nil {
-		result.Status = StatusFailed
-		result.Error = &StepError{
-			Type:      "validation",
-			Message:   "nested parallel or loop steps are not supported within parallel groups",
-			Timestamp: time.Now(),
-		}
-		result.FinishedAt = time.Now()
-		return result
-	}
-
-	// Check context before starting
-	if ctx.Err() != nil {
-		result.Status = StatusCancelled
-		result.FinishedAt = time.Now()
-		result.SkipReason = "context cancelled"
-		result.SkipKind = SkipKindCancelled
-		return result
-	}
-
-	// Evaluate condition if present. bd-s2edh: ctx-aware so foreach
-	// max_rounds overlays reach parallel sub-step When conditions.
-	if step.When != "" {
-		skip, err := e.evaluateConditionCtx(ctx, step.When)
-		if err != nil {
-			result.Status = StatusFailed
-			result.Error = &StepError{
-				Type:      "condition",
-				Message:   fmt.Sprintf("condition evaluation failed: %v", err),
-				Timestamp: time.Now(),
-			}
-			result.FinishedAt = time.Now()
-			return result
-		}
-		if skip {
-			result.Status = StatusSkipped
-			result.SkipReason = fmt.Sprintf("condition '%s' evaluated to false", step.When)
-			result.SkipKind = SkipKindWhenCondition
-			result.FinishedAt = time.Now()
-			return result
-		}
-	}
-
-	// Agent Mail step kinds inside a parallel block: short-circuit before
-	// pane selection because they don't dispatch through tmux (bd-hz1tl).
-	if step.hasMailStep() {
-		return e.executeMailStep(ctx, step)
-	}
-
-	// Select pane with coordination to avoid reusing agents
-	// We select once and reuse for retries to avoid "self-exclusion" issues
-	paneID, agentType, err := e.selectAndMarkPane(ctx, step, usedPanes, panesMu)
-	if err != nil {
-		result.Status = StatusFailed
-		result.Error = &StepError{
-			Type:      "routing",
-			Message:   fmt.Sprintf("failed to select agent: %v", err),
-			Timestamp: time.Now(),
-		}
-		result.FinishedAt = time.Now()
-		return result
-	}
-
-	result.PaneUsed = paneID
-	result.AgentType = agentType
-
-	// Serialize dispatch against other steps targeting the same pane. Within
-	// one parallel group usedPanes already prevents sharing, but concurrent
-	// top-level scheduling (bd-jio7h) can overlap two groups (or a group and
-	// a plain step) on the same pane. Held across retries: the pane was
-	// selected once for all attempts.
-	releasePane, err := e.acquirePaneLock(ctx, paneID)
-	if err != nil {
-		result.Status = StatusCancelled
-		result.SkipReason = "cancelled while waiting for pane"
-		result.SkipKind = SkipKindCancelled
-		result.FinishedAt = time.Now()
-		return result
-	}
-	defer releasePane()
-
-	// Calculate retry parameters
-	maxAttempts := 1
-	if resolveErrorAction(step.OnError, workflow.Settings.OnError) == ErrorActionRetry {
-		maxAttempts = step.RetryCount + 1
-		if maxAttempts < 1 {
-			maxAttempts = 1
-		}
-	}
-
-	retryDelay := step.RetryDelay.Duration
-	if retryDelay == 0 {
-		retryDelay = 5 * time.Second
-	}
-
-	// Execute with retries
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		result.Attempts = attempt
-		result.Status = StatusRunning // Reset status for retry
-		var afterOutput string        // Declare early to allow goto jumps
-		var beforeOutput string       // Declare early to allow goto jumps
-
-		// Initialize wait parameters early to avoid goto jumps over declarations
-		waitCondition := step.Wait
-		if waitCondition == "" {
-			waitCondition = WaitCompletion
-		}
-		timeout := e.config.DefaultTimeout
-		if step.Timeout.Duration > 0 {
-			timeout = step.Timeout.Duration
-		}
-
-		e.emitProgress("step_start", step.ID,
-			stepProgressMessage("Executing parallel step", step, fmt.Sprintf("attempt %d/%d on %s", attempt, maxAttempts, agentType)),
-			e.calculateProgress())
-
-		// --- Execution Logic (inlined from executeStepOnce) ---
-
-		// Resolve and substitute prompt
-		prompt, err := e.resolvePrompt(step)
-		if err != nil {
-			result.Status = StatusFailed
-			result.Error = &StepError{
-				Type:      "prompt",
-				Message:   err.Error(),
-				Timestamp: time.Now(),
-			}
-			// Prompt resolution failure is likely permanent, but we follow retry logic
-			goto HANDLE_RESULT
-		}
-
-		// bd-s2edh: ctx-aware so foreach max_rounds overlays reach
-		// parallel sub-step prompt substitution (and its retries).
-		prompt, err = e.substituteVariablesStrictCtx(ctx, prompt)
-		if err != nil {
-			result.Status = StatusFailed
-			result.Error = &StepError{
-				Type:      "substitution",
-				Message:   fmt.Sprintf("failed to substitute variables in prompt: %v", err),
-				Timestamp: time.Now(),
-			}
-			goto HANDLE_RESULT
-		}
-
-		// Dry run mode. bd-g40ad: sanitize before truncate — same attack
-		// class as bd-82zsc, mirrored here for parallel sub-step retries.
-		// bd-2g48y: fall through to HANDLE_RESULT instead of return so the
-		// OnSuccess hook fires for dry-run completions too; otherwise an
-		// on_success chain attached to a parallel substep would be skipped
-		// during dry-run validation, hiding contract violations.
-		if e.config.DryRun {
-			result.Status = StatusCompleted
-			result.Output = dryRunOutput(step, "Would execute: "+truncatePrompt(SanitizeDescriptionForTerminal(prompt), 100))
-			result.FinishedAt = time.Now()
-			goto HANDLE_RESULT
-		}
-
-		// Capture state before sending
-		beforeOutput, _ = e.tmuxClient().CapturePaneOutput(paneID, 2000)
-
-		// Send prompt
-		if err := e.tmuxClient().PasteKeys(paneID, prompt, true); err != nil {
-			result.Status = StatusFailed
-			result.Error = &StepError{
-				Type:      "send",
-				Message:   fmt.Sprintf("failed to send prompt: %v", err),
-				Timestamp: time.Now(),
-			}
-			goto HANDLE_RESULT
-		}
-
-		switch waitCondition {
-		case WaitNone:
-			result.Status = StatusCompleted
-			result.FinishedAt = time.Now()
-			// Success, proceed to capture/parse (though capture might be early)
-
-		case WaitTime:
-			select {
-			case <-ctx.Done():
-				result.Status = StatusCancelled
-				result.SkipReason = "context cancelled during wait"
-				result.SkipKind = SkipKindCancelled
-				result.FinishedAt = time.Now()
-				return result
-			case <-time.After(timeout):
-				result.Status = StatusCompleted
-				result.FinishedAt = time.Now()
-			}
-
-		case WaitCompletion, WaitIdle:
-			if err := e.waitForIdle(ctx, paneID, timeout); err != nil {
-				if ctx.Err() != nil {
-					result.Status = StatusCancelled
-					result.SkipReason = "context cancelled during execution"
-					result.SkipKind = SkipKindCancelled
-					result.FinishedAt = time.Now()
-					return result
-				}
-				result.Status = StatusFailed
-				result.Error = &StepError{
-					Type:       "timeout",
-					Message:    fmt.Sprintf("timeout waiting for completion: %v", err),
-					PaneOutput: e.captureErrorContext(paneID, 50),
-					AgentState: e.detectAgentState(paneID),
-					Timestamp:  time.Now(),
-				}
-				goto HANDLE_RESULT
-			}
-		}
-
-		// Capture output
-		{
-			var captureErr error
-			afterOutput, captureErr = e.tmuxClient().CapturePaneOutput(paneID, 2000)
-			if captureErr != nil {
-				result.Status = StatusFailed
-				result.Error = &StepError{
-					Type:       "capture",
-					Message:    fmt.Sprintf("failed to capture output: %v", captureErr),
-					PaneOutput: e.captureErrorContext(paneID, 50),
-					AgentState: e.detectAgentState(paneID),
-					Timestamp:  time.Now(),
-				}
-				goto HANDLE_RESULT
-			}
-		}
-
-		result.Output = util.ExtractNewOutput(beforeOutput, afterOutput)
-		result.Status = StatusCompleted
-		result.FinishedAt = time.Now()
-
-		// Parse output if configured
-		if step.OutputParse.Type != "" && step.OutputParse.Type != "none" {
-			parsed, err := e.parseOutput(result.Output, step.OutputParse)
-			if err != nil {
-				e.emitProgress("step_warning", step.ID,
-					fmt.Sprintf("output parse warning: %v", err),
-					e.calculateProgress())
-			} else {
-				result.ParsedData = parsed
-			}
-		}
-
-	HANDLE_RESULT:
-		// Check success
-		if result.Status == StatusCompleted {
-			// Store output
-			e.varMu.Lock()
-			StoreStepOutput(e.state, step.ID, result.Output, result.ParsedData)
-			e.varMu.Unlock()
-
-			// bd-2g48y: parallel substeps run through this inlined dispatch
-			// path, so they need their own OnSuccess hook on the same
-			// Completed contract as executeStep's common success tail.
-			// step.ID is already namespaced via scopedChildStepID, so
-			// OnSuccess child results land at
-			// <parent>_<substep>_on_success_<...>.
-			e.runOnSuccessSteps(ctx, step, workflow)
-
-			return result
-		}
-
-		// Handle retry
-		if attempt < maxAttempts {
-			delay := e.calculateRetryDelay(retryDelay, attempt, step.RetryBackoff)
-			e.emitProgress("step_retry", step.ID,
-				fmt.Sprintf("Parallel step %s failed, retrying in %s: %v", step.ID, delay, result.Error.Message),
-				e.calculateProgress())
-
-			select {
-			case <-ctx.Done():
-				result.Status = StatusCancelled
-				result.FinishedAt = time.Now()
-				return result
-			case <-time.After(delay):
-				// Continue loop
-			}
-		}
-	}
-
-	// Failed after all attempts. Mirror the top-level executeStep tail so a
-	// parallel child step honors the on_failure runtime-action contract
-	// (bd-afwly): a custom action sets ${runtime.<id>_failure_action},
-	// converts the failure to StatusSkipped, and emits the on_failure
-	// event. Recovery (on_failure.steps) also applies.
-	if result.Status == StatusFailed {
-		result = e.executeOnFailureAction(step, result)
-		if result.Status == StatusSkipped {
-			return result
-		}
-		result = e.executeOnFailureRecovery(ctx, step, workflow, result)
-	}
-	return result
+	selection := &parallelPaneSelection{stepID: step.ID, usedPanes: usedPanes, panesMu: panesMu}
+	return e.executeStep(context.WithValue(ctx, parallelPaneSelectionKey{}, selection), step, workflow)
 }
 
 // buildParallelCompletionOrder returns the substep StepIDs in the order
@@ -2756,7 +3201,7 @@ func (e *Executor) selectAndMarkPane(ctx context.Context, step *Step, usedPanes 
 	// ${defaults.triage_pane}) into PaneSpec.Index before looking up the
 	// pane. Foreach materialization handles its own pane assignment; this
 	// path covers normal step dispatch.
-	// bd-s2edh: ctx variant so foreach max_rounds round overlays reach
+	// bd-s2edh: ctx variant so foreach max_rounds overlays reach
 	// pane.expr substitution.
 	if err := e.resolvePaneExprCtx(ctx, step); err != nil {
 		return "", "", err
@@ -2816,16 +3261,10 @@ func (e *Executor) selectAndMarkPane(ctx context.Context, step *Step, usedPanes 
 	}
 
 	// Select routing strategy
+	// The parser accepted step.Route against the router's own strategy set.
 	strategy := robot.StrategyLeastLoaded
 	if step.Route != "" {
-		switch step.Route {
-		case RouteLeastLoaded:
-			strategy = robot.StrategyLeastLoaded
-		case RouteFirstAvailable:
-			strategy = robot.StrategyFirstAvailable
-		case RouteRoundRobin:
-			strategy = robot.StrategyRoundRobin
-		}
+		strategy = robot.StrategyName(step.Route)
 	}
 
 	// Route to best agent
@@ -2866,6 +3305,12 @@ func filterAgentsByType(agents []robot.ScoredAgent, requestedType string) []robo
 
 // selectPane finds the appropriate pane for a step
 func (e *Executor) selectPane(ctx context.Context, step *Step) (paneID string, agentType string, err error) {
+	if selection, ok := ctx.Value(parallelPaneSelectionKey{}).(*parallelPaneSelection); ok && selection.stepID == step.ID {
+		selection.once.Do(func() {
+			selection.paneID, selection.agentType, selection.err = e.selectAndMarkPane(ctx, step, selection.usedPanes, selection.panesMu)
+		})
+		return selection.paneID, selection.agentType, selection.err
+	}
 	// In dry run mode, return dummy pane info
 	if e.config.DryRun {
 		return "dry-run-pane", "dry-run-agent", nil
@@ -2917,16 +3362,10 @@ func (e *Executor) selectPane(ctx context.Context, step *Step) (paneID string, a
 	}
 
 	// Select routing strategy
+	// The parser accepted step.Route against the router's own strategy set.
 	strategy := robot.StrategyLeastLoaded
 	if step.Route != "" {
-		switch step.Route {
-		case RouteLeastLoaded:
-			strategy = robot.StrategyLeastLoaded
-		case RouteFirstAvailable:
-			strategy = robot.StrategyFirstAvailable
-		case RouteRoundRobin:
-			strategy = robot.StrategyRoundRobin
-		}
+		strategy = robot.StrategyName(step.Route)
 	}
 
 	// Route to best agent
@@ -2976,7 +3415,7 @@ func (e *Executor) substituteVariablesRetainingSeals(s string) string {
 
 // substituteVariablesCtx is the ctx-aware form of substituteVariables.
 // Errors are silently dropped (the non-strict contract) but ctx-carried
-// round overrides from withRoundOverrides are respected so a branch
+// round overrides from withRoundOverrides are respected so a body step's
 // predicate / loop.items expression / on_failure recovery field nested
 // inside a foreach max_rounds body can resolve ${round}/${loop.round}
 // against the per-iteration overlay (bd-lwb25).
@@ -3136,10 +3575,57 @@ func (e *Executor) parseOutput(output string, parse OutputParse) (interface{}, e
 // and capture pre-response screen debris as the step output (ntm#213).
 const idleStablePolls = 3
 
+// paneWidthFor returns the real tmux width of paneID, feeding the
+// width-adaptive working detectors the submission verifiers use. A width that
+// cannot be observed is reported as 0, which those detectors document as
+// "unknown" and answer with their calibrated default budget.
+func (e *Executor) paneWidthFor(paneID string) int {
+	panes, err := e.tmuxClient().GetPanes(e.config.Session)
+	if err != nil {
+		return 0
+	}
+	for _, pane := range panes {
+		if pane.ID == paneID {
+			return pane.Width
+		}
+	}
+	return 0
+}
+
+// confirmSubmission establishes that a prompt just pasted into paneID actually
+// left the agent's composer, before any completion wait is allowed to run
+// (ntm#320).
+//
+// Pipeline dispatch used to paste with a trailing Enter and go straight to
+// waitForIdle. When the agent TUI consumed that Enter as part of the bracketed
+// paste, the payload stayed in the composer and the pane read IDLE — so
+// waitForIdle's consecutive-idle streak completed immediately and the step was
+// reported successful with the instruction never submitted. The unattended run
+// then advanced while the worker sat waiting for an operator.
+//
+// This reuses the same agent-appropriate verification the restart prompt path
+// uses. It presses at most one bare Enter, and only when the payload is
+// visibly still in the composer, so an approval dialog (which appears only
+// AFTER a prompt was submitted, leaving the composer empty) is never answered
+// by it. The prompt is never resent.
+func (e *Executor) confirmSubmission(ctx context.Context, paneID, prompt, agentType string) error {
+	return e.tmuxClient().VerifySubmission(ctx, paneID, prompt, agentType, e.paneWidthFor(paneID))
+}
+
+// submissionFailureMessage renders the operator-facing reason a dispatch was
+// not delivered.
+func submissionFailureMessage(err error) string {
+	return fmt.Sprintf("prompt was not submitted: %v", err)
+}
+
 // waitForIdle waits for an agent to return to a *stable* idle state: the
 // detector must report idle for idleStablePolls consecutive polls. Any
 // non-idle reading (or detector error) resets the streak.
-func (e *Executor) waitForIdle(ctx context.Context, paneID string, timeout time.Duration) error {
+//
+// This is only ever reached for a dispatch whose submission was confirmed:
+// idleness is meaningful evidence of completion for a prompt that is actually
+// running, and meaningless for one still sitting in the composer (ntm#320).
+func (e *Executor) waitForIdle(ctx context.Context, paneID string, timeout time.Duration, evidence ...func() (bool, error)) error {
 	ticker := time.NewTicker(e.config.ProgressInterval)
 	defer ticker.Stop()
 
@@ -3165,12 +3651,20 @@ func (e *Executor) waitForIdle(ctx context.Context, paneID string, timeout time.
 		case <-deadline.C:
 			return fmt.Errorf("timeout after %s", timeout)
 		case <-ticker.C:
+			fresh := true
+			for _, observe := range evidence {
+				ready, err := observe()
+				if err != nil {
+					return err
+				}
+				fresh = fresh && ready
+			}
 			state, err := e.detector.Detect(paneID)
 			if err != nil {
 				idleStreak = 0
 				continue
 			}
-			if state.State == status.StateIdle {
+			if state.State == status.StateIdle && fresh {
 				idleStreak++
 				if idleStreak >= idleStablePolls {
 					return nil
@@ -3239,21 +3733,97 @@ func (e *Executor) emitProgress(eventType, stepID, message string, progress floa
 	}
 }
 
-// sendNotification sends a notification if configured and appropriate for the event.
-func (e *Executor) sendNotification(ctx context.Context, workflow *Workflow, event NotificationEvent) {
-	if e.notifier == nil {
-		return
+// pendingNotification carries a notification from the locked section that can
+// safely read execution state to the delivery that must not hold that lock.
+type pendingNotification struct {
+	notifier *Notifier
+	payload  NotificationPayload
+}
+
+// prepareNotification snapshots a notification while the caller holds stateMu,
+// returning nil when nothing should be sent. The caller must hand the result to
+// deliverNotification *after* releasing stateMu.
+//
+// The payload is built here because BuildPayloadFromState walks state.Steps and
+// state.Errors, which is only race-free under the lock.
+func (e *Executor) prepareNotification(workflow *Workflow, event NotificationEvent) *pendingNotification {
+	if workflow == nil || e.state == nil {
+		return nil
 	}
 	if !ShouldNotify(workflow.Settings, event) {
-		return
+		return nil
 	}
 
-	payload := BuildPayloadFromState(e.state, workflow, event)
-	// Use a short timeout context to avoid blocking workflow completion
+	// Fall back to the notifier the workflow's own settings describe. Until this
+	// existed nothing ever called SetNotifier outside tests, so the notifier was
+	// always nil here and the documented notify_channels/webhook_url settings
+	// (docs/WORKFLOW_SCHEMA.md) parsed fine and then did nothing at all.
+	notifier := e.notifier
+	if notifier == nil {
+		notifier = e.notifierForSettings(workflow.Settings)
+	}
+	if notifier == nil {
+		return nil
+	}
+
+	return &pendingNotification{
+		notifier: notifier,
+		payload:  BuildPayloadFromState(e.state, workflow, event),
+	}
+}
+
+// deliverNotification sends a prepared notification, best-effort.
+//
+// It must NOT be called with stateMu held. Desktop, webhook and mail delivery
+// each leave the process under a 10s budget, and holding the state lock across
+// that would stall every reader of workflow state — progress emission, status
+// queries, cancellation — for as long as a slow webhook takes to answer.
+//
+// The timeout is deliberately built from context.Background() rather than the
+// workflow context so that a failed or cancelled run still reports its outcome.
+func (e *Executor) deliverNotification(pending *pendingNotification) {
+	if pending == nil {
+		return
+	}
 	notifyCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	// Ignore errors - notifications are best-effort
-	_ = e.notifier.Notify(notifyCtx, payload)
+	_ = pending.notifier.Notify(notifyCtx, pending.payload)
+}
+
+// notifierForSettings builds the notifier a workflow's settings describe, or nil
+// when the workflow asked for no channels.
+//
+// Mail needs a project key, which the settings schema has no field for; Agent
+// Mail defines that key as the working directory path, and this package already
+// resolves the project that way elsewhere (see robot.go). If the working
+// directory cannot be resolved the mail client is left nil, which notifyMail
+// treats as "not configured" rather than sending into an unknown project.
+func (e *Executor) notifierForSettings(settings WorkflowSettings) *Notifier {
+	if len(settings.NotifyChannels) == 0 {
+		return nil
+	}
+
+	notifier := NewNotifier(NotifierConfig{
+		Channels:      settings.NotifyChannels,
+		WebhookURL:    settings.WebhookURL,
+		MailRecipient: settings.MailRecipient,
+		AgentName:     notifierSenderName,
+	})
+	if len(notifier.channels) == 0 {
+		return nil
+	}
+
+	// Resolved from the notifier's channels rather than the raw settings so the
+	// client is built only when mail is genuinely in play — NewNotifier is what
+	// normalizes the "mail"/"agentmail" spellings and drops unknown names.
+	if settings.MailRecipient != "" && notifier.usesChannel(ChannelMail) {
+		if projectKey, err := os.Getwd(); err == nil {
+			notifier.projectKey = projectKey
+			notifier.mailClient = e.mailClient(projectKey)
+		}
+	}
+	return notifier
 }
 
 func workflowProgressMessage(action string, workflow *Workflow) string {
@@ -3404,9 +3974,9 @@ func truncatePrompt(s string, n int) string {
 	return s[:prevI] + "..."
 }
 
-func (e *Executor) applyResumeState() {
+func (e *Executor) applyResumeState() error {
 	if e.graph == nil {
-		return
+		return nil
 	}
 
 	var rerunStepIDs []string
@@ -3431,23 +4001,32 @@ func (e *Executor) applyResumeState() {
 	// partial write). Without rebuild, downstream steps that reference
 	// ${steps.<id>.output} or the producer's output_var see undefined
 	// variables and fail or stale-resolve.
-	type retainedStepOutput struct {
-		stepID     string
-		output     string
-		parsedData interface{}
-		outputVar  string
-	}
-	var retained []retainedStepOutput
+	var retained []resumeOutputEvent
 
 	e.stateMu.Lock()
 	if e.state == nil {
 		e.stateMu.Unlock()
-		return
+		return nil
+	}
+	merges, settledChildren, err := prepareCompletedParallelOutputs(e.graph, e.state)
+	if err != nil {
+		e.stateMu.Unlock()
+		return err
 	}
 	runID := e.state.RunID
 	workflowID := e.state.WorkflowID
+	for stepID, record := range e.state.CommandExecutions {
+		if record.Status == commandExecutionSettled && record.Background && record.Result.RerunOnResume {
+			result := e.state.Steps[stepID]
+			result.StepID, result.RerunOnResume = stepID, true
+			e.state.Steps[stepID] = result
+		}
+	}
 	for stepID, result := range e.state.Steps {
-		if shouldRerunStep(result) {
+		// In-flight evidence must win before graph completion and output
+		// retention. Clearing the marker afterward is too late: it leaves
+		// a completed graph node and resurrects an untrusted output alias.
+		if resumeResultInFlight(e.state, stepID, result) || (shouldRerunStep(result) && !settledChildren[stepID]) {
 			rerunStepIDs = append(rerunStepIDs, stepID)
 			continue
 		}
@@ -3472,12 +4051,18 @@ func (e *Executor) applyResumeState() {
 		} else {
 			stepForOutput, _ = e.graph.GetStep(stepID)
 		}
-		entry := retainedStepOutput{
+		if shouldRerunStep(result) {
+			// A completed outer group's handled failures remain inspectable;
+			// they do not become successful scalar output producers.
+			continue
+		}
+		entry := resumeOutputEvent{
 			stepID:     stepID,
 			output:     result.Output,
 			parsedData: result.ParsedData,
+			finishedAt: result.FinishedAt,
 		}
-		if stepForOutput != nil {
+		if stepForOutput != nil && !settledChildren[stepID] {
 			entry.outputVar = stepForOutput.OutputVar
 		}
 		retained = append(retained, entry)
@@ -3499,20 +4084,10 @@ func (e *Executor) applyResumeState() {
 	for _, stepID := range orphanStepIDs {
 		e.clearStepVariables(stepID)
 	}
+	retained = append(retained, merges...)
 	if len(retained) > 0 {
 		e.varMu.Lock()
-		if e.state.Variables == nil {
-			e.state.Variables = make(map[string]interface{})
-		}
-		for _, entry := range retained {
-			StoreStepOutput(e.state, entry.stepID, entry.output, entry.parsedData)
-			if entry.outputVar != "" {
-				e.state.Variables[entry.outputVar] = entry.output
-				if entry.parsedData != nil {
-					e.state.Variables[entry.outputVar+"_parsed"] = entry.parsedData
-				}
-			}
-		}
+		restoreResumeOutputEvents(e.state, retained)
 		e.varMu.Unlock()
 	}
 	for _, drop := range orphanDrops {
@@ -3523,6 +4098,7 @@ func (e *Executor) applyResumeState() {
 			"error", drop.err.Error(),
 		)
 	}
+	return nil
 }
 
 func shouldRerunStep(result StepResult) bool {
@@ -3557,7 +4133,11 @@ func (e *Executor) clearStepVariables(stepID string) {
 	delete(e.state.Variables, "steps."+stepID+".output")
 	delete(e.state.Variables, "steps."+stepID+".data")
 
-	if step, ok := e.graph.GetStep(stepID); ok && step.OutputVar != "" {
+	step, ok := e.graph.GetStep(stepID)
+	if !ok {
+		step, _, ok = e.graph.ResolveScopedRuntimeStep(stepID)
+	}
+	if ok && step.OutputVar != "" {
 		delete(e.state.Variables, step.OutputVar)
 		delete(e.state.Variables, step.OutputVar+"_parsed")
 	}
@@ -3583,6 +4163,8 @@ func (e *Executor) snapshotState() *ExecutionState {
 	}
 
 	snapshot := *e.state
+	snapshot.StepAdmissions = cloneStepAdmissions(e.state.StepAdmissions)
+	snapshot.Errors = append([]ExecutionError(nil), e.state.Errors...)
 
 	if e.state.Steps != nil {
 		snapshot.Steps = make(map[string]StepResult, len(e.state.Steps))
@@ -3611,6 +4193,7 @@ func (e *Executor) snapshotState() *ExecutionState {
 			value.CompletedStepIDs = append([]string(nil), value.CompletedStepIDs...)
 			value.FailedStepIDs = append([]string(nil), value.FailedStepIDs...)
 			value.InFlightStepIDs = append([]string(nil), value.InFlightStepIDs...)
+			value.ChildCheckpoints = maps.Clone(value.ChildCheckpoints)
 			snapshot.ParallelState[key] = value
 		}
 	}
@@ -3618,6 +4201,33 @@ func (e *Executor) snapshotState() *ExecutionState {
 		snapshot.InFlightSteps = make(map[string]InFlightStepState, len(e.state.InFlightSteps))
 		for key, value := range e.state.InFlightSteps {
 			snapshot.InFlightSteps[key] = value
+		}
+	}
+	if e.state.AgentDeliveries != nil {
+		snapshot.AgentDeliveries = maps.Clone(e.state.AgentDeliveries)
+	}
+	if e.state.CommandExecutions != nil {
+		snapshot.CommandExecutions = make(map[string]CommandExecutionState, len(e.state.CommandExecutions))
+		for key, record := range e.state.CommandExecutions {
+			snapshot.CommandExecutions[key] = cloneCommandExecution(record)
+		}
+	}
+	if e.state.CommandEvaluations != nil {
+		snapshot.CommandEvaluations = make(map[string]CommandEvaluationState, len(e.state.CommandEvaluations))
+		for key, record := range e.state.CommandEvaluations {
+			snapshot.CommandEvaluations[key] = cloneCommandEvaluation(record)
+		}
+	}
+	if e.state.MailSends != nil {
+		snapshot.MailSends = make(map[string]MailSendState, len(e.state.MailSends))
+		for key, record := range e.state.MailSends {
+			snapshot.MailSends[key] = cloneMailSend(record)
+		}
+	}
+	if e.state.ReservationSteps != nil {
+		snapshot.ReservationSteps = make(map[string]ReservationStepState, len(e.state.ReservationSteps))
+		for key, record := range e.state.ReservationSteps {
+			snapshot.ReservationSteps[key] = cloneReservationStep(record)
 		}
 	}
 	e.stateMu.RUnlock()
@@ -3642,46 +4252,6 @@ func (e *Executor) snapshotState() *ExecutionState {
 	}
 
 	return &snapshot
-}
-
-func (e *Executor) persistState() {
-	e.persistMu.Lock()
-	defer e.persistMu.Unlock()
-
-	if e.state == nil {
-		return
-	}
-
-	now := time.Now()
-	e.stateMu.Lock()
-	if e.state == nil {
-		e.stateMu.Unlock()
-		return
-	}
-	e.state.LastCheckpointAt = now
-	e.state.UpdatedAt = now
-	e.stateMu.Unlock()
-
-	projectDir := e.config.ProjectDir
-	if projectDir == "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			if e.config.Verbose {
-				log.Printf("pipeline: unable to resolve project dir for state persistence: %v", err)
-			}
-			return
-		}
-		projectDir = cwd
-	}
-
-	snapshot := e.snapshotState()
-	if snapshot == nil {
-		return
-	}
-
-	if err := SaveState(projectDir, snapshot); err != nil && e.config.Verbose {
-		log.Printf("pipeline: state persistence failed: %v", err)
-	}
 }
 
 // markFireAndForgetCancelled flags a WaitNone (fire-and-forget) command's

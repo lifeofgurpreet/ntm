@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,8 +36,11 @@ func fakeToolsPath(t *testing.T) string {
 	return ""
 }
 
-// withFakeTools sets up PATH to include fake tools and returns a cleanup function
-func withFakeTools(t *testing.T) func() {
+// withFakeTools prepends the fake tools to PATH for the rest of the test.
+// t.Setenv keeps the restore ordered with any later t.Setenv("PATH", ...) in
+// the same test; a deferred os.Setenv restore ran first and let the later
+// t.Setenv cleanup put the fakes back on PATH for every following test.
+func withFakeTools(t *testing.T) {
 	t.Helper()
 
 	fakePath := fakeToolsPath(t)
@@ -44,13 +48,7 @@ func withFakeTools(t *testing.T) func() {
 		t.Skip("testdata/faketools not found")
 	}
 
-	// Prepend fake tools to PATH
-	oldPath := os.Getenv("PATH")
-	os.Setenv("PATH", fakePath+":"+oldPath)
-
-	return func() {
-		os.Setenv("PATH", oldPath)
-	}
+	t.Setenv("PATH", fakePath+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 // TestJFPAdapterVersionParsing tests JFP version string parsing
@@ -171,8 +169,7 @@ func TestMSAdapterVersionParsing(t *testing.T) {
 }
 
 func TestDCGAvailabilityWithFakeTool(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	adapter := NewDCGAdapter()
 	adapter.InvalidateAvailabilityCache()
@@ -193,6 +190,26 @@ func TestDCGAvailabilityWithFakeTool(t *testing.T) {
 	}
 	if !adapter.IsAvailable(ctx) {
 		t.Fatalf("expected IsAvailable() to return true")
+	}
+}
+
+// A probe run under an already-ended context fails, but that failure must not
+// be cached: the send guard treats unavailable dcg as "no check", so a cached
+// miss let destructive commands through for the whole TTL.
+func TestDCGAvailabilityDoesNotCacheCanceledProbe(t *testing.T) {
+	withFakeTools(t)
+
+	adapter := NewDCGAdapter()
+	adapter.InvalidateAvailabilityCache()
+	t.Cleanup(adapter.InvalidateAvailabilityCache)
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if adapter.IsAvailable(canceled) {
+		t.Fatal("IsAvailable under a canceled context = true, want the failed probe")
+	}
+	if !adapter.IsAvailable(context.Background()) {
+		t.Fatal("IsAvailable after a canceled probe = false, want a fresh probe to find dcg")
 	}
 }
 
@@ -253,8 +270,7 @@ func TestDCGAvailabilityIncompatibleVersion(t *testing.T) {
 
 // TestJFPAdapterWithFakeTools tests the JFP adapter with fake tools
 func TestJFPAdapterWithFakeTools(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	adapter := NewJFPAdapter()
 	ctx := context.Background()
@@ -307,8 +323,7 @@ func TestJFPAdapterWithFakeTools(t *testing.T) {
 
 // TestJFPAdapterMethods tests JFP-specific adapter methods
 func TestJFPAdapterMethods(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	adapter := NewJFPAdapter()
 	ctx := context.Background()
@@ -358,17 +373,13 @@ func TestJFPAdapterMethods(t *testing.T) {
 		t.Error("Suggest() returned invalid JSON")
 	}
 
-	// Test Install
-	result, err = adapter.Install(ctx, []string{"test-prompt"}, "")
-	if err != nil {
-		t.Fatalf("Install() error: %v", err)
-	}
-	if !json.Valid(result) {
-		t.Error("Install() returned invalid JSON")
+	// Skill management moved from jfp to jsm; jfp answers with deprecated_command.
+	if _, err = adapter.Export(ctx, []string{"test-prompt"}, "skill"); !errors.Is(err, ErrJFPCommandMoved) {
+		t.Fatalf("Export(skill) error = %v, want ErrJFPCommandMoved", err)
 	}
 
 	// Test Export
-	result, err = adapter.Export(ctx, []string{"test-prompt"}, "skill")
+	result, err = adapter.Export(ctx, []string{"test-prompt"}, "md")
 	if err != nil {
 		t.Fatalf("Export() error: %v", err)
 	}
@@ -376,13 +387,13 @@ func TestJFPAdapterMethods(t *testing.T) {
 		t.Error("Export() returned invalid JSON")
 	}
 
-	// Test Update
-	result, err = adapter.Update(ctx)
+	// Test Refresh
+	result, err = adapter.Refresh(ctx)
 	if err != nil {
-		t.Fatalf("Update() error: %v", err)
+		t.Fatalf("Refresh() error: %v", err)
 	}
 	if !json.Valid(result) {
-		t.Error("Update() returned invalid JSON")
+		t.Error("Refresh() returned invalid JSON")
 	}
 }
 
@@ -432,8 +443,7 @@ func TestVersionAtLeast(t *testing.T) {
 
 // TestBVAdapterWithFakeTools tests the BV adapter with fake tools
 func TestBVAdapterWithFakeTools(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	adapter := NewBVAdapter()
 	ctx := context.Background()
@@ -486,8 +496,7 @@ func TestBVAdapterWithFakeTools(t *testing.T) {
 
 // TestBVAdapterRobotTriage tests robot-triage command
 func TestBVAdapterRobotTriage(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	adapter := NewBVAdapter()
 	ctx := context.Background()
@@ -526,8 +535,7 @@ func TestBVAdapterRobotTriage(t *testing.T) {
 }
 
 func TestBVAdapterRobotModes(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	adapter := NewBVAdapter()
 	ctx := context.Background()
@@ -572,12 +580,12 @@ func TestBVAdapterRobotModes(t *testing.T) {
 			name: "history",
 			key:  "stats",
 			call: func() (json.RawMessage, error) {
-				return adapter.GetHistory(ctx, projectRoot)
+				return adapter.GetHistory(ctx, projectRoot, "")
 			},
 		},
 		{
 			name: "burndown",
-			key:  "progress",
+			key:  "total_issues",
 			call: func() (json.RawMessage, error) {
 				return adapter.GetBurndown(ctx, projectRoot, "s1")
 			},
@@ -607,7 +615,7 @@ func TestBVAdapterRobotModes(t *testing.T) {
 			name: "search",
 			key:  "results",
 			call: func() (json.RawMessage, error) {
-				return adapter.GetSearch(ctx, projectRoot, "test query")
+				return adapter.GetSearchWithOptions(ctx, projectRoot, BVSearchOptions{Query: "test query"})
 			},
 		},
 		{
@@ -681,8 +689,7 @@ func TestAdapterTimeout(t *testing.T) {
 		t.Skip("Skipping timeout test in short mode")
 	}
 
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	// Set timeout mode
 	os.Setenv("FAKE_TOOL_MODE", "timeout")
@@ -714,8 +721,7 @@ func TestAdapterTimeout(t *testing.T) {
 
 // TestAdapterErrorMode tests error handling
 func TestAdapterErrorMode(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	// Set error mode
 	os.Setenv("FAKE_TOOL_MODE", "error")
@@ -732,8 +738,7 @@ func TestAdapterErrorMode(t *testing.T) {
 
 // TestBDAdapterWithFakeTools tests the BD adapter
 func TestBDAdapterWithFakeTools(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	fakePath := fakeToolsPath(t)
 	if fakePath == "" {
@@ -853,8 +858,7 @@ func TestBDAdapterFallsBackToBdWhenBrVersionFails(t *testing.T) {
 
 // TestCASSAdapterWithFakeTools tests the CASS adapter
 func TestCASSAdapterWithFakeTools(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	adapter := NewCASSAdapter()
 	ctx := context.Background()
@@ -889,8 +893,7 @@ func TestCASSAdapterWithFakeTools(t *testing.T) {
 
 // TestAllAdaptersHaveConsistentInterface verifies all adapters implement Adapter correctly
 func TestAllAdaptersHaveConsistentInterface(t *testing.T) {
-	cleanup := withFakeTools(t)
-	defer cleanup()
+	withFakeTools(t)
 
 	adapters := []struct {
 		name    string
@@ -955,9 +958,6 @@ func TestAllAdaptersHaveConsistentInterface(t *testing.T) {
 			if health == nil {
 				t.Error("Health() returned nil")
 			}
-
-			// All adapters must implement HasCapability
-			_ = tc.adapter.HasCapability(ctx, CapRobotMode)
 
 			// All adapters must implement Info
 			info, err := tc.adapter.Info(ctx)

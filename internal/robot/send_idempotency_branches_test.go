@@ -66,15 +66,6 @@ func installIdempotencyBranchFeed(t *testing.T) {
 	t.Cleanup(func() { SetAttentionFeed(oldFeed) })
 }
 
-func mustTestHTTPSendAdmission(t *testing.T, session string) *AuthenticatedSendAdmission {
-	t.Helper()
-	admission, err := NewAuthenticatedHTTPSendAdmission("test-orchestrator", "operator", session)
-	if err != nil {
-		t.Fatalf("NewAuthenticatedHTTPSendAdmission: %v", err)
-	}
-	return admission
-}
-
 // createIdempotencyBranchSession creates a throwaway real tmux session with a
 // single interactive bash pane and waits for the shell to render. It returns
 // the session name and the pane's tmux ID (%N).
@@ -146,12 +137,8 @@ func logSendEnvelopeSubset(t *testing.T, output *SendOutput) {
 		opSummary = fmt.Sprintf("{status=%s replayed=%v admissions=%d}",
 			output.Operation.Status, output.Operation.Replayed, len(output.Operation.Admissions))
 	}
-	t.Logf("envelope: success=%v error_code=%q hint=%q targets=%v successful=%v operation=%s",
-		output.Success, output.ErrorCode, output.Hint, output.Targets, output.Successful, opSummary)
-}
-
-func sendTestAuthorization(session string) string {
-	return fmt.Sprintf(`{"scheme":"rbac","role":"operator","permission":"agents:write","resource":"session:%s"}`, session)
+	t.Logf("envelope: success=%v error_code=%q error=%q hint=%q targets=%v successful=%v failed=%+v operation=%s",
+		output.Success, output.ErrorCode, output.Error, output.Hint, output.Targets, output.Successful, output.Failed, opSummary)
 }
 
 // mustGetSendOperation reads the durable row for (opID, session); it may
@@ -177,13 +164,10 @@ func TestGetSendIdempotency_FreshClaimRecordsCompletedOutcome(t *testing.T) {
 
 	opID := fmt.Sprintf("op-fresh-%d", time.Now().UnixNano())
 	opts := SendOptions{
-		Session:             session,
-		Message:             "echo ntm-idem-fresh-marker",
-		Pane:                paneID,
-		IdempotencyKey:      opID,
-		Actor:               "test-orchestrator",
-		Origin:              "robot.test",
-		TargetAuthorization: sendTestAuthorization(session),
+		Session:        session,
+		Message:        "echo ntm-idem-fresh-marker",
+		Pane:           paneID,
+		IdempotencyKey: opID,
 	}
 	t.Logf("seeded row: none (fresh claim); op_id=%s target=%s", opID, targetKey)
 
@@ -223,12 +207,6 @@ func TestGetSendIdempotency_FreshClaimRecordsCompletedOutcome(t *testing.T) {
 	if row.Status != state.SendOperationCompleted {
 		t.Fatalf("row.Status = %q, want %q", row.Status, state.SendOperationCompleted)
 	}
-	if row.Actor != "test-orchestrator" || row.Origin != "robot.test" {
-		t.Fatalf("row provenance = actor=%q origin=%q, want test-orchestrator/robot.test", row.Actor, row.Origin)
-	}
-	if !strings.Contains(row.TargetAuthorization, `"targets":["`+paneID+`"]`) {
-		t.Fatalf("row target authorization = %q, want resolved stable pane %s", row.TargetAuthorization, paneID)
-	}
 	if row.BindingHash != sendOperationBindingHash(opts) {
 		t.Fatalf("row.BindingHash = %q, want binding hash of the sent command", row.BindingHash)
 	}
@@ -241,12 +219,6 @@ func TestGetSendIdempotency_FreshClaimRecordsCompletedOutcome(t *testing.T) {
 	}
 	if !outcome.Success || len(outcome.Successful) != 1 || outcome.Successful[0] != targetKey {
 		t.Fatalf("stored outcome = %+v, want successful delivery to %s", outcome, targetKey)
-	}
-	if outcome.Actor != "test-orchestrator" || outcome.Origin != "robot.test" {
-		t.Fatalf("stored outcome provenance = actor=%q origin=%q", outcome.Actor, outcome.Origin)
-	}
-	if !strings.Contains(outcome.TargetAuthorization, `"targets":["`+paneID+`"]`) {
-		t.Fatalf("stored outcome target authorization = %q, want resolved stable pane %s", outcome.TargetAuthorization, paneID)
 	}
 
 	receipt, err := GetSendReceipt(opID)
@@ -262,9 +234,6 @@ func TestGetSendIdempotency_FreshClaimRecordsCompletedOutcome(t *testing.T) {
 	if receipt.Operation == nil || receipt.Operation.Status != state.SendOperationCompleted {
 		t.Fatalf("receipt.Operation = %+v, want completed operation", receipt.Operation)
 	}
-	if receipt.Operation.Actor != "test-orchestrator" || receipt.Operation.Origin != "robot.test" {
-		t.Fatalf("receipt provenance = actor=%q origin=%q", receipt.Operation.Actor, receipt.Operation.Origin)
-	}
 	if receipt.Outcome == nil || !receipt.Outcome.Success ||
 		len(receipt.Outcome.Successful) != 1 || receipt.Outcome.Successful[0] != targetKey {
 		t.Fatalf("receipt.Outcome = %+v, want recorded successful delivery to %s", receipt.Outcome, targetKey)
@@ -273,58 +242,18 @@ func TestGetSendIdempotency_FreshClaimRecordsCompletedOutcome(t *testing.T) {
 		receipt.Session, receipt.Operation.Status, receipt.Outcome.Success)
 }
 
-// A direct CLI-style pane mutation with no client operation ID must still
-// fail closed. An asserted actor/origin is not authenticated authorization;
-// the gate must run before a claim or a pane actuation.
-func TestGetSend_RejectsNonIdempotentDirectSendWithoutAuthorization(t *testing.T) {
-	testutil.RequireTmuxThrottled(t)
-	installIdempotencyBranchFeed(t)
-	session, paneID := createIdempotencyBranchSession(t, "missing-provenance")
-	marker := "non-idempotent-direct-send-must-not-send"
-
-	output, err := GetSend(SendOptions{
-		Session: session,
-		Message: "echo " + marker,
-		Pane:    paneID,
-		// A CLI caller can assert these strings but cannot supply the
-		// authenticated target-authorization record that receipt creation
-		// requires. It must fail before any pane dispatch.
-		Actor:  "self-asserted-cli-actor",
-		Origin: "robot.cli",
-	})
-	if err != nil {
-		t.Fatalf("GetSend returned error: %v", err)
-	}
-	if output.Success || output.ErrorCode != ErrCodeReceiptProvenanceRequired {
-		t.Fatalf("output = %+v, want provenance refusal", output)
-	}
-	if output.Operation != nil {
-		t.Fatalf("Operation = %+v, want no receipt", output.Operation)
-	}
-	capture, captureErr := tmux.CapturePaneOutput(paneID, 50)
-	if captureErr != nil {
-		t.Fatalf("CapturePaneOutput: %v", captureErr)
-	}
-	if strings.Contains(capture, marker) {
-		t.Fatalf("pane received a provenance-refused message: %q", capture)
-	}
-}
-
 // seedCompletedSendOperation claims and completes a row so a later GetSend
 // with the same (opID, session) observes a completed operation.
 func seedCompletedSendOperation(t *testing.T, store *state.Store, opID, session, bindingHash string, outcome sendOperationOutcome) *state.SendOperation {
 	t.Helper()
 
-	payloadSHA, payloadBytes := sendPayloadDigest("seeded payload")
-	_, claimed, err := store.ClaimSendOperation(&state.SendOperation{
-		OperationID:         opID,
-		SessionName:         session,
-		Actor:               "test-orchestrator",
-		Origin:              "robot.test",
-		TargetAuthorization: sendTestAuthorization(session),
-		BindingHash:         bindingHash,
-		PayloadSHA256:       payloadSHA,
-		PayloadBytes:        payloadBytes,
+	payloadSHA, payloadBytes := operationPayloadDigest("seeded payload")
+	claim, claimed, err := store.ClaimSendOperation(&state.SendOperation{
+		OperationID:   opID,
+		SessionName:   session,
+		BindingHash:   bindingHash,
+		PayloadSHA256: payloadSHA,
+		PayloadBytes:  payloadBytes,
 	})
 	if err != nil {
 		t.Fatalf("seed ClaimSendOperation: %v", err)
@@ -336,7 +265,7 @@ func seedCompletedSendOperation(t *testing.T, store *state.Store, opID, session,
 	if err != nil {
 		t.Fatalf("marshal seeded outcome: %v", err)
 	}
-	if err := store.CompleteSendOperation(opID, session, string(data), time.Now().UTC()); err != nil {
+	if err := store.CompleteSendOperation(opID, session, claim.ClaimToken, string(data), time.Now().UTC()); err != nil {
 		t.Fatalf("seed CompleteSendOperation: %v", err)
 	}
 	row := mustGetSendOperation(t, store, opID, session)
@@ -357,13 +286,10 @@ func TestGetSendIdempotency_ReplaysCompletedSuccessWithoutDispatch(t *testing.T)
 	const replayMarker = "ntm-idem-replay-must-not-appear"
 	opID := fmt.Sprintf("op-replay-%d", time.Now().UnixNano())
 	opts := SendOptions{
-		Session:             session,
-		Message:             "echo " + replayMarker,
-		Pane:                paneID,
-		IdempotencyKey:      opID,
-		Actor:               "test-orchestrator",
-		Origin:              "robot.test",
-		TargetAuthorization: sendTestAuthorization(session),
+		Session:        session,
+		Message:        "echo " + replayMarker,
+		Pane:           paneID,
+		IdempotencyKey: opID,
 	}
 
 	// Sentinel values no real dispatch in this session could produce: they
@@ -375,7 +301,7 @@ func TestGetSendIdempotency_ReplaysCompletedSuccessWithoutDispatch(t *testing.T)
 		Targets:    []string{"sentinel-target"},
 		Successful: []string{"sentinel-target"},
 		Failed:     []SendError{},
-		Admissions: []SendAdmission{{Target: "sentinel-target", State: AdmissionSubmitted}},
+		Admissions: []OperationAdmission{{Target: "sentinel-target", State: AdmissionSubmitted}},
 	})
 	logSeededSendOperation(t, "seeded row", seeded)
 
@@ -430,13 +356,10 @@ func TestGetSendIdempotency_ReplaysCompletedFailureWithNewIDHint(t *testing.T) {
 
 	opID := fmt.Sprintf("op-replayfail-%d", time.Now().UnixNano())
 	opts := SendOptions{
-		Session:             session,
-		Message:             "echo ntm-idem-replay-failure",
-		Pane:                paneID,
-		IdempotencyKey:      opID,
-		Actor:               "test-orchestrator",
-		Origin:              "robot.test",
-		TargetAuthorization: sendTestAuthorization(session),
+		Session:        session,
+		Message:        "echo ntm-idem-replay-failure",
+		Pane:           paneID,
+		IdempotencyKey: opID,
 	}
 
 	seeded := seedCompletedSendOperation(t, store, opID, session, sendOperationBindingHash(opts), sendOperationOutcome{
@@ -445,7 +368,7 @@ func TestGetSendIdempotency_ReplaysCompletedFailureWithNewIDHint(t *testing.T) {
 		Targets:    []string{"sentinel-target"},
 		Successful: []string{},
 		Failed:     []SendError{{Pane: "sentinel-target", Error: "seeded delivery failure"}},
-		Admissions: []SendAdmission{{Target: "sentinel-target", State: AdmissionRejected, Error: "seeded delivery failure"}},
+		Admissions: []OperationAdmission{{Target: "sentinel-target", State: AdmissionRejected, Error: "seeded delivery failure"}},
 		Error:      "seeded delivery failure",
 		ErrorCode:  ErrCodeInternalError,
 	})
@@ -487,13 +410,10 @@ func TestGetSendIdempotency_ConflictingBindingRejected(t *testing.T) {
 
 	opID := fmt.Sprintf("op-conflict-%d", time.Now().UnixNano())
 	opts := SendOptions{
-		Session:             session,
-		Message:             "echo ntm-idem-conflict",
-		Pane:                paneID,
-		IdempotencyKey:      opID,
-		Actor:               "test-orchestrator",
-		Origin:              "robot.test",
-		TargetAuthorization: sendTestAuthorization(session),
+		Session:        session,
+		Message:        "echo ntm-idem-conflict",
+		Pane:           paneID,
+		IdempotencyKey: opID,
 	}
 
 	// A binding hash that cannot match sendOperationBindingHash(opts).
@@ -548,25 +468,20 @@ func TestGetSendIdempotency_FreshInProgressClaimReportsInProgress(t *testing.T) 
 
 	opID := fmt.Sprintf("op-inprog-%d", time.Now().UnixNano())
 	opts := SendOptions{
-		Session:             session,
-		Message:             "echo ntm-idem-in-progress",
-		Pane:                paneID,
-		IdempotencyKey:      opID,
-		Actor:               "test-orchestrator",
-		Origin:              "robot.test",
-		TargetAuthorization: sendTestAuthorization(session),
+		Session:        session,
+		Message:        "echo ntm-idem-in-progress",
+		Pane:           paneID,
+		IdempotencyKey: opID,
 	}
 
-	payloadSHA, payloadBytes := sendPayloadDigest(opts.Message)
+	payloadSHA, payloadBytes := operationPayloadDigest(opts.Message)
 	seeded, claimed, err := store.ClaimSendOperation(&state.SendOperation{
-		OperationID:         opID,
-		SessionName:         session,
-		Actor:               opts.Actor,
-		Origin:              opts.Origin,
-		TargetAuthorization: opts.TargetAuthorization,
-		BindingHash:         sendOperationBindingHash(opts),
-		PayloadSHA256:       payloadSHA,
-		PayloadBytes:        payloadBytes,
+		OperationID:   opID,
+		SessionName:   session,
+		BindingHash:   sendOperationBindingHash(opts),
+		PayloadSHA256: payloadSHA,
+		PayloadBytes:  payloadBytes,
+		Targets:       []string{targetKey},
 	})
 	if err != nil || !claimed {
 		t.Fatalf("seed fresh claim: claimed=%v err=%v", claimed, err)
@@ -619,27 +534,21 @@ func TestGetSendIdempotency_StaleInProgressClaimTakenOver(t *testing.T) {
 
 	opID := fmt.Sprintf("op-stale-%d", time.Now().UnixNano())
 	opts := SendOptions{
-		Session:             session,
-		Message:             "echo ntm-idem-stale-takeover",
-		Pane:                paneID,
-		IdempotencyKey:      opID,
-		Actor:               "test-orchestrator",
-		Origin:              "robot.test",
-		TargetAuthorization: sendTestAuthorization(session),
+		Session:        session,
+		Message:        "echo ntm-idem-stale-takeover",
+		Pane:           paneID,
+		IdempotencyKey: opID,
 	}
 
-	staleCreatedAt := time.Now().UTC().Add(-(sendOperationStaleClaimWindow + 10*time.Minute))
-	payloadSHA, payloadBytes := sendPayloadDigest(opts.Message)
+	staleCreatedAt := time.Now().UTC().Add(-(operationStaleClaimWindow + 10*time.Minute))
+	payloadSHA, payloadBytes := operationPayloadDigest(opts.Message)
 	seeded, claimed, err := store.ClaimSendOperation(&state.SendOperation{
-		OperationID:         opID,
-		SessionName:         session,
-		Actor:               opts.Actor,
-		Origin:              opts.Origin,
-		TargetAuthorization: opts.TargetAuthorization,
-		BindingHash:         sendOperationBindingHash(opts),
-		PayloadSHA256:       payloadSHA,
-		PayloadBytes:        payloadBytes,
-		CreatedAt:           staleCreatedAt,
+		OperationID:   opID,
+		SessionName:   session,
+		BindingHash:   sendOperationBindingHash(opts),
+		PayloadSHA256: payloadSHA,
+		PayloadBytes:  payloadBytes,
+		CreatedAt:     staleCreatedAt,
 	})
 	if err != nil || !claimed {
 		t.Fatalf("seed stale claim: claimed=%v err=%v", claimed, err)
@@ -673,7 +582,7 @@ func TestGetSendIdempotency_StaleInProgressClaimTakenOver(t *testing.T) {
 	}
 	// TakeOverStaleSendOperation refreshes created_at to now; a row still
 	// carrying the stale timestamp means the takeover path never ran.
-	if !row.CreatedAt.After(staleCreatedAt.Add(sendOperationStaleClaimWindow)) {
+	if !row.CreatedAt.After(staleCreatedAt.Add(operationStaleClaimWindow)) {
 		t.Fatalf("row.CreatedAt = %v, want refreshed past the stale seed %v", row.CreatedAt, staleCreatedAt)
 	}
 	var outcome sendOperationOutcome
@@ -686,9 +595,13 @@ func TestGetSendIdempotency_StaleInProgressClaimTakenOver(t *testing.T) {
 }
 
 // Branch (f): a preflight failure AFTER the claim (dispatch Prepare rejects
-// the target before any keystroke) releases the claim so the operation ID is
-// immediately reusable. The seam: a negative delay fails dispatch Prepare
-// after the claim block but before a tmux delivery is attempted.
+// the request before any keystroke) releases the claim so the operation ID is
+// immediately reusable. The seam: a negative inter-send delay is only
+// validated by dispatch's Prepare — which runs after the claim block — as
+// invalid_request. (The original seam, prompt_delivery_unsupported for a
+// grok pane, no longer exists: automated prompt delivery is implemented for
+// every agent type, and a grok-titled bare shell is refused later, at
+// delivery, as PANE_AGENT_DEAD.)
 func TestGetSendIdempotency_PreflightFailureReleasesClaim(t *testing.T) {
 	testutil.RequireTmuxThrottled(t)
 	installIdempotencyBranchFeed(t)
@@ -700,11 +613,10 @@ func TestGetSendIdempotency_PreflightFailureReleasesClaim(t *testing.T) {
 		Session:        session,
 		Message:        "echo ntm-idem-preflight",
 		Pane:           paneID,
-		DelayMs:        -1,
 		IdempotencyKey: opID,
-		Admission:      mustTestHTTPSendAdmission(t, session),
+		DelayMs:        -1, // rejected by Prepare, after the claim
 	}
-	t.Logf("seeded row: none (fresh claim before invalid dispatch preflight for pane %s)", paneID)
+	t.Logf("seeded row: none (fresh claim against pane %s with a negative delay)", paneID)
 
 	output, err := GetSend(opts)
 	if err != nil {
@@ -713,10 +625,10 @@ func TestGetSendIdempotency_PreflightFailureReleasesClaim(t *testing.T) {
 	logSendEnvelopeSubset(t, output)
 
 	if output.Success {
-		t.Fatal("Success = true, want dispatch preflight failure")
+		t.Fatal("Success = true, want prompt-delivery preflight failure")
 	}
 	if output.ErrorCode != ErrCodeInvalidFlag {
-		t.Fatalf("ErrorCode = %q, want %q (invalid dispatch delay)", output.ErrorCode, ErrCodeInvalidFlag)
+		t.Fatalf("ErrorCode = %q, want %q (invalid_request: negative delay)", output.ErrorCode, ErrCodeInvalidFlag)
 	}
 
 	// The claim must have been RELEASED: no row remains.
@@ -727,16 +639,13 @@ func TestGetSendIdempotency_PreflightFailureReleasesClaim(t *testing.T) {
 	}
 
 	// And the operation ID is immediately reusable: a fresh claim wins.
-	payloadSHA, payloadBytes := sendPayloadDigest(opts.Message)
+	payloadSHA, payloadBytes := operationPayloadDigest(opts.Message)
 	_, reclaimed, err := store.ClaimSendOperation(&state.SendOperation{
-		OperationID:         opID,
-		SessionName:         session,
-		Actor:               "test-orchestrator",
-		Origin:              "http.api.v1",
-		TargetAuthorization: "test-reclaim-after-release",
-		BindingHash:         sendOperationBindingHash(opts),
-		PayloadSHA256:       payloadSHA,
-		PayloadBytes:        payloadBytes,
+		OperationID:   opID,
+		SessionName:   session,
+		BindingHash:   sendOperationBindingHash(opts),
+		PayloadSHA256: payloadSHA,
+		PayloadBytes:  payloadBytes,
 	})
 	if err != nil {
 		t.Fatalf("re-claim after release: %v", err)
@@ -762,13 +671,10 @@ func TestGetSendIdempotency_NoProjectionStoreNotImplemented(t *testing.T) {
 	t.Logf("seeded row: none (projection store nil); op_id=%s", opID)
 
 	output, err := GetSend(SendOptions{
-		Session:             session,
-		Message:             "echo ntm-idem-no-store",
-		Pane:                paneID,
-		IdempotencyKey:      opID,
-		Actor:               "test-orchestrator",
-		Origin:              "robot.test",
-		TargetAuthorization: sendTestAuthorization(session),
+		Session:        session,
+		Message:        "echo ntm-idem-no-store",
+		Pane:           paneID,
+		IdempotencyKey: opID,
 	})
 	if err != nil {
 		t.Fatalf("GetSend returned error: %v", err)

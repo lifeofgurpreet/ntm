@@ -26,6 +26,12 @@
 #     import graph, so a NEVER-imported package (C9's nine) produces zero
 #     entries. `go list ./internal/...` minus `go list -deps ./cmd/ntm` fills
 #     that blind spot; those violations use entry form `pkg:internal/<path>`.
+#   - Reflection-only check: deadcode keeps every exported method of a type
+#     that reaches an interface value (RTA's reflection rule), so an uncalled
+#     method on a live type is never reported. scripts/guards/reflectdead
+#     lists functions RTA reaches that no call path from main reaches, per
+#     GOOS, intersected like deadcode, in the same <file>.go:<Func> form
+#     (bd-8gbr3). Canary cases d/e pin its behavior.
 #
 # Entry format in ci/allowlists/deadcode.txt:
 #   <file>.go:<Func>        e.g. internal/coordinator/conflicts.go:Engine.Run
@@ -39,6 +45,13 @@
 #   - Test helpers in non-test files are reported dead (no -test): either move
 #     them into _test.go files or add a `# permanent: test-helper` entry
 #     naming the reaching test.
+#   - WS0-G2 claims (config.RegisterReader(key, fn)) take fn as a value, which
+#     keeps a reader nothing else calls reachable. Every claim lives in a
+#     liveness_claims*.go file constrained `//go:build !liveness_audit`, and
+#     the analysis builds with -tags liveness_audit, so a function alive only
+#     through its claim is reported dead (bd-ir0li). The placement check
+#     keeps that exclusion complete: a claim in any other file, or a claim
+#     file without the constraint, fails the gate.
 #   - Generated files: excluded by deadcode's generated-file handling.
 #
 # Mandatory canary (scripts/guards/testdata/deadcode_canary/, standalone
@@ -52,6 +65,9 @@
 # analysis is guaranteed in CI by the dedicated `reality-guards-go` job
 # (.github/workflows/ci.yml), which sets up Go and runs this script.
 set -u
+# The GOOS intersection and orphan-package check merge sorted lists with comm,
+# which is only correct when it collates as sort did; see lib/ratchet.sh.
+export LC_ALL=C
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT" || exit 1
@@ -72,6 +88,32 @@ if [ -n "$shape_bad" ]; then
   exit 1
 fi
 
+# --- claim placement (keeps the liveness_audit exclusion complete) ----------
+# Comment lines and the registry itself (internal/config/liveness.go) are not
+# claims; test files never reach the analysis.
+stray_claims="$(grep -rnE --include='*.go' 'RegisterReader\(' internal cmd \
+  | grep -vE '^[^:]+_test\.go:|/liveness_claims[^/:]*\.go:|^internal/config/liveness\.go:' \
+  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)"
+if [ -n "$stray_claims" ]; then
+  echo "deadcode_gate: FAIL — config.RegisterReader claim outside a liveness_claims*.go file (the liveness_audit build would still see it, hiding claim-only readers):" >&2
+  printf '%s\n' "$stray_claims" | sed 's/^/  /' >&2
+  exit 1
+fi
+unconstrained=""
+for f in $(find internal cmd -name 'liveness_claims*.go' ! -name '*_test.go' | sort); do
+  constraint="$(grep -m1 '^//go:build ' "$f" || true)"
+  case "$constraint" in
+    *'||'*|'') unconstrained="$unconstrained $f" ;;
+    *'!liveness_audit'*) ;;
+    *) unconstrained="$unconstrained $f" ;;
+  esac
+done
+if [ -n "$unconstrained" ]; then
+  echo "deadcode_gate: FAIL — claim file(s) not excluded by -tags liveness_audit (want a '//go:build ... && !liveness_audit' line with no '||'):" >&2
+  printf '  %s\n' $unconstrained >&2
+  exit 1
+fi
+
 if ! command -v go >/dev/null 2>&1; then
   echo "deadcode_gate.sh: OK (format-side only: no Go toolchain here; full analysis runs in the reality-guards-go CI job)"
   exit 0
@@ -82,6 +124,12 @@ trap 'rm -rf "$tmp"' EXIT
 
 if ! go build -o "$tmp/deadcode" golang.org/x/tools/cmd/deadcode; then
   echo "deadcode_gate: FAIL — could not build pinned golang.org/x/tools/cmd/deadcode (see go.mod tool directive)" >&2
+  exit 1
+fi
+# reflectdead reports what deadcode keeps alive by RTA's reflection rule:
+# functions RTA reaches that no call path from main reaches (bd-8gbr3).
+if ! go build -o "$tmp/reflectdead" ./scripts/guards/reflectdead; then
+  echo "deadcode_gate: FAIL — could not build scripts/guards/reflectdead" >&2
   exit 1
 fi
 
@@ -99,10 +147,21 @@ if grep -q 'runEDispatch' "$tmp/canary.out"; then
   echo "deadcode_gate: CANARY FAILURE — cobra RunE-only func falsely reported dead (case b): deadcode version regressed on dynamic-call tracking" >&2
   exit 1
 fi
+if ! "$tmp/reflectdead" -dir "$CANARY_DIR" -filter deadcodecanary/ ./cmd/canary > "$tmp/canary-reflect.out" 2>"$tmp/canary-reflect.err"; then
+  echo "deadcode_gate: CANARY FAILURE — reflectdead failed on $CANARY_DIR:" >&2
+  cat "$tmp/canary-reflect.err" >&2
+  exit 1
+fi
+grep -qx 'lib/lib.go:Reflected.ReflectOnly' "$tmp/canary-reflect.out" || {
+  echo "deadcode_gate: CANARY FAILURE — method kept only by RTA's reflection rule not reported (case d)" >&2; exit 1; }
+if grep -q 'Reflected.Describe' "$tmp/canary-reflect.out"; then
+  echo "deadcode_gate: CANARY FAILURE — interface-called method falsely reported (case e)" >&2
+  exit 1
+fi
 
 # --- multi-GOOS analysis, intersected ---------------------------------------
 for goos in $GOOS_LIST; do
-  if ! GOOS="$goos" GOARCH=amd64 "$tmp/deadcode" -filter "^${MODULE}/internal/" ./cmd/ntm > "$tmp/raw.$goos" 2>"$tmp/err.$goos"; then
+  if ! GOOS="$goos" GOARCH=amd64 "$tmp/deadcode" -tags liveness_audit -filter "^${MODULE}/internal/" ./cmd/ntm > "$tmp/raw.$goos" 2>"$tmp/err.$goos"; then
     echo "deadcode_gate: FAIL — deadcode analysis failed for GOOS=$goos:" >&2
     cat "$tmp/err.$goos" >&2
     exit 1
@@ -110,12 +169,19 @@ for goos in $GOOS_LIST; do
   # "internal/x/y.go:12:3: unreachable func: T.F" -> "internal/x/y.go:T.F"
   awk -F': unreachable func: ' 'NF==2 {p=$1; sub(/:[0-9]+:[0-9]+$/, "", p); print p ":" $2}' \
     "$tmp/raw.$goos" | sort -u > "$tmp/norm.$goos"
+  if ! GOOS="$goos" GOARCH=amd64 "$tmp/reflectdead" -tags liveness_audit -filter "${MODULE}/internal/" ./cmd/ntm > "$tmp/reflect.raw.$goos" 2>"$tmp/reflect.err.$goos"; then
+    echo "deadcode_gate: FAIL — reflectdead analysis failed for GOOS=$goos:" >&2
+    cat "$tmp/reflect.err.$goos" >&2
+    exit 1
+  fi
+  sort -u "$tmp/reflect.raw.$goos" > "$tmp/reflect.$goos"
 done
 comm -12 "$tmp/norm.linux" "$tmp/norm.darwin" | comm -12 - "$tmp/norm.windows" > "$tmp/dead.txt"
+comm -12 "$tmp/reflect.linux" "$tmp/reflect.darwin" | comm -12 - "$tmp/reflect.windows" >> "$tmp/dead.txt"
 
 # --- orphan-package check (deadcode's whole-package blind spot) -------------
 comm -23 <(go list ./internal/... | sort) \
-         <(go list -deps ./cmd/ntm | grep "^${MODULE}/internal" | sort) \
+         <(go list -tags liveness_audit -deps ./cmd/ntm | grep "^${MODULE}/internal" | sort) \
   | sed "s|^${MODULE}/|pkg:|" >> "$tmp/dead.txt"
 
 # --- join violations with the allowlist's bead column, then ratchet ---------
@@ -139,4 +205,4 @@ if ! ratchet_compare "$ALLOWLIST" "$tmp/pairs.txt"; then
   echo "deadcode_gate.sh: FAILED — see ci/allowlists/README.md (waiver protocol: bead FIRST, then the allowlist line)" >&2
   exit 1
 fi
-echo "deadcode_gate.sh: OK (canary fired on a+c, passed b; $(wc -l < "$tmp/dead.txt" | tr -d ' ') dead entries all ratchet-matched against $ALLOWLIST)"
+echo "deadcode_gate.sh: OK (canary fired on a+c+d, passed b+e; $(wc -l < "$tmp/dead.txt" | tr -d ' ') dead entries all ratchet-matched against $ALLOWLIST)"

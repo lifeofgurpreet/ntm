@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -61,6 +63,661 @@ func waitForTestFile(t *testing.T, path, description string) {
 			t.Fatalf("timed out waiting for %s", description)
 		}
 	}
+}
+
+const beadsRecoveryTombstoneWarning = "the tombstone issue IDs could not be read before the rebuild (Database error: database disk image is malformed); preservation of unflushed local state could not be established"
+
+const beadsRebuildPreservationConflict = `{"error":{"code":"SYNC_CONFLICT","message":"Sync conflict: Automatic database recovery refused because unflushed-state preservation could not be established:\n- the tombstone issue IDs could not be read before the rebuild (Database error: database disk image is malformed); preservation of unflushed local state could not be established\nThe database was not replaced. Run br doctor --repair to inspect retained evidence."}}`
+
+func beadsRecoveryJSON(t *testing.T, value any) string {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func beadsRecoveryDoctorReport() map[string]any {
+	return map[string]any{
+		"ok": false, "exit_code": 2, "code": "fix_partial", "repaired": true,
+		"database_verified": true, "preservation_verified": false, "verified": false,
+		"skipped": 0, "fk_violations_cleaned": 0,
+		"history_preservation_warnings": []string{},
+		"dirty_preservation_warnings":   []string{beadsRecoveryTombstoneWarning},
+		"preserved_history":             []any{map[string]any{"table": "events", "restored": 1, "skipped": 0}},
+		"verified_backups":              []any{map[string]any{"backup": "/retained/beads.db.bak"}},
+		"recovery_failure_marker":       "/retained/beads.db.verification-failed.json",
+		"recovery_failure_marker_error": nil,
+	}
+}
+
+type beadsRecoveryTestCommand struct {
+	stdout   string
+	stderr   string
+	exitCode int
+}
+
+type beadsRecoveryTestWorkspace struct {
+	dir           string
+	calls         string
+	doctorStarted string
+	jsonl         string
+	jsonlContents string
+}
+
+// Run the actual subprocess wrapper so exit status, separate output streams,
+// workspace locking and the no-database cache all participate in recovery.
+func setupBeadsRecoveryCommands(t *testing.T, rebuild, doctor beadsRecoveryTestCommand) beadsRecoveryTestWorkspace {
+	t.Helper()
+	databasePath, db := assignmentMutexFixture(t)
+	mutexSQL(t, db, `CREATE INDEX idx_issues_status ON issues(status)`)
+	mutexSQL(t, db, `CREATE INDEX idx_issues_tombstone ON issues(status) WHERE status = 'tombstone'`)
+	mutexIssue(t, db, "ntm-preserved", "tombstone", "")
+	dir := filepath.Dir(databasePath)
+	for _, name := range []string{".git", ".beads"} {
+		if err := os.Mkdir(filepath.Join(dir, name), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", name, err)
+		}
+	}
+	workspace := beadsRecoveryTestWorkspace{
+		dir:           dir,
+		calls:         filepath.Join(dir, "br-calls"),
+		doctorStarted: filepath.Join(dir, "doctor-started"),
+		jsonl:         filepath.Join(dir, ".beads", "issues.jsonl"),
+		jsonlContents: "{\"id\":\"ntm-preserved\",\"status\":\"tombstone\"}\n",
+	}
+	if err := os.WriteFile(workspace.jsonl, []byte(workspace.jsonlContents), 0o600); err != nil {
+		t.Fatalf("write authoritative JSONL: %v", err)
+	}
+	normalizedDir, err := normalizeTriageDir(dir)
+	if err != nil {
+		t.Fatalf("normalize recovery workspace: %v", err)
+	}
+	workspace.dir = normalizedDir
+	setNoDBState(normalizedDir, true)
+	t.Cleanup(func() { setNoDBState(normalizedDir, false) })
+	for key, value := range map[string]string{
+		"NTM_TEST_BR_CALLS":       workspace.calls,
+		"NTM_TEST_BR_INFO":        beadsRecoveryJSON(t, map[string]string{"database_path": databasePath, "jsonl_path": workspace.jsonl}),
+		"NTM_TEST_READ_ARGV":      "--lock-timeout 5000 show task-1 --json",
+		"NTM_TEST_DOCTOR_STARTED": workspace.doctorStarted,
+		"NTM_TEST_REBUILD_STDOUT": rebuild.stdout,
+		"NTM_TEST_REBUILD_STDERR": rebuild.stderr,
+		"NTM_TEST_REBUILD_EXIT":   fmt.Sprint(rebuild.exitCode),
+		"NTM_TEST_DOCTOR_STDOUT":  doctor.stdout,
+		"NTM_TEST_DOCTOR_STDERR":  doctor.stderr,
+		"NTM_TEST_DOCTOR_EXIT":    fmt.Sprint(doctor.exitCode),
+		"NTM_TEST_DOCTOR_BLOCK":   "",
+	} {
+		t.Setenv(key, value)
+	}
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+printf '%s\t%s\n' "$PWD" "$*" >> "$NTM_TEST_BR_CALLS"
+case "$*" in
+  "$NTM_TEST_READ_ARGV")
+    printf '%s' "$NTM_TEST_READ_STDOUT"
+    printf '%s' "$NTM_TEST_READ_STDERR" >&2
+    exit "${NTM_TEST_READ_EXIT:-0}"
+    ;;
+  '--lock-timeout 5000 info --json --no-auto-import --no-auto-flush')
+    printf '%s' "$NTM_TEST_BR_INFO"
+    ;;
+  '--lock-timeout 5000 sync --import-only --rebuild --json')
+    printf '%s' "$NTM_TEST_REBUILD_STDOUT"
+    printf '%s' "$NTM_TEST_REBUILD_STDERR" >&2
+    exit "$NTM_TEST_REBUILD_EXIT"
+    ;;
+  '--lock-timeout 5000 doctor --repair --json')
+    printf '%s' "$NTM_TEST_DOCTOR_STDOUT"
+    printf '%s' "$NTM_TEST_DOCTOR_STDERR" >&2
+    printf 'started\n' > "$NTM_TEST_DOCTOR_STARTED"
+    if [ "$NTM_TEST_DOCTOR_BLOCK" = true ]; then
+      exec sleep 30
+    fi
+    exit "$NTM_TEST_DOCTOR_EXIT"
+    ;;
+  *)
+    printf 'unexpected recovery command: %s\n' "$*" >&2
+    exit 99
+    ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "br"), []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake br: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return workspace
+}
+
+func (w beadsRecoveryTestWorkspace) assertCommands(t *testing.T, commands ...string) {
+	t.Helper()
+	contents, err := os.ReadFile(w.calls)
+	if err != nil && !(os.IsNotExist(err) && len(commands) == 0) {
+		t.Fatalf("read recovery commands: %v", err)
+	}
+	want := ""
+	for _, command := range commands {
+		want += w.dir + "\t--lock-timeout 5000 " + command + "\n"
+	}
+	if string(contents) != want {
+		t.Fatalf("recovery commands=%q, want %q", contents, want)
+	}
+	jsonl, err := os.ReadFile(w.jsonl)
+	if err != nil || string(jsonl) != w.jsonlContents {
+		t.Fatalf("authoritative JSONL changed: contents=%q error=%v", jsonl, err)
+	}
+}
+
+// The read-recovery boundary requires both files to resolve inside .beads.
+// Retain the shared claim fixture and copy its committed SQLite contents into
+// a configured local filename so this also exercises non-default DB names.
+func setupBeadsReadRecoveryCommands(t *testing.T, doctor beadsRecoveryTestCommand) beadsRecoveryTestWorkspace {
+	t.Helper()
+	w := setupBeadsRecoveryCommands(t,
+		beadsRecoveryTestCommand{stderr: beadsRebuildPreservationConflict, exitCode: 6}, doctor)
+	var info beadsWorkspaceInfo
+	if err := json.Unmarshal([]byte(os.Getenv("NTM_TEST_BR_INFO")), &info); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(info.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info.DatabasePath = filepath.Join(w.dir, ".beads", "configured-index.db")
+	if err := os.WriteFile(info.DatabasePath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NTM_TEST_BR_INFO", beadsRecoveryJSON(t, info))
+	t.Setenv("NTM_TEST_READ_STDOUT", `{"error":{"code":"DATABASE_ERROR","message":"database disk image is malformed"}}`)
+	t.Setenv("NTM_TEST_READ_STDERR", "")
+	t.Setenv("NTM_TEST_READ_EXIT", "2")
+	setNoDBState(w.dir, false)
+	return w
+}
+
+func TestReadForMutationContextRepairsOnlyFailedBeadsReads(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		preservation bool
+		unverified   bool
+		persistent   bool
+	}{
+		{name: "verified partial repair with configured database filename"},
+		{name: "preservation refusal from initial read", preservation: true},
+		{name: "unverified repair stops before retry", unverified: true},
+		{name: "persistent corruption gets only one repair", persistent: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			report := beadsRecoveryDoctorReport()
+			if test.unverified {
+				report["database_verified"] = false
+			}
+			w := setupBeadsReadRecoveryCommands(t, beadsRecoveryTestCommand{stdout: beadsRecoveryJSON(t, report), exitCode: 2})
+			if test.preservation {
+				t.Setenv("NTM_TEST_READ_STDOUT", beadsRebuildPreservationConflict)
+				t.Setenv("NTM_TEST_READ_EXIT", "6")
+			}
+			reads := 0
+			result, err := ReadForMutationContext(t.Context(), w.dir, func() (string, error) {
+				reads++
+				if reads == 1 || test.persistent {
+					return RunBdContext(t.Context(), w.dir, "show", "task-1", "--json")
+				}
+				return "fresh evidence", nil
+			})
+			wantReads := 2
+			if test.unverified {
+				wantReads = 1
+			}
+			if reads != wantReads || (err != nil) != (test.unverified || test.persistent) {
+				t.Fatalf("result=%q error=%v reads=%d, want reads=%d", result, err, reads, wantReads)
+			}
+			if err == nil && result != "fresh evidence" {
+				t.Fatalf("result=%q, want newly collected evidence", result)
+			}
+			commands := []string{"show task-1 --json", "info --json --no-auto-import --no-auto-flush", "sync --import-only --rebuild --json", "info --json --no-auto-import --no-auto-flush", "doctor --repair --json"}
+			if test.persistent {
+				commands = append(commands, "show task-1 --json")
+			}
+			w.assertCommands(t, commands...)
+		})
+	}
+}
+
+func TestReadForMutationContextLeavesUnrelatedErrorsUntouched(t *testing.T) {
+	for _, output := range []string{
+		`{"error":{"code":"CONFIG_ERROR","message":"database disk image is malformed"}}`,
+		`{"error":{"code":"DATABASE_ERROR","message":"permission denied"}}`,
+		`{"error":{"code":"SYNC_CONFLICT","message":"JSONL changed concurrently"}}`,
+		`database disk image is malformed`,
+		`{"error":{"code":"DATABASE_ERROR","message":"database disk image is malformed"}} trailing task text`,
+	} {
+		t.Run(output, func(t *testing.T) {
+			w := setupBeadsReadRecoveryCommands(t, beadsRecoveryTestCommand{})
+			t.Setenv("NTM_TEST_READ_STDOUT", output)
+			reads := 0
+			var originalErr error
+			_, err := ReadForMutationContext(t.Context(), w.dir, func() (string, error) {
+				reads++
+				result, readErr := RunBdContext(t.Context(), w.dir, "show", "task-1", "--json")
+				originalErr = readErr
+				return result, readErr
+			})
+			if err == nil || err != originalErr || reads != 1 {
+				t.Fatalf("error=%v original=%v reads=%d, want unchanged read failure", err, originalErr, reads)
+			}
+			w.assertCommands(t, "show task-1 --json")
+		})
+	}
+	for name, originalErr := range map[string]error{
+		"healthy read":        nil,
+		"parser diagnostic":   errors.New("task title contains database disk image is malformed"),
+		"eligibility refusal": fmt.Errorf("database corruption: %w", ErrBeadAssignmentIneligible),
+		"ownership refusal":   fmt.Errorf("database disk image is malformed: %w", ErrBeadAlreadyClaimed),
+		"terminal refusal":    fmt.Errorf("file is not a database: %w", ErrBeadTerminal),
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := setupBeadsReadRecoveryCommands(t, beadsRecoveryTestCommand{})
+			reads := 0
+			result, err := ReadForMutationContext(t.Context(), w.dir, func() (string, error) {
+				reads++
+				return "original evidence", originalErr
+			})
+			if err != originalErr || result != "original evidence" || reads != 1 {
+				t.Fatalf("result=%q error=%v reads=%d", result, err, reads)
+			}
+			w.assertCommands(t)
+		})
+	}
+}
+
+func TestReadForMutationContextDoesNotRepairInheritedOrRedirectedDatabase(t *testing.T) {
+	for _, kind := range []string{"parent workspace", "clone under parent workspace", "symlinked beads directory", "external database", "external JSONL"} {
+		t.Run(kind, func(t *testing.T) {
+			w := setupBeadsReadRecoveryCommands(t, beadsRecoveryTestCommand{})
+			readDir := w.dir
+			commands := []string{"show task-1 --json"}
+			switch kind {
+			case "parent workspace":
+				readDir = filepath.Join(w.dir, "child")
+				if err := os.Mkdir(readDir, 0755); err != nil {
+					t.Fatal(err)
+				}
+			case "clone under parent workspace":
+				readDir = filepath.Join(w.dir, "child")
+				if err := os.MkdirAll(filepath.Join(readDir, ".git"), 0755); err != nil {
+					t.Fatal(err)
+				}
+				// A read that only reached this tracker by walking up must not
+				// let br change it, and that holds for a mutation's reads too.
+				commands = []string{"show task-1 --json --no-auto-import --no-auto-flush"}
+				t.Setenv("NTM_TEST_READ_ARGV", "--lock-timeout 5000 show task-1 --json --no-auto-import --no-auto-flush")
+			case "symlinked beads directory":
+				readDir = t.TempDir()
+				if err := os.Mkdir(filepath.Join(readDir, ".git"), 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(filepath.Join(w.dir, ".beads"), filepath.Join(readDir, ".beads")); err != nil {
+					t.Fatal(err)
+				}
+				w.dir = readDir
+			default:
+				var info beadsWorkspaceInfo
+				if err := json.Unmarshal([]byte(os.Getenv("NTM_TEST_BR_INFO")), &info); err != nil {
+					t.Fatal(err)
+				}
+				external := filepath.Join(t.TempDir(), "outside")
+				if err := os.WriteFile(external, []byte("unrelated workspace evidence"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				redirect := filepath.Join(w.dir, ".beads", "redirect")
+				if err := os.Symlink(external, redirect); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "external database" {
+					info.DatabasePath = redirect
+				} else {
+					info.JSONLPath = redirect
+				}
+				t.Setenv("NTM_TEST_BR_INFO", beadsRecoveryJSON(t, info))
+				commands = append(commands, "info --json --no-auto-import --no-auto-flush")
+			}
+			reads := 0
+			_, err := ReadForMutationContext(t.Context(), readDir, func() (string, error) {
+				reads++
+				return RunBdContext(t.Context(), readDir, "show", "task-1", "--json")
+			})
+			if err == nil || !strings.Contains(err.Error(), "refusing database recovery") || reads != 1 {
+				t.Fatalf("error=%v reads=%d, want unsafe recovery refused", err, reads)
+			}
+			w.assertCommands(t, commands...)
+		})
+	}
+}
+
+func TestReadForMutationContextCancellationPreventsReadAndRetry(t *testing.T) {
+	t.Run("inactive context and missing callback", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		for _, ctx := range []context.Context{nil, ctx} {
+			_, err := ReadForMutationContext(ctx, t.TempDir(), func() (bool, error) {
+				t.Fatal("read called for an inactive context")
+				return false, nil
+			})
+			if err == nil {
+				t.Fatal("inactive context accepted")
+			}
+		}
+		if _, err := ReadForMutationContext[bool](t.Context(), t.TempDir(), nil); err == nil {
+			t.Fatal("nil reader accepted")
+		}
+	})
+	t.Run("canceled after initial read", func(t *testing.T) {
+		w := setupBeadsReadRecoveryCommands(t, beadsRecoveryTestCommand{})
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		_, err := ReadForMutationContext(ctx, w.dir, func() (string, error) {
+			result, err := RunBdContext(ctx, w.dir, "show", "task-1", "--json")
+			cancel()
+			return result, err
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error=%v, want canceled read", err)
+		}
+		w.assertCommands(t, "show task-1 --json")
+	})
+	t.Run("canceled during doctor", func(t *testing.T) {
+		w := setupBeadsReadRecoveryCommands(t, beadsRecoveryTestCommand{stdout: beadsRecoveryJSON(t, beadsRecoveryDoctorReport()), exitCode: 2})
+		t.Setenv("NTM_TEST_DOCTOR_BLOCK", "true")
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		reads := 0
+		done := make(chan error, 1)
+		go func() {
+			_, err := ReadForMutationContext(ctx, w.dir, func() (string, error) {
+				reads++
+				return RunBdContext(ctx, w.dir, "show", "task-1", "--json")
+			})
+			done <- err
+		}()
+		waitForTestFile(t, w.doctorStarted, "read recovery doctor")
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) || reads != 1 {
+				t.Fatalf("error=%v reads=%d, want canceled recovery without reread", err, reads)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("read recovery ignored cancellation")
+		}
+		w.assertCommands(t, "show task-1 --json", "info --json --no-auto-import --no-auto-flush", "sync --import-only --rebuild --json", "info --json --no-auto-import --no-auto-flush", "doctor --repair --json")
+	})
+}
+
+func TestBeadsCorruptionRecoveryRequiresPreservationConflict(t *testing.T) {
+	tests := []struct {
+		name    string
+		rebuild beadsRecoveryTestCommand
+		wantErr bool
+	}{
+		{name: "successful rebuild", rebuild: beadsRecoveryTestCommand{stdout: `{"imported":1}`}},
+		{name: "unrelated sync conflict", rebuild: beadsRecoveryTestCommand{stderr: `{"error":{"code":"SYNC_CONFLICT","message":"JSONL was modified concurrently"}}`, exitCode: 6}, wantErr: true},
+		{name: "preservation wording with wrong code", rebuild: beadsRecoveryTestCommand{stderr: strings.ReplaceAll(beadsRebuildPreservationConflict, "SYNC_CONFLICT", "CONFIG_ERROR"), exitCode: 6}, wantErr: true},
+		{name: "unstructured preservation error", rebuild: beadsRecoveryTestCommand{stderr: "SYNC_CONFLICT: Automatic database recovery refused because unflushed-state preservation could not be established: tombstones unreadable", exitCode: 6}, wantErr: true},
+		{name: "ordinary command failure", rebuild: beadsRecoveryTestCommand{stderr: "permission denied", exitCode: 1}, wantErr: true},
+		{name: "wrong process exit", rebuild: beadsRecoveryTestCommand{stdout: beadsRebuildPreservationConflict, exitCode: 1}, wantErr: true},
+		{name: "code alone", rebuild: beadsRecoveryTestCommand{stdout: `{"error":{"code":"SYNC_CONFLICT"}}`, exitCode: 6}, wantErr: true},
+		{name: "malformed JSON", rebuild: beadsRecoveryTestCommand{stdout: beadsRebuildPreservationConflict + "trailing diagnostic", exitCode: 6}, wantErr: true},
+		{name: "noncorrupt tombstone failure", rebuild: beadsRecoveryTestCommand{stdout: strings.ReplaceAll(beadsRebuildPreservationConflict, "database disk image is malformed", "permission denied"), exitCode: 6}, wantErr: true},
+		{name: "unreadable dirty row", rebuild: beadsRecoveryTestCommand{stdout: strings.ReplaceAll(beadsRebuildPreservationConflict, `\nThe database`, `\n- dirty issue task-1 could not be read\nThe database`), exitCode: 6}, wantErr: true},
+		{name: "unreadable dirty bitmap", rebuild: beadsRecoveryTestCommand{stdout: strings.ReplaceAll(beadsRebuildPreservationConflict, `\n- the tombstone`, `\n- dirty issue IDs could not be read\n- the tombstone`), exitCode: 6}, wantErr: true},
+		{name: "unreadable relationships", rebuild: beadsRecoveryTestCommand{stdout: strings.ReplaceAll(beadsRebuildPreservationConflict, `\nThe database`, `\n- dependencies could not be preserved\nThe database`), exitCode: 6}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			workspace := setupBeadsRecoveryCommands(t, test.rebuild, beadsRecoveryTestCommand{})
+			attempts := 0
+			result, err := withBeadsCorruptionRecovery(t.Context(), workspace.dir, func() (string, error) {
+				attempts++
+				if attempts == 1 {
+					return "", errors.New("database disk image is malformed (11)")
+				}
+				return "claimed", nil
+			})
+			if test.wantErr {
+				var processErr *exec.ExitError
+				if err == nil || attempts != 1 || result != "" || !errors.As(err, &processErr) {
+					t.Fatalf("result=%q error=%v attempts=%d, want failed recovery without retry", result, err, attempts)
+				}
+			} else if err != nil || attempts != 2 || result != "claimed" {
+				t.Fatalf("result=%q error=%v attempts=%d, want one successful retry", result, err, attempts)
+			}
+			workspace.assertCommands(t, "sync --import-only --rebuild --json")
+		})
+	}
+}
+
+func TestBeadsCorruptionRecoveryValidatesDoctorRepair(t *testing.T) {
+	partial := beadsRecoveryJSON(t, beadsRecoveryDoctorReport())
+	type testCase struct {
+		name        string
+		doctor      beadsRecoveryTestCommand
+		wantSuccess bool
+	}
+	tests := []testCase{
+		{name: "verified local repair", doctor: beadsRecoveryTestCommand{stdout: `{"verified":true,"repaired":true,"post_repair":{"ok":true}}`}, wantSuccess: true},
+		{name: "healthy report", doctor: beadsRecoveryTestCommand{stdout: `{"code":"healthy","exit_code":0,"verified":true}`}, wantSuccess: true},
+		{name: "verified partial repair", doctor: beadsRecoveryTestCommand{stdout: partial, exitCode: 2}, wantSuccess: true},
+		{name: "partial with stderr warnings", doctor: beadsRecoveryTestCommand{stdout: partial, stderr: "warning: original database is locked during best-effort inspection\n", exitCode: 2}, wantSuccess: true},
+		{name: "partial unverified", doctor: beadsRecoveryTestCommand{stdout: `{"code":"fix_partial","exit_code":2,"repaired":true,"database_verified":false}`, exitCode: 2}},
+		{name: "partial missing verification", doctor: beadsRecoveryTestCommand{stdout: `{"code":"fix_partial","exit_code":2,"repaired":true}`, exitCode: 2}},
+		{name: "partial missing repair", doctor: beadsRecoveryTestCommand{stdout: `{"code":"fix_partial","exit_code":2,"database_verified":true}`, exitCode: 2}},
+		{name: "partial not repaired", doctor: beadsRecoveryTestCommand{stdout: `{"code":"fix_partial","exit_code":2,"repaired":false,"database_verified":true}`, exitCode: 2}},
+		{name: "partial missing code", doctor: beadsRecoveryTestCommand{stdout: `{"exit_code":2,"repaired":true,"database_verified":true}`, exitCode: 2}},
+		{name: "partial mismatched report exit", doctor: beadsRecoveryTestCommand{stdout: `{"code":"fix_partial","exit_code":0,"repaired":true,"database_verified":true}`, exitCode: 2}},
+		{name: "partial unexpected process exit", doctor: beadsRecoveryTestCommand{stdout: partial, exitCode: 1}},
+		{name: "partial zero process exit", doctor: beadsRecoveryTestCommand{stdout: partial}},
+		{name: "healthy nonzero process exit", doctor: beadsRecoveryTestCommand{stdout: `{"code":"healthy","exit_code":0,"verified":true}`, exitCode: 2}},
+		{name: "healthy missing verification", doctor: beadsRecoveryTestCommand{stdout: `{"code":"healthy","exit_code":0}`}},
+		{name: "healthy false verification", doctor: beadsRecoveryTestCommand{stdout: `{"code":"healthy","exit_code":0,"verified":false}`}},
+		{name: "failed repair code", doctor: beadsRecoveryTestCommand{stdout: `{"code":"fix_failed","exit_code":0,"verified":true}`}},
+		{name: "contradictory database verification", doctor: beadsRecoveryTestCommand{stdout: `{"code":"healthy","exit_code":0,"verified":true,"database_verified":false}`}},
+		{name: "invalid verification type", doctor: beadsRecoveryTestCommand{stdout: `{"verified":"true"}`}},
+		{name: "null verification", doctor: beadsRecoveryTestCommand{stdout: `{"verified":null}`}},
+		{name: "empty report", doctor: beadsRecoveryTestCommand{}},
+		{name: "malformed JSON", doctor: beadsRecoveryTestCommand{stdout: `{"verified":true`}},
+		{name: "concatenated reports", doctor: beadsRecoveryTestCommand{stdout: `{"verified":true}{"verified":false}`}},
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{"partial claims full verification", func(m map[string]any) { m["verified"] = true }},
+		{"partial claims preservation verification", func(m map[string]any) { m["preservation_verified"] = true }},
+		{"partial claims healthy result", func(m map[string]any) { m["ok"] = true }},
+		{"skipped imports", func(m map[string]any) { m["skipped"] = 1 }},
+		{"foreign key cleanup", func(m map[string]any) { m["fk_violations_cleaned"] = 1 }},
+		{"skipped history", func(m map[string]any) {
+			m["preserved_history"] = []any{map[string]any{"table": "events", "skipped": 1}}
+		}},
+		{"missing history counter", func(m map[string]any) { m["preserved_history"] = []any{map[string]any{"table": "events"}} }},
+		{"dirty state loss", func(m map[string]any) {
+			m["dirty_preservation_warnings"] = []string{beadsRecoveryTombstoneWarning, "dirty issue could not be preserved"}
+		}},
+		{"history state loss", func(m map[string]any) { m["history_preservation_warnings"] = []string{"events could not be preserved"} }},
+		{"unrecognized partial warning", func(m map[string]any) { m["dirty_preservation_warnings"] = []string{"some local state was unreadable"} }},
+		{"partial lacks warning", func(m map[string]any) { m["dirty_preservation_warnings"] = []string{} }},
+		{"missing skipped counter", func(m map[string]any) { delete(m, "skipped") }},
+		{"missing FK counter", func(m map[string]any) { delete(m, "fk_violations_cleaned") }},
+		{"missing overall status", func(m map[string]any) { delete(m, "ok") }},
+		{"missing preservation verification", func(m map[string]any) { delete(m, "preservation_verified") }},
+		{"missing history evidence", func(m map[string]any) { delete(m, "preserved_history") }},
+		{"null history warnings", func(m map[string]any) { m["history_preservation_warnings"] = nil }},
+		{"missing dirty warnings", func(m map[string]any) { delete(m, "dirty_preservation_warnings") }},
+		{"no retained backup", func(m map[string]any) { m["verified_backups"] = []any{} }},
+		{"empty backup path", func(m map[string]any) { m["verified_backups"] = []any{map[string]any{"backup": ""}} }},
+		{"no failure marker", func(m map[string]any) { delete(m, "recovery_failure_marker") }},
+		{"failure marker persistence failed", func(m map[string]any) { m["recovery_failure_marker_error"] = "permission denied" }},
+	} {
+		report := beadsRecoveryDoctorReport()
+		test.mutate(report)
+		tests = append(tests, testCase{name: test.name, doctor: beadsRecoveryTestCommand{stdout: beadsRecoveryJSON(t, report), exitCode: 2}})
+	}
+	// Overall verification must not override explicit evidence of loss, even
+	// in a zero-exit response. A complete healthy rebuild remains supported.
+	healthy := beadsRecoveryDoctorReport()
+	healthy["ok"], healthy["verified"], healthy["preservation_verified"] = true, true, true
+	healthy["code"], healthy["exit_code"] = "healthy", 0
+	healthy["dirty_preservation_warnings"], healthy["recovery_failure_marker"] = []string{}, nil
+	tests = append(tests, testCase{name: "verified healthy JSONL rebuild", doctor: beadsRecoveryTestCommand{stdout: beadsRecoveryJSON(t, healthy)}, wantSuccess: true})
+	healthy["recovery_failure_marker"] = "/retained/beads.db.verification-failed.json"
+	tests = append(tests, testCase{name: "healthy rebuild retains verification failure", doctor: beadsRecoveryTestCommand{stdout: beadsRecoveryJSON(t, healthy)}})
+	for _, report := range []string{
+		`{"verified":true,"skipped":1}`,
+		`{"verified":true,"fk_violations_cleaned":1}`,
+		`{"verified":true,"preservation_verified":false}`,
+		`{"verified":true,"ok":false}`,
+		`{"verified":true,"dirty_preservation_warnings":["dirty state could not be preserved"]}`,
+		`{"verified":true,"history_preservation_warnings":["history lost"]}`,
+		`{"verified":true,"recovery_failure_marker_error":"permission denied"}`,
+		`{"verified":true,"database_verified":true}`,
+	} {
+		tests = append(tests, testCase{name: "unsafe verified report " + report, doctor: beadsRecoveryTestCommand{stdout: report}})
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// br versions can put the rebuild error on stdout while logging
+			// separately to stderr; neither stream may hide the other.
+			workspace := setupBeadsRecoveryCommands(t, beadsRecoveryTestCommand{
+				stdout: beadsRebuildPreservationConflict, stderr: "warning: index needs repair\n", exitCode: 6,
+			}, test.doctor)
+			attempts := 0
+			result, err := withBeadsCorruptionRecovery(t.Context(), workspace.dir, func() (string, error) {
+				attempts++
+				if attempts == 1 {
+					return "", errors.New("database disk image is malformed (11)")
+				}
+				return "claimed", nil
+			})
+			if test.wantSuccess {
+				if err != nil || attempts != 2 || result != "claimed" {
+					t.Fatalf("result=%q error=%v attempts=%d, want one successful guarded retry", result, err, attempts)
+				}
+			} else {
+				var processErr *exec.ExitError
+				if err == nil || attempts != 1 || result != "" || !errors.As(err, &processErr) {
+					t.Fatalf("result=%q error=%v attempts=%d, want unverified repair refused with original process error before retry", result, err, attempts)
+				}
+			}
+			workspace.assertCommands(t, "sync --import-only --rebuild --json", "info --json --no-auto-import --no-auto-flush", "doctor --repair --json")
+		})
+	}
+}
+
+func TestBeadsCorruptionRecoveryDoesNotRepeatRepair(t *testing.T) {
+	workspace := setupBeadsRecoveryCommands(t,
+		beadsRecoveryTestCommand{stderr: beadsRebuildPreservationConflict, exitCode: 6},
+		beadsRecoveryTestCommand{stdout: beadsRecoveryJSON(t, beadsRecoveryDoctorReport()), exitCode: 2},
+	)
+	retryErr := errors.New("database disk image is malformed on retry")
+	attempts := 0
+	result, err := withBeadsCorruptionRecovery(t.Context(), workspace.dir, func() (string, error) {
+		attempts++
+		if attempts == 1 {
+			return "", errors.New("file is not a database")
+		}
+		return "retry result", retryErr
+	})
+	if err != retryErr || attempts != 2 || result != "retry result" {
+		t.Fatalf("result=%q error=%v attempts=%d, want unchanged second failure", result, err, attempts)
+	}
+	workspace.assertCommands(t, "sync --import-only --rebuild --json", "info --json --no-auto-import --no-auto-flush", "doctor --repair --json")
+}
+
+func TestBeadsCorruptionRecoveryLeavesUnrelatedErrorsUntouched(t *testing.T) {
+	for name, originalErr := range map[string]error{
+		"normal assignment":   nil,
+		"ordinary failure":    errors.New("permission denied"),
+		"eligibility refusal": fmt.Errorf("database corruption: %w", ErrBeadAssignmentIneligible),
+		"ownership refusal":   fmt.Errorf("database disk image is malformed: %w", ErrBeadAlreadyClaimed),
+		"terminal refusal":    fmt.Errorf("file is not a database: %w", ErrBeadTerminal),
+	} {
+		t.Run(name, func(t *testing.T) {
+			workspace := setupBeadsRecoveryCommands(t, beadsRecoveryTestCommand{}, beadsRecoveryTestCommand{})
+			attempts := 0
+			result, err := withBeadsCorruptionRecovery(t.Context(), workspace.dir, func() (string, error) {
+				attempts++
+				return "original result", originalErr
+			})
+			if err != originalErr || attempts != 1 || result != "original result" {
+				t.Fatalf("result=%q error=%v attempts=%d, want unchanged original failure", result, err, attempts)
+			}
+			workspace.assertCommands(t)
+		})
+	}
+}
+
+func TestBeadsCorruptionRecoveryCancelsDuringDoctor(t *testing.T) {
+	workspace := setupBeadsRecoveryCommands(t,
+		beadsRecoveryTestCommand{stderr: beadsRebuildPreservationConflict, exitCode: 6},
+		beadsRecoveryTestCommand{stdout: beadsRecoveryJSON(t, beadsRecoveryDoctorReport()), exitCode: 2},
+	)
+	t.Setenv("NTM_TEST_DOCTOR_BLOCK", "true")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	attempts := 0
+	result := make(chan error, 1)
+	go func() {
+		_, err := withBeadsCorruptionRecovery(ctx, workspace.dir, func() (bool, error) {
+			attempts++
+			return false, errors.New("database disk image is malformed (11)")
+		})
+		result <- err
+	}()
+	waitForTestFile(t, workspace.doctorStarted, "doctor repair to start")
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) || attempts != 1 {
+			t.Fatalf("error=%v attempts=%d, want cancellation without a guarded retry", err, attempts)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("doctor recovery ignored cancellation")
+	}
+	workspace.assertCommands(t, "sync --import-only --rebuild --json", "info --json --no-auto-import --no-auto-flush", "doctor --repair --json")
+}
+
+func TestBeadsCorruptionRecoveryCancelsAtWorkspaceGate(t *testing.T) {
+	workspace := setupBeadsRecoveryCommands(t, beadsRecoveryTestCommand{}, beadsRecoveryTestCommand{})
+	gate := workspaceBDMutex(workspace.dir)
+	gate.Lock()
+	defer gate.Unlock()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	doneObserved := make(chan struct{}, 1)
+	result := make(chan error, 1)
+	go func() {
+		result <- recoverCorruptBeadsDatabase(doneObservedContext{Context: ctx, doneObserved: doneObserved}, workspace.dir)
+	}()
+	select {
+	case <-doneObserved:
+	case err := <-result:
+		t.Fatalf("recovery returned before waiting for the workspace gate: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovery did not wait for the workspace gate")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("recovery error=%v, want context canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovery ignored cancellation at the workspace gate")
+	}
+	workspace.assertCommands(t)
 }
 
 func TestBeadsMutatorsRejectInactiveContextWithoutInvokingSubprocesses(t *testing.T) {
@@ -290,8 +947,8 @@ func TestRunBdContextCancelsDuringTransientRetryBackoff(t *testing.T) {
 	for attempt := 1; attempt <= 3; attempt++ {
 		select {
 		case delay := <-retryWaitEntered:
-			if want := transientBeadsDBBackoff(attempt); delay != want {
-				t.Fatalf("retry backoff %d delay=%s, want %s", attempt, delay, want)
+			if low, high := transientBeadsDBBackoffBounds(attempt); delay < low || delay > high {
+				t.Fatalf("retry backoff %d delay=%s, want within [%s, %s]", attempt, delay, low, high)
 			}
 			if attempt < 3 {
 				continueRetry <- struct{}{}
@@ -319,6 +976,162 @@ func TestRunBdContextCancelsDuringTransientRetryBackoff(t *testing.T) {
 	}
 	if attempts := strings.Count(string(data), "x"); attempts != 3 {
 		t.Fatalf("fake br attempts=%d, want exactly 3 with no post-cancellation execution", attempts)
+	}
+}
+
+// installFakeBRWithAttempts installs a fake br on PATH that appends one line
+// to the returned attempts file per invocation and runs script after that.
+// The script may reference $attempts (the file path) and $count (invocations
+// so far, including the current one).
+func installFakeBRWithAttempts(t *testing.T, script string) (dir, attempts string) {
+	t.Helper()
+	dir = t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	binDir := t.TempDir()
+	attempts = filepath.Join(t.TempDir(), "attempts")
+	full := "#!/bin/sh\nattempts=" + attempts + "\nprintf 'x\\n' >> \"$attempts\"\ncount=$(wc -l < \"$attempts\" | tr -d ' ')\n" + script
+	if err := os.WriteFile(filepath.Join(binDir, "br"), []byte(full), 0o700); err != nil {
+		t.Fatalf("write fake br: %v", err)
+	}
+	// Keep the host PATH: the script shells out to wc/tr.
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return dir, attempts
+}
+
+func countFakeBRAttempts(t *testing.T, attempts string) int {
+	t.Helper()
+	data, err := os.ReadFile(attempts)
+	if err != nil {
+		t.Fatalf("read fake br attempts: %v", err)
+	}
+	return strings.Count(string(data), "x")
+}
+
+// brWriteLockTimeoutDiagnostic mirrors the exact CONFIG_ERROR br prints when
+// its cross-process workspace write lock times out.
+const brWriteLockTimeoutDiagnostic = "CONFIG_ERROR: Timed out after 5000ms waiting for write lock (database) at .beads/.write.lock. Another br process may be holding that authority; retry after it exits or investigate a stuck process."
+
+func TestIsTransientBeadsDBError(t *testing.T) {
+	cases := []struct {
+		name   string
+		stderr string
+		want   bool
+	}{
+		{name: "sqlite locked", stderr: "Error: database is locked", want: true},
+		{name: "sqlite busy", stderr: "database is busy", want: true},
+		{name: "br write lock timeout", stderr: brWriteLockTimeoutDiagnostic, want: true},
+		{name: "unwritable write lock is terminal", stderr: "CONFIG_ERROR: Failed to open write lock .beads/.write.lock: permission denied", want: false},
+		{name: "other config error is terminal", stderr: "CONFIG_ERROR: invalid [sync] configuration", want: false},
+		{name: "generic timeout is terminal", stderr: "Timed out after 30s waiting for remote", want: false},
+		{name: "empty", stderr: "", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isTransientBeadsDBError(tc.stderr, ""); got != tc.want {
+				t.Fatalf("isTransientBeadsDBError(%q) = %v, want %v", tc.stderr, got, tc.want)
+			}
+			if got := isTransientBeadsDBError("", tc.stderr); got != tc.want {
+				t.Fatalf("isTransientBeadsDBError(stdout=%q) = %v, want %v", tc.stderr, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTransientBeadsDBBackoffIsBoundedExponentialWithJitter(t *testing.T) {
+	wantCeilings := []time.Duration{
+		50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond,
+		400 * time.Millisecond, 800 * time.Millisecond, 800 * time.Millisecond,
+		800 * time.Millisecond,
+	}
+	for i, ceiling := range wantCeilings {
+		attempt := i + 1
+		low, high := transientBeadsDBBackoffBounds(attempt)
+		if high != ceiling || low != ceiling/2 {
+			t.Fatalf("attempt %d bounds = [%s, %s], want [%s, %s]", attempt, low, high, ceiling/2, ceiling)
+		}
+		for sample := 0; sample < 64; sample++ {
+			if got := transientBeadsDBBackoff(attempt); got < low || got > high {
+				t.Fatalf("attempt %d backoff %s outside [%s, %s]", attempt, got, low, high)
+			}
+		}
+	}
+	if low, high := transientBeadsDBBackoffBounds(0); low != 25*time.Millisecond || high != 50*time.Millisecond {
+		t.Fatalf("attempt 0 bounds = [%s, %s], want clamped to attempt 1", low, high)
+	}
+}
+
+func TestTransientBeadsRetryDelayHonorsAttemptAndDeadlineBudgets(t *testing.T) {
+	farDeadline := time.Now().Add(time.Hour)
+	if _, retry := transientBeadsRetryDelay(6, 6, farDeadline); retry {
+		t.Fatal("final attempt must not be retried")
+	}
+	if delay, retry := transientBeadsRetryDelay(1, 6, farDeadline); !retry || delay <= 0 {
+		t.Fatalf("attempt 1 retry = (%s, %v), want positive delay", delay, retry)
+	}
+	if _, retry := transientBeadsRetryDelay(1, 6, time.Now()); retry {
+		t.Fatal("an expired deadline must stop retries even with attempts remaining")
+	}
+}
+
+func TestRunBdContextRetriesBeadsWriteLockTimeoutThenSucceeds(t *testing.T) {
+	dir, attempts := installFakeBRWithAttempts(t, `
+if [ "$count" -lt 3 ]; then
+  printf '%s\n' "`+brWriteLockTimeoutDiagnostic+`" >&2
+  exit 1
+fi
+printf '%s\n' '{"issues":[],"total":0}'
+`)
+
+	output, err := RunBdContext(context.Background(), dir, "ready", "--json")
+	if err != nil {
+		t.Fatalf("RunBdContext returned the transient write-lock timeout: %v", err)
+	}
+	if !strings.Contains(output, `"issues":[]`) {
+		t.Fatalf("RunBdContext output=%q, want the successful third attempt", output)
+	}
+	if got := countFakeBRAttempts(t, attempts); got != 3 {
+		t.Fatalf("fake br attempts=%d, want exactly 3", got)
+	}
+}
+
+func TestRunBdContextDoesNotRetryTerminalConfigError(t *testing.T) {
+	dir, attempts := installFakeBRWithAttempts(t, `
+printf '%s\n' 'CONFIG_ERROR: Failed to open write lock .beads/.write.lock: permission denied' >&2
+exit 1
+`)
+
+	_, err := RunBdContext(context.Background(), dir, "ready", "--json")
+	if err == nil || !strings.Contains(err.Error(), "Failed to open write lock") {
+		t.Fatalf("RunBdContext error=%v, want the terminal CONFIG_ERROR surfaced", err)
+	}
+	if got := countFakeBRAttempts(t, attempts); got != 1 {
+		t.Fatalf("fake br attempts=%d, want exactly 1 (no retry on a terminal error)", got)
+	}
+}
+
+func TestRunBdContextStopsRetryingContentionAtTotalDeadline(t *testing.T) {
+	previous := transientBeadsRetryBudget
+	transientBeadsRetryBudget = 120 * time.Millisecond
+	t.Cleanup(func() { transientBeadsRetryBudget = previous })
+
+	dir, attempts := installFakeBRWithAttempts(t, `
+printf '%s\n' "`+brWriteLockTimeoutDiagnostic+`" >&2
+exit 1
+`)
+
+	start := time.Now()
+	_, err := RunBdContext(context.Background(), dir, "ready", "--json")
+	elapsed := time.Since(start)
+	if err == nil || !strings.Contains(err.Error(), "still contended") || !strings.Contains(err.Error(), "waiting for write lock") {
+		t.Fatalf("RunBdContext error=%v, want contention surfaced after the retry budget", err)
+	}
+	if got := countFakeBRAttempts(t, attempts); got < 1 || got >= 6 {
+		t.Fatalf("fake br attempts=%d, want the deadline to cut retries short of the %d-attempt cap", got, 6)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("RunBdContext took %s, want the total retry deadline to bound it", elapsed)
 	}
 }
 

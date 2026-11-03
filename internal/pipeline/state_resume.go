@@ -1,13 +1,21 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // ResumeMode controls how persisted state is interpreted when execution is
@@ -52,6 +60,12 @@ type ResumeOptions struct {
 	OnRosterChange ResumeRosterChangePolicy `json:"on_roster_change,omitempty"`
 	StepID         string                   `json:"step_id,omitempty"`
 	Iteration      int                      `json:"iteration,omitempty"`
+	// MaxSelectorOutputBytesTotal overrides admission capacity for this
+	// attempt without changing the frozen workflow or replaying its sources.
+	// Zero uses the workflow limit; negative values are rejected.
+	MaxSelectorOutputBytesTotal int64 `json:"max_selector_output_bytes_total,omitempty"`
+	MaxStepCountTotal           int   `json:"max_step_count_total,omitempty"`
+	MaxMaterializedStepNodes    int   `json:"max_materialized_step_nodes,omitempty"`
 }
 
 // ForeachIterationState records durable progress for loop/foreach-style
@@ -106,6 +120,11 @@ type ParallelGroupState struct {
 	UpdatedAt          time.Time `json:"updated_at,omitempty"`
 	CompletedAt        time.Time `json:"completed_at,omitempty"`
 	AllSubstepsSettled bool      `json:"all_substeps_settled,omitempty"`
+
+	// Immutable versioned JSON binds each settled child's definition, result
+	// and owned collection aliases. Persisted atomically with Steps; scoped
+	// reset removes this map together with the enclosing parallel group.
+	ChildCheckpoints map[string]string `json:"child_checkpoints,omitempty"`
 }
 
 // ScopeFrame is the serializable view of active loop/branch variable scopes.
@@ -125,6 +144,2170 @@ type InFlightStepState struct {
 	Output    string    `json:"output,omitempty"`
 }
 
+const (
+	commandEvaluationVersion   = 2
+	commandExecutionVersion    = 1
+	commandExecutionStarting   = "starting"
+	commandExecutionRunning    = "running"
+	commandExecutionUnresolved = "unresolved"
+	commandExecutionSettled    = "settled"
+	commandEvaluationAccepted  = "accepted"
+)
+
+// CommandRecoveryMaxOutputBytes bounds the explicitly supplied final output of
+// an interrupted command. Recovery also observes the frozen workflow's limit.
+const CommandRecoveryMaxOutputBytes = 16 << 20
+
+// CommandExecutionResolutionAccept records the operator's attestation that the
+// original foreground command group ended with the supplied outcome. It never
+// authorizes another launch or treats a recorded numeric PID as a live handle.
+const CommandExecutionResolutionAccept = "accept"
+
+// CommandEvaluationResolutionAccept records an operator-observed final outcome
+// without replacing the original selector's launch or cleanup evidence.
+const CommandEvaluationResolutionAccept = "accept"
+
+// CommandExecutionState keeps a launch intent until the entire command group
+// has settled and its result is durable. InFlightSteps is scheduler bookkeeping:
+// another worker may checkpoint after it is cleared but before the StepResult
+// is published. It cannot prove that replaying an external command is safe.
+// ProcessID is diagnostic evidence only; a resumed process must never signal a
+// numeric PID from an earlier lifetime. A crash can leave that group running.
+// An unresolved receipt records that supervision returned without proof of
+// settlement. Its terminal Result preserves output and cleanup diagnostics,
+// but only settled receipts authorize automatic retry or ordinary resume.
+type CommandExecutionState struct {
+	Version    int        `json:"version"`
+	StepID     string     `json:"step_id"`
+	StepHash   string     `json:"step_hash"`
+	Status     string     `json:"status"`
+	ProcessID  int        `json:"process_id,omitempty"`
+	Background bool       `json:"background,omitempty"`
+	StartedAt  time.Time  `json:"started_at"`
+	SettledAt  time.Time  `json:"settled_at,omitempty"`
+	Result     StepResult `json:"result,omitempty"`
+	// An accepted Result retains the exact supplied output, before parsing.
+	// Ordinary resume interprets it only after checking the materialized step
+	// definition. The scheduler's Steps and output aliases remain untouched here.
+	ResolutionAction     string    `json:"resolution_action,omitempty"`
+	ResolutionToken      string    `json:"resolution_token,omitempty"`
+	ResolutionReason     string    `json:"resolution_reason,omitempty"`
+	ResolutionExitCode   int       `json:"resolution_exit_code,omitempty"`
+	ResolutionOutputHash string    `json:"resolution_output_hash,omitempty"`
+	ResolvedAt           time.Time `json:"resolved_at,omitempty"`
+}
+
+// CommandEvaluationState fences shell commands used to choose branches or
+// resolve iteration sources. These commands can have effects of their own,
+// before any child step or branch decision exists. Scheduler results and
+// failure handlers cannot substitute for proof that those commands ended.
+// A durable intent is written before Start. Verified successful output stays
+// available until an explicit replay resets its scope, so a crash between
+// command completion and branch/item admission cannot repeat source effects.
+// Returned uncertainty retains a terminal receipt without usable output.
+// ProcessID is diagnostic only and must never be signalled on resume.
+type CommandEvaluationState struct {
+	Version    int       `json:"version"`
+	StepID     string    `json:"step_id"`
+	StepHash   string    `json:"step_hash"`
+	Status     string    `json:"status"`
+	ProcessID  int       `json:"process_id,omitempty"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at,omitempty"`
+	Error      string    `json:"error,omitempty"`
+	// InvocationHash binds the expanded executable, arguments, working
+	// directory, effective environment and capture limits without persisting
+	// command text or environment values. Output is base64 in JSON so even
+	// invalid UTF-8 bytes round-trip exactly.
+	InvocationHash string `json:"invocation_hash,omitempty"`
+	StdoutLimit    int64  `json:"stdout_limit,omitempty"`
+	StderrLimit    int64  `json:"stderr_limit,omitempty"`
+	Output         []byte `json:"output,omitempty"`
+	OutputHash     string `json:"output_hash,omitempty"`
+	// Accepted outcomes retain the original status, PID, finish time and
+	// cleanup error. In particular, a starting receipt keeps PID zero: an
+	// operator's attestation is distinct from native process observation.
+	OriginalStatus     string    `json:"original_status,omitempty"`
+	ResolutionAction   string    `json:"resolution_action,omitempty"`
+	ResolutionToken    string    `json:"resolution_token,omitempty"`
+	ResolutionReason   string    `json:"resolution_reason,omitempty"`
+	ResolutionExitCode int       `json:"resolution_exit_code,omitempty"`
+	ResolvedAt         time.Time `json:"resolved_at,omitempty"`
+	ResolutionHash     string    `json:"resolution_hash,omitempty"`
+}
+
+func cloneCommandEvaluation(record CommandEvaluationState) CommandEvaluationState {
+	record.Output = append([]byte(nil), record.Output...)
+	return record
+}
+
+func validCommandEvaluationHash(value string) bool {
+	digest, err := hex.DecodeString(value)
+	return err == nil && len(digest) == sha256.Size && value == strings.ToLower(value)
+}
+
+func commandEvaluationHasOutcome(record CommandEvaluationState) bool {
+	return record.Status == commandExecutionSettled || record.Status == commandEvaluationAccepted
+}
+
+// The decision hash protects the independently meaningful acceptance fields
+// against accidental mutation. Its receipt token separately binds the original
+// execution, run, frozen workflow and session at inspection and consumption.
+func commandEvaluationResolutionHash(record CommandEvaluationState) (string, error) {
+	encoded, err := json.Marshal(struct {
+		Action     string
+		Token      string
+		Reason     string
+		ExitCode   int
+		OutputHash string
+		ResolvedAt time.Time
+	}{record.ResolutionAction, record.ResolutionToken, record.ResolutionReason,
+		record.ResolutionExitCode, record.OutputHash, record.ResolvedAt.UTC()})
+	if err != nil {
+		return "", fmt.Errorf("fingerprint selector acceptance: %w", err)
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func validateCommandEvaluation(id string, record CommandEvaluationState) error {
+	invalid := func(reason string) error {
+		return fmt.Errorf("invalid command evaluation for step %q: %s", id, reason)
+	}
+	if id == "" || record.StepID != id || (record.Version != 1 && record.Version != commandEvaluationVersion) || record.StartedAt.IsZero() ||
+		!validCommandEvaluationHash(record.StepHash) {
+		return invalid("missing or inconsistent launch identity")
+	}
+	if record.Status == commandEvaluationAccepted {
+		if record.Version != commandEvaluationVersion ||
+			(record.OriginalStatus != commandExecutionStarting && record.OriginalStatus != commandExecutionUnresolved) ||
+			record.ResolutionAction != CommandEvaluationResolutionAccept || !validCommandEvaluationHash(record.ResolutionToken) ||
+			record.ResolutionReason == "" || record.ResolutionReason != strings.TrimSpace(record.ResolutionReason) ||
+			len(record.ResolutionReason) > agentDeliveryMaxReasonBytes || !utf8.ValidString(record.ResolutionReason) ||
+			record.ResolutionExitCode < 0 || record.ResolutionExitCode > 255 || record.ResolvedAt.IsZero() ||
+			record.ResolvedAt.Before(record.StartedAt) || (!record.FinishedAt.IsZero() && record.ResolvedAt.Before(record.FinishedAt)) ||
+			len(record.Output) > CommandRecoveryMaxOutputBytes || int64(len(record.Output)) > record.StdoutLimit {
+			return invalid("inconsistent operator selector outcome")
+		}
+		original := record
+		original.Status = record.OriginalStatus
+		original.Output, original.OutputHash = nil, ""
+		original.OriginalStatus, original.ResolutionAction, original.ResolutionToken = "", "", ""
+		original.ResolutionReason, original.ResolutionHash = "", ""
+		original.ResolutionExitCode, original.ResolvedAt = 0, time.Time{}
+		if err := validateCommandEvaluation(id, original); err != nil {
+			return invalid("operator acceptance changed the original receipt: " + err.Error())
+		}
+		outputHash := sha256.Sum256(record.Output)
+		resolutionHash, err := commandEvaluationResolutionHash(record)
+		if err != nil || record.OutputHash != hex.EncodeToString(outputHash[:]) || record.ResolutionHash != resolutionHash {
+			return invalid("operator selector output or decision no longer matches its fingerprint")
+		}
+		return nil
+	}
+	if record.OriginalStatus != "" || record.ResolutionAction != "" || record.ResolutionToken != "" ||
+		record.ResolutionReason != "" || record.ResolutionExitCode != 0 || !record.ResolvedAt.IsZero() || record.ResolutionHash != "" {
+		return invalid("non-accepted evaluation contains operator decision fields")
+	}
+	if record.Version == commandEvaluationVersion {
+		if !validCommandEvaluationHash(record.InvocationHash) || record.StdoutLimit <= 0 || record.StderrLimit <= 0 {
+			return invalid("missing expanded invocation identity or capture limits")
+		}
+	} else if record.InvocationHash != "" || record.StdoutLimit != 0 || record.StderrLimit != 0 || record.OutputHash != "" || len(record.Output) != 0 {
+		return invalid("legacy evaluation contains unsupported output evidence")
+	}
+	if record.Status != commandExecutionSettled && (record.OutputHash != "" || len(record.Output) != 0) {
+		return invalid("unproven evaluation contains usable output")
+	}
+	switch record.Status {
+	case commandExecutionStarting:
+		if record.ProcessID != 0 || !record.FinishedAt.IsZero() || record.Error != "" {
+			return invalid("starting evaluation contains completion evidence")
+		}
+	case commandExecutionUnresolved:
+		if record.ProcessID <= 0 || record.FinishedAt.IsZero() || record.FinishedAt.Before(record.StartedAt) || strings.TrimSpace(record.Error) == "" {
+			return invalid("unresolved evaluation lacks returned cleanup evidence")
+		}
+	case commandExecutionSettled:
+		digest := sha256.Sum256(record.Output)
+		if record.Version != commandEvaluationVersion || record.ProcessID <= 0 || record.FinishedAt.IsZero() ||
+			record.FinishedAt.Before(record.StartedAt) || record.Error != "" || int64(len(record.Output)) > record.StdoutLimit ||
+			record.OutputHash != hex.EncodeToString(digest[:]) {
+			return invalid("settled evaluation lacks consistent complete output evidence")
+		}
+	default:
+		return invalid("unknown evaluation status")
+	}
+	return nil
+}
+
+// Freeze the effective launch inputs before checkpointing them. The process
+// must receive exactly the directory and environment described by this hash,
+// even if another goroutine changes the parent's cwd or environment later.
+func commandEvaluationInvocationHash(request commandOutputRequest) (string, error) {
+	cmd := request.Cmd
+	if cmd == nil || cmd.Path == "" || cmd.Stdin != nil || len(cmd.ExtraFiles) != 0 || request.StdoutLimit <= 0 || request.StderrLimit <= 0 {
+		return "", fmt.Errorf("command evaluation requires a bounded invocation without inherited input or extra files")
+	}
+	if cmd.Err != nil {
+		return "", cmd.Err
+	}
+	for _, value := range cmd.Env {
+		if strings.IndexByte(value, 0) >= 0 {
+			return "", fmt.Errorf("command evaluation environment contains NUL")
+		}
+	}
+	dir, err := filepath.Abs(cmd.Dir)
+	if err != nil {
+		return "", fmt.Errorf("resolve command evaluation directory: %w", err)
+	}
+	// Obtain Environ before filling an empty Dir: exec only rewrites an
+	// inherited PWD when the caller explicitly supplied a working directory.
+	// Freezing the implicit cwd must not silently change that environment.
+	environment := cmd.Environ()
+	cmd.Dir = dir
+	if !filepath.IsAbs(cmd.Path) {
+		cmd.Path = filepath.Join(dir, cmd.Path)
+	}
+	cmd.Env = environment
+	// Environ has already retained the last value of duplicate variables.
+	// Canonicalize their order for a stable identity across equivalent runs.
+	env := append([]string(nil), cmd.Env...)
+	sort.Strings(env)
+	bytesList := func(values []string) [][]byte {
+		out := make([][]byte, len(values))
+		for i, value := range values {
+			out[i] = []byte(value)
+		}
+		return out
+	}
+	// Byte slices prevent JSON's invalid-UTF-8 replacement from collapsing
+	// distinct command arguments or environment values into one identity.
+	encoded, err := json.Marshal(struct {
+		Path        []byte   `json:"path"`
+		Args        [][]byte `json:"args"`
+		Dir         []byte   `json:"dir"`
+		Env         [][]byte `json:"env"`
+		StdoutLimit int64    `json:"stdout_limit"`
+		StderrLimit int64    `json:"stderr_limit"`
+	}{[]byte(cmd.Path), bytesList(cmd.Args), []byte(dir), bytesList(env), request.StdoutLimit, request.StderrLimit})
+	if err != nil {
+		return "", fmt.Errorf("hash command evaluation invocation: %w", err)
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func uncertainCommandEvaluationError(id string) error {
+	return fmt.Errorf("%w for selector step %q; after independently verifying the original command and all descendants finished, use pipeline recover --accept-selector with its exact receipt, final exit code, complete output and reason. Explicitly use restart-failed, a containing force-iter scope, or --keep-state=false only to authorize replay", errCommandOutputUnsettled, id)
+}
+
+// Only the source evaluation receives this context. A branch/foreach body
+// installs its own launch identity rather than inheriting its parent's receipt.
+func (e *Executor) commandEvaluationContext(ctx context.Context, step *Step) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var record CommandEvaluationState
+	lifecycle := &commandOutputLifecycle{
+		beforeStart: func(request commandOutputRequest) ([]byte, bool, error) {
+			digest, err := commandDefinitionHash(step)
+			if err != nil {
+				return nil, false, err
+			}
+			invocation, err := commandEvaluationInvocationHash(request)
+			if err != nil {
+				return nil, false, err
+			}
+			for {
+				if err := ctx.Err(); err != nil {
+					return nil, false, err
+				}
+				e.stateMu.Lock()
+				if e.state == nil {
+					e.stateMu.Unlock()
+					return nil, false, fmt.Errorf("cannot start command evaluation without execution state")
+				}
+				if e.state.CommandEvaluationVersion > commandEvaluationVersion || e.state.CommandEvaluationVersion < 0 {
+					version := e.state.CommandEvaluationVersion
+					e.stateMu.Unlock()
+					return nil, false, fmt.Errorf("unsupported command evaluation journal version %d", version)
+				}
+				if prior, ok := e.state.CommandEvaluations[step.ID]; ok {
+					prior = cloneCommandEvaluation(prior)
+					// Only scalar run identity is read from this snapshot below.
+					// Hashing retained output must not hold the execution-state lock
+					// or make ordinary cached successes pay for operator provenance.
+					identityState := *e.state
+					e.stateMu.Unlock()
+					if err := validateCommandEvaluation(step.ID, prior); err != nil {
+						return nil, false, err
+					}
+					if prior.Status == commandEvaluationAccepted {
+						if _, err := commandEvaluationRecoveryEntry(&identityState, prior); err != nil {
+							return nil, false, err
+						}
+					}
+					if !commandEvaluationHasOutcome(prior) {
+						return nil, false, uncertainCommandEvaluationError(step.ID)
+					}
+					if prior.StepHash != digest || prior.InvocationHash != invocation {
+						return nil, false, fmt.Errorf("command evaluation %q definition or expanded invocation changed since its output was checkpointed; restore the original inputs or explicitly reset its replay scope", step.ID)
+					}
+					if prior.Status == commandEvaluationAccepted && prior.ResolutionExitCode != 0 {
+						return nil, false, fmt.Errorf("accepted selector %q exited with status %d; its recorded outcome will not launch the command again", step.ID, prior.ResolutionExitCode)
+					}
+					return prior.Output, true, nil
+				}
+				wake, err := e.selectorOutputAdmissionLocked(step.ID, request.StdoutLimit)
+				if err != nil {
+					e.stateMu.Unlock()
+					return nil, false, err
+				}
+				if wake != nil {
+					e.stateMu.Unlock()
+					select {
+					case <-ctx.Done():
+						return nil, false, ctx.Err()
+					case <-wake:
+						continue
+					}
+				}
+				if err := ctx.Err(); err != nil {
+					e.stateMu.Unlock()
+					return nil, false, err
+				}
+				if e.state.CommandEvaluations == nil {
+					e.state.CommandEvaluations = make(map[string]CommandEvaluationState)
+				}
+				record = CommandEvaluationState{Version: commandEvaluationVersion, StepID: step.ID, StepHash: digest,
+					InvocationHash: invocation, StdoutLimit: request.StdoutLimit, StderrLimit: request.StderrLimit,
+					Status: commandExecutionStarting, StartedAt: time.Now()}
+				e.state.CommandEvaluations[step.ID] = record
+				e.state.CommandEvaluationVersion = commandEvaluationVersion
+				e.startSelectorOutputReservationLocked(record)
+				e.stateMu.Unlock()
+				if err := e.persistState(); err != nil {
+					// runCommandOutput installs afterWait only after this hook
+					// succeeds. End runtime ownership here but retain the fence
+					// whose removal cannot be proved durable after a save failure.
+					e.finishSelectorOutputReservation(record)
+					return nil, false, err
+				}
+				return nil, false, nil
+			}
+		},
+		afterWait: func(cmd *exec.Cmd, settled bool, output []byte, waitErr error) error {
+			defer e.finishSelectorOutputReservation(record)
+			e.stateMu.Lock()
+			if e.state == nil {
+				e.stateMu.Unlock()
+				return fmt.Errorf("command evaluation lost execution state for step %q", step.ID)
+			}
+			prior, exists := e.state.CommandEvaluations[step.ID]
+			if !exists || prior.Status != commandExecutionStarting || prior.StepID != record.StepID ||
+				!selectorOutputReservationFor(record).matches(prior) {
+				e.stateMu.Unlock()
+				return fmt.Errorf("command evaluation identity changed for step %q", step.ID)
+			}
+			if settled && waitErr == nil {
+				if cmd == nil || cmd.Process == nil || int64(len(output)) > record.StdoutLimit {
+					e.stateMu.Unlock()
+					return fmt.Errorf("command evaluation %q returned invalid successful output evidence", step.ID)
+				}
+				record.Status, record.FinishedAt = commandExecutionSettled, time.Now()
+				record.ProcessID, record.Output = cmd.Process.Pid, append([]byte(nil), output...)
+				digest := sha256.Sum256(record.Output)
+				record.OutputHash = hex.EncodeToString(digest[:])
+				e.state.CommandEvaluations[step.ID] = record
+			} else if settled {
+				delete(e.state.CommandEvaluations, step.ID)
+			} else {
+				if cmd == nil || cmd.Process == nil {
+					e.stateMu.Unlock()
+					return fmt.Errorf("command evaluation %q lost its process identity before cleanup returned", step.ID)
+				}
+				record.Status, record.FinishedAt = commandExecutionUnresolved, time.Now()
+				record.ProcessID = cmd.Process.Pid
+				record.Error = errors.Join(uncertainCommandEvaluationError(step.ID), waitErr).Error()
+				e.state.CommandEvaluations[step.ID] = record
+			}
+			e.stateMu.Unlock()
+			return e.persistState()
+		},
+	}
+	return context.WithValue(ctx, commandOutputLifecycleKey{}, lifecycle)
+}
+
+// A failed source must retain its unfinished process evidence until settlement
+// is known. Follow runtime ownership so one scope cannot disable another's
+// authored recovery. A running background descendant may still have an owner,
+// but a returned failure or unresolved receipt must not become a handled result.
+func (e *Executor) hasUnresolvedCommandExecution(step *Step) bool {
+	return e.hasUnresolvedCommandExecutionForOutcome(step, nil)
+}
+
+// A current wait:none acknowledgement can coexist with an owned live command.
+// A saved scheduler result cannot establish that acknowledgement for this visit.
+func (e *Executor) hasUnresolvedCommandExecutionForOutcome(step *Step, current *StepResult) bool {
+	if step == nil {
+		return false
+	}
+	e.stateMu.RLock()
+	defer e.stateMu.RUnlock()
+	if e.state == nil {
+		return false
+	}
+	for id, record := range e.state.CommandExecutions {
+		if id != step.ID {
+			if _, _, owns := resolveScopedRuntimeChildren(step.ID, id, step); !owns {
+				continue
+			}
+		}
+		if err := validateCommandExecution(id, record); err != nil {
+			return true
+		}
+		if record.Status == commandExecutionSettled {
+			if record.ResolutionAction != "" {
+				if _, err := commandExecutionRecoveryEntry(e.state, record); err != nil {
+					return true
+				}
+			}
+			continue
+		}
+		if record.Background && record.Status == commandExecutionRunning {
+			result := e.state.Steps[id]
+			if id == step.ID {
+				if current == nil || current.StepID != id || current.Status != StatusCompleted {
+					return true
+				}
+				result = *current
+			}
+			switch result.Status {
+			case "", StatusPending, StatusRunning, StatusCompleted:
+				if result.Error == nil && !result.RerunOnResume {
+					continue
+				}
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func (e *Executor) hasUnresolvedCommandEvaluation(step *Step) bool {
+	e.stateMu.RLock()
+	defer e.stateMu.RUnlock()
+	if e.state == nil {
+		return false
+	}
+	for id, record := range e.state.CommandEvaluations {
+		if commandEvaluationHasOutcome(record) && validateCommandEvaluation(id, record) == nil {
+			if record.Status != commandEvaluationAccepted {
+				continue
+			}
+			if _, err := commandEvaluationRecoveryEntry(e.state, record); err == nil {
+				continue
+			}
+		}
+		if id == step.ID {
+			return true
+		}
+		if _, _, owns := resolveScopedRuntimeChildren(step.ID, id, step); owns {
+			return true
+		}
+	}
+	return false
+}
+
+// An operator's final nonzero source outcome cannot change on retry. This
+// checks only the evaluated step: a handled child failure must not suppress an
+// enclosing body's independent retry policy.
+func (e *Executor) hasAcceptedCommandEvaluationFailure(step *Step) bool {
+	if step == nil {
+		return false
+	}
+	e.stateMu.RLock()
+	defer e.stateMu.RUnlock()
+	if e.state == nil {
+		return false
+	}
+	record, exists := e.state.CommandEvaluations[step.ID]
+	return exists && record.Status == commandEvaluationAccepted && record.ResolutionExitCode != 0
+}
+
+func resumeResetsCommandEvaluation(state *ExecutionState, opts ResumeOptions, id string) bool {
+	if !opts.KeepState || (opts.Mode == ResumeModeForceIter && iterationIndexFromID(id, opts.StepID+"_iter") >= opts.Iteration) {
+		return true
+	}
+	if opts.Mode != ResumeModeRestartFailed {
+		return false
+	}
+	record, exists := state.CommandEvaluations[id]
+	if !exists || !commandEvaluationHasOutcome(record) {
+		// A failure handler may have completed the enclosing step without
+		// settling its original source. Explicit replay must reopen that case.
+		return true
+	}
+	if result, recorded := state.Steps[id]; recorded && !shouldRerunStep(result) {
+		return false
+	}
+	// A failed body does not invalidate an already-admitted source. Keep the
+	// original branch choice and foreach item binding while retrying children.
+	if decision, ok := state.Steps[branchDecisionID(id)]; ok {
+		if admitted, err := decodeBranchDecision(branchDecisionID(id), decision); err == nil && admitted.DefinitionHash == record.StepHash {
+			return false
+		}
+	}
+	if progress, ok := state.ForeachState[id]; ok && validCommandEvaluationHash(progress.ItemsFingerprint) {
+		return false
+	}
+	return true
+}
+
+// Check receipts independently of the scheduler's result, including completed
+// results produced by on_failure recovery. Validate even for an explicit reset
+// so corrupt or future-version evidence cannot silently authorize replay.
+func (e *Executor) validateCommandEvaluationResumeLocked(workflow *Workflow, state *ExecutionState, opts ResumeOptions) error {
+	if state.CommandEvaluationVersion < 0 || state.CommandEvaluationVersion > commandEvaluationVersion {
+		return fmt.Errorf("unsupported command evaluation journal version %d", state.CommandEvaluationVersion)
+	}
+	for id, record := range state.CommandEvaluations {
+		if err := validateCommandEvaluation(id, record); err != nil {
+			return err
+		}
+		if record.Status == commandEvaluationAccepted {
+			if _, err := commandEvaluationRecoveryEntry(state, record); err != nil {
+				return err
+			}
+		}
+		if record.Status == commandEvaluationAccepted && e.config.Session != "" && e.config.Session != state.Session &&
+			!resumeResetsCommandEvaluation(state, opts, id) {
+			return fmt.Errorf("accepted selector outcome for step %q belongs to session %q; explicit reset is required before moving to session %q", id, state.Session, e.config.Session)
+		}
+		if !resumeResetsCommandEvaluation(state, opts, id) {
+			if !commandEvaluationHasOutcome(record) {
+				return uncertainCommandEvaluationError(id)
+			}
+			continue
+		}
+		if opts.KeepState && opts.Mode == ResumeModeRestartFailed {
+			graph := e.graph
+			if graph == nil && workflow != nil {
+				graph = NewDependencyGraph(workflow)
+			}
+			resolve, err := resumeRuntimeStepResolver(graph, state)
+			if err != nil {
+				return err
+			}
+			step, ok := resolve(id)
+			if !ok || (step.Branch == "" && step.Foreach == nil && step.ForeachPane == nil && step.BeadQuery == nil) {
+				return fmt.Errorf("command evaluation %q has no matching selector; inspect its effects before a whole-run reset", id)
+			}
+			if err := e.validateLeafReplayScopeLocked(workflow, state, id, stepKind(step)); err != nil {
+				return err
+			}
+		}
+	}
+	if state.CommandEvaluationVersion < commandEvaluationVersion && opts.KeepState {
+		// Earlier executors either lacked intents or deleted successful source
+		// output before admitting it. An absent receipt cannot justify another
+		// evaluation. Existing branch decisions can finish their original body
+		// without evaluating again; dynamic foreach sources need saved output.
+		graph := e.graph
+		if graph == nil && workflow != nil {
+			graph = NewDependencyGraph(workflow)
+		}
+		resolve, err := resumeRuntimeStepResolver(graph, state)
+		if err != nil {
+			return err
+		}
+		unfinished := make(map[string]bool)
+		for id := range state.InFlightSteps {
+			unfinished[id] = true
+		}
+		for id, result := range state.Steps {
+			// Old output waiters could return a terminal failure while a
+			// descendant still ran. A failed/cancelled result is no stronger
+			// termination proof than an interrupted running evaluation.
+			if result.Status == StatusRunning || result.Status == StatusPending || result.Status == StatusFailed || result.Status == StatusCancelled {
+				unfinished[id] = true
+			}
+		}
+		for id := range unfinished {
+			if _, recorded := state.CommandEvaluations[id]; recorded {
+				continue
+			}
+			if resumeCancelledBeforeDispatch(state, id) {
+				continue
+			}
+			step, ok := resolve(id)
+			if !ok || !stepUsesCommandEvaluation(step) {
+				continue
+			}
+			if step.Branch != "" {
+				if saved, exists := state.Steps[branchDecisionID(id)]; exists {
+					decision, err := decodeBranchDecision(branchDecisionID(id), saved)
+					if err != nil {
+						return err
+					}
+					digest, err := branchDefinitionHash(step)
+					if err != nil {
+						return err
+					}
+					if decision.DefinitionHash == digest {
+						continue
+					}
+				}
+			}
+			if !resumeResetsCommandEvaluation(state, opts, id) {
+				return fmt.Errorf("unfinished selector %q has no durable launch evidence: %w", id, uncertainCommandEvaluationError(id))
+			}
+			if opts.Mode == ResumeModeRestartFailed {
+				if err := e.validateLeafReplayScopeLocked(workflow, state, id, stepKind(step)); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func stepUsesCommandEvaluation(step *Step) bool {
+	if step.ForeachPane != nil {
+		return false
+	}
+	if source := step.Foreach; source != nil {
+		// Match source precedence in resolveForeachItems. Items expands data
+		// expressions only; the other source forms can invoke shell or br.
+		return source.Items == "" && (source.Beads != "" || source.Pairs != "" || source.Debates != "" ||
+			(len(source.Models) == 1 && looksLikeShellModelSource(strings.TrimSpace(source.Models[0]))))
+	}
+	if step.Branch != "" {
+		_, shell := stripShellInvocation(step.Branch)
+		return shell || strings.Contains(step.Branch, "${")
+	}
+	return step.BeadQuery != nil
+}
+
+// CommandEvaluationRecoveryEntry deliberately excludes captured source bytes,
+// command text and environment values. Diagnostic PIDs are never live handles.
+type CommandEvaluationRecoveryEntry struct {
+	StepID           string    `json:"step_id"`
+	Status           string    `json:"status"`
+	OriginalStatus   string    `json:"original_status,omitempty"`
+	ReceiptToken     string    `json:"receipt_token"`
+	ProcessID        int       `json:"process_id,omitempty"`
+	StartedAt        time.Time `json:"started_at"`
+	FinishedAt       time.Time `json:"finished_at,omitempty"`
+	StdoutLimit      int64     `json:"stdout_limit,omitempty"`
+	CanAccept        bool      `json:"can_accept"`
+	RefusalReason    string    `json:"refusal_reason,omitempty"`
+	ResolutionAction string    `json:"resolution_action,omitempty"`
+	ResolutionReason string    `json:"resolution_reason,omitempty"`
+	ResolvedAt       time.Time `json:"resolved_at,omitempty"`
+	ExitCode         *int      `json:"exit_code,omitempty"`
+	OutputBytes      int       `json:"output_bytes,omitempty"`
+	OutputHash       string    `json:"output_hash,omitempty"`
+}
+
+type CommandEvaluationRecoveryInspection struct {
+	RunID      string                           `json:"run_id"`
+	WorkflowID string                           `json:"workflow_id"`
+	Session    string                           `json:"session"`
+	Selectors  []CommandEvaluationRecoveryEntry `json:"selectors"`
+}
+
+type CommandEvaluationRecoveryResult struct {
+	RunID      string                         `json:"run_id"`
+	WorkflowID string                         `json:"workflow_id"`
+	Session    string                         `json:"session"`
+	Selector   CommandEvaluationRecoveryEntry `json:"selector"`
+	Replayed   bool                           `json:"replayed"`
+}
+
+func commandEvaluationReceiptToken(state *ExecutionState, record CommandEvaluationState) (string, error) {
+	status := record.Status
+	if status == commandEvaluationAccepted {
+		status = record.OriginalStatus
+	}
+	encoded, err := json.Marshal(struct {
+		JournalVersion   int
+		Version          int
+		RunID            string
+		WorkflowID       string
+		WorkflowSnapshot string
+		Session          string
+		StepID           string
+		StepHash         string
+		InvocationHash   string
+		StdoutLimit      int64
+		StderrLimit      int64
+		Status           string
+		ProcessID        int
+		StartedAt        time.Time
+		FinishedAt       time.Time
+		Error            string
+	}{state.CommandEvaluationVersion, record.Version, state.RunID, state.WorkflowID, filepath.Base(state.WorkflowFile), state.Session,
+		record.StepID, record.StepHash, record.InvocationHash, record.StdoutLimit, record.StderrLimit,
+		status, record.ProcessID, record.StartedAt.UTC(), record.FinishedAt.UTC(), record.Error})
+	if err != nil {
+		return "", fmt.Errorf("fingerprint selector evaluation: %w", err)
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func commandEvaluationRecoveryEntry(state *ExecutionState, record CommandEvaluationState) (CommandEvaluationRecoveryEntry, error) {
+	if err := validateCommandEvaluation(record.StepID, record); err != nil {
+		return CommandEvaluationRecoveryEntry{}, err
+	}
+	token, err := commandEvaluationReceiptToken(state, record)
+	if err != nil {
+		return CommandEvaluationRecoveryEntry{}, err
+	}
+	if record.Status == commandEvaluationAccepted && record.ResolutionToken != token {
+		return CommandEvaluationRecoveryEntry{}, fmt.Errorf("operator resolution for selector %q no longer matches its original receipt identity", record.StepID)
+	}
+	entry := CommandEvaluationRecoveryEntry{
+		StepID: record.StepID, Status: record.Status, OriginalStatus: record.OriginalStatus,
+		ReceiptToken: token, ProcessID: record.ProcessID, StartedAt: record.StartedAt,
+		FinishedAt: record.FinishedAt, StdoutLimit: record.StdoutLimit,
+		CanAccept:        record.Version == commandEvaluationVersion && !commandEvaluationHasOutcome(record),
+		ResolutionAction: record.ResolutionAction, ResolutionReason: record.ResolutionReason, ResolvedAt: record.ResolvedAt,
+	}
+	if record.Status == commandEvaluationAccepted {
+		exitCode := record.ResolutionExitCode
+		entry.ExitCode, entry.OutputBytes, entry.OutputHash = &exitCode, len(record.Output), record.OutputHash
+	}
+	return entry, nil
+}
+
+// InspectCommandEvaluationRecovery reads one atomic checkpoint. It neither
+// executes selectors nor uses a saved PID to infer that their work finished.
+func InspectCommandEvaluationRecovery(ctx context.Context, projectDir, runID string) (*CommandEvaluationRecoveryInspection, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(projectDir) == "" {
+		return nil, fmt.Errorf("project directory is required for selector recovery")
+	}
+	projectDir = normalizeLockRoot(projectDir)
+	state, err := LoadState(projectDir, runID)
+	if err != nil {
+		return nil, err
+	}
+	if state.CommandEvaluationVersion < 0 || state.CommandEvaluationVersion > commandEvaluationVersion {
+		return nil, fmt.Errorf("unsupported command evaluation journal version %d", state.CommandEvaluationVersion)
+	}
+	result := &CommandEvaluationRecoveryInspection{RunID: state.RunID, WorkflowID: state.WorkflowID,
+		Session: state.Session, Selectors: make([]CommandEvaluationRecoveryEntry, 0)}
+	workflow, workflowErr := loadRecoveryWorkflow(projectDir, state)
+	checker := NewExecutor(DefaultExecutorConfig(state.Session))
+	ids := make([]string, 0, len(state.CommandEvaluations))
+	for id := range state.CommandEvaluations {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		record := state.CommandEvaluations[id]
+		if err := validateCommandEvaluation(id, record); err != nil {
+			return nil, err
+		}
+		entry, err := commandEvaluationRecoveryEntry(state, record)
+		if err != nil {
+			return nil, err
+		}
+		if record.Status == commandExecutionSettled {
+			continue
+		}
+		if record.Status != commandEvaluationAccepted {
+			if workflowErr != nil {
+				entry.CanAccept, entry.RefusalReason = false, "a valid frozen workflow is required before accepting selector output"
+			} else if err := checker.validateCommandEvaluationRecovery(workflow, state, record); err != nil {
+				entry.CanAccept, entry.RefusalReason = false, err.Error()
+			}
+		}
+		result.Selectors = append(result.Selectors, entry)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (e *Executor) validateCommandEvaluationRecovery(workflow *Workflow, state *ExecutionState, record CommandEvaluationState) error {
+	if record.Version != commandEvaluationVersion || state.CommandEvaluationVersion != commandEvaluationVersion {
+		return fmt.Errorf("selector %q lacks the expanded invocation and capture limits required for output acceptance", record.StepID)
+	}
+	if now := time.Now(); now.Before(record.StartedAt) || (!record.FinishedAt.IsZero() && now.Before(record.FinishedAt)) {
+		return fmt.Errorf("selector %q receipt contains a future timestamp", record.StepID)
+	}
+	if commandEvaluationHasOutcome(record) {
+		return fmt.Errorf("selector %q already has a final outcome", record.StepID)
+	}
+	if _, cleanup := resolveOnCancelRuntimeStep(workflow, record.StepID); cleanup {
+		return fmt.Errorf("selector %q belongs to cancellation cleanup; ordinary resume may run that phase again", record.StepID)
+	}
+	for i := range workflow.PostPipelineSteps {
+		if _, tail := resolveHookRuntimeStep(&workflow.PostPipelineSteps[i], "post_pipeline", i+1, record.StepID); tail {
+			return fmt.Errorf("selector %q belongs to post-pipeline finalization; ordinary resume may reopen that phase", record.StepID)
+		}
+	}
+	switch state.Status {
+	case StatusPending, StatusRunning, StatusFailed, StatusCancelled:
+	case StatusCompleted:
+		// Older finalizers could report completion after a handled source
+		// failure without settling its receipt. Only an unsuccessful source
+		// result can establish this contradiction; consumed output stays final.
+		if status := state.Steps[record.StepID].Status; status != StatusFailed && status != StatusCancelled {
+			return fmt.Errorf("completed pipeline %q has no failed or cancelled result for selector %q", state.RunID, record.StepID)
+		}
+	default:
+		return fmt.Errorf("pipeline %q has status %q and cannot accept an unfinished selector", state.RunID, state.Status)
+	}
+	if prior := state.Steps[record.StepID]; prior.Status == StatusCompleted || prior.Status == StatusSkipped {
+		return fmt.Errorf("selector %q already published a terminal step result; refusing to replace consumed output", record.StepID)
+	}
+	if _, admitted := state.Steps[branchDecisionID(record.StepID)]; admitted {
+		return fmt.Errorf("selector %q already admitted a branch decision", record.StepID)
+	}
+	if _, admitted := state.ForeachState[record.StepID]; admitted {
+		return fmt.Errorf("selector %q already admitted iteration work", record.StepID)
+	}
+	graph := NewDependencyGraph(workflow)
+	if phaseErrors := graph.validatePhaseOwnership(state); len(phaseErrors) > 0 {
+		return phaseErrors[0]
+	}
+	resolve, err := resumeRuntimeStepResolver(graph, state)
+	if err != nil {
+		return err
+	}
+	step, ok := resolve(record.StepID)
+	if !ok || !stepUsesCommandEvaluation(step) {
+		return fmt.Errorf("selector %q has no matching external source in its frozen workflow", record.StepID)
+	}
+	if err := validateRecoveryWorkflowStep(workflow, state, record.StepID, stepKind(step), record.StepHash, commandDefinitionHash); err != nil {
+		return err
+	}
+	if err := e.validateLeafReplayScopeLocked(workflow, state, record.StepID, stepKind(step)); err != nil {
+		return fmt.Errorf("cannot accept output for a selector that ordinary resume will not revisit: %w", err)
+	}
+	// No source output may be replaced after its body gained effects, even
+	// if a damaged/older checkpoint lost the parent admission record.
+	childEvidence := func(id string) bool {
+		if id == record.StepID {
+			return false
+		}
+		_, _, owns := resolveScopedRuntimeChildren(record.StepID, id, step)
+		return owns
+	}
+	ids := make(map[string]bool)
+	for id := range state.Steps {
+		ids[id] = true
+	}
+	for id := range state.InFlightSteps {
+		ids[id] = true
+	}
+	for id := range state.CommandExecutions {
+		ids[id] = true
+	}
+	for id := range state.CommandEvaluations {
+		ids[id] = true
+	}
+	for id := range state.AgentDeliveries {
+		ids[id] = true
+	}
+	for id := range state.MailSends {
+		ids[id] = true
+	}
+	for id := range state.ReservationSteps {
+		ids[id] = true
+	}
+	for id := range state.ForeachState {
+		ids[id] = true
+	}
+	for id := range state.ParallelState {
+		ids[id] = true
+	}
+	for id := range ids {
+		if childEvidence(id) {
+			return fmt.Errorf("selector %q already has body execution evidence for %q; refusing to replace its source", record.StepID, id)
+		}
+	}
+	return nil
+}
+
+// AcceptCommandEvaluationContext records an operator-observed final selector
+// outcome. The operator must independently establish termination of the entire
+// original process tree and supply complete stdout and its final exit code.
+// Acceptance launches no work, signals no PID, and does not publish a branch or
+// work list. Resume applies the original materialized invocation identity and
+// normal parsing/failure policy before any output is consumed.
+func AcceptCommandEvaluationContext(ctx context.Context, projectDir, runID, stepID, receiptToken, reason string, exitCode int, output []byte) (*CommandEvaluationRecoveryResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	reason = strings.TrimSpace(reason)
+	if strings.TrimSpace(projectDir) == "" || strings.TrimSpace(stepID) == "" || stepID != strings.TrimSpace(stepID) {
+		return nil, fmt.Errorf("selector recovery requires a project directory and exact step ID")
+	}
+	if reason == "" || len(reason) > agentDeliveryMaxReasonBytes || !utf8.ValidString(reason) {
+		return nil, fmt.Errorf("selector recovery reason must contain 1 to %d UTF-8 bytes", agentDeliveryMaxReasonBytes)
+	}
+	if exitCode < 0 || exitCode > 255 || len(output) > CommandRecoveryMaxOutputBytes {
+		return nil, fmt.Errorf("selector recovery requires an exit code from 0 to 255 and at most %d bytes of complete output", CommandRecoveryMaxOutputBytes)
+	}
+	if !validCommandEvaluationHash(receiptToken) {
+		return nil, fmt.Errorf("selector recovery requires the exact inspected receipt token")
+	}
+	projectDir = normalizeLockRoot(projectDir)
+	control, err := AcquireRunControl(ctx, projectDir, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer control.Close()
+	ctx = control.Context()
+	state, err := LoadState(projectDir, runID)
+	if err != nil {
+		return nil, err
+	}
+	if state.CommandEvaluationVersion < 0 || state.CommandEvaluationVersion > commandEvaluationVersion {
+		return nil, fmt.Errorf("unsupported command evaluation journal version %d", state.CommandEvaluationVersion)
+	}
+	for id, saved := range state.CommandEvaluations {
+		if err := validateCommandEvaluation(id, saved); err != nil {
+			return nil, err
+		}
+		if _, err := commandEvaluationRecoveryEntry(state, saved); err != nil {
+			return nil, err
+		}
+	}
+	record, exists := state.CommandEvaluations[stepID]
+	if !exists {
+		return nil, fmt.Errorf("step %q has no saved selector execution receipt", stepID)
+	}
+	entry, err := commandEvaluationRecoveryEntry(state, record)
+	if err != nil {
+		return nil, err
+	}
+	if entry.ReceiptToken != receiptToken {
+		return nil, fmt.Errorf("receipt token for selector %q is stale or belongs to a different execution", stepID)
+	}
+	result := &CommandEvaluationRecoveryResult{RunID: state.RunID, WorkflowID: state.WorkflowID, Session: state.Session, Selector: entry}
+	if record.Status == commandEvaluationAccepted {
+		if record.ResolutionReason != reason || record.ResolutionExitCode != exitCode || !bytes.Equal(record.Output, output) {
+			return nil, fmt.Errorf("selector %q already has an immutable operator decision with a different reason or outcome", stepID)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		result.Replayed = true
+		return result, nil
+	}
+	workflow, err := loadRecoveryWorkflow(projectDir, state)
+	if err != nil {
+		return nil, err
+	}
+	checker := NewExecutor(DefaultExecutorConfig(state.Session))
+	if err := checker.validateCommandEvaluationRecovery(workflow, state, record); err != nil {
+		return nil, err
+	}
+	if int64(len(output)) > record.StdoutLimit {
+		return nil, fmt.Errorf("supplied selector output exceeds its recorded %d-byte stdout limit", record.StdoutLimit)
+	}
+	if limit := workflow.Settings.Limits.EffectiveLimits().MaxCommandStdoutBytes; int64(len(output)) > limit {
+		return nil, fmt.Errorf("supplied selector output exceeds the frozen workflow's %d-byte stdout limit", limit)
+	}
+	now := time.Now().UTC()
+	if now.Before(record.StartedAt) || (!record.FinishedAt.IsZero() && now.Before(record.FinishedAt)) {
+		return nil, fmt.Errorf("selector receipt contains a future timestamp; refusing an inconsistent operator outcome")
+	}
+	outputHash := sha256.Sum256(output)
+	record.OriginalStatus, record.Status = record.Status, commandEvaluationAccepted
+	record.Output, record.OutputHash = append([]byte(nil), output...), hex.EncodeToString(outputHash[:])
+	record.ResolutionAction, record.ResolutionToken, record.ResolutionReason = CommandEvaluationResolutionAccept, receiptToken, reason
+	record.ResolutionExitCode, record.ResolvedAt = exitCode, now
+	record.ResolutionHash, err = commandEvaluationResolutionHash(record)
+	if err != nil {
+		return nil, err
+	}
+	entry, err = commandEvaluationRecoveryEntry(state, record)
+	if err != nil {
+		return nil, err
+	}
+	state.CommandEvaluations[stepID] = record
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	repairCompletedWorkflowForProcessRecovery(state, stepID, now)
+	if err := SaveState(projectDir, state); err != nil {
+		return nil, fmt.Errorf("persist operator selector acceptance: %w", err)
+	}
+	result.Selector = entry
+	slog.Info("pipeline selector outcome accepted by operator", "run_id", state.RunID, "step_id", stepID, "exit_code", exitCode, "output_bytes", len(output))
+	return result, nil
+}
+
+// CommandExecutionRecoveryEntry exposes identity and decision metadata without
+// command text, environment variables, stdin, or supplied command output.
+type CommandExecutionRecoveryEntry struct {
+	StepID           string    `json:"step_id"`
+	Status           string    `json:"status"`
+	ReceiptToken     string    `json:"receipt_token"`
+	ProcessID        int       `json:"process_id,omitempty"`
+	Background       bool      `json:"background"`
+	StartedAt        time.Time `json:"started_at"`
+	CanAccept        bool      `json:"can_accept"`
+	RefusalReason    string    `json:"refusal_reason,omitempty"`
+	ResolutionAction string    `json:"resolution_action,omitempty"`
+	ResolutionReason string    `json:"resolution_reason,omitempty"`
+	ResolvedAt       time.Time `json:"resolved_at,omitempty"`
+	ExitCode         *int      `json:"exit_code,omitempty"`
+	OutputBytes      int       `json:"output_bytes,omitempty"`
+	OutputHash       string    `json:"output_hash,omitempty"`
+}
+
+type CommandExecutionRecoveryInspection struct {
+	RunID      string                          `json:"run_id"`
+	WorkflowID string                          `json:"workflow_id"`
+	Session    string                          `json:"session"`
+	Commands   []CommandExecutionRecoveryEntry `json:"commands"`
+}
+
+type CommandExecutionRecoveryResult struct {
+	RunID      string                        `json:"run_id"`
+	WorkflowID string                        `json:"workflow_id"`
+	Session    string                        `json:"session"`
+	Command    CommandExecutionRecoveryEntry `json:"command"`
+	Replayed   bool                          `json:"replayed"`
+}
+
+func commandDefinitionHash(step *Step) (string, error) {
+	encoded, err := json.Marshal(step)
+	if err != nil {
+		return "", fmt.Errorf("hash command step: %w", err)
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func cloneCommandExecution(record CommandExecutionState) CommandExecutionState {
+	record.Result.ParsedData = cloneInterfaceValue(record.Result.ParsedData)
+	if record.Result.Error != nil {
+		copy := cloneStepErrorValue(*record.Result.Error)
+		record.Result.Error = &copy
+	}
+	return record
+}
+
+func (e *Executor) loadCommandExecution(stepID string) (CommandExecutionState, bool) {
+	e.stateMu.RLock()
+	defer e.stateMu.RUnlock()
+	if e.state == nil {
+		return CommandExecutionState{}, false
+	}
+	record, ok := e.state.CommandExecutions[stepID]
+	return cloneCommandExecution(record), ok
+}
+
+func (e *Executor) saveCommandExecution(record CommandExecutionState) error {
+	if err := validateCommandExecution(record.StepID, record); err != nil {
+		return err
+	}
+	e.stateMu.Lock()
+	if e.state == nil {
+		e.stateMu.Unlock()
+		return fmt.Errorf("cannot save command execution without execution state")
+	}
+	if e.state.CommandExecutions == nil {
+		e.state.CommandExecutions = make(map[string]CommandExecutionState)
+	}
+	e.state.CommandExecutions[record.StepID] = cloneCommandExecution(record)
+	e.stateMu.Unlock()
+	return e.persistState()
+}
+
+func validateCommandExecution(key string, record CommandExecutionState) error {
+	invalid := func(reason string) error {
+		return fmt.Errorf("invalid command execution for step %q: %s", key, reason)
+	}
+	if strings.TrimSpace(key) == "" || record.StepID != key || record.Version != commandExecutionVersion {
+		return invalid("unsupported version or mismatched step identity")
+	}
+	hash, err := hex.DecodeString(record.StepHash)
+	if err != nil || len(hash) != sha256.Size || record.StartedAt.IsZero() || record.ProcessID < 0 {
+		return invalid("missing definition hash, invalid process ID or start time")
+	}
+	switch record.Status {
+	case commandExecutionStarting, commandExecutionRunning:
+		if !record.SettledAt.IsZero() || record.Result.Status != "" {
+			return invalid("unfinished launch contains a settled outcome")
+		}
+		if record.Status == commandExecutionRunning && record.ProcessID == 0 {
+			return invalid("running command is missing its process ID")
+		}
+	case commandExecutionUnresolved:
+		if record.ProcessID == 0 || !record.SettledAt.IsZero() || record.Result.StepID != key ||
+			record.Result.AgentType != "command" || !record.Result.StartedAt.Equal(record.StartedAt) ||
+			record.Result.FinishedAt.IsZero() || record.Result.FinishedAt.Before(record.StartedAt) ||
+			record.Result.Error == nil || record.Result.Error.Message == "" || record.Result.RerunOnResume {
+			return invalid("missing or inconsistent unresolved cleanup evidence")
+		}
+		if record.Result.Status != StatusFailed && record.Result.Status != StatusCancelled {
+			return invalid("unresolved cleanup cannot publish a successful outcome")
+		}
+	case commandExecutionSettled:
+		if record.SettledAt.IsZero() || record.SettledAt.Before(record.StartedAt) || record.Result.StepID != key || record.Result.FinishedAt.IsZero() {
+			return invalid("missing or inconsistent settlement evidence")
+		}
+		switch record.Result.Status {
+		case StatusCompleted, StatusFailed, StatusCancelled:
+		default:
+			return invalid("invalid settled result status")
+		}
+	default:
+		return invalid(fmt.Sprintf("unknown status %q; refusing to discard launch evidence", record.Status))
+	}
+	if record.ResolutionAction == "" {
+		if record.ResolutionToken != "" || record.ResolutionReason != "" || record.ResolutionExitCode != 0 ||
+			record.ResolutionOutputHash != "" || !record.ResolvedAt.IsZero() {
+			return invalid("incomplete operator command resolution")
+		}
+		return nil
+	}
+	if record.ResolutionAction != CommandExecutionResolutionAccept || record.Status != commandExecutionSettled || record.Background ||
+		record.ResolutionReason == "" || record.ResolutionReason != strings.TrimSpace(record.ResolutionReason) ||
+		len(record.ResolutionReason) > agentDeliveryMaxReasonBytes || !utf8.ValidString(record.ResolutionReason) ||
+		record.ResolutionExitCode < 0 || record.ResolutionExitCode > 255 ||
+		record.ResolvedAt.IsZero() || !record.ResolvedAt.Equal(record.SettledAt) ||
+		!record.Result.StartedAt.Equal(record.StartedAt) || !record.Result.FinishedAt.Equal(record.ResolvedAt) ||
+		record.Result.AgentType != "command" || record.Result.ParsedData != nil || record.Result.Error != nil ||
+		record.Result.RerunOnResume || record.Result.Attempts != 0 || record.Result.PaneUsed != "" ||
+		record.Result.SkipReason != "" || record.Result.SkipKind != "" ||
+		len(record.Result.Output) > CommandRecoveryMaxOutputBytes || !utf8.ValidString(record.Result.Output) {
+		return invalid("inconsistent operator command outcome")
+	}
+	expectedStatus := StatusCompleted
+	if record.ResolutionExitCode != 0 {
+		expectedStatus = StatusFailed
+	}
+	if record.Result.Status != expectedStatus {
+		return invalid("operator exit code disagrees with its recorded outcome")
+	}
+	for _, value := range []string{record.ResolutionToken, record.ResolutionOutputHash} {
+		digest, err := hex.DecodeString(value)
+		if err != nil || len(digest) != sha256.Size || value != strings.ToLower(value) {
+			return invalid("invalid operator command fingerprint")
+		}
+	}
+	outputHash := sha256.Sum256([]byte(record.Result.Output))
+	if hex.EncodeToString(outputHash[:]) != record.ResolutionOutputHash {
+		return invalid("operator command output no longer matches its recorded fingerprint")
+	}
+	return nil
+}
+
+func uncertainCommandExecutionError(stepID string, processID int) error {
+	return fmt.Errorf("command step %q has an unresolved launch (recorded process ID %d); its process group may still be running or may already have performed side effects. Ordinary resume will not execute it again. Inspect the command and its effects; after verifying the foreground command group ended, use pipeline recover --accept-command with its exact receipt, final exit code, complete output, and reason. Deliberately use --mode=restart-failed (or --keep-state=false for a whole-workflow replay) only if repeating it is intended", stepID, processID)
+}
+
+func commandExecutionReceiptToken(state *ExecutionState, record CommandExecutionState) (string, error) {
+	encoded, err := json.Marshal(struct {
+		Version          int
+		RunID            string
+		WorkflowID       string
+		WorkflowSnapshot string
+		Session          string
+		StepID           string
+		StepHash         string
+		ProcessID        int
+		Background       bool
+		StartedAt        time.Time
+	}{record.Version, state.RunID, state.WorkflowID, filepath.Base(state.WorkflowFile), state.Session,
+		record.StepID, record.StepHash, record.ProcessID, record.Background, record.StartedAt.UTC()})
+	if err != nil {
+		return "", fmt.Errorf("fingerprint command execution: %w", err)
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func commandExecutionRecoveryEntry(state *ExecutionState, record CommandExecutionState) (CommandExecutionRecoveryEntry, error) {
+	if err := validateCommandExecution(record.StepID, record); err != nil {
+		return CommandExecutionRecoveryEntry{}, err
+	}
+	token, err := commandExecutionReceiptToken(state, record)
+	if err != nil {
+		return CommandExecutionRecoveryEntry{}, err
+	}
+	if record.ResolutionAction != "" && record.ResolutionToken != token {
+		return CommandExecutionRecoveryEntry{}, fmt.Errorf("operator resolution for command %q no longer matches its original receipt identity", record.StepID)
+	}
+	entry := CommandExecutionRecoveryEntry{
+		StepID: record.StepID, Status: record.Status, ReceiptToken: token, ProcessID: record.ProcessID,
+		Background: record.Background, StartedAt: record.StartedAt,
+		CanAccept:        record.Status != commandExecutionSettled && !record.Background,
+		ResolutionAction: record.ResolutionAction, ResolutionReason: record.ResolutionReason, ResolvedAt: record.ResolvedAt,
+	}
+	if record.ResolutionAction != "" {
+		exitCode := record.ResolutionExitCode
+		entry.ExitCode, entry.OutputBytes, entry.OutputHash = &exitCode, len(record.Result.Output), record.ResolutionOutputHash
+	}
+	return entry, nil
+}
+
+// InspectCommandExecutionRecovery reads one atomic checkpoint without looking
+// up or signalling saved process IDs. Acceptance always reloads under ownership.
+func InspectCommandExecutionRecovery(ctx context.Context, projectDir, runID string) (*CommandExecutionRecoveryInspection, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(projectDir) == "" {
+		return nil, fmt.Errorf("project directory is required for pipeline recovery")
+	}
+	projectDir = normalizeLockRoot(projectDir)
+	state, err := LoadState(projectDir, runID)
+	if err != nil {
+		return nil, err
+	}
+	result := &CommandExecutionRecoveryInspection{
+		RunID: state.RunID, WorkflowID: state.WorkflowID, Session: state.Session,
+		Commands: make([]CommandExecutionRecoveryEntry, 0),
+	}
+	workflow, workflowErr := loadRecoveryWorkflow(projectDir, state)
+	checker := NewExecutor(DefaultExecutorConfig(state.Session))
+	ids := make([]string, 0, len(state.CommandExecutions))
+	for id := range state.CommandExecutions {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		record := state.CommandExecutions[id]
+		if err := validateCommandExecution(id, record); err != nil {
+			return nil, err
+		}
+		entry, err := commandExecutionRecoveryEntry(state, record)
+		if err != nil {
+			return nil, err
+		}
+		if record.Status == commandExecutionSettled && record.ResolutionAction == "" {
+			continue
+		}
+		if record.ResolutionAction == "" {
+			if workflowErr != nil {
+				entry.CanAccept, entry.RefusalReason = false, "a valid frozen workflow is required before accepting command output"
+			} else if err := checker.validateCommandRecovery(workflow, state, record); err != nil {
+				entry.CanAccept, entry.RefusalReason = false, err.Error()
+			}
+		}
+		result.Commands = append(result.Commands, entry)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (e *Executor) validateCommandRecovery(workflow *Workflow, state *ExecutionState, record CommandExecutionState) error {
+	if record.Background {
+		return fmt.Errorf("command %q was launched with wait:none; its already-published background outcome cannot be replaced", record.StepID)
+	}
+	if record.Status == commandExecutionSettled {
+		return fmt.Errorf("command %q already has a settled outcome", record.StepID)
+	}
+	if _, cleanup := resolveOnCancelRuntimeStep(workflow, record.StepID); cleanup {
+		return fmt.Errorf("command %q belongs to cancellation cleanup; ordinary resume may run that phase again", record.StepID)
+	}
+	switch state.Status {
+	case StatusPending, StatusRunning, StatusFailed, StatusCancelled:
+	case StatusCompleted:
+		// Accept only the historical false-completion case. The remaining
+		// definition and replay-scope checks still protect consumed outcomes.
+		if status := state.Steps[record.StepID].Status; status != StatusFailed && status != StatusCancelled {
+			return fmt.Errorf("completed pipeline %q has no failed or cancelled result for command %q", state.RunID, record.StepID)
+		}
+	default:
+		return fmt.Errorf("pipeline %q has status %q and cannot accept an unfinished command", state.RunID, state.Status)
+	}
+	if prior := state.Steps[record.StepID]; prior.Status == StatusCompleted || prior.Status == StatusSkipped {
+		return fmt.Errorf("command %q already published a terminal step result; refusing to replace consumed output", record.StepID)
+	}
+	if err := validateRecoveryWorkflowStep(workflow, state, record.StepID, StepKindCommand, record.StepHash, commandDefinitionHash); err != nil {
+		return err
+	}
+	if step, post := topLevelPostPipelineRecoveryStep(workflow, record.StepID); post {
+		if stepKind(step) != StepKindCommand {
+			return fmt.Errorf("post-pipeline step %q is no longer a command", record.StepID)
+		}
+		return nil
+	}
+	if err := e.validateLeafReplayScopeLocked(workflow, state, record.StepID, StepKindCommand); err != nil {
+		return fmt.Errorf("cannot accept output for a command that ordinary resume will not revisit: %w", err)
+	}
+	return nil
+}
+
+// AcceptCommandExecutionContext records an operator-observed final outcome for
+// an unresolved foreground command. The caller must have verified that the
+// entire original process group ended; a PID lookup cannot establish that.
+// It changes the command journal and repairs a contradictory completed workflow
+// status when needed. Resume validates the materialized step, applies its normal
+// output parser/error policy, and publishes dependent data.
+func AcceptCommandExecutionContext(ctx context.Context, projectDir, runID, stepID, receiptToken, reason string, exitCode int, output string) (*CommandExecutionRecoveryResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	reason = strings.TrimSpace(reason)
+	if strings.TrimSpace(projectDir) == "" || strings.TrimSpace(stepID) == "" || stepID != strings.TrimSpace(stepID) {
+		return nil, fmt.Errorf("command recovery requires a project directory and exact step ID")
+	}
+	if reason == "" || len(reason) > agentDeliveryMaxReasonBytes || !utf8.ValidString(reason) {
+		return nil, fmt.Errorf("command recovery reason must contain 1 to %d UTF-8 bytes", agentDeliveryMaxReasonBytes)
+	}
+	if exitCode < 0 || exitCode > 255 || len(output) > CommandRecoveryMaxOutputBytes || !utf8.ValidString(output) {
+		return nil, fmt.Errorf("command recovery requires an exit code from 0 to 255 and at most %d bytes of complete UTF-8 output", CommandRecoveryMaxOutputBytes)
+	}
+	digest, err := hex.DecodeString(receiptToken)
+	if err != nil || len(digest) != sha256.Size || receiptToken != strings.ToLower(receiptToken) {
+		return nil, fmt.Errorf("command recovery requires the exact inspected receipt token")
+	}
+	projectDir = normalizeLockRoot(projectDir)
+	control, err := AcquireRunControl(ctx, projectDir, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer control.Close()
+	ctx = control.Context()
+	state, err := LoadState(projectDir, runID)
+	if err != nil {
+		return nil, err
+	}
+	for id, saved := range state.CommandExecutions {
+		if err := validateCommandExecution(id, saved); err != nil {
+			return nil, err
+		}
+		if _, err := commandExecutionRecoveryEntry(state, saved); err != nil {
+			return nil, err
+		}
+	}
+	record, exists := state.CommandExecutions[stepID]
+	if !exists {
+		return nil, fmt.Errorf("step %q has no saved command execution receipt", stepID)
+	}
+	entry, err := commandExecutionRecoveryEntry(state, record)
+	if err != nil {
+		return nil, err
+	}
+	if entry.ReceiptToken != receiptToken {
+		return nil, fmt.Errorf("receipt token for command %q is stale or belongs to a different execution", stepID)
+	}
+	result := &CommandExecutionRecoveryResult{RunID: state.RunID, WorkflowID: state.WorkflowID, Session: state.Session, Command: entry}
+	if record.ResolutionAction != "" {
+		if record.ResolutionAction != CommandExecutionResolutionAccept || record.ResolutionReason != reason ||
+			record.ResolutionExitCode != exitCode || record.Result.Output != output {
+			return nil, fmt.Errorf("command %q already has an immutable operator decision with a different reason or outcome", stepID)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		result.Replayed = true
+		return result, nil
+	}
+	workflow, err := loadRecoveryWorkflow(projectDir, state)
+	if err != nil {
+		return nil, err
+	}
+	checker := NewExecutor(DefaultExecutorConfig(state.Session))
+	if err := checker.validateCommandRecovery(workflow, state, record); err != nil {
+		return nil, err
+	}
+	if limit := workflow.Settings.Limits.EffectiveLimits().MaxCommandStdoutBytes; int64(len(output)) > limit {
+		return nil, fmt.Errorf("supplied command output exceeds the frozen workflow's %d-byte stdout limit", limit)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	if now.Before(record.StartedAt) {
+		return nil, fmt.Errorf("command start time is in the future; refusing an inconsistent outcome")
+	}
+	status := StatusCompleted
+	if exitCode != 0 {
+		status = StatusFailed
+	}
+	outputHash := sha256.Sum256([]byte(output))
+	record.Status, record.SettledAt = commandExecutionSettled, now
+	record.Result = StepResult{StepID: stepID, Status: status, StartedAt: record.StartedAt, FinishedAt: now, AgentType: "command", Output: output}
+	record.ResolutionAction, record.ResolutionToken, record.ResolutionReason = CommandExecutionResolutionAccept, receiptToken, reason
+	record.ResolutionExitCode, record.ResolutionOutputHash, record.ResolvedAt = exitCode, hex.EncodeToString(outputHash[:]), now
+	entry, err = commandExecutionRecoveryEntry(state, record)
+	if err != nil {
+		return nil, err
+	}
+	state.CommandExecutions[stepID] = record
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	repairCompletedWorkflowForProcessRecovery(state, stepID, now)
+	if err := SaveState(projectDir, state); err != nil {
+		return nil, fmt.Errorf("persist operator command acceptance: %w", err)
+	}
+	result.Command = entry
+	slog.Info("pipeline command outcome accepted by operator", "run_id", state.RunID, "step_id", stepID, "exit_code", exitCode, "output_bytes", len(output))
+	return result, nil
+}
+
+// Completed-run admission requires an unfinished receipt and an unsuccessful
+// scheduler result for its source. Persist the repaired workflow outcome in the
+// same transaction as the accepted decision, without publishing source output or
+// discarding other uncertainty. Immutable acceptance replays return before here.
+func repairCompletedWorkflowForProcessRecovery(state *ExecutionState, stepID string, now time.Time) {
+	if state.Status != StatusCompleted {
+		return
+	}
+	state.Status, state.UpdatedAt = StatusFailed, now
+	state.Errors = append(state.Errors, ExecutionError{
+		StepID: stepID, Type: "recovery", Timestamp: now, Fatal: true,
+		Message: fmt.Sprintf("workflow reported completion while step %q remained unsettled; an operator accepted its outcome, and ordinary resume is required", stepID),
+	})
+}
+
+const (
+	agentDeliveryVersion         = 1
+	agentDeliveryNotSent         = "not_sent"
+	agentDeliverySending         = "sending"
+	agentDeliveryDelivered       = "delivered"
+	agentDeliveryCompleted       = "completed"
+	agentDeliveryMaxCaptureBytes = 1 << 20
+	agentDeliveryMaxOutputBytes  = 1 << 20
+	agentDeliveryMaxReasonBytes  = 4096
+)
+
+// AgentDeliveryResolutionAccept records an operator's attestation that an
+// uncertain prompt was delivered. It never authorizes sending it again.
+const AgentDeliveryResolutionAccept = "accept"
+
+// AgentDeliveryState journals a single runtime leaf's external dispatch. The
+// enclosing ExecutionState binds it to a run and workflow; StepID includes any
+// iteration or parallel namespace. Only not_sent proves no prompt actuation.
+// A sending record is deliberately ambiguous: recovery must not assume that
+// absence of a delivered timestamp means no send.
+type AgentDeliveryState struct {
+	Version        int    `json:"version"`
+	StepID         string `json:"step_id"`
+	Kind           string `json:"kind"`
+	Session        string `json:"session"`
+	Endpoint       string `json:"endpoint"`
+	PaneID         string `json:"pane_id"`
+	PanePID        int    `json:"pane_pid"`
+	AgentType      string `json:"agent_type"`
+	StepHash       string `json:"step_hash"`
+	PromptHash     string `json:"prompt_hash"`
+	PromptEchoHash string `json:"prompt_echo_hash"`
+	// PromptEchoLength bounds pi's hash-based repaint recovery without saving
+	// prompt text. Older receipts leave it zero and retain strict boundaries.
+	PromptEchoLength int `json:"prompt_echo_length,omitempty"`
+	// PiPromptEcho binds pi's rendered Markdown form. Raw text alone cannot
+	// distinguish a formatted prompt echo from a response after repainting.
+	PiPromptEchoHash   string    `json:"pi_prompt_echo_hash,omitempty"`
+	PiPromptEchoLength int       `json:"pi_prompt_echo_length,omitempty"`
+	Status             string    `json:"status"`
+	BeforeOutput       string    `json:"before_output,omitempty"`
+	Output             string    `json:"output,omitempty"`
+	StartedAt          time.Time `json:"started_at"`
+	DeliveredAt        time.Time `json:"delivered_at,omitempty"`
+	CompletedAt        time.Time `json:"completed_at,omitempty"`
+	// Resolution fields remain values so snapshots cannot share mutable audit
+	// data. The boundary hash keeps the accepted receipt identity stable after
+	// ordinary resume advances or clears BeforeOutput.
+	ResolutionAction       string    `json:"resolution_action,omitempty"`
+	ResolutionToken        string    `json:"resolution_token,omitempty"`
+	ResolutionReason       string    `json:"resolution_reason,omitempty"`
+	ResolutionBoundaryHash string    `json:"resolution_boundary_hash,omitempty"`
+	ResolvedAt             time.Time `json:"resolved_at,omitempty"`
+}
+
+// AgentDeliveryRecoveryEntry exposes receipt identity without prompt text or
+// captured agent output. CanAccept describes the journal phase; acceptance also
+// verifies the saved workflow and the original live pane's process lifetime.
+type AgentDeliveryRecoveryEntry struct {
+	StepID           string    `json:"step_id"`
+	Kind             string    `json:"kind"`
+	Status           string    `json:"status"`
+	ReceiptToken     string    `json:"receipt_token"`
+	Endpoint         string    `json:"endpoint"`
+	PaneID           string    `json:"pane_id"`
+	PanePID          int       `json:"pane_pid"`
+	AgentType        string    `json:"agent_type"`
+	StartedAt        time.Time `json:"started_at"`
+	CanAccept        bool      `json:"can_accept"`
+	ResolutionAction string    `json:"resolution_action,omitempty"`
+	ResolutionReason string    `json:"resolution_reason,omitempty"`
+	ResolvedAt       time.Time `json:"resolved_at,omitempty"`
+}
+
+// AgentDeliveryRecoveryInspection includes unfinished deliveries and retained
+// operator decisions, including decisions whose original delivery completed.
+type AgentDeliveryRecoveryInspection struct {
+	RunID      string                       `json:"run_id"`
+	WorkflowID string                       `json:"workflow_id"`
+	Session    string                       `json:"session"`
+	Deliveries []AgentDeliveryRecoveryEntry `json:"deliveries"`
+}
+
+type AgentDeliveryRecoveryResult struct {
+	RunID      string                     `json:"run_id"`
+	WorkflowID string                     `json:"workflow_id"`
+	Session    string                     `json:"session"`
+	Delivery   AgentDeliveryRecoveryEntry `json:"delivery"`
+	Replayed   bool                       `json:"replayed"`
+}
+
+func agentStepHash(step *Step) (string, error) {
+	if step == nil {
+		return "", fmt.Errorf("cannot hash a nil agent step")
+	}
+	encoded, err := json.Marshal(step)
+	if err != nil {
+		return "", fmt.Errorf("hash agent step %q: %w", step.ID, err)
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func (e *Executor) loadAgentDelivery(stepID string) (AgentDeliveryState, bool) {
+	e.stateMu.RLock()
+	defer e.stateMu.RUnlock()
+	if e.state == nil {
+		return AgentDeliveryState{}, false
+	}
+	// Records contain only value fields, so callers cannot mutate the journal.
+	record, ok := e.state.AgentDeliveries[stepID]
+	return record, ok
+}
+
+func (e *Executor) saveAgentDelivery(record AgentDeliveryState) error {
+	e.stateMu.Lock()
+	if e.state == nil {
+		e.stateMu.Unlock()
+		return fmt.Errorf("cannot save agent delivery without execution state")
+	}
+	if err := validateAgentDelivery(record.StepID, record, e.state.Session); err != nil {
+		e.stateMu.Unlock()
+		return err
+	}
+	if record.ResolutionAction != "" {
+		if _, err := agentDeliveryRecoveryEntry(e.state, record); err != nil {
+			e.stateMu.Unlock()
+			return err
+		}
+	}
+	if e.state.AgentDeliveries == nil {
+		e.state.AgentDeliveries = make(map[string]AgentDeliveryState)
+	}
+	e.state.AgentDeliveries[record.StepID] = record
+	e.stateMu.Unlock()
+	return e.persistState()
+}
+
+// markAgentDeliveryNotSent is only for the live owner's final preflight
+// refusal, before PasteKeys. Crash recovery and post-paste errors cannot prove
+// non-delivery and must retain their sending receipt. Persist this proof before
+// permitting retry; a storage failure trips the existing checkpoint fence even
+// if the in-memory phase has already changed.
+func (e *Executor) markAgentDeliveryNotSent(record AgentDeliveryState) error {
+	e.stateMu.Lock()
+	if e.state == nil {
+		e.stateMu.Unlock()
+		return fmt.Errorf("cannot record an unsent agent delivery without execution state")
+	}
+	current, ok := e.state.AgentDeliveries[record.StepID]
+	if !ok || current != record || record.Status != agentDeliverySending {
+		e.stateMu.Unlock()
+		return fmt.Errorf("unsent agent delivery for step %q no longer matches its live owner", record.StepID)
+	}
+	record.Status, record.BeforeOutput = agentDeliveryNotSent, ""
+	e.state.AgentDeliveries[record.StepID] = record
+	e.stateMu.Unlock()
+	return e.persistState()
+}
+
+func validateAgentDelivery(key string, record AgentDeliveryState, session string) error {
+	invalid := func(reason string) error {
+		return fmt.Errorf("invalid agent delivery for step %q: %s", key, reason)
+	}
+	if strings.TrimSpace(key) == "" || record.StepID != key {
+		return invalid("journal key does not match its step identity")
+	}
+	if record.Version != agentDeliveryVersion {
+		return invalid(fmt.Sprintf("unsupported version %d", record.Version))
+	}
+	if record.Kind != StepKindPrompt && record.Kind != StepKindTemplate {
+		return invalid(fmt.Sprintf("unsupported step kind %q", record.Kind))
+	}
+	if strings.TrimSpace(record.Session) == "" || record.Session != session {
+		return invalid("session identity does not match execution state")
+	}
+	if record.Endpoint != "local" && (!strings.HasPrefix(record.Endpoint, "ssh:") || strings.TrimSpace(strings.TrimPrefix(record.Endpoint, "ssh:")) == "") {
+		return invalid("tmux endpoint must be local or ssh: followed by a remote target")
+	}
+	if len(record.PaneID) < 2 || record.PaneID[0] != '%' || record.PanePID <= 0 {
+		return invalid("physical pane ID and positive pane PID are required")
+	}
+	for _, digit := range record.PaneID[1:] {
+		if digit < '0' || digit > '9' {
+			return invalid("physical pane ID must contain only % followed by digits")
+		}
+	}
+	if strings.TrimSpace(record.AgentType) == "" {
+		return invalid("agent type is missing")
+	}
+	for _, hash := range []string{record.StepHash, record.PromptHash, record.PromptEchoHash} {
+		decoded, err := hex.DecodeString(hash)
+		if err != nil || len(decoded) != sha256.Size {
+			return invalid("step and prompt hashes must be SHA-256 hex digests")
+		}
+	}
+	if len(record.BeforeOutput) > agentDeliveryMaxCaptureBytes || len(record.Output) > agentDeliveryMaxOutputBytes {
+		return invalid("captured output exceeds the agent delivery size limit")
+	}
+	if record.PromptEchoLength < 0 || record.PromptEchoLength > agentDeliveryMaxCaptureBytes {
+		return invalid("prompt echo length exceeds the agent delivery size limit")
+	}
+	if record.PiPromptEchoHash != "" || record.PiPromptEchoLength != 0 {
+		digest, err := hex.DecodeString(record.PiPromptEchoHash)
+		if !strings.EqualFold(strings.TrimSpace(record.AgentType), "pi") || err != nil || len(digest) != sha256.Size || record.PiPromptEchoLength <= 0 || record.PiPromptEchoLength > agentDeliveryMaxCaptureBytes {
+			return invalid("pi rendered prompt identity requires a SHA-256 digest and bounded positive length")
+		}
+	}
+	if record.StartedAt.IsZero() {
+		return invalid("start timestamp is missing")
+	}
+	if record.ResolutionAction == "" {
+		if record.ResolutionToken != "" || record.ResolutionReason != "" || record.ResolutionBoundaryHash != "" || !record.ResolvedAt.IsZero() {
+			return invalid("incomplete operator resolution")
+		}
+	} else {
+		if record.ResolutionAction != AgentDeliveryResolutionAccept ||
+			(record.Status != agentDeliveryDelivered && record.Status != agentDeliveryCompleted) ||
+			record.ResolutionReason == "" || record.ResolutionReason != strings.TrimSpace(record.ResolutionReason) ||
+			len(record.ResolutionReason) > agentDeliveryMaxReasonBytes || record.ResolvedAt.IsZero() ||
+			record.ResolvedAt.Before(record.StartedAt) || !record.ResolvedAt.Equal(record.DeliveredAt) {
+			return invalid("inconsistent operator acceptance")
+		}
+		for _, value := range []string{record.ResolutionToken, record.ResolutionBoundaryHash} {
+			digest, err := hex.DecodeString(value)
+			if err != nil || len(digest) != sha256.Size || value != strings.ToLower(value) {
+				return invalid("invalid operator resolution fingerprint")
+			}
+		}
+	}
+	switch record.Status {
+	case agentDeliveryNotSent:
+		if record.BeforeOutput != "" || record.Output != "" || !record.DeliveredAt.IsZero() || !record.CompletedAt.IsZero() {
+			return invalid("not-sent record contains capture, delivery, or completion evidence")
+		}
+	case agentDeliverySending:
+		if !record.DeliveredAt.IsZero() || !record.CompletedAt.IsZero() {
+			return invalid("sending record contains delivery or completion timestamps")
+		}
+	case agentDeliveryDelivered, agentDeliveryCompleted:
+		if record.DeliveredAt.IsZero() || record.DeliveredAt.Before(record.StartedAt) {
+			return invalid("delivery timestamp is missing or precedes dispatch")
+		}
+		if record.Status == agentDeliveryCompleted {
+			if record.CompletedAt.IsZero() || record.CompletedAt.Before(record.DeliveredAt) {
+				return invalid("completion timestamp is missing or precedes delivery")
+			}
+		} else if !record.CompletedAt.IsZero() {
+			return invalid("delivered record contains a completion timestamp")
+		}
+	default:
+		return invalid(fmt.Sprintf("unknown delivery status %q; refusing to discard dispatch evidence", record.Status))
+	}
+	return nil
+}
+
+// agentDeliveryReceiptToken binds the inspected attempt, including its original
+// capture boundary. A decision retains that boundary's hash while subsequent
+// observation can advance the transcript without changing the decision token.
+func agentDeliveryReceiptToken(state *ExecutionState, record AgentDeliveryState) (string, error) {
+	boundary := record.ResolutionBoundaryHash
+	if record.ResolutionAction == "" {
+		digest := sha256.Sum256([]byte(record.BeforeOutput))
+		boundary = hex.EncodeToString(digest[:])
+	}
+	identity := record
+	identity.Status = agentDeliverySending
+	identity.BeforeOutput, identity.Output = "", ""
+	identity.DeliveredAt, identity.CompletedAt, identity.ResolvedAt = time.Time{}, time.Time{}, time.Time{}
+	identity.ResolutionAction, identity.ResolutionToken, identity.ResolutionReason, identity.ResolutionBoundaryHash = "", "", "", ""
+	identity.StartedAt = identity.StartedAt.UTC()
+	encoded, err := json.Marshal(struct {
+		Version          int
+		RunID            string
+		WorkflowID       string
+		WorkflowSnapshot string
+		Receipt          AgentDeliveryState
+		BoundaryHash     string
+	}{1, state.RunID, state.WorkflowID, filepath.Base(state.WorkflowFile), identity, boundary})
+	if err != nil {
+		return "", fmt.Errorf("fingerprint agent delivery: %w", err)
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func agentDeliveryRecoveryEntry(state *ExecutionState, record AgentDeliveryState) (AgentDeliveryRecoveryEntry, error) {
+	if err := validateAgentDelivery(record.StepID, record, state.Session); err != nil {
+		return AgentDeliveryRecoveryEntry{}, err
+	}
+	token, err := agentDeliveryReceiptToken(state, record)
+	if err != nil {
+		return AgentDeliveryRecoveryEntry{}, err
+	}
+	if record.ResolutionAction != "" && record.ResolutionToken != token {
+		return AgentDeliveryRecoveryEntry{}, fmt.Errorf("operator resolution for step %q no longer matches its original receipt identity", record.StepID)
+	}
+	return AgentDeliveryRecoveryEntry{
+		StepID: record.StepID, Kind: record.Kind, Status: record.Status, ReceiptToken: token,
+		Endpoint: record.Endpoint, PaneID: record.PaneID, PanePID: record.PanePID,
+		AgentType: record.AgentType, StartedAt: record.StartedAt,
+		CanAccept:        record.Status == agentDeliverySending && record.ResolutionAction == "",
+		ResolutionAction: record.ResolutionAction, ResolutionReason: record.ResolutionReason, ResolvedAt: record.ResolvedAt,
+	}, nil
+}
+
+// InspectAgentDeliveryRecovery reads one atomic checkpoint and exposes safe
+// receipt identities. It creates no locks or state and does not contact tmux.
+// Acceptance must re-read the receipt under run ownership; an inspection token
+// never permits replacing a newer attempt with an older decision.
+func InspectAgentDeliveryRecovery(ctx context.Context, projectDir, runID string) (*AgentDeliveryRecoveryInspection, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(projectDir) == "" {
+		return nil, fmt.Errorf("project directory is required for pipeline recovery")
+	}
+	state, err := LoadState(normalizeLockRoot(projectDir), runID)
+	if err != nil {
+		return nil, err
+	}
+	result := &AgentDeliveryRecoveryInspection{
+		RunID: state.RunID, WorkflowID: state.WorkflowID, Session: state.Session,
+		Deliveries: make([]AgentDeliveryRecoveryEntry, 0),
+	}
+	ids := make([]string, 0, len(state.AgentDeliveries))
+	for id := range state.AgentDeliveries {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		record := state.AgentDeliveries[id]
+		if err := validateAgentDelivery(id, record, state.Session); err != nil {
+			return nil, err
+		}
+		entry, err := agentDeliveryRecoveryEntry(state, record)
+		if err != nil {
+			return nil, err
+		}
+		if record.Status != agentDeliveryCompleted || record.ResolutionAction != "" {
+			result.Deliveries = append(result.Deliveries, entry)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// AcceptAgentDeliveryContext records an explicit operator attestation for one
+// uncertain delivery. It never sends, marks a step completed, or runs dependent
+// work. Normal resume observes the original agent using its saved boundary.
+// Frozen workflow integrity and structural ownership are checked here. Scoped
+// foreach and selected branch definitions retain the executor's canonical
+// materialized StepHash check on resume, before any observation result or
+// dependent work.
+func AcceptAgentDeliveryContext(ctx context.Context, projectDir, runID, stepID, receiptToken, reason string) (*AgentDeliveryRecoveryResult, error) {
+	cfg := DefaultExecutorConfig("")
+	cfg.ProjectDir, cfg.RunID = projectDir, runID
+	return NewExecutor(cfg).acceptAgentDeliveryContext(ctx, stepID, receiptToken, reason)
+}
+
+func (e *Executor) acceptAgentDeliveryContext(ctx context.Context, stepID, receiptToken, reason string) (*AgentDeliveryRecoveryResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	reason = strings.TrimSpace(reason)
+	if strings.TrimSpace(e.config.ProjectDir) == "" || strings.TrimSpace(stepID) == "" || stepID != strings.TrimSpace(stepID) {
+		return nil, fmt.Errorf("pipeline recovery requires a project directory and exact step ID")
+	}
+	if reason == "" || len(reason) > agentDeliveryMaxReasonBytes {
+		return nil, fmt.Errorf("pipeline recovery reason must contain 1 to %d bytes", agentDeliveryMaxReasonBytes)
+	}
+	digest, err := hex.DecodeString(receiptToken)
+	if err != nil || len(digest) != sha256.Size || receiptToken != strings.ToLower(receiptToken) {
+		return nil, fmt.Errorf("pipeline recovery requires the exact inspected receipt token")
+	}
+	if e.config.DryRun {
+		return nil, fmt.Errorf("acceptance cannot be a dry run; inspect pipeline recovery instead")
+	}
+	e.config.ProjectDir = normalizeLockRoot(e.config.ProjectDir)
+	control, err := AcquireRunControl(ctx, e.config.ProjectDir, e.config.RunID)
+	if err != nil {
+		return nil, err
+	}
+	defer control.Close()
+	ctx = control.Context()
+	state, err := LoadState(e.config.ProjectDir, e.config.RunID)
+	if err != nil {
+		return nil, err
+	}
+	for id, saved := range state.AgentDeliveries {
+		if err := validateAgentDelivery(id, saved, state.Session); err != nil {
+			return nil, err
+		}
+		if _, err := agentDeliveryRecoveryEntry(state, saved); err != nil {
+			return nil, err
+		}
+	}
+	record, exists := state.AgentDeliveries[stepID]
+	if !exists {
+		return nil, fmt.Errorf("step %q has no saved agent delivery", stepID)
+	}
+	entry, err := agentDeliveryRecoveryEntry(state, record)
+	if err != nil {
+		return nil, err
+	}
+	if entry.ReceiptToken != receiptToken {
+		return nil, fmt.Errorf("receipt token for step %q is stale or belongs to a different delivery", stepID)
+	}
+	result := &AgentDeliveryRecoveryResult{RunID: state.RunID, WorkflowID: state.WorkflowID, Session: state.Session, Delivery: entry}
+	if record.ResolutionAction != "" {
+		if record.ResolutionAction != AgentDeliveryResolutionAccept || record.ResolutionReason != reason {
+			return nil, fmt.Errorf("step %q already has an immutable operator decision with a different action or reason", stepID)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		result.Replayed = true
+		return result, nil
+	}
+	if record.Status != agentDeliverySending {
+		return nil, fmt.Errorf("step %q is %s; only an uncertain sending receipt can be accepted", stepID, record.Status)
+	}
+	switch state.Status {
+	case StatusPending, StatusRunning, StatusFailed, StatusCancelled:
+	default:
+		return nil, fmt.Errorf("pipeline %q has status %q and cannot accept an unfinished delivery", state.RunID, state.Status)
+	}
+	if prior := state.Steps[stepID]; prior.Status == StatusCompleted || prior.Status == StatusSkipped {
+		return nil, fmt.Errorf("step %q already has a terminal outcome; refusing to replace it with an operator acceptance", stepID)
+	}
+	fireAndForget, err := validateAgentRecoveryWorkflow(e.config.ProjectDir, state, record)
+	if err != nil {
+		return nil, err
+	}
+	e.config.Session = state.Session
+	release, err := e.acquirePaneLockCrossProcess(ctx, record.PaneID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	pane, err := e.agentDeliveryPane(ctx, record.PaneID, record.PanePID, record.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+	if pane.IsServicePane() || normalizeAgentType(string(pane.Type)) != normalizeAgentType(record.AgentType) {
+		return nil, fmt.Errorf("original agent pane %s changed agent identity", record.PaneID)
+	}
+	isPi := strings.EqualFold(strings.TrimSpace(record.AgentType), "pi")
+	if !isPi || !fireAndForget {
+		current, err := e.captureAgentDelivery(ctx, record)
+		if err != nil {
+			return nil, fmt.Errorf("inspect original agent delivery: %w", err)
+		}
+		if isPi {
+			// Pi can erase the original boundary immediately after the one
+			// uncertain send. Apply the observer's unique-prompt and partial-
+			// response safeguards here too, but leave collection to resume:
+			// acceptance changes only the operator decision, not its evidence.
+			observed, _, repaintErr := observeAgentDelivery(record, current)
+			if repaintErr != nil {
+				return nil, repaintErr
+			}
+			if observed.BeforeOutput != current {
+				return nil, fmt.Errorf("saved pi output boundary is not visible; wait for a complete attributed frame before accepting delivery")
+			}
+		} else if _, err := agentDeliveryNewOutput(record.BeforeOutput, current); err != nil {
+			return nil, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	if now.Before(record.StartedAt) {
+		return nil, fmt.Errorf("agent delivery start time is in the future; refusing an inconsistent acceptance")
+	}
+	boundary := sha256.Sum256([]byte(record.BeforeOutput))
+	record.Status, record.DeliveredAt = agentDeliveryDelivered, now
+	record.ResolutionAction, record.ResolutionToken, record.ResolutionReason = AgentDeliveryResolutionAccept, receiptToken, reason
+	record.ResolutionBoundaryHash, record.ResolvedAt = hex.EncodeToString(boundary[:]), now
+	entry, err = agentDeliveryRecoveryEntry(state, record)
+	if err != nil {
+		return nil, err
+	}
+	state.AgentDeliveries[stepID] = record
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := SaveState(e.config.ProjectDir, state); err != nil {
+		return nil, fmt.Errorf("persist operator delivery acceptance: %w", err)
+	}
+	result.Delivery = entry
+	slog.Info("pipeline agent delivery accepted by operator", "run_id", state.RunID, "step_id", stepID, "session", state.Session, "pane", record.PaneID, "agent_type", record.AgentType)
+	return result, nil
+}
+
+// recoveryWorkflowStep uses the scheduler's runtime namespace resolver, counting
+// root owners so a literal authored ID cannot silently steal a scoped receipt.
+// topLevelPostPipelineRecoveryStep returns an independently scheduled post-pipeline
+// root. Ordinary resume always revisits this phase, so an accepted foreground
+// outcome can be consumed without replaying the original command. Nested hooks
+// and cancellation cleanup remain subject to their existing replay-scope fences.
+func topLevelPostPipelineRecoveryStep(workflow *Workflow, stepID string) (*Step, bool) {
+	if workflow == nil {
+		return nil, false
+	}
+	for i := range workflow.PostPipelineSteps {
+		step := &workflow.PostPipelineSteps[i]
+		id := step.ID
+		if id == "" {
+			id = fmt.Sprintf("post_pipeline_%d", i+1)
+		}
+		if id == stepID {
+			return step, true
+		}
+	}
+	return nil, false
+}
+
+func recoveryWorkflowStep(workflow *Workflow, stepID string) (*Step, error) {
+	var found *Step
+	for _, phase := range []struct {
+		steps  []Step
+		prefix string
+	}{{workflow.Steps, "steps"}, {workflow.PostPipelineSteps, "post_pipeline"}, {workflow.Settings.OnCancel, "on_cancel"}} {
+		for i := range phase.steps {
+			if candidate, owns := resolveHookRuntimeStep(&phase.steps[i], phase.prefix, i+1, stepID); owns {
+				if found != nil {
+					return nil, fmt.Errorf("step %q has ambiguous ownership in the saved workflow", stepID)
+				}
+				found = candidate
+			}
+		}
+	}
+	if found == nil {
+		return nil, fmt.Errorf("step %q has no structural owner in the saved workflow", stepID)
+	}
+	return found, nil
+}
+
+// A fallback is owned by its actual parent, including the selected branch and
+// concrete iteration namespace. A suffix alone is not evidence of ownership.
+func recoveryFallbackParent(workflow *Workflow, state *ExecutionState, stepID string) (*Step, string, bool, error) {
+	if !strings.HasSuffix(stepID, onFailureStepSuffix) {
+		return nil, "", false, nil
+	}
+	parentID := strings.TrimSuffix(stepID, onFailureStepSuffix)
+	resolve, err := resumeRuntimeStepResolver(NewDependencyGraph(workflow), state)
+	if err != nil {
+		return nil, "", false, err
+	}
+	parent, found := resolve(parentID)
+	if !found {
+		parent, err = recoveryWorkflowStep(workflow, parentID)
+		if err != nil {
+			return nil, "", false, nil
+		}
+	}
+	_, owns := onFailureRuntimeStep(parentID, stepID, parent)
+	return parent, parentID, owns, nil
+}
+
+func validateAgentRecoveryWorkflow(projectDir string, state *ExecutionState, record AgentDeliveryState) (bool, error) {
+	workflow, err := loadRecoveryWorkflow(projectDir, state)
+	if err != nil {
+		return false, err
+	}
+	if err := validateRecoveryWorkflowStep(workflow, state, record.StepID, record.Kind, record.StepHash, agentStepHash); err != nil {
+		return false, err
+	}
+	step, err := recoveryWorkflowStep(workflow, record.StepID)
+	if err != nil {
+		return false, err
+	}
+	parent, parentID, fallback, err := recoveryFallbackParent(workflow, state, record.StepID)
+	if err != nil {
+		return false, err
+	}
+	if fallback {
+		step, _, err = recoveryStepDefinition(parentID, parent.OnFailure.Fallback, nil)
+		if err != nil {
+			return false, err
+		}
+		if parent.Command != "" {
+			original, exists := state.CommandExecutions[parentID]
+			if !exists {
+				return false, fmt.Errorf("failure recovery for %q has lost its original command receipt", parentID)
+			}
+			if err := validateCommandExecution(parentID, original); err != nil {
+				return false, err
+			}
+			if original.ResolutionAction != "" {
+				if _, err := commandExecutionRecoveryEntry(state, original); err != nil {
+					return false, err
+				}
+			}
+			if original.Status != commandExecutionSettled || original.Result.Status != StatusFailed || original.StartedAt.After(record.StartedAt) {
+				return false, fmt.Errorf("failure recovery for %q no longer belongs to its original settled failed command", parentID)
+			}
+			if err := validateRecoveryWorkflowStep(workflow, state, parentID, StepKindCommand, original.StepHash, commandDefinitionHash); err != nil {
+				return false, err
+			}
+		}
+	}
+	definition := cloneStep(*step)
+	definition.ID = record.StepID
+	hash, err := agentStepHash(&definition)
+	if err != nil {
+		return false, err
+	}
+	// Scoped ownership validation can defer the materialized definition to
+	// resume. Only an exact frozen match may bypass response observation:
+	// another branch with the same child ID cannot grant wait:none behavior.
+	return hash == record.StepHash && definition.Wait == WaitNone, nil
+}
+
+func loadRecoveryWorkflow(projectDir string, state *ExecutionState) (*Workflow, error) {
+	path := strings.TrimSpace(state.WorkflowFile)
+	if path == "" || state.WorkflowID == "" {
+		return nil, fmt.Errorf("pipeline recovery requires its saved workflow identity and definition")
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(projectDir, path)
+	}
+	if filepath.Base(filepath.Dir(path)) != workflowSnapshotDir {
+		return nil, fmt.Errorf("pipeline recovery requires a verified frozen workflow snapshot")
+	}
+	workflow, validation, err := LoadResumeWorkflow(path)
+	if err != nil {
+		return nil, fmt.Errorf("verify saved recovery workflow: %w", err)
+	}
+	if !validation.Valid || workflow.Name != state.WorkflowID {
+		return nil, fmt.Errorf("saved recovery workflow is invalid or no longer matches pipeline %q", state.RunID)
+	}
+	return workflow, nil
+}
+
+// A frozen definition establishes structural ownership at acceptance. Dynamic
+// scopes retain the executor's exact materialized hash check before any outcome
+// can be parsed, published, or consumed by downstream work on ordinary resume.
+func validateRecoveryWorkflowStep(workflow *Workflow, state *ExecutionState, stepID, kind, stepHash string, hashStep func(*Step) (string, error)) error {
+	step, err := recoveryWorkflowStep(workflow, stepID)
+	if err != nil {
+		return err
+	}
+	deferred := false
+	parent, parentID, fallback, err := recoveryFallbackParent(workflow, state, stepID)
+	if err != nil {
+		return err
+	}
+	if fallback {
+		step, _, err = recoveryStepDefinition(parentID, parent.OnFailure.Fallback, nil)
+		if err != nil {
+			return err
+		}
+		// Static fallback definitions must match immediately. Dynamic fields
+		// are reconstructed in their original runtime scope on resume, where
+		// executeAgentDelivery still requires the exact materialized hash.
+		definition, err := json.Marshal(step)
+		if err != nil {
+			return err
+		}
+		deferred = strings.Contains(string(definition), "${")
+	}
+	// Branch alternatives can share an authored child ID. The generic namespace
+	// resolver can then return a different alternative; only normal resume uses
+	// the durable selected branch and original variable scope to materialize it.
+	for id, result := range state.Steps {
+		if !isBranchDecisionID(id) {
+			continue
+		}
+		decision, err := decodeBranchDecision(id, result)
+		if err != nil {
+			return err
+		}
+		parent, err := recoveryWorkflowStep(workflow, decision.ParentID)
+		if err != nil {
+			continue
+		}
+		branch, exists := parent.Branches[decision.BranchKey]
+		if !exists {
+			continue
+		}
+		children, err := parseBranchSteps(branch, decision.ParentID, decision.BranchKey)
+		if err != nil {
+			return err
+		}
+		if _, _, owns := resolveScopedRuntimeStepFromSteps(decision.ParentID, stepID, children); owns && !fallback {
+			deferred = true
+		}
+	}
+	for parentID := range state.ForeachState {
+		parent, err := recoveryWorkflowStep(workflow, parentID)
+		if err != nil || (parent.Foreach == nil && parent.ForeachPane == nil) {
+			continue
+		}
+		if _, _, owns := resolveScopedRuntimeChildren(parentID, stepID, parent); owns && !fallback && iterationIndexFromID(stepID, parentID+"_iter") >= 0 {
+			deferred = true
+		}
+	}
+	if stepKind(step) != kind && !deferred {
+		return fmt.Errorf("step %q kind differs from its saved execution", stepID)
+	}
+	definition := cloneStep(*step)
+	definition.ID = stepID
+	hash, err := hashStep(&definition)
+	if err != nil {
+		return err
+	}
+	if hash == stepHash || deferred {
+		return nil
+	}
+	return fmt.Errorf("step %q definition differs from its saved execution", stepID)
+}
+
 func defaultResumeOptions() ResumeOptions {
 	return ResumeOptions{
 		Mode:           ResumeModeContinue,
@@ -133,7 +2316,29 @@ func defaultResumeOptions() ResumeOptions {
 	}
 }
 
+// Resume capacities belong to this attempt. Both detached preflight and the
+// executor use them without changing the frozen workflow or receipt identity.
+func resumeAttemptLimits(limits LimitsConfig, opts ResumeOptions) LimitsConfig {
+	limits = limits.EffectiveLimits()
+	if opts.MaxSelectorOutputBytesTotal > 0 {
+		limits.MaxSelectorOutputBytesTotal = opts.MaxSelectorOutputBytesTotal
+	}
+	if opts.MaxStepCountTotal > 0 {
+		limits.MaxStepCountTotal = opts.MaxStepCountTotal
+	}
+	if opts.MaxMaterializedStepNodes > 0 {
+		limits.MaxMaterializedStepNodes = opts.MaxMaterializedStepNodes
+	}
+	return limits
+}
+
 func normalizeResumeOptions(opts ResumeOptions) (ResumeOptions, error) {
+	if opts.MaxStepCountTotal < 0 || opts.MaxMaterializedStepNodes < 0 {
+		return opts, fmt.Errorf("max_step_count_total and max_materialized_step_nodes must not be negative")
+	}
+	if opts.MaxSelectorOutputBytesTotal < 0 {
+		return opts, fmt.Errorf("max_selector_output_bytes_total must not be negative")
+	}
 	if opts == (ResumeOptions{}) {
 		return defaultResumeOptions(), nil
 	}
@@ -192,9 +2397,114 @@ func (e *Executor) applyResumeOptions(workflow *Workflow, opts ResumeOptions) er
 		e.stateMu.RUnlock()
 		return fmt.Errorf("resume state is nil")
 	}
+	graph := e.graph
+	if graph == nil && workflow != nil {
+		graph = NewDependencyGraph(workflow)
+	}
+	if graph != nil {
+		if phaseErrors := graph.validatePhaseOwnership(state); len(phaseErrors) > 0 {
+			e.stateMu.RUnlock()
+			return phaseErrors[0]
+		}
+	}
 	checkpoint := resumeCheckpointTime(state)
+	if err := validateStepAdmissions(state.StepAdmissions); err != nil {
+		e.stateMu.RUnlock()
+		return err
+	}
 	priorSession := state.Session
 	targetSession := e.config.Session
+	if err := e.validateCommandEvaluationResumeLocked(workflow, state, opts); err != nil {
+		e.stateMu.RUnlock()
+		return err
+	}
+	// Check every record before interpreting an explicit restart. In particular,
+	// a future or corrupt status must not be erased and mistaken for permission
+	// to send the same prompt again.
+	for stepID, record := range state.AgentDeliveries {
+		if err := validateAgentDelivery(stepID, record, priorSession); err != nil {
+			e.stateMu.RUnlock()
+			return err
+		}
+		if record.ResolutionAction != "" {
+			if _, err := agentDeliveryRecoveryEntry(state, record); err != nil {
+				e.stateMu.RUnlock()
+				return err
+			}
+		}
+		if record.Status == agentDeliverySending && !resumeResetsAgentDelivery(state, opts, stepID) && workflow != nil {
+			_, _, fallback, err := recoveryFallbackParent(workflow, state, stepID)
+			if err != nil {
+				e.stateMu.RUnlock()
+				return err
+			}
+			if fallback {
+				// A fallback is dispatched after its parent has already failed.
+				// Stop before reopening that parent or rewriting its checkpoint;
+				// only an explicit receipt decision can resolve the delivery.
+				e.stateMu.RUnlock()
+				return fmt.Errorf("agent prompt delivery outcome is unknown for failure recovery %q; inspect the original pane and use pipeline recover %s to accept its exact receipt before continuing, or explicitly restart-failed or reset to authorize resending", stepID, state.RunID)
+			}
+		}
+		if targetSession != "" && priorSession != targetSession && !resumeResetsAgentDelivery(state, opts, stepID) {
+			e.stateMu.RUnlock()
+			return fmt.Errorf("agent delivery for step %q belongs to session %q; explicit reset is required before moving to session %q", stepID, priorSession, targetSession)
+		}
+	}
+	for stepID, record := range state.CommandExecutions {
+		if err := validateCommandExecution(stepID, record); err != nil {
+			e.stateMu.RUnlock()
+			return err
+		}
+		if record.ResolutionAction != "" {
+			if _, err := commandExecutionRecoveryEntry(state, record); err != nil {
+				e.stateMu.RUnlock()
+				return err
+			}
+			if targetSession != "" && priorSession != targetSession && !resumeResetsCommandExecution(state, opts, stepID) {
+				e.stateMu.RUnlock()
+				return fmt.Errorf("accepted command outcome for step %q belongs to session %q; explicit reset is required before moving to session %q", stepID, priorSession, targetSession)
+			}
+		}
+		if record.Status != commandExecutionSettled && !resumeResetsCommandExecution(state, opts, stepID) {
+			e.stateMu.RUnlock()
+			return uncertainCommandExecutionError(stepID, record.ProcessID)
+		}
+		if _, cleanup := resolveOnCancelRuntimeStep(workflow, stepID); cleanup && record.Status == commandExecutionSettled {
+			// Proven-settled cleanup belongs to the previous cancellation
+			// attempt. A resumed attempt can acquire resources again.
+			continue
+		}
+		if opts.KeepState && opts.Mode != ResumeModeForceIter &&
+			(record.Result.RerunOnResume || resumeResetsCommandExecution(state, opts, stepID)) {
+			if err := e.validateLeafReplayScopeLocked(workflow, state, stepID, StepKindCommand); err != nil {
+				e.stateMu.RUnlock()
+				return err
+			}
+		}
+	}
+	if opts.KeepState && opts.Mode == ResumeModeForceIter {
+		if err := validateForceResumeIteration(workflow, state, opts); err != nil {
+			e.stateMu.RUnlock()
+			return err
+		}
+	}
+	if err := e.validateLegacyAgentResumeLocked(state, opts, workflow); err != nil {
+		e.stateMu.RUnlock()
+		return err
+	}
+	if err := e.validateLegacyCommandResumeLocked(state, opts, workflow); err != nil {
+		e.stateMu.RUnlock()
+		return err
+	}
+	if err := e.validateMailSendResumeLocked(state, opts, workflow); err != nil {
+		e.stateMu.RUnlock()
+		return err
+	}
+	if err := e.validateReservationResumeLocked(state, opts, workflow); err != nil {
+		e.stateMu.RUnlock()
+		return err
+	}
 	e.stateMu.RUnlock()
 
 	if opts.MaxResumeAge > 0 && !checkpoint.IsZero() && time.Since(checkpoint) > opts.MaxResumeAge {
@@ -204,6 +2514,12 @@ func (e *Executor) applyResumeOptions(workflow *Workflow, opts ResumeOptions) er
 	if priorSession != "" && targetSession != "" && priorSession != targetSession && opts.OnRosterChange != ResumeRosterProceed {
 		return fmt.Errorf("resume state was captured for session %q but target session is %q; set OnRosterChange=proceed to override", priorSession, targetSession)
 	}
+	e.stateMu.Lock()
+	admissionErr := e.seedStepAdmissionsLocked(workflow, graph)
+	e.stateMu.Unlock()
+	if admissionErr != nil {
+		return admissionErr
+	}
 	if targetSession != "" && priorSession != targetSession && opts.OnRosterChange == ResumeRosterProceed {
 		e.stateMu.Lock()
 		if e.state != nil {
@@ -212,6 +2528,11 @@ func (e *Executor) applyResumeOptions(workflow *Workflow, opts ResumeOptions) er
 		e.stateMu.Unlock()
 	}
 
+	// Admission has accounted for legacy unfinished selectors. From this
+	// point every new evaluation uses the durable launch protocol.
+	e.stateMu.Lock()
+	e.state.CommandEvaluationVersion = commandEvaluationVersion
+	e.stateMu.Unlock()
 	if !opts.KeepState {
 		e.resetResumeState(workflow)
 		return nil
@@ -219,8 +2540,697 @@ func (e *Executor) applyResumeOptions(workflow *Workflow, opts ResumeOptions) er
 
 	if opts.Mode == ResumeModeForceIter {
 		e.forceResumeIteration(opts.StepID, opts.Iteration)
+	} else if opts.Mode == ResumeModeRestartFailed {
+		e.stateMu.Lock()
+		for stepID := range e.state.CommandEvaluations {
+			if !resumeResetsCommandEvaluation(e.state, opts, stepID) {
+				continue
+			}
+			// A recovery handler may have completed the enclosing selector.
+			// Explicit replay must reopen it as well as remove its receipt.
+			if e.state.Steps == nil {
+				e.state.Steps = make(map[string]StepResult)
+			}
+			e.state.Steps[stepID] = StepResult{StepID: stepID, Status: StatusPending}
+			delete(e.state.CommandEvaluations, stepID)
+		}
+		for stepID := range e.state.AgentDeliveries {
+			if resumeResetsAgentDelivery(e.state, opts, stepID) {
+				delete(e.state.AgentDeliveries, stepID)
+			}
+		}
+		for stepID := range e.state.CommandExecutions {
+			if resumeResetsCommandExecution(e.state, opts, stepID) {
+				// WaitNone records a synchronous Completed result while its
+				// process still runs. An explicit replay must reopen that leaf.
+				result := e.state.Steps[stepID]
+				result.StepID, result.Status = stepID, StatusPending
+				if e.state.Steps == nil {
+					e.state.Steps = make(map[string]StepResult)
+				}
+				e.state.Steps[stepID] = result
+				delete(e.state.CommandExecutions, stepID)
+			}
+		}
+		for stepID := range e.state.MailSends {
+			if resumeResetsMailSend(e.state, opts, stepID) {
+				// A failure handler can mark an uncertain send complete. An
+				// explicit replay must reopen the leaf as well as its receipt.
+				result := e.state.Steps[stepID]
+				result.StepID, result.Status = stepID, StatusPending
+				if e.state.Steps == nil {
+					e.state.Steps = make(map[string]StepResult)
+				}
+				e.state.Steps[stepID] = result
+				delete(e.state.MailSends, stepID)
+			}
+		}
+		for stepID := range e.state.ReservationSteps {
+			if resumeResetsReservationStep(e.state, opts, stepID) {
+				if e.state.Steps == nil {
+					e.state.Steps = make(map[string]StepResult)
+				}
+				e.state.Steps[stepID] = StepResult{StepID: stepID, Status: StatusPending}
+				delete(e.state.ReservationSteps, stepID)
+			}
+		}
+		e.stateMu.Unlock()
+	}
+	e.resetSettledOnCancelState(workflow)
+
+	return nil
+}
+
+// Resolve cleanup ownership structurally, including dynamic iterations and
+// success hooks. A prefix match could otherwise erase an unrelated main step
+// whose authored name happens to start with a cleanup step's ID.
+func resolveOnCancelRuntimeStep(workflow *Workflow, stepID string) (*Step, bool) {
+	if workflow == nil {
+		return nil, false
+	}
+	for i := range workflow.Steps {
+		main := &workflow.Steps[i]
+		if main.ID == stepID {
+			return nil, false
+		}
+		if _, _, mainOwned := resolveScopedRuntimeChildren(main.ID, stepID, main); mainOwned {
+			// Authored IDs can collide with another phase's materialized
+			// namespace. Preserve main-work evidence when ownership is ambiguous.
+			return nil, false
+		}
+	}
+	for i := range workflow.Settings.OnCancel {
+		step := &workflow.Settings.OnCancel[i]
+		rootID := step.ID
+		if rootID == "" {
+			rootID = fmt.Sprintf("on_cancel_%d", i+1)
+		}
+		if stepID == rootID {
+			return step, true
+		}
+		if child, _, ok := resolveScopedRuntimeChildren(rootID, stepID, step); ok {
+			return child, true
+		}
+	}
+	return nil, false
+}
+
+// Called only after resume preflight accepts all launch evidence. Successful
+// on_cancel commands must run again after a later cancellation, including
+// bodies behind completed parallel groups or foreach iteration watermarks.
+// Unsettled command receipts are never discarded here.
+func (e *Executor) resetSettledOnCancelState(workflow *Workflow) {
+	if workflow == nil || len(workflow.Settings.OnCancel) == 0 {
+		return
+	}
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	e.varMu.Lock()
+	defer e.varMu.Unlock()
+	owned := make(map[string]*Step)
+	collect := func(id string) {
+		if step, ok := resolveOnCancelRuntimeStep(workflow, id); ok {
+			owned[id] = step
+		}
+	}
+	for id := range e.state.Steps {
+		collect(id)
+	}
+	for id := range e.state.CommandExecutions {
+		collect(id)
+	}
+	for id := range e.state.CommandEvaluations {
+		collect(id)
+	}
+	for id := range e.state.AgentDeliveries {
+		collect(id)
+	}
+	for id := range e.state.MailSends {
+		collect(id)
+	}
+	for id := range e.state.ReservationSteps {
+		collect(id)
+	}
+	for id := range e.state.ForeachState {
+		collect(id)
+	}
+	for id := range e.state.ParallelState {
+		collect(id)
+	}
+	for id, step := range owned {
+		recovery, hasRecovery := e.state.AgentDeliveries[onFailureStepID(id)]
+		pendingRecovery := hasRecovery && recovery.Status != agentDeliveryCompleted && recovery.Status != agentDeliveryNotSent
+		if record, ok := e.state.CommandExecutions[id]; ok && record.Status == commandExecutionSettled && !pendingRecovery {
+			delete(e.state.CommandExecutions, id)
+		}
+		if record, ok := e.state.CommandEvaluations[id]; ok && commandEvaluationHasOutcome(record) {
+			delete(e.state.CommandEvaluations, id)
+		}
+		if record, ok := e.state.AgentDeliveries[id]; ok && record.Status == agentDeliveryCompleted {
+			delete(e.state.AgentDeliveries, id)
+		}
+		if record, ok := e.state.MailSends[id]; ok && record.Status != mailSendSending {
+			delete(e.state.MailSends, id)
+		}
+		if record, ok := e.state.ReservationSteps[id]; ok && (record.Status == reservationReleased || record.Status == reservationRejected) {
+			delete(e.state.ReservationSteps, id)
+		}
+		delete(e.state.Steps, id)
+		delete(e.state.ForeachState, id)
+		delete(e.state.ParallelState, id)
+		delete(e.state.InFlightSteps, id)
+		delete(e.state.Variables, "steps."+id+".output")
+		delete(e.state.Variables, "steps."+id+".data")
+		if step.OutputVar != "" {
+			delete(e.state.Variables, step.OutputVar)
+			delete(e.state.Variables, step.OutputVar+"_parsed")
+		}
+	}
+}
+
+// A crash midway through finalization adopts the completed tail. If resume
+// reopens actual main work, its old handoff/cleanup belongs to the previous
+// attempt and must run again after the new work. Inspect top-level roots,
+// because a completed container may retain unmarked child graph placeholders.
+// Admission has already validated launch evidence; unfinished receipts are
+// deliberately retained even when the surrounding tail bookkeeping is reset.
+func (e *Executor) resetPostPipelineForMainAttempt(workflow *Workflow) {
+	if workflow == nil || len(workflow.PostPipelineSteps) == 0 || e.graph == nil {
+		return
+	}
+	reopensMain := false
+	for _, step := range workflow.Steps {
+		if !e.graph.IsExecuted(step.ID) {
+			reopensMain = true
+			break
+		}
+	}
+	if !reopensMain {
+		return
+	}
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	e.varMu.Lock()
+	defer e.varMu.Unlock()
+	owned := make(map[string]*Step)
+	collect := func(id string) {
+		if step, ok := e.graph.resolvePostPipelineRuntimeStep(id); ok {
+			owned[id] = step
+		}
+	}
+	for id := range e.state.Steps {
+		collect(id)
+	}
+	for id := range e.state.CommandExecutions {
+		collect(id)
+	}
+	for id := range e.state.CommandEvaluations {
+		collect(id)
+	}
+	for id := range e.state.AgentDeliveries {
+		collect(id)
+	}
+	for id := range e.state.MailSends {
+		collect(id)
+	}
+	for id := range e.state.ReservationSteps {
+		collect(id)
+	}
+	for id := range e.state.ForeachState {
+		collect(id)
+	}
+	for id := range e.state.ParallelState {
+		collect(id)
+	}
+	for id := range e.state.InFlightSteps {
+		collect(id)
+	}
+	for id, step := range owned {
+		recovery, hasRecovery := e.state.AgentDeliveries[onFailureStepID(id)]
+		pendingRecovery := hasRecovery && recovery.Status != agentDeliveryCompleted && recovery.Status != agentDeliveryNotSent
+		if record, ok := e.state.CommandExecutions[id]; ok && record.Status == commandExecutionSettled && !pendingRecovery {
+			delete(e.state.CommandExecutions, id)
+		}
+		if record, ok := e.state.CommandEvaluations[id]; ok && commandEvaluationHasOutcome(record) {
+			delete(e.state.CommandEvaluations, id)
+		}
+		if record, ok := e.state.AgentDeliveries[id]; ok && record.Status == agentDeliveryCompleted {
+			delete(e.state.AgentDeliveries, id)
+		}
+		if record, ok := e.state.MailSends[id]; ok && record.Status != mailSendSending {
+			delete(e.state.MailSends, id)
+		}
+		if record, ok := e.state.ReservationSteps[id]; ok && (record.Status == reservationReleased || record.Status == reservationRejected) {
+			delete(e.state.ReservationSteps, id)
+		}
+		delete(e.state.Steps, id)
+		delete(e.state.ForeachState, id)
+		delete(e.state.ParallelState, id)
+		delete(e.state.InFlightSteps, id)
+		delete(e.state.Variables, "steps."+id+".output")
+		delete(e.state.Variables, "steps."+id+".data")
+		if step.OutputVar != "" {
+			delete(e.state.Variables, step.OutputVar)
+			delete(e.state.Variables, step.OutputVar+"_parsed")
+		}
+	}
+}
+
+// validateForceResumeIteration checks the replay scope before any checkpoint
+// or session mutation. A forced suffix authorizes iteration replay, not reuse
+// of downstream results produced from the old loop output, nor automatic
+// redispatch of those consumers. Such recovery needs an explicit whole-run
+// reset. The caller holds stateMu for the supplied state.
+func validateForceResumeIteration(workflow *Workflow, state *ExecutionState, opts ResumeOptions) error {
+	if workflow == nil {
+		return fmt.Errorf("force-iter requires a workflow")
+	}
+	var target *Step
+	for i := range workflow.Steps {
+		if workflow.Steps[i].ID == opts.StepID {
+			target = &workflow.Steps[i]
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("force-iter requires a top-level iteration step; %q is not one", opts.StepID)
+	}
+	if target.Foreach == nil && target.ForeachPane == nil && (target.Loop == nil || target.Loop.Items == "") {
+		return fmt.Errorf("force-iter step %q must use foreach, foreach_pane, or loop.items; while/times loops have no durable iteration cursor", opts.StepID)
+	}
+	if prior, ok := state.ForeachState[opts.StepID]; ok {
+		if prior.StepID != "" && prior.StepID != opts.StepID {
+			return fmt.Errorf("force-iter checkpoint for %q names a different step %q", opts.StepID, prior.StepID)
+		}
+		if prior.Total <= 0 || opts.Iteration >= prior.Total {
+			return fmt.Errorf("force-iter iteration %d is outside the %d recorded iterations for %q", opts.Iteration, prior.Total, opts.StepID)
+		}
+	} else if opts.Iteration != 0 {
+		return fmt.Errorf("force-iter step %q has no recorded iterations; only iteration 0 can restart an unstarted loop", opts.StepID)
+	}
+	if _, recorded := state.AgentDeliveries[opts.StepID]; recorded {
+		return fmt.Errorf("force-iter step %q has a leaf agent-delivery receipt; inspect it before an explicit reset", opts.StepID)
+	}
+	if _, recorded := state.CommandExecutions[opts.StepID]; recorded {
+		return fmt.Errorf("force-iter step %q has a leaf command-execution receipt; inspect it before an explicit reset", opts.StepID)
+	}
+	if _, recorded := state.MailSends[opts.StepID]; recorded {
+		return fmt.Errorf("force-iter step %q has a leaf mail-send receipt; inspect it before an explicit reset", opts.StepID)
+	}
+	if _, recorded := state.ReservationSteps[opts.StepID]; recorded {
+		return fmt.Errorf("force-iter step %q has a leaf reservation receipt; inspect it before an explicit reset", opts.StepID)
+	}
+	for _, step := range workflow.Steps {
+		if iterationIndexFromID(step.ID, opts.StepID+"_iter") >= opts.Iteration {
+			return fmt.Errorf("force-iter namespace for %q overlaps top-level step %q; refusing to discard unrelated work", opts.StepID, step.ID)
+		}
 	}
 
+	// Dependency edges are structural and independent of the live scheduler.
+	// Build from the supplied workflow so detached-worker preflight (before an
+	// executor graph exists) enforces the same boundary as foreground resume.
+	graph := NewDependencyGraph(workflow)
+	seen := map[string]bool{opts.StepID: true}
+	consumerSet := make(map[string]bool)
+	queue := []string{opts.StepID}
+	var consumers []string
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		for _, dependent := range graph.GetDependents(id) {
+			if seen[dependent] {
+				continue
+			}
+			seen[dependent] = true
+			queue = append(queue, dependent)
+			// A dependency declared in a nested body belongs to its owning
+			// top-level container's runtime namespace, not the authored child
+			// name. Inspect that container and follow its consumers as well.
+			owner := dependent
+			owners := make(map[string]bool)
+			for graph.container[owner] != "" {
+				if owners[owner] {
+					return fmt.Errorf("force-iter dependency %q has ambiguous container ownership", dependent)
+				}
+				owners[owner] = true
+				owner = graph.container[owner]
+			}
+			if owner == opts.StepID {
+				continue
+			}
+			if !consumerSet[owner] {
+				consumerSet[owner] = true
+				consumers = append(consumers, owner)
+			}
+			if !seen[owner] {
+				seen[owner] = true
+				queue = append(queue, owner)
+			}
+		}
+	}
+	sort.Strings(consumers)
+	for _, consumer := range consumers {
+		if hasRuntimeCheckpoint(state.Steps, consumer) ||
+			hasRuntimeCheckpoint(state.AgentDeliveries, consumer) ||
+			hasRuntimeCheckpoint(state.CommandExecutions, consumer) ||
+			hasRuntimeCheckpoint(state.CommandEvaluations, consumer) ||
+			hasRuntimeCheckpoint(state.MailSends, consumer) ||
+			hasRuntimeCheckpoint(state.ReservationSteps, consumer) ||
+			hasRuntimeCheckpoint(state.InFlightSteps, consumer) ||
+			hasRuntimeCheckpoint(state.ForeachState, consumer) ||
+			hasRuntimeCheckpoint(state.ParallelState, consumer) {
+			return fmt.Errorf("force-iter step %q has downstream recovery evidence for %q; inspect that work and use an explicit reset instead of retaining stale dependent results", opts.StepID, consumer)
+		}
+	}
+	return nil
+}
+
+// A consumer's nested runtime work is evidence even when the containing step
+// has not checkpointed a result. Ambiguous textual overlaps only refuse replay;
+// they never authorize deleting another step's receipts.
+func hasRuntimeCheckpoint[T any](entries map[string]T, root string) bool {
+	for id := range entries {
+		if id == root || strings.HasPrefix(id, root+"_") || strings.HasPrefix(id, root+".") {
+			return true
+		}
+	}
+	return false
+}
+
+func resumeResetsAgentDelivery(state *ExecutionState, opts ResumeOptions, stepID string) bool {
+	if !opts.KeepState {
+		return true
+	}
+	switch opts.Mode {
+	case ResumeModeRestartFailed:
+		// The receipt may reach disk before the containing step checkpoints its
+		// result or clears its in-flight marker. Its completion is authoritative.
+		if record, ok := state.AgentDeliveries[stepID]; ok && record.Status == agentDeliveryCompleted {
+			return false
+		}
+		if _, inFlight := state.InFlightSteps[stepID]; inFlight {
+			return true
+		}
+		switch state.Steps[stepID].Status {
+		case StatusFailed, StatusCancelled, StatusRunning, StatusPending:
+			return true
+		}
+	case ResumeModeForceIter:
+		return iterationIndexFromID(stepID, opts.StepID+"_iter") >= opts.Iteration
+	}
+	return false
+}
+
+func resumeResetsCommandExecution(state *ExecutionState, opts ResumeOptions, stepID string) bool {
+	if !opts.KeepState {
+		return true
+	}
+	switch opts.Mode {
+	case ResumeModeForceIter:
+		return iterationIndexFromID(stepID, opts.StepID+"_iter") >= opts.Iteration
+	case ResumeModeRestartFailed:
+		if record, ok := state.CommandExecutions[stepID]; ok {
+			if record.Status != commandExecutionSettled || record.Result.RerunOnResume {
+				return true
+			}
+			if record.Result.Status == StatusCompleted {
+				return false
+			}
+		}
+		if _, ok := state.InFlightSteps[stepID]; ok {
+			return true
+		}
+		if result, ok := state.Steps[stepID]; ok {
+			return shouldRerunStep(result)
+		}
+	}
+	return false
+}
+
+// Resume must classify dynamic children against the durable branch selection.
+// Alternative bodies may reuse a runtime ID for different step kinds; choosing
+// the first alternative can turn a recorded command into an unfinished prompt.
+func resumeRuntimeStepResolver(graph *DependencyGraph, state *ExecutionState) (func(string) (*Step, bool), error) {
+	type selectedBranch struct {
+		parentID string
+		steps    []Step
+	}
+	var selected []selectedBranch
+	resolve := func(id string) (*Step, bool) {
+		if graph == nil {
+			return nil, false
+		}
+		if step, ok := graph.GetStep(id); ok {
+			return step, true
+		}
+		// Alternatives may reuse child IDs with different kinds. Prefer the
+		// durable selected body, from the innermost recorded branch outward.
+		for i := len(selected) - 1; i >= 0; i-- {
+			if child, _, ok := resolveScopedRuntimeStepFromSteps(selected[i].parentID, id, selected[i].steps); ok {
+				return child, true
+			}
+		}
+		step, _, ok := graph.ResolveScopedRuntimeStep(id)
+		return step, ok
+	}
+	if graph == nil || state == nil {
+		return resolve, nil
+	}
+	decisionIDs := make([]string, 0)
+	for id := range state.Steps {
+		if isBranchDecisionID(id) {
+			decisionIDs = append(decisionIDs, id)
+		}
+	}
+	sort.Slice(decisionIDs, func(i, j int) bool {
+		if len(decisionIDs[i]) != len(decisionIDs[j]) {
+			return len(decisionIDs[i]) < len(decisionIDs[j])
+		}
+		return decisionIDs[i] < decisionIDs[j]
+	})
+	for _, id := range decisionIDs {
+		decision, err := decodeBranchDecision(id, state.Steps[id])
+		if err != nil {
+			return nil, err
+		}
+		parent, ok := resolve(decision.ParentID)
+		if !ok {
+			continue
+		}
+		branch, ok := parent.Branches[decision.BranchKey]
+		if !ok {
+			continue
+		}
+		children, err := parseBranchSteps(branch, decision.ParentID, decision.BranchKey)
+		if err != nil {
+			return nil, err
+		}
+		selected = append(selected, selectedBranch{parentID: decision.ParentID, steps: children})
+	}
+	return resolve, nil
+}
+
+// Replaying a leaf must not silently retain a completed container/iteration
+// that prevents the scheduler from ever reaching it. Nor may a leaf-only
+// restart implicitly invalidate dependent work already produced by that
+// container. Existing force-iter and whole-run reset provide those explicit
+// replay scopes. Validate before deleting any launch evidence.
+func (e *Executor) validateLeafReplayScopeLocked(workflow *Workflow, state *ExecutionState, stepID, kind string) error {
+	if workflow == nil {
+		return fmt.Errorf("%s replay requires its saved workflow", kind)
+	}
+	for i := range workflow.Steps {
+		if workflow.Steps[i].ID == stepID && stepKind(&workflow.Steps[i]) == kind {
+			return nil // An independently scheduled leaf.
+		}
+	}
+	refuse := func(container string) error {
+		return fmt.Errorf("cannot replay %s %q independently of completed or unscheduled container %q; inspect the old %s and its effects, then use --mode=force-iter for a containing top-level iteration or --keep-state=false to deliberately repeat the whole workflow", kind, stepID, container, kind)
+	}
+	graph := e.graph
+	if graph == nil {
+		graph = NewDependencyGraph(workflow)
+	}
+	resolve, err := resumeRuntimeStepResolver(graph, state)
+	if err != nil {
+		return err
+	}
+	if step, ok := resolve(stepID); !ok || stepKind(step) != kind {
+		// An unknown or differently typed leaf cannot be independently replayed.
+		return refuse(stepID)
+	}
+	for parentID, result := range state.Steps {
+		if shouldRerunStep(result) {
+			continue
+		}
+		parent, ok := resolve(parentID)
+		if !ok {
+			continue
+		}
+		if _, _, owns := resolveScopedRuntimeChildren(parentID, stepID, parent); owns {
+			return refuse(parentID)
+		}
+	}
+	for parentID, progress := range state.ForeachState {
+		iterationID, ok := scopedRuntimeOrdinal(stepID, parentID+"_iter", 0)
+		if !ok || !strings.HasPrefix(stepID, iterationID+"_") {
+			continue
+		}
+		for _, completed := range progress.CompletedIterationIDs {
+			if completed == iterationID {
+				return refuse(iterationID)
+			}
+		}
+		lastRound := progress.CompletedRounds[iterationID]
+		parent, ok := resolve(parentID)
+		if !ok || lastRound <= 0 {
+			continue
+		}
+		for _, config := range []*ForeachConfig{parent.Foreach, parent.ForeachPane} {
+			if config == nil {
+				continue
+			}
+			body, err := foreachBodySteps(parent, config)
+			if err != nil {
+				return refuse(parentID)
+			}
+			for i, child := range body {
+				name := child.ID
+				if name == "" {
+					name = fmt.Sprintf("step%d", i)
+				}
+				prefix := iterationID + "_" + name + "_round"
+				roundID, ok := scopedRuntimeOrdinal(stepID, prefix, 1)
+				if ok {
+					round, _ := strconv.Atoi(strings.TrimPrefix(roundID, prefix))
+					if round <= lastRound {
+						return refuse(roundID)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// resumeCancelledBeforeDispatch recognizes affirmative scheduler or admission
+// evidence that a child never entered its executor. Generic cancellation, zero attempts, and
+// human-readable reasons cannot establish this on their own. Callers validate
+// existing execution receipts independently before considering missing journals.
+// The caller holds stateMu.
+func resumeCancelledBeforeDispatch(state *ExecutionState, stepID string) bool {
+	result, exists := state.Steps[stepID]
+	if !exists || result.StepID != stepID || result.Attempts != 0 || result.RerunOnResume {
+		return false
+	}
+	if !(result.Status == StatusCancelled && result.SkipKind == SkipKindCancelledBeforeDispatch) &&
+		!(result.Status == StatusFailed && result.SkipKind == SkipKindAdmissionDenied) {
+		return false
+	}
+	_, inFlight := state.InFlightSteps[stepID]
+	return !inFlight
+}
+
+// A legacy scheduler outcome does not prove the command group stopped. Older
+// waiters could return failed/cancelled while descendants were still executing,
+// and a background rerun marker carries no stronger settlement evidence. Without
+// a journal, these launches need the same explicit replay decision as unresolved
+// receipts. Proven-settled failures retain ordinary retry semantics above.
+// The caller holds stateMu.
+func (e *Executor) validateLegacyCommandResumeLocked(state *ExecutionState, opts ResumeOptions, workflow *Workflow) error {
+	if !opts.KeepState {
+		return nil
+	}
+	graph := e.graph
+	if graph == nil && workflow != nil {
+		graph = NewDependencyGraph(workflow)
+	}
+	resolve, err := resumeRuntimeStepResolver(graph, state)
+	if err != nil {
+		return err
+	}
+	unfinished := make(map[string]bool)
+	for stepID := range state.InFlightSteps {
+		unfinished[stepID] = true
+	}
+	for stepID, result := range state.Steps {
+		switch result.Status {
+		case StatusFailed, StatusCancelled, StatusRunning, StatusPending:
+			unfinished[stepID] = true
+		}
+		if result.RerunOnResume {
+			unfinished[stepID] = true
+		}
+	}
+	for stepID := range unfinished {
+		if _, recorded := state.CommandExecutions[stepID]; recorded || resumeResetsCommandExecution(state, opts, stepID) {
+			continue
+		}
+		if resumeCancelledBeforeDispatch(state, stepID) {
+			continue
+		}
+		command := state.InFlightSteps[stepID].Kind == StepKindCommand || state.Steps[stepID].AgentType == "command"
+		if step, ok := resolve(stepID); ok {
+			command = command || stepKind(step) == StepKindCommand
+		}
+		if command {
+			return uncertainCommandExecutionError(stepID, 0)
+		}
+	}
+	return nil
+}
+
+// The caller holds stateMu. Legacy checkpoints have no way to distinguish a
+// delivered prompt from work that never reached tmux. Only an explicit restart
+// can authorize redispatch of a known unfinished agent leaf without a receipt.
+func (e *Executor) validateLegacyAgentResumeLocked(state *ExecutionState, opts ResumeOptions, workflow *Workflow) error {
+	if !opts.KeepState {
+		return nil
+	}
+	graph := e.graph
+	if graph == nil && workflow != nil {
+		// Detached resume preflight precedes executor graph construction.
+		// Classify against the same workflow there instead of silently
+		// bypassing the missing-delivery guard until after worker launch.
+		graph = NewDependencyGraph(workflow)
+	}
+	if graph == nil {
+		return nil
+	}
+	resolve, err := resumeRuntimeStepResolver(graph, state)
+	if err != nil {
+		return err
+	}
+	unfinished := make(map[string]bool)
+	for stepID, result := range state.Steps {
+		switch result.Status {
+		case StatusFailed, StatusCancelled, StatusRunning, StatusPending:
+			unfinished[stepID] = true
+		}
+	}
+	for stepID := range state.InFlightSteps {
+		unfinished[stepID] = true
+	}
+	for stepID := range unfinished {
+		if _, recorded := state.AgentDeliveries[stepID]; recorded || resumeResetsAgentDelivery(state, opts, stepID) {
+			continue
+		}
+		if resumeCancelledBeforeDispatch(state, stepID) {
+			continue
+		}
+		step, ok := resolve(stepID)
+		// A changed/ambiguous runtime namespace must not erase explicit
+		// evidence that the old execution dispatched agent work. The saved
+		// kind is independent of the current workflow's interpretation.
+		kind := state.InFlightSteps[stepID].Kind
+		agentWork := kind == StepKindPrompt || kind == StepKindTemplate
+		if ok {
+			agentWork = agentWork || stepKind(step) == StepKindPrompt || stepKind(step) == StepKindTemplate
+		}
+		if agentWork {
+			return fmt.Errorf("unfinished agent step %q has no durable delivery evidence; use an explicit restart-failed or reset to authorize resending", stepID)
+		}
+	}
 	return nil
 }
 
@@ -235,6 +3245,11 @@ func (e *Executor) resetResumeState(workflow *Workflow) {
 	e.state.ParallelState = nil
 	e.state.ScopeStack = nil
 	e.state.InFlightSteps = nil
+	e.state.AgentDeliveries = nil
+	e.state.CommandExecutions = nil
+	e.state.CommandEvaluations = nil
+	e.state.MailSends = nil
+	e.state.ReservationSteps = nil
 	e.state.CurrentStep = ""
 	e.state.Errors = nil
 	e.stateMu.Unlock()
@@ -274,12 +3289,17 @@ func clearWorkflowStepVariables(vars map[string]interface{}, workflow *Workflow)
 			if step.ForeachPane != nil {
 				walk(step.ForeachPane.Steps)
 			}
+			walk(step.OnSuccess)
 		}
 	}
 	walk(workflow.Steps)
+	walk(workflow.PostPipelineSteps)
 }
 
 func (e *Executor) forceResumeIteration(stepID string, iteration int) {
+	if strings.TrimSpace(stepID) == "" || iteration < 0 {
+		return
+	}
 	var prunedStepIDs []string
 	e.stateMu.Lock()
 	if e.state == nil {
@@ -293,6 +3313,10 @@ func (e *Executor) forceResumeIteration(stepID string, iteration int) {
 	state.StepID = stepID
 	state.CurrentIteration = iteration
 	state.CompletedIterationIDs = filterCompletedIterationsBefore(state.CompletedIterationIDs, stepID, iteration)
+	prefix := fmt.Sprintf("%s_iter", stepID)
+	// A forced iteration must restart its rounds too. Otherwise max_rounds
+	// can skip every round even after its StepResults have been removed.
+	removeIterationEntries(state.CompletedRounds, prefix, iteration)
 	// bd-t3q8a: sequential foreach (loops.go) appends collected outputs in
 	// iteration order, so truncating to length=iteration drops the entries
 	// for the iterations that are about to rerun. Without this, the
@@ -303,14 +3327,25 @@ func (e *Executor) forceResumeIteration(stepID string, iteration int) {
 	}
 	state.UpdatedAt = time.Now()
 	e.state.ForeachState[stepID] = state
+	// Reopen the containing scheduler node as well as its iteration suffix.
+	// Keeping a completed parent result would make applyResumeState mark the
+	// whole loop executed and silently skip the requested replay.
+	delete(e.state.Steps, stepID)
+	delete(e.state.InFlightSteps, stepID)
+	prunedStepIDs = append(prunedStepIDs, stepID)
 
-	prefix := fmt.Sprintf("%s_iter", stepID)
-	for id := range e.state.Steps {
-		if iterationIndexFromID(id, prefix) >= iteration {
-			delete(e.state.Steps, id)
-			prunedStepIDs = append(prunedStepIDs, id)
-		}
-	}
+	// All iteration-local checkpoints participate in the rewind. Nested
+	// loops and parallel groups otherwise restore stale completion markers;
+	// receipts and in-flight markers can exist before any StepResult does.
+	prunedStepIDs = append(prunedStepIDs, removeIterationEntries(e.state.Steps, prefix, iteration)...)
+	prunedStepIDs = append(prunedStepIDs, removeIterationEntries(e.state.AgentDeliveries, prefix, iteration)...)
+	prunedStepIDs = append(prunedStepIDs, removeIterationEntries(e.state.CommandExecutions, prefix, iteration)...)
+	prunedStepIDs = append(prunedStepIDs, removeIterationEntries(e.state.CommandEvaluations, prefix, iteration)...)
+	prunedStepIDs = append(prunedStepIDs, removeIterationEntries(e.state.MailSends, prefix, iteration)...)
+	prunedStepIDs = append(prunedStepIDs, removeIterationEntries(e.state.ReservationSteps, prefix, iteration)...)
+	prunedStepIDs = append(prunedStepIDs, removeIterationEntries(e.state.InFlightSteps, prefix, iteration)...)
+	prunedStepIDs = append(prunedStepIDs, removeIterationEntries(e.state.ParallelState, prefix, iteration)...)
+	prunedStepIDs = append(prunedStepIDs, removeIterationEntries(e.state.ForeachState, prefix, iteration)...)
 	e.stateMu.Unlock()
 
 	// bd-a3fwf: deleting StepResults is not enough — Substitutor.resolveSteps
@@ -325,22 +3360,49 @@ func (e *Executor) forceResumeIteration(stepID string, iteration int) {
 	// can be invoked before the workflow graph is rebuilt (and in unit tests
 	// the graph is never set), and the executor helper would NPE on
 	// e.graph.GetStep(id) in those cases.
-	if len(prunedStepIDs) > 0 {
-		e.varMu.Lock()
-		if e.state != nil && e.state.Variables != nil {
-			for _, id := range prunedStepIDs {
-				delete(e.state.Variables, "steps."+id+".output")
-				delete(e.state.Variables, "steps."+id+".data")
-				if e.graph != nil {
-					if step, ok := e.graph.GetStep(id); ok && step.OutputVar != "" {
+	e.varMu.Lock()
+	if e.state != nil && e.state.Variables != nil {
+		// Flat output keys may survive a checkpoint without a StepResult.
+		// Scan them independently rather than relying on prunedStepIDs alone.
+		for key := range e.state.Variables {
+			if !strings.HasPrefix(key, "steps.") {
+				continue
+			}
+			id := strings.TrimPrefix(key, "steps.")
+			switch {
+			case strings.HasSuffix(id, ".output"):
+				id = strings.TrimSuffix(id, ".output")
+			case strings.HasSuffix(id, ".data"):
+				id = strings.TrimSuffix(id, ".data")
+			default:
+				continue
+			}
+			if iterationIndexFromID(id, prefix) >= iteration {
+				delete(e.state.Variables, key)
+				prunedStepIDs = append(prunedStepIDs, id)
+			}
+		}
+		for _, id := range prunedStepIDs {
+			delete(e.state.Variables, "steps."+id+".output")
+			delete(e.state.Variables, "steps."+id+".data")
+			if e.graph != nil {
+				step, ok := e.graph.GetStep(id)
+				if !ok {
+					step, _, ok = e.graph.ResolveScopedRuntimeStep(id)
+				}
+				if ok {
+					if step.OutputVar != "" {
 						delete(e.state.Variables, step.OutputVar)
 						delete(e.state.Variables, step.OutputVar+"_parsed")
+					}
+					if step.Loop != nil && step.Loop.Collect != "" {
+						delete(e.state.Variables, step.Loop.Collect)
 					}
 				}
 			}
 		}
-		e.varMu.Unlock()
 	}
+	e.varMu.Unlock()
 }
 
 func filterCompletedIterationsBefore(ids []string, stepID string, iteration int) []string {
@@ -362,7 +3424,9 @@ func iterationIndexFromID(id, prefix string) int {
 	rest := strings.TrimPrefix(id, prefix)
 	for i, r := range rest {
 		if r < '0' || r > '9' {
-			if i == 0 {
+			// Runtime descendants are separated with underscores. An arbitrary
+			// textual suffix may instead name an unrelated workflow step.
+			if i == 0 || r != '_' {
 				return -1
 			}
 			var idx int
@@ -377,6 +3441,24 @@ func iterationIndexFromID(id, prefix string) int {
 		return -1
 	}
 	return idx
+}
+
+// removeIterationEntries clears a suffix of a loop's runtime namespace while
+// preserving prior iterations and unrelated work. Callers hold the lock that
+// protects entries. Returning the removed IDs also permits output-var cleanup
+// for checkpoints that have no corresponding StepResult yet.
+func removeIterationEntries[T any](entries map[string]T, prefix string, iteration int) []string {
+	if iteration < 0 {
+		return nil
+	}
+	var removed []string
+	for id := range entries {
+		if iterationIndexFromID(id, prefix) >= iteration {
+			delete(entries, id)
+			removed = append(removed, id)
+		}
+	}
+	return removed
 }
 
 func (e *Executor) markStepInFlight(stepID, kind string, iteration int) {
@@ -460,10 +3542,11 @@ func computeForeachItemsFingerprint(items []interface{}) string {
 // verifyForeachItemsFingerprint compares the supplied fingerprint against
 // the one persisted on prior foreach state. Returns nil if no prior state
 // exists, the fingerprints match, or there is no recorded fingerprint
-// (legacy state files predate this field). Returns an error when the prior
-// run completed at least one iteration with a fingerprint that no longer
-// matches — that is the unsafe-resume case where iteration N's completion
-// record applies to a different items[N] than the resume sees.
+// (legacy state files predate this field). Any iteration-local progress binds
+// the items, not just whole-iteration completion: interrupted rounds, nested
+// checkpoints and dispatch receipts can all predate the first completed
+// iteration. Reusing them against changed items would skip work or attribute
+// an earlier dispatch to a different item.
 func (e *Executor) verifyForeachItemsFingerprint(stepID, fingerprint string) error {
 	e.stateMu.RLock()
 	defer e.stateMu.RUnlock()
@@ -474,14 +3557,39 @@ func (e *Executor) verifyForeachItemsFingerprint(stepID, fingerprint string) err
 	if !ok {
 		return nil
 	}
-	if prior.ItemsFingerprint == "" || len(prior.CompletedIterationIDs) == 0 {
+	if prior.ItemsFingerprint == "" || prior.ItemsFingerprint == fingerprint {
 		return nil
 	}
-	if prior.ItemsFingerprint == fingerprint {
+	prefix := fmt.Sprintf("%s_iter", stepID)
+	hasProgress := len(prior.CompletedIterationIDs) > 0 ||
+		len(prior.CompletedRounds) > 0 || len(prior.CollectedOutputs) > 0 ||
+		hasIterationEntries(e.state.Steps, prefix) ||
+		hasIterationEntries(e.state.AgentDeliveries, prefix) ||
+		hasIterationEntries(e.state.CommandExecutions, prefix) ||
+		hasIterationEntries(e.state.CommandEvaluations, prefix) ||
+		hasIterationEntries(e.state.MailSends, prefix) ||
+		hasIterationEntries(e.state.ReservationSteps, prefix) ||
+		hasIterationEntries(e.state.InFlightSteps, prefix) ||
+		hasIterationEntries(e.state.ForeachState, prefix) ||
+		hasIterationEntries(e.state.ParallelState, prefix)
+	if !hasProgress {
 		return nil
 	}
-	return fmt.Errorf("foreach %q items changed since prior run (completed=%d, prior_fingerprint=%s, current_fingerprint=%s); resume would apply old iteration records to different items",
-		stepID, len(prior.CompletedIterationIDs), prior.ItemsFingerprint[:12], fingerprint[:12])
+	// Precision bounds diagnostics without slicing unchecked checkpoint data.
+	// A corrupt/short fingerprint must produce an error, not panic on resume.
+	return fmt.Errorf("foreach %q items changed since prior run (completed=%d, prior_fingerprint=%.12s, current_fingerprint=%.12s); resume would apply old iteration records to different items",
+		stepID, len(prior.CompletedIterationIDs), prior.ItemsFingerprint, fingerprint)
+}
+
+// hasIterationEntries recognizes only this loop's runtime namespace. Callers
+// hold the read lock protecting entries; unrelated steps do not bind its items.
+func hasIterationEntries[T any](entries map[string]T, prefix string) bool {
+	for id := range entries {
+		if iterationIndexFromID(id, prefix) >= 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // appendForeachCollectedOutput persists a single loop.Collect output for

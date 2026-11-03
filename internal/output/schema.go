@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/Dicklesworthstone/ntm/internal/spawnidentity"
 )
 
 // ErrorResponse is the standard JSON error format
@@ -93,11 +94,15 @@ type PaneResponse struct {
 	ContextLimit   int     `json:"context_limit,omitempty"`
 	ContextPercent float64 `json:"context_percent,omitempty"`
 	ContextModel   string  `json:"context_model,omitempty"`
+	// ContextSource says how the context reading was taken: "status_bar"
+	// (the agent's own gauge), "transcript" (the agent's session transcript)
+	// or "scrollback_estimate" (a guess from what is still on screen).
+	ContextSource string `json:"context_source,omitempty"`
 }
 
 // AgentCountsResponse is the standard format for agent counts.
 //
-// Real agent types (claude/codex/gemini/cursor/windsurf/aider/opencode/
+// Real agent types (claude/codex/gemini/cursor/windsurf/aider/opencode/omp/
 // ollama) always emit even at 0 so consumers see a stable schema across
 // sessions. Only the metadata categories (user, other) use `omitempty` —
 // they're not agents per se, just fallback buckets.
@@ -112,6 +117,7 @@ type AgentCountsResponse struct {
 	Windsurf    int `json:"windsurf"`
 	Aider       int `json:"aider"`
 	Opencode    int `json:"opencode"`
+	Omp         int `json:"omp"`
 	User        int `json:"user,omitempty"`
 	Other       int `json:"other,omitempty"`
 	Total       int `json:"total"`
@@ -119,17 +125,9 @@ type AgentCountsResponse struct {
 
 // StaggerConfig represents stagger settings in spawn response
 type StaggerConfig struct {
-	Enabled    bool  `json:"enabled"`
-	IntervalMs int64 `json:"interval_ms,omitempty"`
-}
-
-// AgentMailSpawnStatus represents Agent Mail registration status for a spawn operation
-type AgentMailSpawnStatus struct {
-	Available         bool              `json:"available"`
-	ProjectRegistered bool              `json:"project_registered"`
-	AgentsRegistered  int               `json:"agents_registered"`
-	AgentsFailed      int               `json:"agents_failed"`
-	AgentMap          map[string]string `json:"agent_map,omitempty"` // stable %pane_id -> agent name
+	Enabled    bool   `json:"enabled"`
+	Mode       string `json:"mode,omitempty"` // fixed, smart, or legacy (bare --stagger)
+	IntervalMs int64  `json:"interval_ms,omitempty"`
 }
 
 // RecoverySpawnStatus reports whether configured session recovery produced
@@ -140,23 +138,42 @@ type RecoverySpawnStatus struct {
 	Partial   bool     `json:"partial"`
 	ErrorCode string   `json:"error_code,omitempty"`
 	Warnings  []string `json:"warnings"`
+	// HandoffPath identifies the local handoff included in prepared recovery.
+	HandoffPath string `json:"handoff_path,omitempty"`
 }
 
 // SpawnResponse is the output format for spawn command (with agents)
 type SpawnResponse struct {
 	TimestampedResponse
-	Session          string                `json:"session"`
-	Created          bool                  `json:"created"`
-	WorkingDirectory string                `json:"working_directory,omitempty"`
-	Panes            []PaneResponse        `json:"panes"`
-	AgentCounts      AgentCountsResponse   `json:"agent_counts"`
-	Stagger          *StaggerConfig        `json:"stagger,omitempty"`
-	AgentMail        *AgentMailSpawnStatus `json:"agent_mail,omitempty"`
-	Recovery         *RecoverySpawnStatus  `json:"recovery,omitempty"`
+	Session          string                              `json:"session"`
+	Created          bool                                `json:"created"`
+	WorkingDirectory string                              `json:"working_directory,omitempty"`
+	Panes            []PaneResponse                      `json:"panes"`
+	AgentCounts      AgentCountsResponse                 `json:"agent_counts"`
+	Stagger          *StaggerConfig                      `json:"stagger,omitempty"`
+	AgentMail        *spawnidentity.AgentMailSpawnStatus `json:"agent_mail,omitempty"`
+	Recovery         *RecoverySpawnStatus                `json:"recovery,omitempty"`
 	// ProfileSet is the --profile-set name when the session was spawned from a
 	// persona set. Combined with each pane's `persona` field this gives an
 	// orchestrator a deterministic persona→pane mapping (ntm#149).
 	ProfileSet string `json:"profile_set,omitempty"`
+	// SeatSkips lists panes that CAAM seat selection refused to launch
+	// (ntm#319). Present only when [integrations.caam] seat_selection is on
+	// AND a pool could not be ranked, so the response shape is unchanged for
+	// every host that has not opted in.
+	SeatSkips []SeatSkipResponse `json:"seat_skips,omitempty"`
+}
+
+// SeatSkipResponse reports one pane that CAAM seat selection declined to
+// launch, and why (ntm#319). A skip is deliberate: an unpinned pane whose
+// seat cannot be determined must not fall through to whatever the agent
+// command template pins statically.
+type SeatSkipResponse struct {
+	AgentType string `json:"agent_type"`
+	// Provider is the caam provider token whose pool could not be ranked
+	// ("claude" or "codex").
+	Provider string `json:"provider,omitempty"`
+	Reason   string `json:"reason"`
 }
 
 // CreateResponse is the output format for create command (basic session)
@@ -184,12 +201,17 @@ type AddResponse struct {
 	AddedWindsurf    int            `json:"added_windsurf"`
 	AddedAider       int            `json:"added_aider"`
 	AddedOpencode    int            `json:"added_opencode"`
+	AddedOmp         int            `json:"added_omp"`
 	TotalAdded       int            `json:"total_added"`
 	NewPanes         []PaneResponse `json:"new_panes,omitempty"`
 	// AgentMail mirrors SpawnResponse.AgentMail: added panes are registered
 	// with Agent Mail too, so automation can read back the pane_id -> agent
 	// name mapping for panes that joined an existing session (#240).
-	AgentMail *AgentMailSpawnStatus `json:"agent_mail,omitempty"`
+	AgentMail *spawnidentity.AgentMailSpawnStatus `json:"agent_mail,omitempty"`
+	// SeatSkips mirrors SpawnResponse.SeatSkips: panes CAAM seat selection
+	// refused to launch, with the reason (ntm#319). Omitted entirely unless
+	// seat_selection is on and a pool could not be ranked.
+	SeatSkips []SeatSkipResponse `json:"seat_skips,omitempty"`
 }
 
 // SendResponse is the output format for send command
@@ -291,6 +313,9 @@ type DependencyCheck struct {
 	Installed bool   `json:"installed"`
 	Version   string `json:"version,omitempty"`
 	Path      string `json:"path,omitempty"`
+	// Category groups the row the way `ntm deps` text output does:
+	// "Required", "AI Agents", "Recommended", "Services" or "Flywheel Tools".
+	Category string `json:"category,omitempty"`
 }
 
 // VersionResponse is the output format for version command

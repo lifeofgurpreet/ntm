@@ -11,12 +11,13 @@
 > **Shipped**, **Partial**, or **Planned** — for the semantics the parse gate
 > cannot check.
 
-**Document Version**: 2.2 (2026-08-17)
+**Document Version**: 2.3 (2026-10-07)
 
 ## Revision History
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 2.3 | 2026-10-07 | Documented the session coordinator runtime: the session monitor hosts the coordinator, always maintains assignment leases, applies persisted toggles live, yields to foreground coordinators, and `conflict_notify` is now opt-in |
 | 2.2 | 2026-08-17 | Reality sweep: corrected every stale API example to shipped syntax (activity/wait/route/send/diff/CASS/spawn), fixed `[alerts]`/`[cass]` config keys and the session-health JSON shape to match the code, added per-section status markers, and put the file under the G3 docs-conformance gate with zero skip waivers |
 | 2.1 | 2026-07-18 | Documented atomic assignment, fail-closed operator-label enrichment, persistent coordinator toggles, and the canonical resilience configuration |
 | 2.0 | 2025-12-30 | Major revision: Added state transition hysteresis, enhanced wait command with error handling, Agent Mail integration for alerts, configurable scoring weights, sticky routing, parallel step execution, conditional logic, loop constructs, output parsing, pipeline notifications |
@@ -387,6 +388,28 @@ Crash/restart/rate-limit notifications are controlled by `[resilience]`
 (`notify_on_crash`, `notify_on_max_restarts`, `[resilience.rate_limit] notify`),
 not by `[alerts]`.
 
+### Bounded Background Archives
+
+**Status: Shipped** — the resident session monitor writes incremental agent
+output to `~/.ntm/archive/` for CASS indexing. Each writer creates unique JSONL
+chunks named `{session}_{date}_{time}-{unique}.jsonl`; starting another monitor
+never reopens an earlier chunk.
+
+The producer rotates before a record would push the current chunk beyond
+64 MiB, and before writing the first new record of another local calendar day.
+One capture larger than 64 MiB is preserved as a single intact JSONL record in
+its own chunk; the following record starts a new chunk. Rotation preserves the
+per-pane incremental capture state and sequence numbers, and does not restart
+agent panes or reset monitor health state.
+
+A handoff syncs the old file, prepares the successor, and closes the old file
+before logging `archive file rotated` with `closed_path`, `closed_bytes`, and
+`active_path`. The `closed_path` is no longer writable by that monitor and can
+be moved or compressed by an external retention job. If preparing the next
+chunk fails, the pending capture stays uncommitted and is retried on the next
+capture interval. NTM does not automatically delete archived chunks. Do not
+rename or copy/truncate the active chunk to rotate it externally.
+
 ### API Design
 
 **Robot Mode:**
@@ -470,7 +493,7 @@ $ ntm health myproject --verbose
 
 ## Feature 3: Smart Work Distribution
 
-**Status: Shipped** — `ntm send --smart/--route`, `--robot-route`, and `--robot-assign` are live. Shipped strategies go beyond this design: least-loaded, first-available, round-robin, round-robin-available, random, sticky, explicit.
+**Status: Shipped** — `ntm send --smart/--route`, `--robot-route`, and `--robot-assign` are live. Shipped strategies go beyond this design: least-loaded, first-available, round-robin, round-robin-available, random, sticky, explicit, affinity.
 
 ### Problem Statement
 
@@ -518,6 +541,22 @@ Rotate through agents regardless of state. Predictable distribution.
 **4. random**
 Random selection among available agents. Simple load distribution.
 
+**5. affinity**
+Pick the agent holding live Agent Mail file reservations on the files the
+prompt names (the highest fraction of named files covered; score breaks
+ties). Falls back to least-loaded — reported as `fallback_used` — when no
+available agent holds any. Needs `[agent_mail] enabled = true` and the
+session's agent registry (written when ntm registers panes with Agent Mail).
+Choosing this strategy is its own opt-in; `[routing] affinity_enabled`
+separately adds the same signal as a score bonus under every strategy.
+
+Whenever reservations are loaded (either opt-in), a recommendation whose
+pick would edit files another agent reserves carries
+`recommendation.reservation_warning` (`message`, `paths`, `holders`,
+`selected_has_reserved`) plus an `_agent_hints` suggestion, and
+`ntm send --smart` prints the warning on stderr. It is omitted when the
+selected agent is the only holder.
+
 ### API Design
 
 **Get Routing Recommendation:**
@@ -555,9 +594,17 @@ ntm send myproject --cc "Fix the bug"
 # New way: send to best available Claude agent
 ntm send myproject --cc --smart "Fix the bug"
 
-# Or with explicit strategy
+# Or with explicit strategy (--route implies --smart)
 ntm send myproject --cc --route=least-loaded "Fix the bug"
+
+# Prefer the agent already holding the files the prompt names
+ntm send myproject --route=affinity "Fix internal/auth/session.go"
 ```
+
+An explicit `--pane`/`--panes` wins over routing. `--all`, `--skip-first`,
+`--project`, `--batch`, and `--distribute` are rejected alongside
+`--smart`/`--route`: each would otherwise silently ignore or contradict the
+single-agent routing decision.
 
 **Robot Mode Send with Routing:**
 
@@ -568,7 +615,14 @@ to the recommended pane:
 ```bash
 ntm --robot-route=myproject --type=claude --strategy=least-loaded
 ntm --robot-send=myproject --msg="Fix bug" --pane=%12
+
+# Affinity ranks by the files the message names, so pass the message
+ntm --robot-route=myproject --strategy=affinity --msg="Fix internal/auth/session.go"
 ```
+
+`--robot-send` rejects the route-only modifiers (`--strategy`, `--last-agent`,
+`--route-*`) with `INVALID_FLAG` instead of ignoring them and delivering to
+every matching pane.
 
 (Human CLI callers get the same composition in one step via
 `ntm send --smart`.)
@@ -677,7 +731,7 @@ $ ntm diff myproject cc_1 cod_1
 
 ## Feature 5: CASS Auto-Injection
 
-**Status: Shipped** — `ntm send --with-cass/--no-cass`, `--robot-send --with-cass/--no-cass`, `ntm cass preview`, and the `[cass.context]` config are live.
+**Status: Shipped** — `ntm send --with-cass/--no-cass`, `--robot-send --with-cass/--no-cass`, `ntm cass preview`, and the `[cass.context]` config are live. Assignment prompts are enriched through the same pipeline: `ntm assign` (and `ntm coordinator assign`) and `--robot-bulk-assign` take `--with-cass/--no-cass/--with-memory`, and the coordinator's auto-assign follows `[cass.context] enabled` and `[memory] send_injection` (see [Assignment-time injection](#assignment-time-injection)).
 
 ### Problem Statement
 
@@ -767,6 +821,36 @@ ntm cass preview "Implement rate limiting"
   ...
 }
 ```
+
+### Assignment-time injection
+
+Every surface that hands an agent its work enriches the assignment prompt
+before the agent starts, so each task begins with the lessons from past
+sessions that solved similar problems:
+
+| Surface | Control |
+|---------|---------|
+| `ntm assign` (`--auto`, `--pane`, `--watch`, `--retry`, `--reassign`), `ntm coordinator assign` | `--with-cass` / `--no-cass` / `--with-memory` |
+| `ntm --robot-bulk-assign` | `--with-cass` / `--no-cass` / `--with-memory` |
+| Session coordinator auto-assign (`ntm coordinator run`, session monitor) | config only |
+
+Precedence matches send: `--no-cass` > `--with-cass` > `[cass] enabled &&
+[cass.context] enabled`; `--with-memory` or `[memory] enabled &&
+send_injection` turns on CM rules. The CASS query is built from the bead's
+title, labels, and description (credentials redacted) rather than the
+template boilerplate, and the CM workspace is the bead's project.
+
+The prompt is enriched once, **before** the durable assignment intent is
+recorded: the assignment ledger hashes and persists the enriched prompt
+(`pending_prompt` / `prompt_sent`), plus `base_intent_sha256`, the checksum of
+the prompt before enrichment. Retries and recovery (`ntm assign --retry` of a
+pending claim, a same-intent `ntm assign --pane` re-run, a
+`--robot-bulk-assign` re-run of the same template intent, and the
+coordinator's pending recovery) replay the recorded prompt exactly and never
+query cass or cm again. cass or cm being missing, disabled, or failing never
+blocks an assignment; each assignment record in the JSON output carries the
+same `cass_injection` / `memory_injection` objects as send, including the
+skip reason on the degraded path.
 
 ---
 
@@ -1082,7 +1166,7 @@ ntm --robot-pipeline-cancel=run-abc123
 
 ## Feature 7: Thundering Herd Prevention
 
-**Status: Partial** — `ntm spawn --stagger/--stagger-mode/--stagger-delay`, `ntm spawn --assign`, `--robot-spawn --spawn-assign-work`, and the `NTM_SPAWN_*` env vars are shipped. NOT shipped: stagger flags on `--robot-spawn` and a `[spawn]` config table (the 90s default is built-in).
+**Status: Shipped** — `ntm spawn --stagger/--stagger-mode/--stagger-delay`, `ntm spawn --assign`, the `NTM_SPAWN_*` env vars (`ntm spawn`), `--robot-spawn --spawn-assign-work`, `--robot-spawn --spawn-prompt/--spawn-prompt-file`, `--robot-spawn --spawn-stagger-mode/--spawn-stagger-delay`, and the `[spawn]` config table (`stagger_mode`, `stagger_delay`) are shipped. Both surfaces resolve stagger through one planner (`robot.ResolveSpawnStagger`).
 
 ### Problem Statement
 
@@ -1198,14 +1282,73 @@ ntm coordinator disable conflict-negotiate
 
 The writer preserves unrelated keys, comments, file modes, and symlink targets;
 serializes concurrent writers; and validates the complete strict NTM schema
-before atomic replacement. A running coordinator daemon reads configuration at
-startup and must be restarted to apply a toggle.
+before atomic replacement. The coordinator each session monitor hosts (see
+below) re-reads the selected config every 15 seconds and applies a toggle
+without a restart. A foreground `ntm coordinator run` reads configuration at
+startup and must be restarted to apply one.
 
 Persistence supports both a `[coordinator]` table and root dotted assignments
 such as `coordinator.auto_assign = false`. It deliberately refuses a
 whole-section inline assignment such as
 `coordinator = { auto_assign = false }` without mutating the file, because that
 form cannot be updated surgically while preserving the operator's source.
+
+### Session Coordinator Runtime
+
+**Status: Shipped** — the session monitor `ntm spawn` starts hosts the
+coordinator; `ntm coordinator status` reports it.
+
+Every session monitor runs the session coordinator, so a toggle persisted with
+`ntm coordinator enable` acts on spawned sessions without a separate
+`ntm coordinator run`:
+
+```bash
+ntm coordinator enable auto-assign
+ntm coordinator status myproject
+ntm coordinator status myproject --json
+```
+
+- **Assignment maintenance always runs.** It renews the exact file
+  reservations of delivered, still-owned assignments before their one-hour
+  leases lapse, and releases an assignment's reservations and Beads claim once
+  its bead is closed (or its pane is gone). Reservations taken by a one-shot
+  `ntm assign` are therefore kept alive and cleaned up without
+  `ntm assign --watch`. With no feature enabled the monitor runs only this
+  maintenance, every 30 seconds, and does nothing while the session's
+  assignment ledger has no active assignments. Maintenance reads the saved
+  coordinator identity; it never registers one, sends mail, or admits work.
+- **Every other action is opt-in.** `auto-assign`, `digest`,
+  `conflict-notify`, `conflict-negotiate`, `mail-nudge`, the
+  `[rotation] usage_percent_threshold` trigger and
+  `[integrations.caam] auto_failover` all default off. Enabling any of them
+  switches the monitor to the full coordinator loop that
+  `ntm coordinator run` runs. `conflict_notify` is off by default because
+  notification mails every holder of overlapping reservations in the project,
+  including other sessions' agents, at high importance and again for each
+  persisting pair after its cooldown. The monitor never hosts
+  `conflict-notify`, even when it is set: releases up to v1.36.1 defaulted it
+  to true and `ntm config init` wrote that default into config files, so a
+  persisted `true` is not a reliable opt-in, and every session would mail each
+  conflicting pair. Conflict notification runs only under
+  `ntm coordinator run`, as before. Enabled auto-assignment whose assignment
+  safety policy does not load stays disabled, and the status reports why.
+- **No double coordination.** A foreground `ntm coordinator run` (including
+  `--once`) or an `ntm assign --watch` that maintains reservations claims the
+  session: the monitor stops its coordinator within about a second, stays paused
+  while any claim is held, and resumes after the last one ends. The claim waits
+  at most one minute for the monitor to stop. `coordinator run --json` reports
+  `monitor_yielded: true` when it paused the monitor. Ownership uses `flock`
+  locks next to the monitor's control files, so a crashed process never wedges
+  the other side.
+- **Status.** `ntm coordinator status` shows a Runtime section, and its JSON
+  carries `runtime`: `host` (`session-monitor` or `none`), `state`
+  (`running`, `yielded`, or `not_running`), `mode` (`maintenance` or `full`),
+  the enabled `features`, the monitor's `config_path`,
+  `last_maintenance_at`, `maintenance_error`, and `error`. Stopping the session
+  (`ntm kill`) stops the coordinator before the monitor releases its lease.
+
+Account-rotation monitors (`ntm swarm` CAAM rotation) run only their CAAM
+checker and do not host the coordinator.
 
 ### API Design
 
@@ -1220,20 +1363,79 @@ ntm spawn myproject --cc=4 --stagger-mode=fixed --stagger-delay=20s
 ntm spawn myproject --cc=3 --assign
 ntm spawn myproject --cc=3 --assign --strategy=dependency
 
-# Robot mode (no stagger flags on --robot-spawn; stagger is a `ntm spawn` feature)
-ntm --robot-spawn=myproject --spawn-cc=3 --spawn-assign-work --strategy=diverse
+# Robot mode: initial prompt + the same stagger modes
+ntm --robot-spawn=myproject --spawn-cc=3 --spawn-prompt='Read AGENTS.md, then pick ready work' \
+    --spawn-stagger-mode=fixed --spawn-stagger-delay=90s
+ntm --robot-spawn=myproject --spawn-cc=5 --spawn-prompt-file=boot.md --spawn-stagger-mode=smart
+ntm --robot-spawn=myproject --spawn-cc=3 --spawn-assign-work --strategy=diverse \
+    --spawn-stagger-mode=fixed --spawn-stagger-delay=30s
 ```
 
-Staggered prompts are scheduled in spawn state and reported on the CLI as each
-agent's prompt delay; there is no JSON stagger-schedule envelope.
+`--spawn-prompt` (or `--spawn-prompt-file`, `-` for stdin) is delivered to
+every spawned agent only after the readiness wait — it implies `--spawn-wait` —
+and goes through the same canonical dispatch port as robot send and spawn work
+assignment (final-message redaction, per-agent delivery protocol, and a
+dispatch-time re-observation that refuses any pane that is not freshly idle;
+never raw send-keys). With `--spawn-assign-work` the initial prompt prefixes
+each agent's work prompt, so both arrive in one atomic, paced delivery — a
+second back-to-back dispatch would be refused by the idle gate once the first
+prompt is running. Grok Build panes take spawn prompts like any other agent
+(readiness and composer-gated delivery shipped in phase 2, GH#251).
+
+Pacing is identical on both surfaces: the agent at delivery position `i`
+(0-based, launch order) receives its prompt `i × interval` after the first.
+`fixed` uses `--stagger-delay` / `--spawn-stagger-delay`; `smart` uses the
+learned delay of the strictest provider in the batch from the project's
+`.ntm/rate_limits.json` (anthropic, then openai, then google, then omp's own
+bucket); `none` delivers back to back. `ntm spawn --stagger[=DURATION]`
+remains the legacy fixed interval when no mode is chosen. In assignment mode
+each agent's whole claim-and-dispatch waits for its slot, so no bead claim is
+held across a stagger wait.
+
+`ntm spawn` reports each pane's `prompt_delay_ms` and, when pacing is active,
+`stagger: {enabled, mode, interval_ms}`. `--robot-spawn` reports a `stagger`
+plan whenever it delivers prompts (including `--dry-run`, which previews the
+delays without delivering):
+
+```json
+"stagger": {
+  "mode": "fixed", "interval_ms": 90000,
+  "schedule": [
+    {"pane": "0.1", "agent_type": "claude", "order": 1, "delay_ms": 0,      "scheduled_at": "2026-10-07T12:00:00Z"},
+    {"pane": "0.2", "agent_type": "claude", "order": 2, "delay_ms": 90000,  "scheduled_at": "2026-10-07T12:01:30Z"},
+    {"pane": "0.3", "agent_type": "claude", "order": 3, "delay_ms": 180000, "scheduled_at": "2026-10-07T12:03:00Z"}
+  ]
+},
+"prompt_deliveries": [
+  {"pane": "0.1", "agent_type": "claude", "order": 1, "prompt_sent": true, "delivered_at": "2026-10-07T12:00:00Z"}
+]
+```
+
+`prompt_deliveries[]` holds one `--spawn-prompt` outcome per agent; any failed
+delivery makes the envelope fail with `PROMPT_SEND_FAILED` while every
+launched pane keeps running. In assignment mode the outcome is on
+`assignments[]` (`prompt_sent`, `delivered_at`). Smart mode adds `provider`,
+and a `warning` when the rate-limit history is unreadable (the provider's
+built-in delay is used). An unsupported mode or a delay outside 0–5m fails
+with `INVALID_FLAG` before any session is touched.
 
 ### Configuration
 
-There is no `[spawn]` config table: the 90s stagger default is built in
-(`--stagger` with no value), and stagger is opt-in per spawn — there is no
-config key to change the default or auto-enable it. Spawn *rate* pacing
-(concurrent spawn limits per provider) is configured separately via
-`[spawn_pacing]`.
+The `[spawn]` table supplies defaults for both `ntm spawn` and
+`--robot-spawn`. A flag always wins; `[spawn]` applies only when the flag is
+not given (an explicit `ntm spawn --stagger` also counts as choosing the
+mode):
+
+```toml
+[spawn]
+stagger_mode = "fixed"   # none (default), fixed, or smart
+stagger_delay = "90s"    # fixed-mode interval between agents, 0-5m (default 30s)
+```
+
+An invalid value is reported against its key (`[spawn] stagger_mode must be
+one of none, fixed, or smart`) and by `ntm config validate`. The bare
+`--stagger` default stays 90s. Spawn *rate* pacing (concurrent spawn limits per
+provider) is configured separately via `[spawn_pacing]`.
 
 ---
 

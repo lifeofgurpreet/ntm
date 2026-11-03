@@ -2,8 +2,12 @@ package coordinator
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -14,9 +18,13 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	assignmentstore "github.com/Dicklesworthstone/ntm/internal/assignment"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
+	"github.com/Dicklesworthstone/ntm/internal/config"
+	ctxmon "github.com/Dicklesworthstone/ntm/internal/context"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/Dicklesworthstone/ntm/internal/sqliteutil"
 	"github.com/Dicklesworthstone/ntm/internal/status"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 type fakeCoordinatorReservationClient struct {
@@ -26,6 +34,7 @@ type fakeCoordinatorReservationClient struct {
 	reserveErr     error
 	reservations   []agentmail.FileReservation
 	listErr        error
+	beforeList     func()
 	releaseResult  *agentmail.ReleaseReservationsResult
 	releaseErr     error
 	releaseIDs     [][]int
@@ -34,6 +43,8 @@ type fakeCoordinatorReservationClient struct {
 	releaseStarted chan struct{}
 	allowRelease   chan struct{}
 	releaseOnce    sync.Once
+	renewRequests  []agentmail.RenewReservationsOptions
+	renewFn        func(context.Context, agentmail.RenewReservationsOptions) (*agentmail.RenewReservationsResult, error)
 }
 
 func (f *fakeCoordinatorReservationClient) EnsureProject(_ context.Context, projectKey string) (*agentmail.Project, error) {
@@ -52,6 +63,9 @@ func (f *fakeCoordinatorReservationClient) ReservePaths(context.Context, agentma
 }
 
 func (f *fakeCoordinatorReservationClient) ListReservations(context.Context, string, string, bool) ([]agentmail.FileReservation, error) {
+	if f.beforeList != nil {
+		f.beforeList()
+	}
 	return append([]agentmail.FileReservation(nil), f.reservations...), f.listErr
 }
 
@@ -90,8 +104,974 @@ func (f *fakeCoordinatorReservationClient) ReleaseReservations(_ context.Context
 	return &agentmail.ReleaseReservationsResult{Released: len(ids) + len(paths)}, nil
 }
 
-func (f *fakeCoordinatorReservationClient) RenewReservations(context.Context, agentmail.RenewReservationsOptions) (*agentmail.RenewReservationsResult, error) {
+func (f *fakeCoordinatorReservationClient) RenewReservations(ctx context.Context, opts agentmail.RenewReservationsOptions) (*agentmail.RenewReservationsResult, error) {
+	f.renewRequests = append(f.renewRequests, opts)
+	if f.renewFn != nil {
+		return f.renewFn(ctx, opts)
+	}
 	return &agentmail.RenewReservationsResult{}, nil
+}
+
+func newAssignmentHeartbeatTestCoordinator(t *testing.T) (*SessionCoordinator, *assignmentstore.AssignmentStore, *fakeCoordinatorReservationClient) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	const session, beadID, owner, paneID = "lease-heartbeat", "ntm-heartbeat", "BlueLake", "%94"
+	projectDir := t.TempDir()
+	expiresAt := time.Now().UTC().Add(2 * time.Minute)
+	store := assignmentstore.NewStore(session)
+	store.Assignments[beadID] = &assignmentstore.Assignment{
+		BeadID: beadID, BeadTitle: "Long-running work", Pane: 1, AgentType: "cc", AgentName: owner,
+		Status: assignmentstore.StatusWorking, AssignedAt: time.Now().UTC().Add(-58 * time.Minute), IdempotencyKey: "heartbeat-generation",
+		ClaimActor: "BlueLake:heartbeat-generation", DispatchTarget: paneID, OccupancyKey: paneID, DispatchState: assignmentstore.DispatchSent,
+		ReservationRequired: true, ReservationState: assignmentstore.ReservationReserved, ReservationCompleted: true,
+		ReservationAgent: owner, ReservationTarget: paneID, ReservationRequested: []string{"internal/a.go", "internal/b.go"},
+		ReservedPaths: []string{"internal/a.go", "internal/b.go"}, ReservationIDs: []int{941, 942}, ReservationExpiresAt: &expiresAt,
+	}
+	if err := store.Save(); err != nil {
+		t.Fatalf("seed heartbeat assignment: %v", err)
+	}
+	registry := agentmail.NewSessionAgentRegistry(session, projectDir)
+	registry.AddAgent(session+"__cc_1", paneID, owner)
+	if err := agentmail.SaveSessionAgentRegistry(registry); err != nil {
+		t.Fatalf("save heartbeat pane registry: %v", err)
+	}
+	client := &fakeCoordinatorReservationClient{reservations: []agentmail.FileReservation{
+		{ID: 941, ProjectID: 9, AgentName: owner, Reason: "bead assignment: " + beadID, PathPattern: "internal/a.go", Exclusive: true, ExpiresTS: agentmail.FlexTime{Time: expiresAt}},
+		{ID: 942, ProjectID: 9, AgentName: owner, Reason: "bead assignment: " + beadID, PathPattern: "internal/b.go", Exclusive: true, ExpiresTS: agentmail.FlexTime{Time: expiresAt.Add(time.Minute)}},
+		{ID: 999, ProjectID: 9, AgentName: owner, Reason: "another task", PathPattern: "other.go", Exclusive: true, ExpiresTS: agentmail.FlexTime{Time: expiresAt}},
+	}}
+	client.renewFn = func(_ context.Context, opts agentmail.RenewReservationsOptions) (*agentmail.RenewReservationsResult, error) {
+		for i := range client.reservations {
+			for _, id := range opts.ReservationIDs {
+				if client.reservations[i].ID == id {
+					client.reservations[i].ExpiresTS.Time = client.reservations[i].ExpiresTS.Add(time.Duration(opts.ExtendSeconds) * time.Second)
+				}
+			}
+		}
+		return &agentmail.RenewReservationsResult{Renewed: len(opts.ReservationIDs)}, nil
+	}
+	c := New(session, projectDir, nil, "Coordinator")
+	c.config.AutoAssign, c.config.ConflictNotify = false, false
+	c.reservationClient = client
+	c.workItemDetailsFn = func(context.Context, string) (*bv.BeadAssignmentDetails, error) {
+		return &bv.BeadAssignmentDetails{ID: beadID, Status: "in_progress", Assignee: "BlueLake:heartbeat-generation"}, nil
+	}
+	c.workItemStatusFn = func(context.Context, string) (string, error) {
+		return "in_progress", nil
+	}
+	c.monitor = NewAgentMonitor(session, nil, projectDir)
+	c.monitor.observer = status.NewSessionObserverWithDependencies(status.NewDetector(), status.SessionObserverConfig{}, status.SessionObserverDependencies{
+		ListPanes: func(context.Context, string) ([]tmux.PaneActivity, error) {
+			return []tmux.PaneActivity{{Pane: tmux.Pane{ID: paneID, Index: 1, Title: session + "__cc_1", Type: tmux.AgentClaude}, LastActivity: time.Now().Add(-time.Minute)}}, nil
+		},
+		CapturePane: func(context.Context, string, int) (string, error) { return idleCapture, nil },
+	})
+	return c, store, client
+}
+
+func TestRunCycleRenewsPendingContinuationReservations(t *testing.T) {
+	for _, mode := range []string{"source before boot", "accepted partial commit", "unreadable source", "source PID changed", "replacement PID changed", "replacement token changed", "foreign target", "foreign project", "foreign generation", "unaccepted handoff", "duplicate recipient", "replacement unavailable", "shell after exit", "missing journal"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+			c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+			oldPending := ctxmon.DefaultPendingRotationStore
+			ctxmon.DefaultPendingRotationStore = ctxmon.NewPendingRotationStoreWithPath(filepath.Join(t.TempDir(), "pending.jsonl"))
+			t.Cleanup(func() { ctxmon.DefaultPendingRotationStore = oldPending })
+			const token = "lease-continuation"
+			source := tmux.Pane{ID: "%94", Index: 2, Title: "custom predecessor title", Type: tmux.AgentClaude, PID: 940000000, Command: "node", RotationToken: token}
+			replacement := tmux.Pane{ID: "%95", Index: 1, Title: "replacement title", Type: tmux.AgentClaude, PID: 950000000, Command: "node", RotationToken: token}
+			current := store.Get("ntm-heartbeat")
+			current.ClaimState = assignmentstore.ClaimClaimed
+			current.DispatchReceiptID = "original-dispatch-receipt"
+			store.Assignments[current.BeadID] = current
+			if err := store.Save(); err != nil {
+				t.Fatal(err)
+			}
+			current, applied, err := store.BeginPaneContinuation(t.Context(), current, token)
+			if err != nil || !applied {
+				t.Fatalf("begin continuation: %v, %v", applied, err)
+			}
+			current, applied, err = store.BindPaneContinuation(t.Context(), current, token, assignmentstore.ReassignmentTarget{Pane: replacement.Index, DispatchTarget: replacement.ID, OccupancyKey: replacement.ID})
+			if err != nil || !applied {
+				t.Fatalf("bind continuation: %v, %v", applied, err)
+			}
+			registry, err := agentmail.LoadSessionAgentRegistry(c.session, c.projectKey)
+			if err != nil || registry == nil {
+				t.Fatalf("load source registry: %+v, %v", registry, err)
+			}
+			registry.SetPanePID(source.ID, source.PID)
+			if err := agentmail.SaveSessionAgentRegistry(registry); err != nil {
+				t.Fatal(err)
+			}
+			if mode != "source before boot" {
+				registry, applied, err = agentmail.RebindSessionAgentPaneContext(t.Context(), c.session, c.projectKey,
+					agentmail.PaneIdentityBinding{PaneID: source.ID, PaneTitle: source.Title, PanePID: source.PID, AgentName: current.AgentName},
+					agentmail.PaneIdentityBinding{PaneID: replacement.ID, PaneTitle: replacement.Title, PanePID: replacement.PID, AgentName: current.AgentName})
+				if err != nil || !applied {
+					t.Fatalf("commit registry before later stores: %v, %v", applied, err)
+				}
+			}
+			receipt := &ctxmon.RotationContinuation{
+				Token: token, Phase: "handoff_accepted", Source: source, Replacement: replacement,
+				RegistryProject: c.projectKey, AgentName: current.AgentName, BeadID: current.BeadID, AssignmentKey: current.IdempotencyKey,
+			}
+			switch mode {
+			case "source before boot":
+				receipt.Phase = "replacement_prepared"
+				replacement.Command = "bash"
+			case "source PID changed":
+				source.PID++
+			case "replacement PID changed":
+				replacement.PID++
+			case "replacement token changed":
+				replacement.RotationToken = "another-rotation"
+			case "foreign target":
+				registry.AddAgent("foreign target", "%96", current.AgentName)
+				registry.SetPanePID("%96", 9600)
+			case "foreign project":
+				receipt.RegistryProject = t.TempDir()
+			case "foreign generation":
+				receipt.AssignmentKey = "another-generation"
+			case "unaccepted handoff":
+				receipt.Phase = "handoff_started"
+			case "duplicate recipient":
+				registry.PaneIDMap["%96"] = "bluelake"
+				registry.SetPanePID("%96", 9600)
+			case "shell after exit":
+				replacement.Command = "bash"
+			}
+			if mode == "foreign target" || mode == "duplicate recipient" {
+				if err := agentmail.SaveSessionAgentRegistry(registry); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode != "missing journal" {
+				if err := ctxmon.AddPendingRotation(&ctxmon.PendingRotation{
+					AgentID: "heartbeat-source", SessionName: c.session, PaneID: receipt.Source.ID, PanePID: receipt.Source.PID, PaneType: "cc",
+					CreatedAt: time.Now(), TimeoutAt: time.Now().Add(time.Hour), SelectedAction: ctxmon.ConfirmRotate,
+					ExecutionState: ctxmon.RotationStateFailed, ExecutionID: token, Continuation: receipt,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			c.monitor.observer = status.NewSessionObserverWithDependencies(status.NewDetector(), status.SessionObserverConfig{}, status.SessionObserverDependencies{
+				ListPanes: func(context.Context, string) ([]tmux.PaneActivity, error) {
+					return []tmux.PaneActivity{{Pane: source, LastActivity: time.Now()}, {Pane: replacement, LastActivity: time.Now()}}, nil
+				},
+				CapturePane: func(_ context.Context, paneID string, _ int) (string, error) {
+					if mode == "unreadable source" && paneID == source.ID || mode == "replacement unavailable" && paneID == replacement.ID {
+						return "", errors.New("pane output unavailable")
+					}
+					if mode == "source before boot" && paneID == replacement.ID {
+						return "$ ", nil
+					}
+					return idleCapture, nil
+				},
+			})
+			unrelatedExpiry := client.reservations[2].ExpiresTS.Time
+			_, runErr := c.RunCycle(t.Context())
+			wantRenewal := mode == "source before boot" || mode == "accepted partial commit" || mode == "unreadable source"
+			if wantRenewal {
+				if len(client.renewRequests) != 1 || mode != "unreadable source" && runErr != nil {
+					t.Fatalf("pending owner was not renewed: requests=%+v err=%v", client.renewRequests, runErr)
+				}
+				request := client.renewRequests[0]
+				if !reflect.DeepEqual(request.ReservationIDs, current.ReservationIDs) || request.AgentName != current.AgentName || len(request.Paths) != 0 || request.ProjectKey != agentmail.CanonicalProjectKey(c.projectKey) {
+					t.Fatalf("pending renewal widened ownership: %+v", request)
+				}
+			} else if len(client.renewRequests) != 0 || runErr == nil {
+				t.Fatalf("unverified continuation renewed: requests=%+v err=%v", client.renewRequests, runErr)
+			}
+			if err := store.LoadStrict(); err != nil {
+				t.Fatal(err)
+			}
+			after := store.Get(current.BeadID)
+			if after == nil || !after.HasPendingPaneContinuation() || after.ReservationRenewalCheckedAt == nil ||
+				!client.reservations[2].ExpiresTS.Equal(unrelatedExpiry) {
+				t.Fatalf("renewal lost the pending barrier or touched unrelated leases: %+v", after)
+			}
+			if wantRenewal {
+				if after.ReservationRenewalError != "" || !after.ReservationExpiresAt.Equal(current.ReservationExpiresAt.Add(time.Hour)) {
+					t.Fatalf("pending renewal was not persisted: %+v", after)
+				}
+			} else if after.ReservationRenewalError == "" || !after.ReservationExpiresAt.Equal(*current.ReservationExpiresAt) {
+				t.Fatalf("rejected renewal lost protection diagnostics: %+v", after)
+			}
+			after.ReservationExpiresAt, after.ReservationRenewalCheckedAt, after.ReservationRenewalError = current.ReservationExpiresAt, current.ReservationRenewalCheckedAt, current.ReservationRenewalError
+			if !reflect.DeepEqual(after, current) {
+				t.Fatalf("renewal moved the pending assignment or changed original ownership:\nwant %+v\ngot  %+v", current, after)
+			}
+		})
+	}
+}
+
+func TestRunCycleRenewsAssignmentReservationsWithAutoAssignOff(t *testing.T) {
+	c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+	before := store.Get("ntm-heartbeat")
+	unrelatedExpiry := client.reservations[2].ExpiresTS.Time
+	if _, err := c.RunCycle(t.Context()); err != nil {
+		t.Fatalf("RunCycle: %v", err)
+	}
+	if len(client.renewRequests) != 1 {
+		t.Fatalf("renew requests = %+v", client.renewRequests)
+	}
+	request := client.renewRequests[0]
+	// Reservations are created and renewed under the canonical key (macOS
+	// temp dirs sit behind /var -> /private/var).
+	if !reflect.DeepEqual(request.ReservationIDs, []int{941, 942}) || len(request.Paths) != 0 || request.AgentName != "BlueLake" || request.ExtendSeconds != 3600 || request.ProjectKey != agentmail.CanonicalProjectKey(c.projectKey) {
+		t.Fatalf("renewal widened ownership: %+v", request)
+	}
+	if !client.reservations[2].ExpiresTS.Equal(unrelatedExpiry) {
+		t.Fatal("renewed an unrelated lease belonging to the same agent")
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	after := store.Get(before.BeadID)
+	if after.ReservationExpiresAt == nil || !after.ReservationExpiresAt.Equal(before.ReservationExpiresAt.Add(time.Hour)) || after.ReservationRenewalError != "" || after.ReservationRenewalCheckedAt == nil || after.Status != assignmentstore.StatusWorking {
+		t.Fatalf("renewal was not durably recorded: %+v", after)
+	}
+	if _, err := c.RunCycle(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.renewRequests) != 1 {
+		t.Fatal("renewed again while durable expiry was outside the lead window")
+	}
+}
+
+func TestRunCycleMaintainsProvenAssignmentsDespiteObservationFailures(t *testing.T) {
+	for _, failure := range []string{"sibling_capture", "whole_topology", "capture_and_cleanup"} {
+		t.Run(failure, func(t *testing.T) {
+			c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+			const unknownBead, closedBead = "ntm-unobservable", "ntm-finished"
+			for _, sibling := range []struct {
+				bead, pane, owner string
+				id                int
+			}{
+				{unknownBead, "%95", "RedLake", 951},
+				{closedBead, "%96", "GreenLake", 961},
+			} {
+				row := store.Get("ntm-heartbeat")
+				row.BeadID, row.AgentName, row.ReservationAgent = sibling.bead, sibling.owner, sibling.owner
+				row.IdempotencyKey = sibling.bead + "-generation"
+				row.ClaimActor = sibling.owner + ":" + row.IdempotencyKey
+				row.DispatchTarget, row.OccupancyKey, row.ReservationTarget = sibling.pane, sibling.pane, sibling.pane
+				row.ReservationRequested, row.ReservedPaths = []string{sibling.bead + ".go"}, []string{sibling.bead + ".go"}
+				row.ReservationIDs = []int{sibling.id}
+				store.Assignments[sibling.bead] = row
+				client.reservations = append(client.reservations, agentmail.FileReservation{
+					ID: sibling.id, ProjectID: 9, AgentName: sibling.owner, PathPattern: row.ReservedPaths[0],
+					Reason: "bead assignment: " + sibling.bead, Exclusive: true, ExpiresTS: agentmail.FlexTime{Time: *row.ReservationExpiresAt},
+				})
+			}
+			if err := store.Save(); err != nil {
+				t.Fatal(err)
+			}
+			beforeUnknown := store.Get(unknownBead)
+			beforeHealthy := store.Get("ntm-heartbeat")
+			registry, err := agentmail.LoadSessionAgentRegistry(c.session, c.projectKey)
+			if err != nil || registry == nil {
+				t.Fatalf("load registry before adding sibling owner: %+v, %v", registry, err)
+			}
+			registry.AddAgent(c.session+"__cc_1", "%94", "BlueLake")
+			registry.AddAgent(c.session+"__cc_2", "%95", "RedLake")
+			if err := agentmail.SaveSessionAgentRegistry(registry); err != nil {
+				t.Fatal(err)
+			}
+			c.workItemStatusFn = func(_ context.Context, beadID string) (string, error) {
+				if beadID == closedBead {
+					return "closed", nil
+				}
+				return "in_progress", nil
+			}
+			c.workItemDetailsFn = func(_ context.Context, beadID string) (*bv.BeadAssignmentDetails, error) {
+				return &bv.BeadAssignmentDetails{ID: beadID, Status: "in_progress", Assignee: store.Get(beadID).ClaimActor}, nil
+			}
+			claimReleases := 0
+			c.releaseWorkItemClaimFn = func(_ context.Context, project, beadID, actor string) (bool, error) {
+				if project != c.projectKey || beadID != closedBead || actor != store.Get(closedBead).ClaimActor {
+					t.Fatalf("cleanup changed claim identity: %q %q %q", project, beadID, actor)
+				}
+				claimReleases++
+				return true, nil
+			}
+			c.config.AutoAssign = true
+			c.config.ConflictNotify = true
+			c.config.ConflictNegotiate = true
+			c.config.MailNudge = true
+			c.config.RotationUsageThreshold = 1
+			c.assignWorkFn = func(context.Context) ([]AssignmentResult, error) {
+				t.Fatal("degraded observation admitted new work")
+				return nil, nil
+			}
+			c.detectConflictsFn = func(context.Context) ([]Conflict, error) {
+				t.Fatal("degraded observation started conflict actions")
+				return nil, nil
+			}
+			c.monitor.observer = status.NewSessionObserverWithDependencies(status.NewDetector(), status.SessionObserverConfig{}, status.SessionObserverDependencies{
+				ListPanes: func(context.Context, string) ([]tmux.PaneActivity, error) {
+					if failure == "whole_topology" {
+						return nil, errors.New("topology unavailable")
+					}
+					return []tmux.PaneActivity{
+						{Pane: tmux.Pane{ID: "%94", Index: 1, Title: c.session + "__cc_1", Type: tmux.AgentClaude}},
+						{Pane: tmux.Pane{ID: "%95", Index: 2, Title: c.session + "__cc_2", Type: tmux.AgentClaude}},
+					}, nil
+				},
+				CapturePane: func(_ context.Context, paneID string, _ int) (string, error) {
+					if paneID == "%95" {
+						return "", errors.New("sibling capture unavailable")
+					}
+					return idleCapture, nil
+				},
+			})
+			if failure == "capture_and_cleanup" {
+				client.releaseErr = errors.New("terminal release unavailable")
+			}
+
+			results, err := c.RunCycle(t.Context())
+			wantObservationError := "sibling capture unavailable"
+			if failure == "whole_topology" {
+				wantObservationError = "topology unavailable"
+			}
+			if err == nil || !strings.Contains(err.Error(), wantObservationError) || !strings.Contains(err.Error(), unknownBead) || len(results) != 0 {
+				t.Fatalf("missing observation and target-maintenance errors: results=%+v err=%v", results, err)
+			}
+			if c.rotation != nil || c.caamFailover != nil || c.mailNudge != nil || c.conflictDetector != nil {
+				t.Fatal("degraded observation started automatic agent actions")
+			}
+			if err := store.LoadStrict(); err != nil {
+				t.Fatal(err)
+			}
+			healthy := store.Get("ntm-heartbeat")
+			if failure == "whole_topology" {
+				if len(client.renewRequests) != 0 || healthy.ReservationRenewalError == "" || !healthy.ReservationExpiresAt.Equal(*beforeHealthy.ReservationExpiresAt) {
+					t.Fatalf("unavailable topology renewed an unproven owner: %+v requests=%+v", healthy, client.renewRequests)
+				}
+			} else if len(client.renewRequests) != 1 || !reflect.DeepEqual(client.renewRequests[0].ReservationIDs, []int{941, 942}) || healthy.ReservationRenewalError != "" || healthy.ReservationExpiresAt.Before(time.Now().Add(time.Hour)) {
+				t.Fatalf("sibling failure prevented exact healthy renewal: %+v requests=%+v", healthy, client.renewRequests)
+			}
+			unknown := store.Get(unknownBead)
+			if unknown.Status != assignmentstore.StatusWorking || unknown.ReservationRenewalError == "" ||
+				!unknown.ReservationExpiresAt.Equal(*beforeUnknown.ReservationExpiresAt) ||
+				!reflect.DeepEqual(unknown.ReservationIDs, beforeUnknown.ReservationIDs) || unknown.IdempotencyKey != beforeUnknown.IdempotencyKey {
+				t.Fatalf("unobservable assignment lost its ownership barrier: %+v", unknown)
+			}
+			closed := store.Get(closedBead)
+			if failure == "capture_and_cleanup" {
+				if !strings.Contains(err.Error(), "exact reservations for bead "+closedBead+" remain active") ||
+					!strings.Contains(closed.ClearError, "remain active") || closed.ClearState != assignmentstore.ClearStateReservationReleasing ||
+					closed.PendingTerminalStatus != assignmentstore.StatusCompleted || len(closed.ReservationIDs) != 1 || claimReleases != 0 {
+					t.Fatalf("cleanup error or durable retry barrier lost: %+v err=%v", closed, err)
+				}
+			} else if closed.Status != assignmentstore.StatusCompleted || len(closed.ReservationIDs) != 0 || claimReleases != 1 {
+				t.Fatalf("observation failure prevented authoritative terminal cleanup: %+v claims=%d", closed, claimReleases)
+			}
+			if len(client.releaseIDs) == 0 || failure != "capture_and_cleanup" && len(client.releaseIDs) != 1 {
+				t.Fatalf("unexpected terminal release attempts: %+v", client.releaseIDs)
+			}
+			for _, ids := range client.releaseIDs {
+				if !reflect.DeepEqual(ids, []int{961}) {
+					t.Fatalf("terminal cleanup widened release scope: %+v", client.releaseIDs)
+				}
+			}
+		})
+	}
+}
+
+func TestMaintainAssignmentsDoesNotStartOtherConfiguredActions(t *testing.T) {
+	c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+	c.mailClient = &agentmail.Client{}
+	c.config.AutoAssign, c.config.SendDigests, c.config.MailNudge = true, true, true
+	c.config.ConflictNotify, c.config.ConflictNegotiate = true, true
+	c.config.RotationUsageThreshold = 1
+	c.ntmConfig = config.Default()
+	c.ntmConfig.Integrations.CAAM.AutoFailover = true
+	c.assignWorkFn = func(context.Context) ([]AssignmentResult, error) {
+		t.Fatal("maintenance assigned new work")
+		return nil, nil
+	}
+	c.detectConflictsFn = func(context.Context) ([]Conflict, error) {
+		t.Fatal("maintenance ran conflict actions")
+		return nil, nil
+	}
+	if err := c.MaintainAssignments(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if c.started || c.rotation != nil || c.caamFailover != nil || c.mailNudge != nil || c.conflictDetector != nil {
+		t.Fatal("maintenance started an unrelated subsystem")
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.renewRequests) != 1 || store.Get("ntm-heartbeat").ReservationExpiresAt.Before(time.Now().Add(time.Hour)) {
+		t.Fatalf("maintenance did not protect existing work: %+v", store.Get("ntm-heartbeat"))
+	}
+}
+
+func TestMaintainAssignmentsCancellationDoesNotReleaseOrRenew(t *testing.T) {
+	for _, stage := range []string{"before_observation", "during_observation", "before_terminal_cleanup"} {
+		t.Run(stage, func(t *testing.T) {
+			c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+			before := store.Get("ntm-heartbeat")
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			observations, statusReads := 0, 0
+			c.monitor.observer = status.NewSessionObserverWithDependencies(status.NewDetector(), status.SessionObserverConfig{}, status.SessionObserverDependencies{
+				ListPanes: func(context.Context, string) ([]tmux.PaneActivity, error) {
+					observations++
+					return []tmux.PaneActivity{{Pane: tmux.Pane{ID: "%94", Index: 1, Title: c.session + "__cc_1", Type: tmux.AgentClaude}}}, nil
+				},
+				CapturePane: func(context.Context, string, int) (string, error) {
+					if stage == "during_observation" {
+						cancel()
+						return "", context.Canceled
+					}
+					return idleCapture, nil
+				},
+			})
+			c.workItemStatusFn = func(context.Context, string) (string, error) {
+				statusReads++
+				cancel()
+				return "closed", nil
+			}
+			if stage == "before_observation" {
+				cancel()
+			}
+			if err := c.MaintainAssignments(ctx); !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancellation error=%v", err)
+			}
+			if stage == "before_observation" && observations != 0 || stage != "before_terminal_cleanup" && statusReads != 0 {
+				t.Fatalf("work continued after cancellation: observations=%d statusReads=%d", observations, statusReads)
+			}
+			if len(client.releaseIDs) != 0 || len(client.renewRequests) != 0 {
+				t.Fatalf("cancellation caused lease mutation: releases=%v renewals=%v", client.releaseIDs, client.renewRequests)
+			}
+			if err := store.LoadStrict(); err != nil {
+				t.Fatal(err)
+			}
+			if after := store.Get(before.BeadID); !reflect.DeepEqual(before, after) {
+				t.Fatalf("cancellation changed durable assignment: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func TestRunCycleRetiresTerminalAssignmentsWithAutoAssignOff(t *testing.T) {
+	for _, trackerStatus := range []string{"closed", "tombstone"} {
+		t.Run(trackerStatus, func(t *testing.T) {
+			c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+			before := store.Get("ntm-heartbeat")
+			// A newly acquired lease still needs prompt release when its task
+			// ends; maintenance must not wait until the renewal lead window.
+			expiresAt := time.Now().UTC().Add(time.Hour)
+			store.Assignments[before.BeadID].ReservationExpiresAt = &expiresAt
+			if err := store.Save(); err != nil {
+				t.Fatal(err)
+			}
+			c.workItemStatusFn = func(context.Context, string) (string, error) {
+				return trackerStatus, nil
+			}
+			c.assignWorkFn = func(context.Context) ([]AssignmentResult, error) {
+				t.Fatal("disabled auto-assignment admitted new work")
+				return nil, nil
+			}
+			claimReleases := 0
+			c.releaseWorkItemClaimFn = func(_ context.Context, projectKey, beadID, actor string) (bool, error) {
+				claimReleases++
+				if projectKey != c.projectKey || beadID != before.BeadID || actor != before.ClaimActor {
+					t.Fatalf("claim cleanup changed ownership: project=%q bead=%q actor=%q", projectKey, beadID, actor)
+				}
+				return true, nil
+			}
+
+			if results, err := c.RunCycle(t.Context()); err != nil || len(results) != 0 {
+				t.Fatalf("paused admission maintenance results=%+v error=%v", results, err)
+			}
+			if err := store.LoadStrict(); err != nil {
+				t.Fatal(err)
+			}
+			wantStatus := assignmentstore.StatusCompleted
+			if trackerStatus == "tombstone" {
+				wantStatus = assignmentstore.StatusFailed
+			}
+			after := store.Get(before.BeadID)
+			if after.Status != wantStatus || after.ClearState != assignmentstore.ClearStateNone ||
+				after.ReservationState != assignmentstore.ReservationReleased || len(after.ReservationIDs) != 0 ||
+				after.IdempotencyKey != before.IdempotencyKey || after.DispatchTarget != before.DispatchTarget || len(store.ListActive()) != 0 ||
+				after.PendingCompletionEventID != "" {
+				t.Fatalf("terminal assignment retained occupancy or lost its receipt: %+v", after)
+			}
+			if len(client.releaseIDs) != 1 || !reflect.DeepEqual(client.releaseIDs[0], before.ReservationIDs) || claimReleases != 1 || len(client.renewRequests) != 0 {
+				t.Fatalf("terminal cleanup effects: releases=%v claims=%d renewals=%v", client.releaseIDs, claimReleases, client.renewRequests)
+			}
+			if len(client.reservations) != 1 || client.reservations[0].ID != 999 {
+				t.Fatalf("terminal cleanup released an unrelated task's lease: %+v", client.reservations)
+			}
+			if _, err := c.RunCycle(t.Context()); err != nil || len(client.releaseIDs) != 1 || claimReleases != 1 {
+				t.Fatalf("completed cleanup replayed external effects: releases=%v claims=%d error=%v", client.releaseIDs, claimReleases, err)
+			}
+		})
+	}
+}
+
+func TestMaintainAssignmentsPreservesCompletionOutboxThroughCleanupRetry(t *testing.T) {
+	c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+	c.WithCompletionEvents()
+	c.workItemStatusFn = func(context.Context, string) (string, error) { return "closed", nil }
+	claimReleases := 0
+	c.releaseWorkItemClaimFn = func(context.Context, string, string, string) (bool, error) {
+		claimReleases++
+		return true, nil
+	}
+	client.releaseErr = errors.New("release response unavailable")
+	if err := c.MaintainAssignments(t.Context()); err == nil {
+		t.Fatal("failed external cleanup reported success")
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	barrier := store.Get("ntm-heartbeat")
+	eventID := barrier.PendingCompletionEventID
+	if eventID == "" || barrier.CompletionDetectedAt == nil || barrier.ClearState != assignmentstore.ClearStateReservationReleasing || len(store.ListPendingCompletionEvents()) != 0 {
+		t.Fatalf("cleanup did not preserve an undeliverable pending event: %+v", barrier)
+	}
+	failedReleaseAttempts := len(client.releaseIDs)
+	if failedReleaseAttempts == 0 || !strings.Contains(barrier.ClearError, "remain active") {
+		t.Fatalf("failed cleanup did not record its unresolved leases: %+v releases=%v", barrier, client.releaseIDs)
+	}
+	for _, ids := range client.releaseIDs {
+		if !reflect.DeepEqual(ids, []int{941, 942}) {
+			t.Fatalf("cleanup retry widened release scope: %+v", client.releaseIDs)
+		}
+	}
+	client.releaseErr = nil
+	c.workItemStatusFn = func(context.Context, string) (string, error) {
+		t.Fatal("maintenance re-read a durably terminal outcome")
+		return "", nil
+	}
+	if err := c.MaintainAssignments(t.Context()); err != nil {
+		t.Fatalf("resume terminal cleanup: %v", err)
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	terminal := store.Get("ntm-heartbeat")
+	if terminal.Status != assignmentstore.StatusCompleted || terminal.PendingCompletionEventID != eventID ||
+		terminal.ClearState != assignmentstore.ClearStateNone || len(store.ListPendingCompletionEvents()) != 1 || claimReleases != 1 || len(client.releaseIDs) != failedReleaseAttempts+1 {
+		t.Fatalf("cleanup lost or duplicated the completion event: %+v claims=%d releases=%v", terminal, claimReleases, client.releaseIDs)
+	}
+	if err := c.MaintainAssignments(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Get(terminal.BeadID); got.PendingCompletionEventID != eventID || len(client.releaseIDs) != failedReleaseAttempts+1 || claimReleases != 1 {
+		t.Fatalf("maintenance replay repeated completion cleanup: %+v", got)
+	}
+	const consumer = "watch-completion-consumer"
+	if _, claimed, err := store.ClaimPendingCompletionEvent(t.Context(), terminal.BeadID, eventID, consumer, time.Minute); err != nil || !claimed {
+		t.Fatalf("claim completion event: claimed=%t error=%v", claimed, err)
+	}
+	if acknowledged, err := store.AcknowledgeCompletionEvent(t.Context(), terminal.BeadID, eventID, consumer); err != nil || !acknowledged {
+		t.Fatalf("acknowledge completion event: acknowledged=%t error=%v", acknowledged, err)
+	}
+	if err := c.MaintainAssignments(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Get(terminal.BeadID); got.PendingCompletionEventID != "" || len(store.ListPendingCompletionEvents()) != 0 || len(client.releaseIDs) != failedReleaseAttempts+1 || claimReleases != 1 {
+		t.Fatalf("maintenance resurrected an acknowledged completion: %+v", got)
+	}
+}
+
+func TestMaintenanceDoesNotRecreateAcknowledgedCompletionFromStaleObservation(t *testing.T) {
+	c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+	c.WithCompletionEvents()
+	observed := store.Get("ntm-heartbeat")
+	c.workItemStatusFn = func(context.Context, string) (string, error) { return "closed", nil }
+	claimReleases := 0
+	c.releaseWorkItemClaimFn = func(context.Context, string, string, string) (bool, error) {
+		claimReleases++
+		return true, nil
+	}
+	if err := c.MaintainAssignments(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	eventID := store.Get(observed.BeadID).PendingCompletionEventID
+	if eventID == "" {
+		t.Fatal("watch maintenance lost its completion event")
+	}
+	const consumer = "competing-watch-consumer"
+	if _, claimed, err := store.ClaimPendingCompletionEvent(t.Context(), observed.BeadID, eventID, consumer, time.Minute); err != nil || !claimed {
+		t.Fatalf("claim completion event: claimed=%t error=%v", claimed, err)
+	}
+	if acknowledged, err := store.AcknowledgeCompletionEvent(t.Context(), observed.BeadID, eventID, consumer); err != nil || !acknowledged {
+		t.Fatalf("acknowledge completion event: acknowledged=%t error=%v", acknowledged, err)
+	}
+	// This maintenance pass captured an active generation before a competing
+	// watcher completed cleanup and consumed its event under the same locks.
+	if completed, err := c.reconcileTerminalAssignment(t.Context(), store, observed, assignmentstore.StatusCompleted, ""); err != nil || completed {
+		t.Fatalf("stale maintenance revisited terminal generation: completed=%t err=%v", completed, err)
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Get(observed.BeadID); got.Status != assignmentstore.StatusCompleted || got.PendingCompletionEventID != "" || len(client.releaseIDs) != 1 || claimReleases != 1 {
+		t.Fatalf("stale maintenance resurrected completion or repeated cleanup: %+v claims=%d releases=%v", got, claimReleases, client.releaseIDs)
+	}
+}
+
+func TestObservePreservesAssignmentsWithAutomaticActionsEnabled(t *testing.T) {
+	c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+	before := store.Get("ntm-heartbeat")
+	c.config.AutoAssign = true
+	c.config.ConflictNotify = true
+	c.config.ConflictNegotiate = true
+	c.config.MailNudge = true
+	c.config.SendDigests = true
+	c.config.RotationUsageThreshold = 1
+	c.config.PollInterval = MinPollInterval
+	c.workItemStatusFn = func(context.Context, string) (string, error) {
+		t.Fatal("observation inspected assignment lifecycle")
+		return "closed", nil
+	}
+	c.assignWorkFn = func(context.Context) ([]AssignmentResult, error) {
+		t.Fatal("observation admitted new work")
+		return nil, nil
+	}
+	c.detectConflictsFn = func(context.Context) ([]Conflict, error) {
+		t.Fatal("observation ran conflict negotiation")
+		return nil, nil
+	}
+	if err := c.Observe(t.Context()); err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if got := c.GetAgents()["%94"]; got == nil || !got.Healthy || got.ObservationFreshness != status.FreshnessFresh || got.AgentMailName != "BlueLake" {
+		t.Fatalf("observation did not produce current agent state: %+v", got)
+	}
+	if c.started || c.rotation != nil || c.mailNudge != nil || c.conflictDetector != nil {
+		t.Fatal("observation started background coordination")
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	if after := store.Get(before.BeadID); !reflect.DeepEqual(before, after) || len(client.renewRequests) != 0 || len(client.releaseIDs) != 0 {
+		t.Fatalf("observation changed durable assignment state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestRunCycleMaintainsIndependentAssignmentsDespiteFailures(t *testing.T) {
+	for _, failure := range []string{"renewal", "terminal_cleanup", "both"} {
+		t.Run(failure, func(t *testing.T) {
+			c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+			const closedBead = "ntm-terminal-maintenance"
+			terminal := store.Get("ntm-heartbeat")
+			terminal.BeadID = closedBead
+			terminal.Pane = 2
+			terminal.IdempotencyKey = "terminal-maintenance-generation"
+			terminal.ClaimActor = "BlueLake:terminal-maintenance-generation"
+			terminal.DispatchTarget, terminal.OccupancyKey, terminal.ReservationTarget = "%95", "%95", "%95"
+			terminal.ReservationRequested, terminal.ReservedPaths = []string{"finished.go"}, []string{"finished.go"}
+			terminal.ReservationIDs = []int{951}
+			store.Assignments[closedBead] = terminal
+			if err := store.Save(); err != nil {
+				t.Fatal(err)
+			}
+			client.reservations = append(client.reservations, agentmail.FileReservation{
+				ID: 951, ProjectID: 9, AgentName: "BlueLake", PathPattern: "finished.go", Exclusive: true,
+				Reason: "bead assignment: " + closedBead, ExpiresTS: agentmail.FlexTime{Time: time.Now().Add(time.Hour)},
+			})
+			c.config.AutoAssign = true
+			c.assignWorkFn = func(context.Context) ([]AssignmentResult, error) {
+				t.Fatal("maintenance failure admitted new work")
+				return nil, nil
+			}
+			c.workItemStatusFn = func(_ context.Context, beadID string) (string, error) {
+				if beadID == closedBead {
+					return "closed", nil
+				}
+				return "in_progress", nil
+			}
+			claimReleases := 0
+			c.releaseWorkItemClaimFn = func(_ context.Context, projectKey, beadID, actor string) (bool, error) {
+				claimReleases++
+				if projectKey != c.projectKey || beadID != closedBead || actor != terminal.ClaimActor {
+					t.Fatalf("claim cleanup changed ownership: project=%q bead=%q actor=%q", projectKey, beadID, actor)
+				}
+				return true, nil
+			}
+			failsRenewal := failure == "renewal" || failure == "both"
+			failsCleanup := failure == "terminal_cleanup" || failure == "both"
+			if failsRenewal {
+				client.reservations[0].AgentName = "DifferentOwner"
+			}
+			if failsCleanup {
+				client.releaseErr = errors.New("terminal release unavailable")
+			}
+
+			_, err := c.RunCycle(t.Context())
+			if err == nil || failsRenewal && !strings.Contains(err.Error(), "reservation protection for ntm-heartbeat") ||
+				failsCleanup && !strings.Contains(err.Error(), "release terminal assignment "+closedBead) {
+				t.Fatalf("cycle did not retain every maintenance failure: %v", err)
+			}
+			if err := store.LoadStrict(); err != nil {
+				t.Fatal(err)
+			}
+			active := store.Get("ntm-heartbeat")
+			if active.Status != assignmentstore.StatusWorking || !reflect.DeepEqual(active.ReservationIDs, []int{941, 942}) {
+				t.Fatalf("unrelated cleanup changed active ownership: %+v", active)
+			}
+			if failsRenewal {
+				if active.ReservationRenewalError == "" || len(client.renewRequests) != 0 {
+					t.Fatalf("uncertain reservation was renewed or lost its diagnostic: %+v", active)
+				}
+			} else if len(client.renewRequests) != 1 || active.ReservationExpiresAt.Before(time.Now().Add(50*time.Minute)) {
+				t.Fatalf("failed terminal cleanup prevented healthy lease renewal: %+v requests=%v", active, client.renewRequests)
+			}
+			closed := store.Get(closedBead)
+			if failsCleanup {
+				if closed.ClearState != assignmentstore.ClearStateReservationReleasing || closed.ClearError == "" ||
+					closed.PendingTerminalStatus != assignmentstore.StatusCompleted || !reflect.DeepEqual(closed.ReservationIDs, []int{951}) || claimReleases != 0 {
+					t.Fatalf("failed cleanup lost its durable retry barrier: %+v claims=%d", closed, claimReleases)
+				}
+			} else if closed.Status != assignmentstore.StatusCompleted || len(closed.ReservationIDs) != 0 || claimReleases != 1 {
+				t.Fatalf("failed renewal prevented terminal cleanup: %+v claims=%d", closed, claimReleases)
+			}
+
+			// Maintenance can finish after admission is disabled, resuming the
+			// durable cleanup barrier without asking the tracker to reopen it.
+			c.config.AutoAssign = false
+			client.releaseErr = nil
+			client.reservations[0].AgentName = "BlueLake"
+			c.workItemStatusFn = func(_ context.Context, beadID string) (string, error) {
+				if beadID == closedBead {
+					t.Fatal("durable terminal barrier re-read tracker status")
+				}
+				return "in_progress", nil
+			}
+			if _, err := c.RunCycle(t.Context()); err != nil {
+				t.Fatalf("maintenance recovery while admission paused: %v", err)
+			}
+			if err := store.LoadStrict(); err != nil {
+				t.Fatal(err)
+			}
+			if closed := store.Get(closedBead); closed.Status != assignmentstore.StatusCompleted || closed.ClearState != assignmentstore.ClearStateNone || len(closed.ReservationIDs) != 0 || claimReleases != 1 {
+				t.Fatalf("terminal maintenance recovery lost progress: %+v claims=%d", closed, claimReleases)
+			}
+			if active := store.Get("ntm-heartbeat"); active.Status != assignmentstore.StatusWorking || active.ReservationRenewalError != "" || active.ReservationExpiresAt.Before(time.Now().Add(50*time.Minute)) || len(store.ListActive()) != 1 {
+				t.Fatalf("active maintenance recovery failed: %+v", active)
+			}
+		})
+	}
+}
+
+func TestRunCycleReconcilesLostAssignmentRenewalResponse(t *testing.T) {
+	c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+	renew := client.renewFn
+	client.renewFn = func(ctx context.Context, opts agentmail.RenewReservationsOptions) (*agentmail.RenewReservationsResult, error) {
+		_, _ = renew(ctx, opts)
+		return nil, errors.New("response lost after server commit")
+	}
+	if _, err := c.RunCycle(t.Context()); err != nil {
+		t.Fatalf("authoritative readback did not reconcile lost response: %v", err)
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Get("ntm-heartbeat"); got.ReservationRenewalError != "" || got.ReservationExpiresAt.Before(time.Now().Add(time.Hour)) {
+		t.Fatalf("lost-response recovery = %+v", got)
+	}
+}
+
+func TestRunCycleRefreshesStalePaneObservationBeforeReservationRenewal(t *testing.T) {
+	for _, stage := range []string{"claim", "lease", "replacement", "unrelated_capture"} {
+		t.Run(stage, func(t *testing.T) {
+			c, _, client := newAssignmentHeartbeatTestCoordinator(t)
+			observations := 0
+			c.monitor.observer = status.NewSessionObserverWithDependencies(status.NewDetector(), status.SessionObserverConfig{}, status.SessionObserverDependencies{
+				ListPanes: func(context.Context, string) ([]tmux.PaneActivity, error) {
+					observations++
+					if stage == "replacement" && observations > 1 {
+						return []tmux.PaneActivity{{Pane: tmux.Pane{ID: "%94", Index: 1, Title: "shell", Type: tmux.AgentUser}}}, nil
+					}
+					if stage == "unrelated_capture" && observations > 1 {
+						return []tmux.PaneActivity{
+							{Pane: tmux.Pane{ID: "%94", Index: 1, Title: c.session + "__cc_1", Type: tmux.AgentClaude}},
+							{Pane: tmux.Pane{ID: "%95", Index: 2, Title: c.session + "__cc_2", Type: tmux.AgentClaude}},
+						}, nil
+					}
+					return []tmux.PaneActivity{{Pane: tmux.Pane{ID: "%94", Index: 1, Title: c.session + "__cc_1", Type: tmux.AgentClaude}, LastActivity: time.Now().Add(-time.Minute)}}, nil
+				},
+				CapturePane: func(_ context.Context, paneID string, _ int) (string, error) {
+					if paneID == "%95" {
+						return "", errors.New("unrelated capture failed during refresh")
+					}
+					return idleCapture, nil
+				},
+			})
+			ageObservation := func() {
+				c.mu.Lock()
+				c.agents["%94"].ObservedAt = time.Now().Add(-time.Minute)
+				c.mu.Unlock()
+			}
+			if stage == "lease" {
+				client.beforeList = func() {
+					ageObservation()
+					client.beforeList = nil
+				}
+			} else {
+				lookup := c.workItemDetailsFn
+				c.workItemDetailsFn = func(ctx context.Context, beadID string) (*bv.BeadAssignmentDetails, error) {
+					ageObservation()
+					return lookup(ctx, beadID)
+				}
+			}
+			_, err := c.RunCycle(t.Context())
+			if observations != 2 {
+				t.Fatalf("pane observations = %d, want a fresh observation after the slow %s read", observations, stage)
+			}
+			if stage == "replacement" {
+				if err == nil || len(client.renewRequests) != 0 {
+					t.Fatalf("renewed a lease after the pane became a user shell: requests=%v err=%v", client.renewRequests, err)
+				}
+			} else if err != nil || len(client.renewRequests) != 1 {
+				t.Fatalf("stale batch observation prevented renewal: requests=%v err=%v", client.renewRequests, err)
+			}
+		})
+	}
+}
+
+func TestRunCycleRetriesOnlyUnrenewedAssignmentReservationIDs(t *testing.T) {
+	c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+	renew := client.renewFn
+	client.renewFn = func(ctx context.Context, opts agentmail.RenewReservationsOptions) (*agentmail.RenewReservationsResult, error) {
+		opts.ReservationIDs = []int{941}
+		return renew(ctx, opts)
+	}
+	if _, err := c.RunCycle(t.Context()); err == nil {
+		t.Fatal("partially renewed assignment was accepted")
+	}
+	protectedExpiry := client.reservations[0].ExpiresTS.Time
+	client.renewFn = renew
+	if _, err := c.RunCycle(t.Context()); err != nil {
+		t.Fatalf("retry of unrenewed lease: %v", err)
+	}
+	if len(client.renewRequests) != 2 || !reflect.DeepEqual(client.renewRequests[1].ReservationIDs, []int{942}) || !client.reservations[0].ExpiresTS.Equal(protectedExpiry) {
+		t.Fatalf("retry extended an already healthy lease: %+v", client.renewRequests)
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Get("ntm-heartbeat"); got.ReservationRenewalError != "" || !got.ReservationExpiresAt.Equal(protectedExpiry) {
+		t.Fatalf("partial renewal recovery not persisted: %+v", got)
+	}
+}
+
+func TestRunCycleRetainsAssignmentAfterPartialRenewalAndRecoversByReadback(t *testing.T) {
+	c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+	before := store.Get("ntm-heartbeat")
+	c.config.AutoAssign = true
+	assignCalls := 0
+	c.assignWorkFn = func(context.Context) ([]AssignmentResult, error) { assignCalls++; return nil, nil }
+	client.renewFn = func(context.Context, agentmail.RenewReservationsOptions) (*agentmail.RenewReservationsResult, error) {
+		client.reservations[0].ExpiresTS.Time = time.Now().Add(time.Hour)
+		return &agentmail.RenewReservationsResult{Renewed: 2}, nil // Incorrect success count.
+	}
+	if _, err := c.RunCycle(t.Context()); err == nil || !strings.Contains(err.Error(), "every assignment lease") {
+		t.Fatalf("partial renewal error = %v", err)
+	}
+	if assignCalls != 0 {
+		t.Fatal("new work was assigned with uncertain reservation protection")
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	failed := store.Get(before.BeadID)
+	if failed.Status != assignmentstore.StatusWorking || failed.ReservationRenewalError == "" || !failed.ReservationExpiresAt.Equal(*before.ReservationExpiresAt) || !reflect.DeepEqual(failed.ReservationIDs, before.ReservationIDs) {
+		t.Fatalf("failed renewal released or altered the active assignment: %+v", failed)
+	}
+	// The server completes the second renewal after our inconclusive response.
+	client.reservations[1].ExpiresTS.Time = time.Now().Add(time.Hour)
+	if _, err := c.RunCycle(t.Context()); err != nil {
+		t.Fatalf("readback recovery: %v", err)
+	}
+	if len(client.renewRequests) != 1 || assignCalls != 1 {
+		t.Fatalf("recovery repeated renewal or did not resume coordination: renew=%d assign=%d", len(client.renewRequests), assignCalls)
+	}
+	if err := store.LoadStrict(); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Get(before.BeadID); got.ReservationRenewalError != "" || got.ReservationExpiresAt.Before(time.Now().Add(50*time.Minute)) {
+		t.Fatalf("recovery was not persisted: %+v", got)
+	}
+}
+
+func TestRunCycleRejectsChangedAssignmentReservationBindings(t *testing.T) {
+	for _, kind := range []string{"project", "owner", "reason", "path", "missing", "expired", "released", "shared", "claim", "pane", "closed"} {
+		t.Run(kind, func(t *testing.T) {
+			c, store, client := newAssignmentHeartbeatTestCoordinator(t)
+			switch kind {
+			case "project":
+				client.reservations[0].ProjectID++
+			case "owner":
+				client.reservations[0].AgentName = "OtherAgent"
+			case "reason":
+				client.reservations[0].Reason = "another bead"
+			case "path":
+				client.reservations[0].PathPattern = "unrelated.go"
+			case "missing":
+				client.reservations = client.reservations[1:]
+			case "expired":
+				client.reservations[0].ExpiresTS.Time = time.Now().Add(-time.Second)
+			case "released":
+				client.reservations[0].ReleasedTS = &agentmail.FlexTime{Time: time.Now()}
+			case "shared":
+				client.reservations[0].Exclusive = false
+			case "claim":
+				c.workItemDetailsFn = func(context.Context, string) (*bv.BeadAssignmentDetails, error) {
+					return &bv.BeadAssignmentDetails{ID: "ntm-heartbeat", Status: "in_progress", Assignee: "NewOwner"}, nil
+				}
+			case "pane":
+				registry, err := agentmail.LoadSessionAgentRegistry(c.session, c.projectKey)
+				if err != nil || registry == nil {
+					t.Fatalf("load registry before changing owner: %+v, %v", registry, err)
+				}
+				registry.AddAgent(c.session+"__cc_1", "%94", "ReplacementAgent")
+				if err := agentmail.SaveSessionAgentRegistry(registry); err != nil {
+					t.Fatal(err)
+				}
+			case "closed":
+				c.workItemDetailsFn = func(context.Context, string) (*bv.BeadAssignmentDetails, error) {
+					return &bv.BeadAssignmentDetails{ID: "ntm-heartbeat", Status: "closed"}, nil
+				}
+			}
+			_, err := c.RunCycle(t.Context())
+			if kind == "closed" {
+				if err != nil {
+					t.Fatalf("closed work should skip renewal: %v", err)
+				}
+			} else if err == nil {
+				t.Fatal("unsafe renewal did not fail")
+			}
+			if len(client.renewRequests) != 0 {
+				t.Fatalf("renewed after %s changed: %+v", kind, client.renewRequests)
+			}
+			if err := store.LoadStrict(); err != nil {
+				t.Fatal(err)
+			}
+			got := store.Get("ntm-heartbeat")
+			if got.Status != assignmentstore.StatusWorking || len(got.ReservationIDs) != 2 || (kind != "closed" && got.ReservationRenewalError == "") {
+				t.Fatalf("unsafe renewal lost durable occupancy/evidence: %+v", got)
+			}
+		})
+	}
 }
 
 func TestWorkAssignmentStruct(t *testing.T) {
@@ -253,6 +1233,14 @@ func TestAttemptAssignmentRequiresAgentMailIdentity(t *testing.T) {
 func TestAttemptAssignmentAtomicSuccessPersistsReceipt(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	projectDir := t.TempDir()
+	// Reservation candidates must resolve inside the repository (ntm#302), so
+	// the path this assignment reserves has to actually exist.
+	if err := os.MkdirAll(filepath.Join(projectDir, "internal", "coordinator"), 0o755); err != nil {
+		t.Fatalf("create repository path: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "internal", "coordinator", "assign.go"), []byte("package coordinator\n"), 0o600); err != nil {
+		t.Fatalf("write repository path: %v", err)
+	}
 	c := New("coordinator-atomic-success", projectDir, &agentmail.Client{}, "CoordinatorAgent")
 	var order []string
 	c.atomicCoordinatorFactory = func(store *assignmentstore.AssignmentStore) *assignmentstore.AtomicCoordinator {
@@ -302,6 +1290,130 @@ func TestAttemptAssignmentAtomicSuccessPersistsReceipt(t *testing.T) {
 	if stored == nil || stored.DispatchState != assignmentstore.DispatchSent || stored.DispatchReceiptID != "mail-91" ||
 		stored.ClaimActor != result.ClaimActor || stored.IdempotencyKey != result.IdempotencyKey || stored.OccupancyKey != "%9" {
 		t.Fatalf("durable coordinator assignment = %+v", stored)
+	}
+}
+
+const coordinatorContextCASSMarker = "NTM_COORDINATOR_CASS_HISTORY"
+
+// writeCoordinatorStubCass writes a stub cass that logs each invocation and
+// prints one dateless, high-scoring hit.
+func writeCoordinatorStubCass(t *testing.T) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "cass.log")
+	payload := `{"query":"rate limiting","total_matches":1,"hits":[{"source_path":"/home/user/.cass/sessions/gateway/session-a.jsonl",` +
+		`"line_number":7,"agent":"codex","content":"` + coordinatorContextCASSMarker + ` token bucket per API key","score":0.93}]}`
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '" + logPath + "'\ncat <<'NTM_FIXTURE_EOF'\n" + payload + "\nNTM_FIXTURE_EOF\n"
+	binPath := filepath.Join(dir, "cass")
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write stub cass: %v", err)
+	}
+	return binPath, logPath
+}
+
+func readCoordinatorStubLog(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read stub log: %v", err)
+	}
+	return string(data)
+}
+
+// TestAttemptAssignmentEnrichesPromptAndRecoveryReplaysRecordedPrompt proves
+// coordinator auto-assign enriches the work-assignment message with CASS
+// history before the durable intent is recorded, and that pending recovery
+// re-delivers the recorded enriched prompt without querying cass again.
+func TestAttemptAssignmentEnrichesPromptAndRecoveryReplaysRecordedPrompt(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cassBin, cassLog := writeCoordinatorStubCass(t)
+	query := robot.DefaultCASSConfig()
+	query.BinaryPath = cassBin
+	query.Timeout = 10 * time.Second
+	filter := robot.DefaultFilterConfig()
+	filter.MinRelevance = 0
+	filter.MaxAgeDays = 0
+	projectDir := t.TempDir()
+	c := New("coordinator-prompt-context", projectDir, &agentmail.Client{}, "CoordinatorAgent").
+		WithPromptContext(robot.PromptContextOptions{WithCASS: true, CASSConfig: &query, FilterConfig: &filter})
+
+	refuseDispatch := true
+	var dispatched []string
+	c.atomicCoordinatorFactory = func(store *assignmentstore.AssignmentStore) *assignmentstore.AtomicCoordinator {
+		claim := assignmentstore.ClaimFunc(func(_ context.Context, beadID, actor string) (assignmentstore.ClaimReceipt, error) {
+			return assignmentstore.ClaimReceipt{BeadID: beadID, Actor: actor, Status: "in_progress", ClaimedAt: time.Now().UTC()}, nil
+		})
+		dispatch := assignmentstore.DispatchFunc(func(_ context.Context, request assignmentstore.DispatchRequest) (assignmentstore.DispatchReceipt, error) {
+			if refuseDispatch {
+				return assignmentstore.DispatchReceipt{}, assignmentstore.GuaranteeNoActuation(errors.New("mailbox unavailable"))
+			}
+			dispatched = append(dispatched, request.Prompt)
+			return assignmentstore.DispatchReceipt{DeliveryID: "mail-context"}, nil
+		})
+		preflight := assignmentstore.PromptPreflightFunc(func(_ context.Context, request assignmentstore.DispatchRequest) (assignmentstore.PromptPreflightResult, error) {
+			return assignmentstore.PromptPreflightResult{DispatchPrompt: request.Prompt, DurablePrompt: request.Prompt}, nil
+		})
+		return assignmentstore.NewAtomicCoordinator(store, claim, nil, dispatch, preflight)
+	}
+
+	work := &WorkAssignment{
+		BeadID: "ntm-context", BeadTitle: "Add rate limiting middleware", AgentPaneID: "%9", AgentPaneIndex: 4,
+		AgentMailName: "BlueFox", AgentType: "cod", Priority: 1, Score: 0.9,
+	}
+	rec := &bv.TriageRecommendation{ID: work.BeadID, Title: work.BeadTitle, Labels: []string{"gateway"}}
+	first := c.attemptAssignment(t.Context(), work, rec)
+	if first.Success || first.MessageSent || first.CASSInjection == nil || first.CASSInjection.ItemsInjected == 0 {
+		t.Fatalf("first attempt = %+v (cass %+v), want an enriched intent refused before delivery", first, first.CASSInjection)
+	}
+	// Enrichment searches globally and within the project at once
+	// (cass.SearchContext), both over the bead title and labels.
+	cassCalls := readCoordinatorStubLog(t, cassLog)
+	var globalSearches, projectSearches int
+	for _, call := range strings.Split(strings.TrimSpace(cassCalls), "\n") {
+		switch {
+		case !strings.HasPrefix(call, "search ") || !strings.Contains(call, "gateway"):
+			globalSearches = -1
+		case strings.Contains(call, "--workspace="+filepath.Clean(projectDir)+" "):
+			projectSearches++
+		case !strings.Contains(call, "--workspace="):
+			globalSearches++
+		default:
+			globalSearches = -1
+		}
+	}
+	if globalSearches != 1 || projectSearches != 1 {
+		t.Fatalf("cass calls = %q, want one global and one project search over the bead title and labels", cassCalls)
+	}
+
+	store, err := assignmentstore.LoadStoreStrict(c.session)
+	if err != nil {
+		t.Fatalf("LoadStoreStrict: %v", err)
+	}
+	pending := store.Get(work.BeadID)
+	if pending == nil || pending.Status != assignmentstore.StatusClaimed || pending.DispatchState != assignmentstore.DispatchPending {
+		t.Fatalf("pending intent = %+v, want a claimed, undelivered row", pending)
+	}
+	history, body := strings.Index(pending.PendingPrompt, coordinatorContextCASSMarker), strings.Index(pending.PendingPrompt, "# Work Assignment")
+	if history < 0 || body < 0 || history > body {
+		t.Fatalf("recorded prompt lacks history above the assignment message:\n%s", pending.PendingPrompt)
+	}
+	if want := assignmentstore.PromptSHA256(c.formatAssignmentMessage(work, rec, pending.ClaimActor)); pending.BaseIntentSHA256 != want {
+		t.Fatalf("base intent = %q, want the unenriched message checksum %q", pending.BaseIntentSHA256, want)
+	}
+
+	refuseDispatch = false
+	recovered := c.recoverPendingAssignment(t.Context(), store, pending, coordinatorWorkAssignmentFromRecord(pending))
+	if !recovered.Success || !recovered.MessageSent || recovered.IdempotencyKey != pending.IdempotencyKey {
+		t.Fatalf("recovery = %+v, want key %s delivered", recovered, pending.IdempotencyKey)
+	}
+	if recovered.CASSInjection != nil {
+		t.Fatalf("recovery re-ran enrichment: %+v", recovered.CASSInjection)
+	}
+	if len(dispatched) != 1 || dispatched[0] != pending.PendingPrompt {
+		t.Fatalf("recovery delivered %q, want the recorded prompt", dispatched)
+	}
+	if calls := readCoordinatorStubLog(t, cassLog); calls != cassCalls {
+		t.Fatalf("recovery queried cass again: %q", calls)
 	}
 }
 
@@ -961,6 +2073,189 @@ func addEligibleCoordinatorAgent(c *SessionCoordinator, paneID, agentName string
 	c.actionableRecommendationsFn = func(context.Context, string, int) ([]bv.TriageRecommendation, error) { return nil, nil }
 }
 
+func TestAssignWorkRepairsCorruptPreclaimReadsBeforeDispatch(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		planning   bool
+		verified   bool
+		gated      bool
+		unrelated  bool
+		wantError  bool
+		wantAssign bool
+	}{
+		{name: "planning read", planning: true, verified: true, wantAssign: true},
+		{name: "live eligibility read", verified: true, wantAssign: true},
+		{name: "unverified repair", planning: true, wantError: true},
+		{name: "operator gate survives", verified: true, gated: true},
+		{name: "unrelated error", planning: true, unrelated: true, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			projectDir := t.TempDir()
+			beadsDir := filepath.Join(projectDir, ".beads")
+			if err := os.Mkdir(beadsDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			dbPath := filepath.Join(beadsDir, "index.db")
+			database, err := sql.Open(sqliteutil.DriverName, sqliteutil.FileDSN(dbPath))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = database.Exec(`CREATE TABLE issues (id TEXT PRIMARY KEY, status TEXT NOT NULL);
+CREATE INDEX idx_issues_status ON issues(status);
+CREATE INDEX idx_issues_tombstone ON issues(status) WHERE status = 'tombstone';
+INSERT INTO issues VALUES ('ntm-deleted', 'tombstone');`)
+			closeErr := database.Close()
+			if err != nil || closeErr != nil {
+				t.Fatalf("create preservation indexes: %v, close: %v", err, closeErr)
+			}
+			jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+			source := []byte("{\"id\":\"ntm-deleted\",\"status\":\"tombstone\"}\n")
+			if err := os.WriteFile(jsonlPath, source, 0600); err != nil {
+				t.Fatal(err)
+			}
+			binDir := t.TempDir()
+			writeJSON := func(name string, value any) {
+				t.Helper()
+				data, err := json.Marshal(value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(binDir, name+".json"), data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeJSON("info", map[string]any{"database_path": dbPath, "jsonl_path": jsonlPath})
+			code := "DATABASE_ERROR"
+			if test.unrelated {
+				code = "VALIDATION_ERROR"
+			}
+			writeJSON("read-error", map[string]any{"error": map[string]any{"code": code, "message": "Database error: database disk image is malformed"}})
+			warning := "the tombstone issue IDs could not be read before the rebuild (Database error: database disk image is malformed); preservation of unflushed local state could not be established"
+			writeJSON("sync", map[string]any{"error": map[string]any{
+				"code": "SYNC_CONFLICT", "message": "Sync conflict: Automatic database recovery refused because unflushed-state preservation could not be established:\n- " + warning + "\nThe database was not replaced.",
+			}})
+			writeJSON("doctor", map[string]any{
+				"exit_code": 2, "code": "fix_partial", "ok": false, "repaired": true,
+				"database_verified": test.verified, "verified": false, "preservation_verified": false,
+				"skipped": 0, "fk_violations_cleaned": 0, "preserved_history": []any{},
+				"history_preservation_warnings": []string{}, "dirty_preservation_warnings": []string{warning},
+				"verified_backups":        []any{map[string]any{"backup": filepath.Join(beadsDir, "index.db.backup")}},
+				"recovery_failure_marker": filepath.Join(beadsDir, "recovery-marker"), "recovery_failure_marker_error": nil,
+			})
+			labels := []string{}
+			if test.gated {
+				labels = append(labels, "operator-only")
+			}
+			writeJSON("details", []any{map[string]any{"id": "ntm-recover-read", "title": "Recovered work", "status": "open", "issue_type": "task", "labels": labels}})
+			script := `#!/bin/sh
+set -eu
+[ "$1" = "--lock-timeout" ] && [ "$2" = "5000" ] || exit 97
+shift 2
+printf '%s\n' "$*" >> "$NTM_COORD_RECOVERY_FIXTURE/calls"
+case "$1" in
+info)
+  [ "$*" = "info --json --no-auto-import --no-auto-flush" ] || exit 98
+  cat "$NTM_COORD_RECOVERY_FIXTURE/info.json" ;;
+sync)
+  [ "$*" = "sync --import-only --rebuild --json" ] || exit 98
+  cat "$NTM_COORD_RECOVERY_FIXTURE/sync.json"
+  exit 6 ;;
+doctor)
+  [ "$*" = "doctor --repair --json" ] || exit 98
+  cat "$NTM_COORD_RECOVERY_FIXTURE/doctor.json"
+  : > "$NTM_COORD_RECOVERY_FIXTURE/repaired"
+  exit 2 ;;
+ready|show)
+  if [ ! -f "$NTM_COORD_RECOVERY_FIXTURE/repaired" ]; then
+    cat "$NTM_COORD_RECOVERY_FIXTURE/read-error.json"
+    exit 2
+  fi
+  cat "$NTM_COORD_RECOVERY_FIXTURE/details.json" ;;
+*) exit 99 ;;
+esac
+`
+			if err := os.WriteFile(filepath.Join(binDir, "br"), []byte(script), 0755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("NTM_COORD_RECOVERY_FIXTURE", binDir)
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			if err := bv.ConfigureProjectOperatorGatedLabels(projectDir, []string{"operator-only"}); err != nil {
+				t.Fatal(err)
+			}
+			c := New("coordinator-preclaim-recovery", projectDir, &agentmail.Client{}, "CoordinatorAgent")
+			addEligibleCoordinatorAgent(c, "%85", "BlueLake")
+			c.workItemStatusFn = nil // Exercise real live details instead of the fixture's status stub.
+			planningCalls := 0
+			c.actionableRecommendationsFn = func(ctx context.Context, dir string, _ int) ([]bv.TriageRecommendation, error) {
+				planningCalls++
+				if test.planning {
+					if _, err := bv.RunBdContext(ctx, dir, "ready", "--json"); err != nil {
+						return nil, err
+					}
+				}
+				return []bv.TriageRecommendation{{ID: "ntm-recover-read", Title: "Recovered work", Status: "open", Type: "task", Priority: 1, Score: 1}}, nil
+			}
+			claims, dispatches := 0, 0
+			c.atomicCoordinatorFactory = func(store *assignmentstore.AssignmentStore) *assignmentstore.AtomicCoordinator {
+				claim := assignmentstore.ClaimFunc(func(_ context.Context, id, actor string) (assignmentstore.ClaimReceipt, error) {
+					claims++
+					return assignmentstore.ClaimReceipt{BeadID: id, Actor: actor, Status: "in_progress", ClaimedAt: time.Now().UTC()}, nil
+				})
+				dispatch := assignmentstore.DispatchFunc(func(context.Context, assignmentstore.DispatchRequest) (assignmentstore.DispatchReceipt, error) {
+					dispatches++
+					return assignmentstore.DispatchReceipt{DeliveryID: "recovered-read-delivery"}, nil
+				})
+				preflight := assignmentstore.PromptPreflightFunc(func(_ context.Context, request assignmentstore.DispatchRequest) (assignmentstore.PromptPreflightResult, error) {
+					return assignmentstore.PromptPreflightResult{DispatchPrompt: request.Prompt, DurablePrompt: request.Prompt}, nil
+				})
+				return assignmentstore.NewAtomicCoordinator(store, claim, nil, dispatch, preflight).
+					WithAssignmentEligibilityAuthorizationPort(assignmentstore.AssignmentEligibilityAuthorizationFunc(func(ctx context.Context, request assignmentstore.AssignmentEligibilityAuthorizationRequest) error {
+						// This authorization remains a plain read, even after preflight repair.
+						_, err := bv.GetBeadAssignmentDetailsContext(ctx, projectDir, request.BeadID)
+						return err
+					}))
+			}
+			results, err := c.AssignWork(t.Context())
+			if (err != nil) != test.wantError {
+				t.Fatalf("AssignWork results=%+v error=%v", results, err)
+			}
+			wantEffects := 0
+			if test.wantAssign {
+				wantEffects = 1
+				if len(results) != 1 || !results[0].Success {
+					t.Fatalf("repaired assignment results=%+v", results)
+				}
+			}
+			if claims != wantEffects || dispatches != wantEffects {
+				t.Fatalf("claims=%d dispatches=%d, want %d each", claims, dispatches, wantEffects)
+			}
+			calls, err := os.ReadFile(filepath.Join(binDir, "calls"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantRepairs := 1
+			if test.unrelated {
+				wantRepairs = 0
+			}
+			if strings.Count(string(calls), "sync --import-only --rebuild --json\n") != wantRepairs || strings.Count(string(calls), "doctor --repair --json\n") != wantRepairs {
+				t.Fatalf("repair calls=%s", calls)
+			}
+			wantPlanning := 1
+			if test.planning && test.verified {
+				wantPlanning = 2
+			}
+			if planningCalls != wantPlanning {
+				t.Fatalf("planning reads=%d, want %d", planningCalls, wantPlanning)
+			}
+			after, err := os.ReadFile(jsonlPath)
+			if err != nil || string(after) != string(source) {
+				t.Fatalf("authoritative JSONL changed: %q, %v", after, err)
+			}
+		})
+	}
+}
+
 func TestAssignWorkFailsClosedBeforePendingRecoveryWhenActionableVerificationFails(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	tests := []struct {
@@ -1241,6 +2536,9 @@ func TestAssignWorkKeepsUnknownDispatchFailClosed(t *testing.T) {
 	}
 
 	c := New(session, t.TempDir(), &agentmail.Client{}, "CoordinatorAgent")
+	c.dispatchDeliveryProbeFn = func(context.Context, *assignmentstore.Assignment) (assignmentstore.DispatchReceipt, bool, error) {
+		return assignmentstore.DispatchReceipt{}, false, errors.New("delivery evidence unavailable")
+	}
 	addEligibleCoordinatorAgent(c, request.Target, request.AgentName)
 	c.atomicCoordinatorFactory = func(*assignmentstore.AssignmentStore) *assignmentstore.AtomicCoordinator {
 		t.Fatal("unknown dispatch must not reach an atomic retry")
@@ -1787,40 +3085,6 @@ func TestFilterActionableRecommendationsUsesLiveDependencyAndLabelTruth(t *testi
 	filtered, terminal, err := c.filterActionableRecommendations(t.Context(), staleReady, nil)
 	if err != nil || terminal || len(filtered) != 1 || filtered[0].ID != "ntm-ready" || filtered[0].Title != "Current ready" {
 		t.Fatalf("filtered=%+v terminal=%v error=%v", filtered, terminal, err)
-	}
-}
-
-func TestFilterActionableRecommendationsExcludesLiveAssignedOpenWork(t *testing.T) {
-	t.Parallel()
-	c := New("recommendation-live-assignee", t.TempDir(), nil, "CoordinatorAgent")
-	details := map[string]*bv.BeadAssignmentDetails{
-		"ntm-ready":   {ID: "ntm-ready", Title: "Unassigned work", IssueType: "task", Status: "open"},
-		"ntm-claimed": {ID: "ntm-claimed", Title: "Externally owned", IssueType: "task", Status: "open", Assignee: "partners@mereka.my"},
-	}
-	c.workItemDetailsFn = func(_ context.Context, beadID string) (*bv.BeadAssignmentDetails, error) {
-		copy := *details[beadID]
-		return &copy, nil
-	}
-
-	filtered, terminal, err := c.filterActionableRecommendations(t.Context(), []bv.TriageRecommendation{
-		{ID: "ntm-claimed", Title: "Stale unassigned", Type: "task", Status: "open"},
-		{ID: "ntm-ready", Title: "Stale ready", Type: "task", Status: "open"},
-	}, nil)
-	if err != nil || terminal || len(filtered) != 1 || filtered[0].ID != "ntm-ready" {
-		t.Fatalf("filtered=%+v terminal=%v error=%v, want only live unassigned work", filtered, terminal, err)
-	}
-}
-
-func TestAssignWorkDefersHonestlyUnderCriticalHostPressure(t *testing.T) {
-	c := New("critical-pressure", t.TempDir(), nil, "IvoryAnchor")
-	c.config.AutoAssign = true
-	c.assignmentPressureFn = func(context.Context) AssignmentPressure {
-		return AssignmentPressure{Available: true, Level: "critical", Limiting: []string{"load"}}
-	}
-
-	results, err := c.AssignWork(t.Context())
-	if err != nil || len(results) != 1 || !results[0].Deferred || results[0].Success || results[0].ReasonCode != "critical_pressure" || results[0].PressureLevel != "critical" || !reflect.DeepEqual(results[0].PressureLimit, []string{"load"}) {
-		t.Fatalf("critical-pressure results=%+v error=%v", results, err)
 	}
 }
 
@@ -2858,5 +4122,113 @@ func TestScoreAssignmentWithNilProfile(t *testing.T) {
 	}
 	if result.ScoreBreakdown.FocusPatternBonus != 0 {
 		t.Errorf("expected zero FocusPatternBonus with nil profile, got %f", result.ScoreBreakdown.FocusPatternBonus)
+	}
+}
+
+func TestCoordinatorMailDispatchErrorTerminalizesOnlyToolRejection(t *testing.T) {
+	rejection := &agentmail.ToolRejectionError{Err: errors.New("sender is not registered")}
+	if got := coordinatorMailDispatchError(rejection); !assignmentstore.IsGuaranteedNoActuation(got) {
+		t.Fatalf("explicit server rejection stayed outcome-unknown: %v", got)
+	}
+	wrapped := fmt.Errorf("send work assignment: %w", rejection)
+	if got := coordinatorMailDispatchError(wrapped); !assignmentstore.IsGuaranteedNoActuation(got) {
+		t.Fatalf("wrapped server rejection stayed outcome-unknown: %v", got)
+	}
+
+	timeout := agentmail.NewAPIError("send_message", 0, agentmail.ErrTimeout)
+	if got := coordinatorMailDispatchError(timeout); assignmentstore.IsGuaranteedNoActuation(got) || !errors.Is(got, agentmail.ErrTimeout) {
+		t.Fatalf("ambiguous timeout was terminalized: %v", got)
+	}
+
+	transport := errors.New("connection reset by peer")
+	if got := coordinatorMailDispatchError(transport); assignmentstore.IsGuaranteedNoActuation(got) {
+		t.Fatalf("ambiguous transport failure was terminalized: %v", got)
+	}
+
+	if got := coordinatorMailDispatchError(nil); got != nil {
+		t.Fatalf("nil error changed to %v", got)
+	}
+}
+
+// TestRepositoryReservationPathsRequireRealRepositoryTargets pins ntm#302:
+// reservation candidates come from free-text bead titles, so slash-bearing
+// prose ("13714/2m", a date) used to become Agent Mail leases on paths that do
+// not exist. Only candidates that resolve inside the repository survive.
+func TestRepositoryReservationPathsRequireRealRepositoryTargets(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "internal", "coordinator"), 0o755); err != nil {
+		t.Fatalf("create repo tree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "internal", "coordinator", "assign.go"), []byte("package coordinator\n"), 0o600); err != nil {
+		t.Fatalf("write repo file: %v", err)
+	}
+
+	got := repositoryReservationPaths(root, []string{
+		"internal/coordinator/assign.go", // real file
+		"internal/coordinator/*.go",      // glob with a real literal prefix
+		"internal/coordinator/assign.go", // duplicate
+		"13714/2m",                       // rate expression
+		"2026/09/03",                     // date
+		"internal/coordinator/new.go",    // to-be-created file: parent exists
+		"docs/does-not-exist.md",         // plausible but absent
+		"/etc/passwd",                    // absolute
+		"../outside/file.go",             // escapes the repo
+		"   ",                            // blank
+	})
+	want := []string{"internal/coordinator/assign.go", "internal/coordinator/*.go", "internal/coordinator/new.go"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("repositoryReservationPaths() = %v, want %v", got, want)
+	}
+
+	if got := repositoryReservationPaths("", []string{"internal/coordinator/assign.go"}); len(got) != 0 {
+		t.Fatalf("no project key must yield no reservations, got %v", got)
+	}
+}
+
+// TestIsFilePathRejectsLeadingDigitProse is the extraction-side half of the
+// same guard: "13714/2m" is a quantity, not a path.
+func TestIsFilePathRejectsLeadingDigitProse(t *testing.T) {
+	for _, s := range []string{"13714/2m", "2026/09/03", "3/4"} {
+		if isFilePath(s) {
+			t.Errorf("isFilePath(%q) = true, want false", s)
+		}
+	}
+	for _, s := range []string{"internal/coordinator/assign.go", "docs/README.md", "cmd/ntm", ".github/workflows"} {
+		if !isFilePath(s) {
+			t.Errorf("isFilePath(%q) = false, want true", s)
+		}
+	}
+}
+
+// TestCoordinatorDispatchRetryBackoff pins the spacing applied to retries of a
+// pre-actuation dispatch failure (ntm#294): retryable is not the same as
+// retry-immediately-every-cycle.
+func TestCoordinatorDispatchRetryBackoff(t *testing.T) {
+	now := time.Now().UTC()
+	recorded := &assignmentstore.Assignment{
+		DispatchState: assignmentstore.DispatchPending, DispatchAttempts: 1,
+		DispatchStartedAt: &now, LastDispatchError: "composer not ready",
+	}
+	if coordinatorDispatchRetryReady(recorded, now.Add(coordinatorDispatchRetryInitial-time.Millisecond)) {
+		t.Fatal("first retry became eligible before the initial backoff")
+	}
+	if !coordinatorDispatchRetryReady(recorded, now.Add(coordinatorDispatchRetryInitial)) {
+		t.Fatal("first retry did not become eligible at the initial backoff")
+	}
+
+	recorded.DispatchAttempts = 9
+	if coordinatorDispatchRetryReady(recorded, now.Add(coordinatorDispatchRetryMaximum-time.Millisecond)) {
+		t.Fatal("retry became eligible before the capped backoff")
+	}
+	if !coordinatorDispatchRetryReady(recorded, now.Add(coordinatorDispatchRetryMaximum)) {
+		t.Fatal("retry did not become eligible at the capped backoff")
+	}
+
+	// A row that has not failed yet is never held back.
+	if !coordinatorDispatchRetryReady(&assignmentstore.Assignment{DispatchStartedAt: &now}, now) {
+		t.Fatal("a row with no recorded dispatch error must not be delayed")
+	}
+	if !coordinatorDispatchRetryReady(nil, now) {
+		t.Fatal("a nil row must not be delayed")
 	}
 }

@@ -270,6 +270,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -333,6 +343,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -388,6 +408,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -893,6 +923,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -958,6 +998,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -1195,6 +1245,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -1268,6 +1328,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -1333,6 +1403,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -1510,6 +1590,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -2275,6 +2365,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -2338,6 +2438,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -2419,6 +2529,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -2492,6 +2612,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -2547,6 +2677,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -2626,6 +2766,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -2690,6 +2840,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -3588,8 +3748,8 @@
           }
         },
         "responses": {
-          "200": {
-            "description": "Successful operation",
+          "202": {
+            "description": "Job accepted for asynchronous execution",
             "content": {
               "application/json": {
                 "schema": {
@@ -3620,6 +3780,26 @@
           },
           "500": {
             "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Job type not implemented",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Job admission closed, queue full, or receipt could not be checkpointed",
             "content": {
               "application/json": {
                 "schema": {
@@ -3673,6 +3853,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -3742,8 +3932,38 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Job is not cancellable in its current state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Cancellation signalled but its receipt could not be checkpointed",
             "content": {
               "application/json": {
                 "schema": {
@@ -3763,6 +3983,16 @@
         "summary": "List mail agents",
         "description": "Served route `GET /api/v1/mail/agents/`. Handler: `handleListMailAgents`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
         "operationId": "get_api_v1_mail_agents_index",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful operation",
@@ -3813,6 +4043,16 @@
         "summary": "Create mail agent",
         "description": "Served route `POST /api/v1/mail/agents/`. Handler: `handleCreateMailAgent`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
         "operationId": "post_api_v1_mail_agents_index",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -3884,6 +4124,14 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -3917,6 +4165,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -3938,6 +4196,16 @@
         "summary": "List contacts",
         "description": "Served route `GET /api/v1/mail/contacts/`. Handler: `handleListContacts`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
         "operationId": "get_api_v1_mail_contacts_index",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful operation",
@@ -3990,6 +4258,16 @@
         "summary": "Set contact policy",
         "description": "Served route `PUT /api/v1/mail/contacts/policy`. Handler: `handleSetContactPolicy`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
         "operationId": "put_api_v1_mail_contacts_policy",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -4052,6 +4330,16 @@
         "summary": "Request contact",
         "description": "Served route `POST /api/v1/mail/contacts/request`. Handler: `handleRequestContact`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
         "operationId": "post_api_v1_mail_contacts_request",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -4114,6 +4402,16 @@
         "summary": "Respond contact",
         "description": "Served route `POST /api/v1/mail/contacts/respond`. Handler: `handleRespondContact`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
         "operationId": "post_api_v1_mail_contacts_respond",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -4228,6 +4526,16 @@
         "summary": "Mail inbox",
         "description": "Served route `GET /api/v1/mail/inbox`. Handler: `handleMailInbox`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
         "operationId": "get_api_v1_mail_inbox",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful operation",
@@ -4280,6 +4588,16 @@
         "summary": "Send message",
         "description": "Served route `POST /api/v1/mail/messages/`. Handler: `handleSendMessage`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
         "operationId": "post_api_v1_mail_messages_index",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -4351,6 +4669,14 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -4376,6 +4702,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -4414,6 +4750,14 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -4449,6 +4793,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -4487,76 +4841,11 @@
             "schema": {
               "type": "string"
             }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "additionalProperties": true
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SuccessEnvelope"
-                }
-              }
-            }
           },
-          "400": {
-            "description": "Bad request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal server error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/mail/messages/{id}/reply": {
-      "post": {
-        "tags": [
-          "mail"
-        ],
-        "summary": "Reply message",
-        "description": "Served route `POST /api/v1/mail/messages/{id}/reply`. Handler: `handleReplyMessage`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
-        "operationId": "post_api_v1_mail_messages_id_reply",
-        "parameters": [
           {
-            "name": "id",
-            "in": "path",
-            "description": "The id identifier",
-            "required": true,
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
             "schema": {
               "type": "string"
             }
@@ -4603,6 +4892,107 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/mail/messages/{id}/reply": {
+      "post": {
+        "tags": [
+          "mail"
+        ],
+        "summary": "Reply message",
+        "description": "Served route `POST /api/v1/mail/messages/{id}/reply`. Handler: `handleReplyMessage`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
+        "operationId": "post_api_v1_mail_messages_id_reply",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The id identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -4624,6 +5014,16 @@
         "summary": "List mail projects",
         "description": "Served route `GET /api/v1/mail/projects`. Handler: `handleListMailProjects`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
         "operationId": "get_api_v1_mail_projects",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful operation",
@@ -4676,6 +5076,16 @@
         "summary": "Search messages",
         "description": "Served route `GET /api/v1/mail/search`. Handler: `handleSearchMessages`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
         "operationId": "get_api_v1_mail_search",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful operation",
@@ -4737,6 +5147,14 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -4762,6 +5180,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -5701,6 +6129,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -5754,6 +6192,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -5835,8 +6283,313 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/pipelines/{id}/recover": {
+      "get": {
+        "tags": [
+          "pipelines"
+        ],
+        "summary": "Recover pipeline",
+        "description": "Served route `GET /api/v1/pipelines/{id}/recover`. Handler: `handleRecoverPipeline`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields. Uses the server's configured project, fixed for execution and HTTP idempotency replay; project and session overrides are not accepted. GET returns deliveries, commands, and selectors arrays containing receipt identities and acceptance eligibility without prompt, transcript, or captured output contents. POST records one explicit acceptance only; it does not launch work, signal processes, or infer settlement from a saved PID. Before accepting command or selector output, independently verify that the original process and all descendants have finished. Use the ordinary resume endpoint or a pipeline_resume job to continue.",
+        "operationId": "get_api_v1_pipelines_id_recover",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The id identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing pipelines:read for inspection or pipelines:write for acceptance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Run is owned, receipt is stale, or the recovery decision conflicts with saved state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Configured project is unavailable or recovery storage failed; inspect recovery before retrying",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Recovery canceled or timed out",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "pipelines"
+        ],
+        "summary": "Recover pipeline",
+        "description": "Served route `POST /api/v1/pipelines/{id}/recover`. Handler: `handleRecoverPipeline`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields. Uses the server's configured project, fixed for execution and HTTP idempotency replay; project and session overrides are not accepted. GET returns deliveries, commands, and selectors arrays containing receipt identities and acceptance eligibility without prompt, transcript, or captured output contents. POST records one explicit acceptance only; it does not launch work, signal processes, or infer settlement from a saved PID. Before accepting command or selector output, independently verify that the original process and all descendants have finished. Use the ordinary resume endpoint or a pipeline_resume job to continue.",
+        "operationId": "post_api_v1_pipelines_id_recover",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The id identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "One JSON object of at most 10 MiB including encoded output and metadata. Unknown fields are rejected. Exactly one of accept_delivery, accept_command, or accept_selector must be true. Every decision requires the exact receipt_token returned by inspection and an operator observation. Command and selector decisions additionally require explicit exit_code and output values; an empty string records observed empty output. Delivery decisions cannot supply outcome fields. Output is never truncated, and invalid UTF-8 or unpaired Unicode surrogates are rejected. Enabled redact/block modes reject detected secrets before persistence.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "accept_command": {
+                    "type": "boolean",
+                    "description": "Accept the independently verified final outcome of the inspected foreground command; requires exit_code and output."
+                  },
+                  "accept_delivery": {
+                    "type": "boolean",
+                    "description": "Accept the inspected agent delivery; mutually exclusive with accept_command and accept_selector."
+                  },
+                  "accept_selector": {
+                    "type": "boolean",
+                    "description": "Accept the independently verified final outcome of the inspected selector; requires exit_code and output."
+                  },
+                  "exit_code": {
+                    "type": "integer",
+                    "description": "Explicit observed exit code from 0 to 255 for a command or selector. Omitted and null values are refused for these decisions."
+                  },
+                  "output": {
+                    "type": "string",
+                    "description": "Complete observed UTF-8 output, including an explicit empty string when no output was produced. Use stdout for selectors and commands with output_parse, otherwise combined stdout and stderr. The encoded request and frozen capture limits apply; binary selector output can be recovered through the CLI."
+                  },
+                  "reason": {
+                    "type": "string",
+                    "description": "Operator observation; after trimming whitespace, 1 to 4096 UTF-8 bytes. Enabled redact/block modes reject detected secrets with 422 SECRETS_DETECTED before persistence; submitted values are never replaced with placeholders."
+                  },
+                  "receipt": {
+                    "type": "string",
+                    "description": "Exact 64-character lowercase hexadecimal receipt_token returned by inspection."
+                  },
+                  "step_id": {
+                    "type": "string",
+                    "description": "Exact step_id returned by inspection."
+                  }
+                },
+                "required": [
+                  "step_id",
+                  "receipt",
+                  "reason"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing pipelines:read for inspection or pipelines:write for acceptance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Run is owned, receipt is stale, or the recovery decision conflicts with saved state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Encoded recovery request exceeds the server's 10 MiB body limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request redaction refused sensitive outcome data before persistence",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Configured project is unavailable or recovery storage failed; inspect recovery before retrying",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Recovery canceled or timed out",
             "content": {
               "application/json": {
                 "schema": {
@@ -5900,6 +6653,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -6277,6 +7040,16 @@
         "summary": "List reservations",
         "description": "Served route `GET /api/v1/reservations/`. Handler: `handleListReservations`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
         "operationId": "get_api_v1_reservations_index",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful operation",
@@ -6327,6 +7100,16 @@
         "summary": "Reserve paths",
         "description": "Served route `POST /api/v1/reservations/`. Handler: `handleReservePaths`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
         "operationId": "post_api_v1_reservations_index",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -6387,6 +7170,16 @@
         "summary": "Release reservations",
         "description": "Served route `DELETE /api/v1/reservations/`. Handler: `handleReleaseReservations`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
         "operationId": "delete_api_v1_reservations_index",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful operation",
@@ -6439,6 +7232,16 @@
         "summary": "Reservation conflicts",
         "description": "Served route `GET /api/v1/reservations/conflicts`. Handler: `handleReservationConflicts`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
         "operationId": "get_api_v1_reservations_conflicts",
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful operation",
@@ -6500,6 +7303,14 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -6525,6 +7336,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -6563,6 +7384,14 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -6598,6 +7427,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -6636,76 +7475,11 @@
             "schema": {
               "type": "string"
             }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "additionalProperties": true
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful operation",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SuccessEnvelope"
-                }
-              }
-            }
           },
-          "400": {
-            "description": "Bad request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal server error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/reservations/{id}/renew": {
-      "post": {
-        "tags": [
-          "reservations"
-        ],
-        "summary": "Renew reservation",
-        "description": "Served route `POST /api/v1/reservations/{id}/renew`. Handler: `handleRenewReservation`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
-        "operationId": "post_api_v1_reservations_id_renew",
-        "parameters": [
           {
-            "name": "id",
-            "in": "path",
-            "description": "The id identifier",
-            "required": true,
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
             "schema": {
               "type": "string"
             }
@@ -6744,6 +7518,107 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/reservations/{id}/renew": {
+      "post": {
+        "tags": [
+          "reservations"
+        ],
+        "summary": "Renew reservation",
+        "description": "Served route `POST /api/v1/reservations/{id}/renew`. Handler: `handleRenewReservation`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
+        "operationId": "post_api_v1_reservations_id_renew",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The id identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Existing absolute project directory on the server host. Overrides the configured project for this mail or reservation request only; omitted uses the server default. The effective project is fixed before execution and idempotency replay, and scopes reservation approvals and events.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -7781,6 +8656,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -7854,6 +8739,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -7919,6 +8814,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -8268,6 +9173,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -8341,6 +9256,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -8404,6 +9329,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -8459,6 +9394,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -8540,6 +9485,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -8613,6 +9568,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -8668,6 +9633,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -8749,6 +9724,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -8814,6 +9799,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -8895,6 +9890,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -8968,6 +9973,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -9023,6 +10038,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -9095,6 +10120,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -9185,6 +10220,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -9267,6 +10312,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -9331,6 +10386,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -9421,6 +10486,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -9483,6 +10558,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -9555,6 +10640,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -9643,6 +10738,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -9698,6 +10803,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -9769,6 +10884,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -9850,6 +10975,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -9922,6 +11057,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -9984,6 +11129,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -10064,6 +11219,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -10136,6 +11301,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -10226,6 +11401,16 @@
               }
             }
           },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -10290,6 +11475,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -10363,6 +11558,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -11175,6 +12380,44 @@
           }
         }
       },
+      "AgentMailSpawnStatus": {
+        "type": "object",
+        "properties": {
+          "agent_map": {
+            "type": "object",
+            "description": "Agent map",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "agents_failed": {
+            "type": "integer",
+            "description": "Agents failed"
+          },
+          "agents_registered": {
+            "type": "integer",
+            "description": "Agents registered"
+          },
+          "available": {
+            "type": "boolean",
+            "description": "Available"
+          },
+          "project_registered": {
+            "type": "boolean",
+            "description": "Project registered"
+          },
+          "session_agent": {
+            "type": "string",
+            "description": "Session agent"
+          }
+        },
+        "required": [
+          "available",
+          "project_registered",
+          "agents_registered",
+          "agents_failed"
+        ]
+      },
       "AgentMailSummary": {
         "type": "object",
         "properties": {
@@ -11944,6 +13187,10 @@
           "tokens_added": {
             "type": "integer",
             "description": "Tokens added"
+          },
+          "workspace": {
+            "type": "string",
+            "description": "Workspace"
           }
         },
         "required": [
@@ -12018,6 +13265,13 @@
             "type": "string",
             "description": "Output format"
           },
+          "pagination_contract_violations": {
+            "type": "array",
+            "description": "Pagination contract violations",
+            "items": {
+              "type": "string"
+            }
+          },
           "structured_error": {
             "description": "Structured error",
             "$ref": "#/components/schemas/StructuredError"
@@ -12030,7 +13284,7 @@
             "type": "array",
             "description": "Surfaces",
             "items": {
-              "$ref": "#/components/schemas/RobotSurfaceDescriptor"
+              "$ref": "#/components/schemas/CapabilitySurfaceMetadata"
             }
           },
           "timestamp": {
@@ -12064,6 +13318,58 @@
         },
         "required": [
           "status"
+        ]
+      },
+      "CapabilitySurfaceMetadata": {
+        "type": "object",
+        "properties": {
+          "action_handoff": {
+            "description": "Action handoff",
+            "$ref": "#/components/schemas/ActionHandoffInfo"
+          },
+          "attention_ops": {
+            "description": "Attention ops",
+            "$ref": "#/components/schemas/AttentionOpsInfo"
+          },
+          "boundedness": {
+            "description": "Boundedness",
+            "$ref": "#/components/schemas/BoundednessInfo"
+          },
+          "consumer_guidance": {
+            "description": "Consumer guidance",
+            "$ref": "#/components/schemas/ConsumerGuidance"
+          },
+          "explainability": {
+            "description": "Explainability",
+            "$ref": "#/components/schemas/ExplainabilityInfo"
+          },
+          "follow_up": {
+            "description": "Follow up",
+            "$ref": "#/components/schemas/FollowUpInfo"
+          },
+          "lifecycle": {
+            "description": "Lifecycle",
+            "$ref": "#/components/schemas/LifecycleInfo"
+          },
+          "name": {
+            "type": "string",
+            "description": "Name"
+          },
+          "paginated": {
+            "type": "boolean",
+            "description": "Paginated"
+          },
+          "paginated_reason": {
+            "type": "string",
+            "description": "Paginated reason"
+          },
+          "request_semantics": {
+            "description": "Request semantics",
+            "$ref": "#/components/schemas/RequestSemantics"
+          }
+        },
+        "required": [
+          "name"
         ]
       },
       "Conflict": {
@@ -12121,21 +13427,6 @@
             "description": "Summary hint"
           }
         }
-      },
-      "Cycle": {
-        "type": "object",
-        "properties": {
-          "nodes": {
-            "type": "array",
-            "description": "Nodes",
-            "items": {
-              "type": "string"
-            }
-          }
-        },
-        "required": [
-          "nodes"
-        ]
       },
       "DashboardOutput": {
         "type": "object",
@@ -12547,6 +13838,33 @@
           "error",
           "error_code",
           "timestamp"
+        ]
+      },
+      "Exclusion": {
+        "type": "object",
+        "properties": {
+          "blocked_by": {
+            "type": "array",
+            "description": "Blocked by",
+            "items": {
+              "type": "string"
+            }
+          },
+          "id": {
+            "type": "string",
+            "description": "I d"
+          },
+          "reasons": {
+            "type": "array",
+            "description": "Reasons",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "reasons"
         ]
       },
       "ExplainabilityInfo": {
@@ -13244,6 +14562,27 @@
           "BottleneckCount"
         ]
       },
+      "Identity": {
+        "type": "object",
+        "properties": {
+          "head_sha": {
+            "type": "string",
+            "description": "Head s h a"
+          },
+          "jsonl_path": {
+            "type": "string",
+            "description": "J s o n l path"
+          },
+          "jsonl_sha256": {
+            "type": "string",
+            "description": "J s o n l s h a256"
+          },
+          "project_dir": {
+            "type": "string",
+            "description": "Project dir"
+          }
+        }
+      },
       "InProgressInfo": {
         "type": "object",
         "properties": {
@@ -13294,7 +14633,10 @@
             "type": "array",
             "description": "Cycles",
             "items": {
-              "$ref": "#/components/schemas/Cycle"
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             }
           },
           "Hubs": {
@@ -13389,6 +14731,10 @@
           "method": {
             "type": "string",
             "description": "Method"
+          },
+          "operation": {
+            "description": "Operation",
+            "$ref": "#/components/schemas/OperationInfo"
           },
           "output_format": {
             "type": "string",
@@ -13532,6 +14878,86 @@
         "required": [
           "ID",
           "Value"
+        ]
+      },
+      "OperationAdmission": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Error"
+          },
+          "state": {
+            "type": "string",
+            "description": "State"
+          },
+          "target": {
+            "type": "string",
+            "description": "Target"
+          }
+        },
+        "required": [
+          "target",
+          "state"
+        ]
+      },
+      "OperationInfo": {
+        "type": "object",
+        "properties": {
+          "admissions": {
+            "type": "array",
+            "description": "Admissions",
+            "items": {
+              "$ref": "#/components/schemas/OperationAdmission"
+            }
+          },
+          "completed_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC3339 timestamp"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC3339 timestamp"
+          },
+          "dispatch_started_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC3339 timestamp"
+          },
+          "kind": {
+            "type": "string",
+            "description": "Kind"
+          },
+          "operation_id": {
+            "type": "string",
+            "description": "Operation i d"
+          },
+          "payload_bytes": {
+            "type": "integer",
+            "description": "Payload bytes"
+          },
+          "payload_sha256": {
+            "type": "string",
+            "description": "Payload s h a256"
+          },
+          "replayed": {
+            "type": "boolean",
+            "description": "Replayed"
+          },
+          "status": {
+            "type": "string",
+            "description": "Status"
+          }
+        },
+        "required": [
+          "operation_id",
+          "kind",
+          "status",
+          "payload_sha256",
+          "payload_bytes",
+          "created_at"
         ]
       },
       "OperatorLoopGuardrail": {
@@ -14037,6 +15463,10 @@
               "type": "integer"
             }
           },
+          "total": {
+            "type": "integer",
+            "description": "Total"
+          },
           "type_distribution": {
             "type": "object",
             "description": "Type distribution",
@@ -14483,140 +15913,6 @@
           "level"
         ]
       },
-      "RobotSurfaceDescriptor": {
-        "type": "object",
-        "properties": {
-          "action_handoff": {
-            "description": "Action handoff",
-            "$ref": "#/components/schemas/ActionHandoffInfo"
-          },
-          "attention_ops": {
-            "description": "Attention ops",
-            "$ref": "#/components/schemas/AttentionOpsInfo"
-          },
-          "boundedness": {
-            "description": "Boundedness",
-            "$ref": "#/components/schemas/BoundednessInfo"
-          },
-          "category": {
-            "type": "string",
-            "description": "Category"
-          },
-          "consumer_guidance": {
-            "description": "Consumer guidance",
-            "$ref": "#/components/schemas/ConsumerGuidance"
-          },
-          "default_output_format": {
-            "type": "string",
-            "description": "Default output format"
-          },
-          "description": {
-            "type": "string",
-            "description": "Description"
-          },
-          "examples": {
-            "type": "array",
-            "description": "Examples",
-            "items": {
-              "type": "string"
-            }
-          },
-          "explainability": {
-            "description": "Explainability",
-            "$ref": "#/components/schemas/ExplainabilityInfo"
-          },
-          "flag": {
-            "type": "string",
-            "description": "Flag"
-          },
-          "follow_up": {
-            "description": "Follow up",
-            "$ref": "#/components/schemas/FollowUpInfo"
-          },
-          "lifecycle": {
-            "description": "Lifecycle",
-            "$ref": "#/components/schemas/LifecycleInfo"
-          },
-          "name": {
-            "type": "string",
-            "description": "Name"
-          },
-          "note": {
-            "type": "string",
-            "description": "Note"
-          },
-          "output_formats": {
-            "type": "array",
-            "description": "Output formats",
-            "items": {
-              "type": "string"
-            }
-          },
-          "parameters": {
-            "type": "array",
-            "description": "Parameters",
-            "items": {
-              "$ref": "#/components/schemas/RobotParameter"
-            }
-          },
-          "request_semantics": {
-            "description": "Request semantics",
-            "$ref": "#/components/schemas/RequestSemantics"
-          },
-          "schema_id": {
-            "type": "string",
-            "description": "Schema i d"
-          },
-          "schema_source": {
-            "type": "string",
-            "description": "Schema source"
-          },
-          "schema_type": {
-            "type": "string",
-            "description": "Schema type"
-          },
-          "schema_unavailable_reason": {
-            "type": "string",
-            "description": "Schema unavailable reason"
-          },
-          "sections": {
-            "type": "array",
-            "description": "Sections",
-            "items": {
-              "type": "string"
-            }
-          },
-          "summary": {
-            "type": "string",
-            "description": "Summary"
-          },
-          "transports": {
-            "type": "array",
-            "description": "Transports",
-            "items": {
-              "$ref": "#/components/schemas/RobotTransportInfo"
-            }
-          },
-          "unavailable": {
-            "type": "boolean",
-            "description": "Unavailable"
-          },
-          "unavailable_reason": {
-            "type": "string",
-            "description": "Unavailable reason"
-          }
-        },
-        "required": [
-          "name",
-          "flag",
-          "category",
-          "summary",
-          "description",
-          "output_formats",
-          "default_output_format",
-          "schema_source"
-        ]
-      },
       "RobotTransportInfo": {
         "type": "object",
         "properties": {
@@ -14781,6 +16077,10 @@
             "type": "integer",
             "description": "Commits in window"
           },
+          "evidence_complete": {
+            "type": "boolean",
+            "description": "Evidence complete"
+          },
           "last_commit_at": {
             "type": "string",
             "description": "Last commit at"
@@ -14808,28 +16108,8 @@
           "commits_in_window",
           "claims_in_window",
           "last_commit_at",
-          "window_seconds"
-        ]
-      },
-      "SendAdmission": {
-        "type": "object",
-        "properties": {
-          "error": {
-            "type": "string",
-            "description": "Error"
-          },
-          "state": {
-            "type": "string",
-            "description": "State"
-          },
-          "target": {
-            "type": "string",
-            "description": "Target"
-          }
-        },
-        "required": [
-          "target",
-          "state"
+          "window_seconds",
+          "evidence_complete"
         ]
       },
       "SendAgentHints": {
@@ -14863,55 +16143,6 @@
         "required": [
           "pane",
           "error"
-        ]
-      },
-      "SendOperationInfo": {
-        "type": "object",
-        "properties": {
-          "admissions": {
-            "type": "array",
-            "description": "Admissions",
-            "items": {
-              "$ref": "#/components/schemas/SendAdmission"
-            }
-          },
-          "completed_at": {
-            "type": "string",
-            "format": "date-time",
-            "description": "RFC3339 timestamp"
-          },
-          "created_at": {
-            "type": "string",
-            "format": "date-time",
-            "description": "RFC3339 timestamp"
-          },
-          "operation_id": {
-            "type": "string",
-            "description": "Operation i d"
-          },
-          "payload_bytes": {
-            "type": "integer",
-            "description": "Payload bytes"
-          },
-          "payload_sha256": {
-            "type": "string",
-            "description": "Payload s h a256"
-          },
-          "replayed": {
-            "type": "boolean",
-            "description": "Replayed"
-          },
-          "status": {
-            "type": "string",
-            "description": "Status"
-          }
-        },
-        "required": [
-          "operation_id",
-          "status",
-          "payload_sha256",
-          "payload_bytes",
-          "created_at"
         ]
       },
       "SendOutput": {
@@ -14967,7 +16198,7 @@
           },
           "operation": {
             "description": "Operation",
-            "$ref": "#/components/schemas/SendOperationInfo"
+            "$ref": "#/components/schemas/OperationInfo"
           },
           "output_format": {
             "type": "string",
@@ -15694,6 +16925,32 @@
           "event_count"
         ]
       },
+      "SnapshotService": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "Command"
+          },
+          "manager": {
+            "type": "string",
+            "description": "Manager"
+          },
+          "name": {
+            "type": "string",
+            "description": "Name"
+          },
+          "pane": {
+            "type": "string",
+            "description": "Pane"
+          }
+        },
+        "required": [
+          "pane",
+          "name",
+          "manager"
+        ]
+      },
       "SnapshotSession": {
         "type": "object",
         "properties": {
@@ -15711,6 +16968,13 @@
           "name": {
             "type": "string",
             "description": "Name"
+          },
+          "services": {
+            "type": "array",
+            "description": "Services",
+            "items": {
+              "$ref": "#/components/schemas/SnapshotService"
+            }
           }
         },
         "required": [
@@ -15864,6 +17128,21 @@
             "type": "integer",
             "description": "Agent headroom"
           },
+          "agent_inventory_available": {
+            "type": "boolean",
+            "description": "Agent inventory available"
+          },
+          "agent_inventory_error": {
+            "type": "string",
+            "description": "Agent inventory error"
+          },
+          "agent_type_limits": {
+            "type": "array",
+            "description": "Agent type limits",
+            "items": {
+              "$ref": "#/components/schemas/SpawnAdmissionAgentLimit"
+            }
+          },
           "current_panes": {
             "type": "integer",
             "description": "Current panes"
@@ -15923,6 +17202,10 @@
             "type": "integer",
             "description": "Running sessions"
           },
+          "serialized": {
+            "type": "boolean",
+            "description": "Serialized"
+          },
           "session": {
             "type": "string",
             "description": "Session"
@@ -15940,6 +17223,7 @@
           }
         },
         "required": [
+          "serialized",
           "decision",
           "reason",
           "requested_agents",
@@ -15951,7 +17235,50 @@
           "running_agents",
           "running_sessions",
           "large_spawn",
-          "pressure_level"
+          "pressure_level",
+          "agent_inventory_available"
+        ]
+      },
+      "SpawnAdmissionAgentLimit": {
+        "type": "object",
+        "properties": {
+          "agent_type": {
+            "type": "string",
+            "description": "Agent type"
+          },
+          "blocks_request": {
+            "type": "boolean",
+            "description": "Blocks request"
+          },
+          "headroom": {
+            "type": "integer",
+            "description": "Headroom"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Limit"
+          },
+          "projected": {
+            "type": "integer",
+            "description": "Projected"
+          },
+          "requested": {
+            "type": "integer",
+            "description": "Requested"
+          },
+          "running": {
+            "type": "integer",
+            "description": "Running"
+          }
+        },
+        "required": [
+          "agent_type",
+          "running",
+          "requested",
+          "projected",
+          "limit",
+          "headroom",
+          "blocks_request"
         ]
       },
       "SpawnAdmissionSource": {
@@ -15987,6 +17314,10 @@
             "type": "string",
             "description": "Agent type"
           },
+          "assign_reason": {
+            "type": "string",
+            "description": "Assign reason"
+          },
           "bead_id": {
             "type": "string",
             "description": "Bead i d"
@@ -15994,6 +17325,10 @@
           "bead_title": {
             "type": "string",
             "description": "Bead title"
+          },
+          "cass_injection": {
+            "description": "C a s s injection",
+            "$ref": "#/components/schemas/CASSInjectionInfo"
           },
           "claim_actor": {
             "type": "string",
@@ -16007,6 +17342,10 @@
             "type": "boolean",
             "description": "Claimed"
           },
+          "delivered_at": {
+            "type": "string",
+            "description": "Delivered at"
+          },
           "dispatch_receipt_id": {
             "type": "string",
             "description": "Dispatch receipt i d"
@@ -16014,6 +17353,10 @@
           "idempotency_key": {
             "type": "string",
             "description": "Idempotency key"
+          },
+          "memory_injection": {
+            "description": "Memory injection",
+            "$ref": "#/components/schemas/CMInjectionInfo"
           },
           "pane": {
             "type": "string",
@@ -16060,6 +17403,10 @@
           "admission": {
             "description": "Admission",
             "$ref": "#/components/schemas/SpawnAdmission"
+          },
+          "agent_mail": {
+            "description": "Agent mail",
+            "$ref": "#/components/schemas/AgentMailSpawnStatus"
           },
           "agents": {
             "type": "array",
@@ -16111,6 +17458,13 @@
             "type": "string",
             "description": "Mode"
           },
+          "model_hints": {
+            "type": "array",
+            "description": "Model hints",
+            "items": {
+              "type": "string"
+            }
+          },
           "monitor_error": {
             "type": "string",
             "description": "Monitor error"
@@ -16131,6 +17485,13 @@
             "type": "string",
             "description": "Preset used"
           },
+          "prompt_deliveries": {
+            "type": "array",
+            "description": "Prompt deliveries",
+            "items": {
+              "$ref": "#/components/schemas/SpawnPromptDelivery"
+            }
+          },
           "recovery": {
             "description": "Recovery",
             "$ref": "#/components/schemas/SpawnRecovery"
@@ -16138,6 +17499,10 @@
           "session": {
             "type": "string",
             "description": "Session"
+          },
+          "stagger": {
+            "description": "Stagger",
+            "$ref": "#/components/schemas/SpawnStaggerPlan"
           },
           "structured_error": {
             "description": "Structured error",
@@ -16158,6 +17523,10 @@
           "version": {
             "type": "string",
             "description": "Version"
+          },
+          "work_source_mismatch": {
+            "description": "Work source mismatch",
+            "$ref": "#/components/schemas/StaleError"
           },
           "working_dir": {
             "type": "string",
@@ -16181,6 +17550,41 @@
           "layout",
           "total_startup_ms",
           "monitor_started"
+        ]
+      },
+      "SpawnPromptDelivery": {
+        "type": "object",
+        "properties": {
+          "agent_type": {
+            "type": "string",
+            "description": "Agent type"
+          },
+          "delivered_at": {
+            "type": "string",
+            "description": "Delivered at"
+          },
+          "error": {
+            "type": "string",
+            "description": "Error"
+          },
+          "order": {
+            "type": "integer",
+            "description": "Order"
+          },
+          "pane": {
+            "type": "string",
+            "description": "Pane"
+          },
+          "prompt_sent": {
+            "type": "boolean",
+            "description": "Prompt sent"
+          }
+        },
+        "required": [
+          "pane",
+          "agent_type",
+          "order",
+          "prompt_sent"
         ]
       },
       "SpawnRecovery": {
@@ -16216,9 +17620,77 @@
           }
         }
       },
+      "SpawnStaggerPlan": {
+        "type": "object",
+        "properties": {
+          "interval_ms": {
+            "type": "integer",
+            "description": "Interval ms"
+          },
+          "mode": {
+            "type": "string",
+            "description": "Mode"
+          },
+          "provider": {
+            "type": "string",
+            "description": "Provider"
+          },
+          "schedule": {
+            "type": "array",
+            "description": "Schedule",
+            "items": {
+              "$ref": "#/components/schemas/SpawnStaggerSlot"
+            }
+          },
+          "warning": {
+            "type": "string",
+            "description": "Warning"
+          }
+        },
+        "required": [
+          "mode",
+          "interval_ms",
+          "schedule"
+        ]
+      },
+      "SpawnStaggerSlot": {
+        "type": "object",
+        "properties": {
+          "agent_type": {
+            "type": "string",
+            "description": "Agent type"
+          },
+          "delay_ms": {
+            "type": "integer",
+            "description": "Delay ms"
+          },
+          "order": {
+            "type": "integer",
+            "description": "Order"
+          },
+          "pane": {
+            "type": "string",
+            "description": "Pane"
+          },
+          "scheduled_at": {
+            "type": "string",
+            "description": "Scheduled at"
+          }
+        },
+        "required": [
+          "pane",
+          "agent_type",
+          "order",
+          "delay_ms"
+        ]
+      },
       "SpawnedAgent": {
         "type": "object",
         "properties": {
+          "agent_mail_name": {
+            "type": "string",
+            "description": "Agent mail name"
+          },
           "error": {
             "type": "string",
             "description": "Error"
@@ -16230,6 +17702,10 @@
           "pane": {
             "type": "string",
             "description": "Pane"
+          },
+          "pane_id": {
+            "type": "string",
+            "description": "Pane i d"
           },
           "ready": {
             "type": "boolean",
@@ -16258,6 +17734,26 @@
           "title",
           "ready",
           "startup_ms"
+        ]
+      },
+      "StaleError": {
+        "type": "object",
+        "properties": {
+          "expected": {
+            "description": "Expected",
+            "$ref": "#/components/schemas/Identity"
+          },
+          "observed": {
+            "description": "Observed",
+            "$ref": "#/components/schemas/Identity"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Reason"
+          }
+        },
+        "required": [
+          "reason"
         ]
       },
       "StatusAlert": {
@@ -16574,6 +18070,10 @@
             "type": "integer",
             "description": "Ollama count"
           },
+          "omp_count": {
+            "type": "integer",
+            "description": "Omp count"
+          },
           "opencode_count": {
             "type": "integer",
             "description": "Opencode count"
@@ -16608,6 +18108,7 @@
           "windsurf_count",
           "aider_count",
           "opencode_count",
+          "omp_count",
           "ollama_count",
           "agents_by_state",
           "agents_by_type",
@@ -17114,6 +18615,10 @@
             "items": {
               "type": "string"
             }
+          },
+          "disabled": {
+            "type": "boolean",
+            "description": "Disabled"
           },
           "health": {
             "description": "Health",
@@ -17749,6 +19254,45 @@
           "unblocks"
         ]
       },
+      "WorkReservationVerification": {
+        "type": "object",
+        "properties": {
+          "active": {
+            "type": "integer",
+            "description": "Active"
+          },
+          "mapped_beads": {
+            "type": "integer",
+            "description": "Mapped beads"
+          },
+          "observed_at": {
+            "type": "string",
+            "description": "Observed at"
+          },
+          "project_id": {
+            "type": "integer",
+            "description": "Project i d"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Reason"
+          },
+          "state": {
+            "type": "string",
+            "description": "State"
+          },
+          "unmapped": {
+            "type": "integer",
+            "description": "Unmapped"
+          }
+        },
+        "required": [
+          "state",
+          "active",
+          "mapped_beads",
+          "unmapped"
+        ]
+      },
       "WorkSection": {
         "type": "object",
         "properties": {
@@ -17792,6 +19336,10 @@
           "triage": {
             "description": "Triage",
             "$ref": "#/components/schemas/WorkTriage"
+          },
+          "verification": {
+            "description": "Verification",
+            "$ref": "#/components/schemas/WorkVerification"
           }
         },
         "required": [
@@ -17862,6 +19410,87 @@
           "ready_count",
           "quick_wins_count",
           "blockers_count"
+        ]
+      },
+      "WorkVerification": {
+        "type": "object",
+        "properties": {
+          "cache_collected_at": {
+            "type": "string",
+            "description": "Cache collected at"
+          },
+          "cache_expires_at": {
+            "type": "string",
+            "description": "Cache expires at"
+          },
+          "candidates_observed": {
+            "type": "integer",
+            "description": "Candidates observed"
+          },
+          "count_scope": {
+            "type": "string",
+            "description": "Count scope"
+          },
+          "dirty": {
+            "type": "boolean",
+            "description": "Dirty"
+          },
+          "excluded": {
+            "type": "array",
+            "description": "Excluded",
+            "items": {
+              "$ref": "#/components/schemas/Exclusion"
+            }
+          },
+          "from_cache": {
+            "type": "boolean",
+            "description": "From cache"
+          },
+          "mismatch": {
+            "description": "Mismatch",
+            "$ref": "#/components/schemas/StaleError"
+          },
+          "preview_limit": {
+            "type": "integer",
+            "description": "Preview limit"
+          },
+          "preview_truncated": {
+            "type": "boolean",
+            "description": "Preview truncated"
+          },
+          "project_dir": {
+            "type": "string",
+            "description": "Project dir"
+          },
+          "reason_code": {
+            "type": "string",
+            "description": "Reason code"
+          },
+          "remediation": {
+            "type": "string",
+            "description": "Remediation"
+          },
+          "reported_ready": {
+            "type": "integer",
+            "description": "Reported ready"
+          },
+          "reservations": {
+            "description": "Reservations",
+            "$ref": "#/components/schemas/WorkReservationVerification"
+          },
+          "source": {
+            "description": "Source",
+            "$ref": "#/components/schemas/Identity"
+          },
+          "verified_ready": {
+            "type": "integer",
+            "description": "Verified ready"
+          }
+        },
+        "required": [
+          "excluded",
+          "reported_ready",
+          "count_scope"
         ]
       }
     },

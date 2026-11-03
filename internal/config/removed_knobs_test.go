@@ -17,6 +17,67 @@ import (
 	"testing"
 )
 
+// removedKnobErrorLine and deprecatedKnobErrorLine name the strict-loader
+// error line for a knob in a specific removal batch. Production renders every
+// batch through the one deadKnobErrorLine, parameterized by the batch's own
+// release provenance (ntm#323); these are the test-side names for "the line
+// this tier produces", so an assertion cannot silently start comparing
+// against another batch's release text.
+func removedKnobErrorLine(knob RemovedKnob) string {
+	return deadKnobErrorLine(knob, DeadKeyTierProvenance(DeadKeyTierRemoved))
+}
+
+func deprecatedKnobErrorLine(knob RemovedKnob) string {
+	return deadKnobErrorLine(knob, DeadKeyTierProvenance(DeadKeyTierDeprecated))
+}
+
+// TestDeadKeyTiersAreWellFormed guards the table a future removal batch will
+// be added to: every batch needs its own name, its own key set, and its own
+// release provenance. Two batches sharing a provenance string is how a key
+// ends up telling users it was removed in a release it had nothing to do with
+// (ntm#323).
+func TestDeadKeyTiersAreWellFormed(t *testing.T) {
+	seenName := map[string]bool{}
+	seenProvenance := map[string]string{}
+
+	for _, tier := range deadKeyTiers {
+		if tier.name == "" {
+			t.Error("a dead-key tier has no name")
+		}
+		if seenName[tier.name] {
+			t.Errorf("duplicate tier name %q", tier.name)
+		}
+		seenName[tier.name] = true
+
+		if tier.provenance == "" {
+			t.Errorf("tier %q has no provenance; its error line would not say when the key went away", tier.name)
+		}
+		if prev, dup := seenProvenance[tier.provenance]; dup {
+			t.Errorf("tiers %q and %q share a provenance string; each batch must cite its own release", prev, tier.name)
+		}
+		seenProvenance[tier.provenance] = tier.name
+
+		if len(tier.exact) == 0 && len(tier.prefixes) == 0 {
+			t.Errorf("tier %q classifies no keys", tier.name)
+		}
+		if DeadKeyTierProvenance(tier.name) != tier.provenance {
+			t.Errorf("DeadKeyTierProvenance(%q) does not round-trip", tier.name)
+		}
+	}
+
+	// A key may only belong to one batch, or its classification depends on
+	// table order rather than intent.
+	owner := map[string]string{}
+	for _, tier := range deadKeyTiers {
+		for key := range tier.exact {
+			if prev, dup := owner[key]; dup {
+				t.Errorf("key %q is claimed by both tier %q and tier %q", key, prev, tier.name)
+			}
+			owner[key] = tier.name
+		}
+	}
+}
+
 // removedKnobFixtures covers every removed knob family: TOML that sets the
 // key, the dotted key the load error must name, and its full disposition
 // text.
@@ -128,6 +189,75 @@ func TestRemovedKnobsErrorAtLoad(t *testing.T) {
 	}
 }
 
+// TestReaderlessKnobsErrorScanAndMigrate covers the bd-syx9t batch end to
+// end on the [context_rotation] block `ntm config init` used to write: the
+// strict loader names every reader-less key under this batch's provenance,
+// doctor lists them, and `config migrate` deletes them while keeping the live
+// [context_rotation] keys, after which the config loads.
+func TestReaderlessKnobsErrorScanAndMigrate(t *testing.T) {
+	path := createTempConfig(t, `projects_base = "/tmp/removed-knob-proof"
+
+[agents.plugins]
+mytool = "mytool --run"
+
+[context_rotation]
+enabled = true
+warning_threshold = 0.80
+rotate_threshold = 0.90
+summary_max_tokens = 2000
+min_session_age_sec = 300
+try_compact_first = true
+require_confirm = false
+confirm_timeout_sec = 60
+default_confirm_action = "rotate"
+`)
+	wantKeys := map[string]string{
+		"context_rotation.default_confirm_action": readerlessKnobExact["context_rotation.default_confirm_action"],
+		"agents.plugins.mytool":                   readerlessKnobPrefixes["agents.plugins"],
+		"context_rotation.enabled":                readerlessKnobExact["context_rotation.enabled"],
+		"context_rotation.warning_threshold":      noReader,
+		"context_rotation.min_session_age_sec":    noReader,
+		"context_rotation.require_confirm":        readerlessKnobExact["context_rotation.require_confirm"],
+	}
+
+	_, _, err := loadCapturingStderr(t, path)
+	if err == nil {
+		t.Fatal("Load must fail on reader-less keys")
+	}
+	provenance := DeadKeyTierProvenance(DeadKeyTierReaderless)
+	for key, disposition := range wantKeys {
+		want := deadKnobErrorLine(RemovedKnob{Key: key, Disposition: disposition}, provenance)
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("load error is missing the line for %s.\nwant: %q\ngot:  %q", key, want, err.Error())
+		}
+	}
+
+	knobs, err := ScanRemovedKnobs(path)
+	if err != nil {
+		t.Fatalf("ScanRemovedKnobs: %v", err)
+	}
+	scanned := map[string]string{}
+	for _, knob := range knobs {
+		scanned[knob.Key] = knob.Tier
+	}
+	for key := range wantKeys {
+		if scanned[key] != DeadKeyTierReaderless {
+			t.Errorf("doctor scan: %s tier = %q, want %q (scan: %v)", key, scanned[key], DeadKeyTierReaderless, knobs)
+		}
+	}
+
+	if _, err := MigrateDeadKeys(path, false); err != nil {
+		t.Fatalf("MigrateDeadKeys: %v", err)
+	}
+	cfg, _, err := loadCapturingStderr(t, path)
+	if err != nil {
+		t.Fatalf("migrated config must load: %v", err)
+	}
+	if cfg.ContextRotation.RotateThreshold != 0.90 || cfg.ContextRotation.SummaryMaxTokens != 2000 || cfg.ContextRotation.ConfirmTimeoutSec != 60 {
+		t.Errorf("migrate must keep live [context_rotation] keys, got %+v", cfg.ContextRotation)
+	}
+}
+
 // TestCleanConfigLoadsSilently: a config with no removed keys loads without
 // error and without any removed-key (or other) warning on stderr.
 func TestCleanConfigLoadsSilently(t *testing.T) {
@@ -206,7 +336,7 @@ func TestUnknownFieldStillErrors(t *testing.T) {
 // TestClassifyUndecodedKeys_TableHeaderDedup: when a removed table has
 // concrete child keys, only the children are reported.
 func TestClassifyUndecodedKeys_TableHeaderDedup(t *testing.T) {
-	removed, deprecated, unknown := classifyUndecodedKeys([]string{
+	byTier, unknown := classifyUndecodedKeys([]string{
 		"integrations.caut",
 		"integrations.caut.enabled",
 		"integrations.caut.currency",
@@ -214,9 +344,10 @@ func TestClassifyUndecodedKeys_TableHeaderDedup(t *testing.T) {
 	if len(unknown) != 0 {
 		t.Fatalf("unexpected unknown keys: %v", unknown)
 	}
-	if len(deprecated) != 0 {
+	if deprecated := byTier[DeadKeyTierDeprecated]; len(deprecated) != 0 {
 		t.Fatalf("unexpected deprecated keys: %v", deprecated)
 	}
+	removed := byTier[DeadKeyTierRemoved]
 	got := make([]string, 0, len(removed))
 	for _, k := range removed {
 		got = append(got, k.Key)

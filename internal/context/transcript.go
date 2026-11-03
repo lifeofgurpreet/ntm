@@ -13,25 +13,45 @@
 // payload.info.last_token_usage and payload.info.model_context_window, and
 // turn_context entries carry payload.model. The first line is a session_meta
 // entry whose payload.cwd identifies the working directory.
+//
+// Oh My Pi (omp) writes pi-family JSONL under
+// ~/.omp/agent/sessions/<safe-path>/<timestamp>_<uuid>.jsonl (profile, XDG,
+// and PI_CODING_AGENT_* overrides relocate the store). A padded "title" line
+// precedes the "session" header, whose cwd identifies the working directory;
+// assistant "message" entries carry message.usage (input, cacheRead,
+// cacheWrite, output, totalTokens) with message.provider and message.model.
+// Sub-agent transcripts live one directory deeper
+// (<timestamp>_<uuid>/<AgentName>.jsonl) and are never attributed to a pane.
+// omp also renders the same occupancy live in its composer border, which
+// OmpStatusBarUsage reads without any cwd correlation.
 package context
 
 import (
 	"bytes"
+	stdcontext "context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/agentsession"
+	"github.com/Dicklesworthstone/ntm/internal/models"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 // TranscriptUsage is the last usage record extracted from an agent's own
 // session transcript. Tokens is the effective context occupancy after the
 // last turn (input + cache_read + cache_creation + output for Claude;
-// last_token_usage.total_tokens for Codex).
+// last_token_usage.total_tokens for Codex; native total for Gemini).
 type TranscriptUsage struct {
 	Path                string    // transcript file the record came from
+	ProviderSessionID   string    // native Gemini identity; empty for other formats
 	Model               string    // model reported by the transcript, verbatim
 	Tokens              int       // effective context occupancy (tokens)
 	InputTokens         int       // uncached input tokens of the last turn
@@ -39,27 +59,44 @@ type TranscriptUsage struct {
 	CacheCreationTokens int       // cache creation tokens of the last turn
 	OutputTokens        int       // output tokens of the last turn
 	ContextWindow       int       // model context window if the transcript reports one (Codex), else 0
-	UpdatedAt           time.Time // transcript file mtime
+	UpdatedAt           time.Time // native accounting timestamp, capped by the file snapshot; zero when unknown
 }
 
-// transcriptTailWindow bounds how much of a transcript is read. Transcripts
-// can exceed 100MB; the last usage-bearing line is always near the end.
-const transcriptTailWindow = 256 * 1024
+// Start with a cheap tail, but allow large assistant/tool records between the
+// latest accounting and EOF. Expansion reads only additional bytes and is
+// capped independently of total transcript size. One extra byte establishes
+// whether the first record crosses the scan boundary.
+const (
+	transcriptTailWindow = 256 * 1024
+	transcriptScanLimit  = 8 * 1024 * 1024
+)
 
 // TranscriptFreshness is the maximum age of a transcript for its usage to be
 // considered current (confidence "high").
 const TranscriptFreshness = 10 * time.Minute
 
-// transcriptEntry is a permissive union of the Claude and Codex line shapes.
+// transcriptEntry is a permissive union of the Claude, Codex, and omp line
+// shapes.
 type transcriptEntry struct {
-	Type    string `json:"type"`
+	Type      string `json:"type"`
+	Timestamp string `json:"timestamp"`
+	// Model is top-level on omp "model_change" lines.
+	Model   string `json:"model"`
 	Message struct {
-		Model string `json:"model"`
-		Usage struct {
+		Role     string `json:"role"`
+		Provider string `json:"provider"`
+		Model    string `json:"model"`
+		Usage    *struct {
 			InputTokens              int `json:"input_tokens"`
 			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 			OutputTokens             int `json:"output_tokens"`
+			// omp (pi-family) spelling.
+			Input       int `json:"input"`
+			CacheRead   int `json:"cacheRead"`
+			CacheWrite  int `json:"cacheWrite"`
+			Output      int `json:"output"`
+			TotalTokens int `json:"totalTokens"`
 		} `json:"usage"`
 	} `json:"message"`
 	Payload struct {
@@ -67,8 +104,8 @@ type transcriptEntry struct {
 		Model        string `json:"model"`
 		Cwd          string `json:"cwd"`
 		ThreadSource string `json:"thread_source"`
-		Info         struct {
-			LastTokenUsage struct {
+		Info         *struct {
+			LastTokenUsage *struct {
 				InputTokens           int `json:"input_tokens"`
 				CachedInputTokens     int `json:"cached_input_tokens"`
 				CacheWriteInputTokens int `json:"cache_write_input_tokens"`
@@ -80,10 +117,11 @@ type transcriptEntry struct {
 	} `json:"payload"`
 }
 
-// ReadLatestTranscriptUsage reads the tail of a JSONL transcript and returns
-// the last usage-bearing record. It reads at most transcriptTailWindow bytes
-// from the end of the file and tolerates a truncated first line in that
-// window. Returns (nil, nil) when the tail contains no usage record.
+// ReadLatestTranscriptUsage returns the current provider-native usage record.
+// Claude/Codex/omp use a bounded JSONL tail. Gemini JSON conversations and
+// JSONL journals require bounded history replay to honor rewinds/replacements;
+// unchanged snapshots are cached without retaining conversation content.
+// Returns (nil, nil) when there is no attributable usage record.
 func ReadLatestTranscriptUsage(path string) (*TranscriptUsage, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -95,75 +133,174 @@ func ReadLatestTranscriptUsage(path string) (*TranscriptUsage, error) {
 	if err != nil {
 		return nil, err
 	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("transcript must be a regular file")
+	}
+	if usage, handled, err := readGeminiTranscriptUsage(f, info, path); handled || err != nil {
+		return usage, err
+	}
 
-	offset := int64(0)
-	if info.Size() > transcriptTailWindow {
-		offset = info.Size() - transcriptTailWindow
-	}
-	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return nil, err
-	}
-	buf, err := io.ReadAll(io.LimitReader(f, transcriptTailWindow))
+	usage, err := readNativeTranscriptTail(f, info.Size())
 	if err != nil {
 		return nil, err
 	}
-
-	// If we started mid-file the first line is almost certainly partial:
-	// drop everything through the first newline.
-	if offset > 0 {
-		if nl := bytes.IndexByte(buf, '\n'); nl >= 0 {
-			buf = buf[nl+1:]
-		} else {
-			return nil, nil // window is a single partial line
-		}
+	after, err := f.Stat()
+	if err != nil {
+		return nil, err
 	}
-
-	usage := parseLastUsage(buf)
+	if after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) {
+		return nil, fmt.Errorf("transcript changed during accounting read")
+	}
 	if usage == nil {
 		return nil, nil
 	}
 	usage.Path = path
-	usage.UpdatedAt = info.ModTime()
+	// Progress and tool-output writes do not refresh an earlier token count.
+	// Missing/invalid native timestamps stay unknown rather than borrowing
+	// the mtime of unrelated data. Never claim evidence newer than this file.
+	if usage.UpdatedAt.After(info.ModTime()) {
+		usage.UpdatedAt = info.ModTime()
+	}
 	return usage, nil
 }
 
+// readNativeTranscriptTail searches complete JSONL records within a fixed
+// snapshot. It neither chases appends nor rereads overlapping windows. A model
+// declaration can precede a large tool result, so expand until both the latest
+// usage and its preceding model are found, or the bounded history is exhausted.
+func readNativeTranscriptTail(src io.ReaderAt, size int64) (*TranscriptUsage, error) {
+	if size < 0 {
+		return nil, fmt.Errorf("invalid transcript snapshot size")
+	}
+	var buf []byte
+	for window := int64(transcriptTailWindow); ; window = min(window*2, transcriptScanLimit) {
+		length := min(size, window+1)
+		offset := size - length
+		expanded := make([]byte, int(length))
+		added := len(expanded) - len(buf)
+		copy(expanded[added:], buf)
+		if _, err := io.ReadFull(io.NewSectionReader(src, offset, int64(added)), expanded[:added]); err != nil {
+			return nil, fmt.Errorf("read transcript snapshot: %w", err)
+		}
+		buf = expanded
+		complete := buf
+		if offset > 0 {
+			// buf includes the byte immediately before the nominal window.
+			// If it is a newline, the first complete record is preserved.
+			if newline := bytes.IndexByte(complete, '\n'); newline >= 0 {
+				complete = complete[newline+1:]
+			} else {
+				complete = nil
+			}
+		}
+		usage, mayLookBack := parseLastUsage(complete)
+		if !mayLookBack || (usage != nil && usage.Model != "") || offset == 0 || window == transcriptScanLimit {
+			return usage, nil
+		}
+	}
+}
+
 // parseLastUsage scans JSONL content and returns the last usage-bearing
-// record, with the last seen model filled in for records that do not carry
-// one themselves (Codex token_count events).
-func parseLastUsage(buf []byte) *TranscriptUsage {
+// record, with its preceding model. The second result permits looking farther
+// back only when no corruption or history-rewrite barrier was encountered.
+// Native compaction/branch records invalidate old accounting; their pre-counts
+// and projected after-counts are not a new provider measurement.
+func parseLastUsage(buf []byte) (*TranscriptUsage, bool) {
 	var last *TranscriptUsage
 	lastModel := ""
+	mayLookBack := true
+	invalidate := func() {
+		last = nil
+		lastModel = ""
+		mayLookBack = false
+	}
 
 	for _, line := range bytes.Split(buf, []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
 		}
-		// Cheap pre-filter before full JSON decode.
-		hasUsage := bytes.Contains(line, []byte(`"usage"`))
-		hasTokenCount := bytes.Contains(line, []byte(`"token_count"`))
-		hasModel := bytes.Contains(line, []byte(`"model"`))
-		if !hasUsage && !hasTokenCount && !hasModel {
+		// Decode a minimal discriminator first. Valid unknown records may
+		// use message/payload fields with other shapes and must not be
+		// confused with accounting. String mentions of reset markers are
+		// not barriers, while escaped JSON discriminator spellings still are.
+		var header struct {
+			Type    string `json:"type"`
+			Subtype string `json:"subtype"`
+		}
+		if line[0] != '{' || json.Unmarshal(line, &header) != nil {
+			invalidate()
+			continue
+		}
+		if (header.Type == "system" && header.Subtype == "compact_boundary") ||
+			header.Type == "compacted" || header.Type == "compaction" || header.Type == "branch_summary" {
+			invalidate()
+			continue
+		}
+		switch header.Type {
+		case "assistant", "message", "model_change", "turn_context":
+		case "event_msg":
+			var event struct {
+				Payload struct {
+					Type string `json:"type"`
+				} `json:"payload"`
+			}
+			if json.Unmarshal(line, &event) != nil || event.Payload.Type == "thread_rolled_back" {
+				invalidate()
+				continue
+			}
+			if event.Payload.Type != "token_count" {
+				continue
+			}
+		default:
 			continue
 		}
 
 		var e transcriptEntry
 		if err := json.Unmarshal(line, &e); err != nil {
-			continue // partial/corrupt line
+			invalidate()
+			continue
 		}
 
-		if e.Message.Model != "" {
-			lastModel = e.Message.Model
-		} else if e.Payload.Model != "" {
+		if (e.Type == "assistant" || (e.Type == "message" && e.Message.Role == "assistant")) && e.Message.Model != "" {
+			lastModel = ompQualifiedModel(e.Message.Provider, e.Message.Model)
+		} else if e.Type == "turn_context" && e.Payload.Model != "" {
 			lastModel = e.Payload.Model
+		} else if e.Type == "model_change" && e.Model != "" {
+			lastModel = e.Model // omp: already provider-qualified
 		}
 
 		switch {
-		case e.Type == "assistant" && hasUsage:
+		case e.Type == "message" && e.Message.Role == "assistant" && e.Message.Usage != nil:
+			// omp shape: input excludes cache reads/writes; totalTokens is
+			// their sum with output. Aborted turns record all-zero usage and
+			// must not mask the previous real reading.
+			u := e.Message.Usage
+			total, valid := transcriptTokenTotal(u.TotalTokens, u.Input, u.CacheRead, u.CacheWrite, u.Output)
+			if !valid {
+				invalidate()
+				continue
+			}
+			if total == 0 {
+				continue
+			}
+			last = &TranscriptUsage{
+				Model:               ompQualifiedModel(e.Message.Provider, e.Message.Model),
+				Tokens:              total,
+				InputTokens:         u.Input,
+				CacheReadTokens:     u.CacheRead,
+				CacheCreationTokens: u.CacheWrite,
+				OutputTokens:        u.Output,
+			}
+		case e.Type == "assistant" && e.Message.Usage != nil:
 			// Claude Code shape.
 			u := e.Message.Usage
-			total := u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens + u.OutputTokens
-			if total <= 0 {
+			total, valid := transcriptTokenTotal(0, u.InputTokens, u.CacheReadInputTokens, u.CacheCreationInputTokens, u.OutputTokens)
+			if !valid || (e.Message.Role != "" && e.Message.Role != "assistant") {
+				invalidate()
+				continue
+			}
+			if total == 0 {
 				continue
 			}
 			last = &TranscriptUsage{
@@ -174,15 +311,20 @@ func parseLastUsage(buf []byte) *TranscriptUsage {
 				CacheCreationTokens: u.CacheCreationInputTokens,
 				OutputTokens:        u.OutputTokens,
 			}
-		case e.Payload.Type == "token_count":
+		case e.Type == "event_msg" && e.Payload.Type == "token_count":
 			// Codex shape: last_token_usage.input_tokens already includes
 			// cached tokens; total_tokens = input + output.
-			u := e.Payload.Info.LastTokenUsage
-			total := u.TotalTokens
-			if total <= 0 {
-				total = u.InputTokens + u.OutputTokens
+			if e.Payload.Info == nil || e.Payload.Info.LastTokenUsage == nil {
+				continue // Rate-limit-only token_count events carry no usage.
 			}
-			if total <= 0 {
+			u := e.Payload.Info.LastTokenUsage
+			total, valid := transcriptTokenTotal(u.TotalTokens, u.InputTokens, u.OutputTokens)
+			if !valid || u.CachedInputTokens < 0 || u.CachedInputTokens > u.InputTokens ||
+				u.CacheWriteInputTokens < 0 || e.Payload.Info.ModelContextWindow < 0 {
+				invalidate()
+				continue
+			}
+			if total == 0 {
 				continue
 			}
 			last = &TranscriptUsage{
@@ -198,12 +340,45 @@ func parseLastUsage(buf []byte) *TranscriptUsage {
 		if last.Model == "" {
 			last.Model = lastModel
 		}
+		last.UpdatedAt, _ = time.Parse(time.RFC3339Nano, e.Timestamp)
 	}
 
-	if last != nil && last.Model == "" {
-		last.Model = lastModel
+	return last, mayLookBack
+}
+
+// transcriptTokenTotal validates native counters before using them for
+// context pressure. Cache counters are passed only when they are additive for
+// that provider. A native total may include extra provider-accounted tokens,
+// but cannot be negative or smaller than the components we already know.
+func transcriptTokenTotal(reported int, components ...int) (int, bool) {
+	if reported < 0 {
+		return 0, false
 	}
-	return last
+	maxInt := int(^uint(0) >> 1)
+	total := 0
+	for _, component := range components {
+		if component < 0 || component > maxInt-total {
+			return 0, false
+		}
+		total += component
+	}
+	if reported > 0 {
+		if reported < total {
+			return 0, false
+		}
+		return reported, true
+	}
+	return total, true
+}
+
+// ompQualifiedModel joins omp's per-message provider and model into the
+// "provider/model" spelling omp's --model flag and model_change entries use.
+// Claude and Codex entries carry no provider and pass through unchanged.
+func ompQualifiedModel(provider, model string) string {
+	if provider == "" || model == "" || strings.HasPrefix(model, provider+"/") {
+		return model
+	}
+	return provider + "/" + model
 }
 
 // MungeProjectPath converts a working directory into the directory name
@@ -411,6 +586,26 @@ func codexSessionMatchesCwd(path, cwd string) bool {
 	return filepath.Clean(e.Payload.Cwd) == filepath.Clean(cwd)
 }
 
+// OmpStatusBarUsage converts the context gauge omp renders in its composer
+// border ("6%" … "262K", or annotated "6.0%/262K") into a usage reading. It
+// is the agent's own live accounting, attributed to the captured pane itself,
+// so unlike transcript correlation it stays unambiguous when several omp
+// panes share one working directory. Path and Model are empty; Tokens is
+// derived from the percentage and window. It reports false when no gauge
+// with a window is visible (for example while a selector overlay covers the
+// composer).
+func OmpStatusBarUsage(captured string, capturedAt time.Time) (*TranscriptUsage, bool) {
+	usedPct, window, ok := agent.OmpContextUsage(captured)
+	if !ok || window <= 0 {
+		return nil, false
+	}
+	return &TranscriptUsage{
+		Tokens:        int(float64(window)*usedPct/100 + 0.5),
+		ContextWindow: int(window),
+		UpdatedAt:     capturedAt,
+	}, true
+}
+
 // LatestAgentTranscriptUsage finds the transcript for an agent pane by agent
 // type and working directory and returns its last usage record. agentType is
 // NTM's normalized agent type string ("claude", "codex", ...). newerThan
@@ -424,8 +619,19 @@ func LatestAgentTranscriptUsage(agentType, cwd string, newerThan time.Time) (*Tr
 		path, ok = FindClaudeTranscript(DefaultClaudeProjectsDir(), cwd, newerThan)
 	case "codex", "cod":
 		path, ok = FindCodexTranscript(DefaultCodexSessionsDir(), cwd, newerThan)
+	case "gemini", "gmi":
+		home, _ := os.UserHomeDir()
+		ctx, cancel := stdcontext.WithTimeout(stdcontext.Background(), 2*time.Second)
+		defer cancel()
+		path, ok = agentsession.FindGeminiTranscriptForCwd(ctx, home, cwd, newerThan)
+	case "omp":
+		// The omp store layout is owned by agentsession (shared with
+		// session capture/resume discovery).
+		home, _ := os.UserHomeDir()
+		path, _ = agentsession.NewestOmpTranscriptForCwd(agentsession.OmpSessionRoots(home, os.Getenv), cwd, newerThan, nil)
+		ok = path != ""
 	default:
-		// Seam: other agent CLIs (gemini, cursor, ...) do not yet have known
+		// Other agent CLIs (cursor, ...) do not yet have known
 		// transcript locations; fall back to scrollback estimation.
 		return nil, false
 	}
@@ -436,14 +642,215 @@ func LatestAgentTranscriptUsage(agentType, cwd string, newerThan time.Time) (*Tr
 	if err != nil || usage == nil {
 		return nil, false
 	}
+	if (agentType == "gemini" || agentType == "gmi") && usage.ProviderSessionID == "" {
+		return nil, false // A native Gemini path must contain Gemini accounting.
+	}
 	return usage, true
+}
+
+// ProcessTranscriptUsage reads usage from the transcript of the session the
+// agent process under panePID is writing, found through the pane's process
+// tree (agentsession.DiscoverProcessSession). That binding is exact per pane,
+// so it holds where (agent type, cwd) correlation cannot attribute a
+// transcript: several panes of one agent type sharing a directory, the normal
+// NTM swarm layout. It reports false when there is no exact binding.
+func ProcessTranscriptUsage(ctx stdcontext.Context, agentType string, panePID int) (*TranscriptUsage, bool) {
+	if ctx == nil || ctx.Err() != nil {
+		return nil, false
+	}
+	info := agentsession.DiscoverProcessSession(ctx, agentType, panePID)
+	if ctx.Err() != nil {
+		return nil, false
+	}
+	usage, ok := readBoundTranscriptUsage(info)
+	if ctx.Err() != nil {
+		return nil, false
+	}
+	return usage, ok
+}
+
+// MaxPaneContextUsage measures only the selected physical panes for optional
+// prompt enrichment. A shared broadcast must respect its fullest known target.
+// Unknown usage is distinct from a measured zero and never invents capacity
+// from scrollback, cwd correlation, or a provider's quota percentage.
+//
+// All probes share a two-second budget. Exhausting this optional budget keeps
+// any readings already obtained; canceling the caller discards them and fails
+// the operation. stopAt allows returning as soon as the caller's skip threshold
+// is reached. Percentages are truncated to the injection engines' whole-percent
+// contract, so a reading just below the threshold is never rounded up.
+func MaxPaneContextUsage(ctx stdcontext.Context, client *tmux.Client, panes []tmux.Pane, stopAt int) (percent int, known bool, err error) {
+	if ctx == nil {
+		return 0, false, fmt.Errorf("pane context measurement requires an operation context")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	if client == nil {
+		client = tmux.DefaultClient
+	}
+	probeCtx, cancel := stdcontext.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	percent, known = maxPaneContextUsage(probeCtx, panes, stopAt, client.Remote == "",
+		client.CapturePaneVisibleContext, ProcessTranscriptUsage, time.Now)
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	return percent, known, nil
+}
+
+func maxPaneContextUsage(ctx stdcontext.Context, panes []tmux.Pane, stopAt int, local bool,
+	capture func(stdcontext.Context, string) (string, error),
+	transcript func(stdcontext.Context, string, int) (*TranscriptUsage, bool),
+	now func() time.Time,
+) (percent int, known bool) {
+	seen := make(map[string]bool, len(panes))
+	for _, pane := range panes {
+		if ctx.Err() != nil {
+			break
+		}
+		if pane.Dead || pane.IsServicePane() || !strings.HasPrefix(pane.ID, "%") || seen[pane.ID] {
+			continue
+		}
+		if _, err := strconv.ParseUint(strings.TrimPrefix(pane.ID, "%"), 10, 64); err != nil {
+			continue // a window-local index cannot identify measurement evidence
+		}
+		seen[pane.ID] = true
+		agentType := agent.AgentType(pane.Type).Canonical()
+		switch agentType {
+		case agent.AgentTypeClaudeCode, agent.AgentTypeCodex, agent.AgentTypeGemini, agent.AgentTypeOmp:
+		default:
+			continue
+		}
+		var used float64
+		var measured bool
+		// Only these existing parsers establish a native context gauge from
+		// its live composer/footer structure. Codex's generic percentage regex
+		// can match quoted history, so Codex uses exact transcript binding.
+		if agentType == agent.AgentTypeGemini || agentType == agent.AgentTypeOmp {
+			if visible, err := capture(ctx, pane.ID); err == nil && ctx.Err() == nil {
+				if agentType == agent.AgentTypeOmp {
+					composer := agent.ParseOmpComposer(visible)
+					if composer.Found && composer.RowsBelow == 0 {
+						used, _, measured = agent.OmpContextUsage(visible)
+					}
+				} else if parsed, err := agent.NewParser().ParseWithHint(visible, agentType); err == nil && parsed.ContextRemaining != nil {
+					used, measured = 100-*parsed.ContextRemaining, true
+				}
+			}
+		}
+		if !measured && local && pane.PID > 0 && ctx.Err() == nil {
+			if usage, ok := transcript(ctx, string(agentType), pane.PID); ok {
+				used, measured = freshTranscriptUsagePercent(usage, now())
+			}
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		if measured {
+			percent, known = max(percent, int(used)), true
+			if stopAt > 0 && percent >= stopAt {
+				return percent, known
+			}
+		}
+	}
+	return percent, known
+}
+
+func freshTranscriptUsagePercent(usage *TranscriptUsage, now time.Time) (float64, bool) {
+	if usage == nil || usage.Tokens < 0 || TranscriptConfidence(usage.UpdatedAt, now) != "high" {
+		return 0, false
+	}
+	limit := usage.ContextWindow
+	if limit <= 0 {
+		if !models.KnownModel(usage.Model) {
+			return 0, false
+		}
+		limit = models.GetContextLimit(usage.Model)
+	}
+	if limit <= 0 {
+		return 0, false
+	}
+	return min(float64(usage.Tokens)*100/float64(limit), 100), true
+}
+
+func readBoundTranscriptUsage(info *agentsession.Info) (*TranscriptUsage, bool) {
+	if info == nil || info.SourcePath == "" {
+		return nil, false
+	}
+	usage, err := ReadLatestTranscriptUsage(info.SourcePath)
+	if err != nil || usage == nil {
+		return nil, false
+	}
+	if info.Provider == "gemini" || usage.ProviderSessionID != "" {
+		// Reopening a discovered pathname must not silently bind a replaced
+		// file or another provider's transcript to this pane.
+		if info.Provider != "gemini" || usage.ProviderSessionID == "" || usage.ProviderSessionID != info.SessionID {
+			return nil, false
+		}
+	}
+	return usage, true
+}
+
+// PaneTranscriptRef is one agent pane for AttributePaneTranscripts.
+type PaneTranscriptRef struct {
+	PaneID    string
+	AgentType string // transcript agent type: "claude", "codex", "gemini", "omp"
+	PID       int    // the pane's shell PID; 0 when unknown
+	Cwd       string // the pane's working directory; "" when unknown
+}
+
+// AttributePaneTranscripts attributes session transcript usage to panes,
+// keyed by pane ID. It is the one attribution rule every reader of pane
+// transcripts shares (robot context and snapshot, the coordinator's rotation
+// trigger).
+//
+// known holds readings already attributed to a pane by other means (omp's own
+// context gauge). byProcess binds a pane through its agent process's session
+// (exact per pane; may be nil). byCwd finds the newest transcript for an agent
+// type in a directory, which is only trustworthy for a pane that is the sole
+// pane of its type there: with several, it may belong to any of them, so those
+// panes get no reading rather than another pane's. Panes resolved through
+// known or byProcess still count toward their directory for that rule.
+func AttributePaneTranscripts(panes []PaneTranscriptRef, known map[string]*TranscriptUsage, byProcess func(agentType string, pid int) (*TranscriptUsage, bool), byCwd func(agentType, cwd string) (*TranscriptUsage, bool)) map[string]*TranscriptUsage {
+	type group struct{ agentType, cwd string }
+	groups := make(map[group][]string)
+	result := make(map[string]*TranscriptUsage, len(panes))
+	for paneID, usage := range known {
+		if usage != nil {
+			result[paneID] = usage
+		}
+	}
+	for _, pane := range panes {
+		if result[pane.PaneID] == nil && byProcess != nil && pane.PID > 0 {
+			if usage, ok := byProcess(pane.AgentType, pane.PID); ok && usage != nil {
+				result[pane.PaneID] = usage
+			}
+		}
+		if pane.Cwd != "" {
+			key := group{agentType: pane.AgentType, cwd: pane.Cwd}
+			groups[key] = append(groups[key], pane.PaneID)
+		}
+	}
+	if byCwd == nil {
+		return result
+	}
+	for key, paneIDs := range groups {
+		if len(paneIDs) != 1 || result[paneIDs[0]] != nil {
+			continue // ambiguous attribution: no transcript beats a wrong one
+		}
+		if usage, ok := byCwd(key.agentType, key.cwd); ok && usage != nil {
+			result[paneIDs[0]] = usage
+		}
+	}
+	return result
 }
 
 // TranscriptConfidence maps transcript freshness to a confidence label:
 // "high" when the transcript was updated within TranscriptFreshness of now,
 // "medium" otherwise (the session may have moved on or ended).
 func TranscriptConfidence(updatedAt, now time.Time) string {
-	if now.Sub(updatedAt) < TranscriptFreshness {
+	if !updatedAt.IsZero() && !updatedAt.After(now) && now.Sub(updatedAt) < TranscriptFreshness {
 		return "high"
 	}
 	return "medium"

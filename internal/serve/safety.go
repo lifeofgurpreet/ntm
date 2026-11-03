@@ -63,7 +63,13 @@ type SafetyStatusResponse struct {
 	WrapperPath         string `json:"wrapper_path,omitempty"`
 	GitWrapperInstalled bool   `json:"git_wrapper_installed"`
 	RmWrapperInstalled  bool   `json:"rm_wrapper_installed"`
-	HookInstalled       bool   `json:"hook_installed"`
+	// HookInstalled is true only when the hook script exists and Claude
+	// Code's settings register it; Claude never runs unregistered scripts.
+	HookInstalled     bool   `json:"hook_installed"`
+	HookScriptPresent bool   `json:"hook_script_present"`
+	HookRegistered    bool   `json:"hook_registered"`
+	HookSettingsPath  string `json:"hook_settings_path,omitempty"`
+	HookSettingsError string `json:"hook_settings_error,omitempty"`
 }
 
 func (s *Server) handleSafetyStatusV1(w http.ResponseWriter, r *http.Request) {
@@ -85,9 +91,11 @@ func (s *Server) handleSafetyStatusV1(w http.ResponseWriter, r *http.Request) {
 	gitWrapperInstalled := safetyFileExists(gitWrapper)
 	rmWrapperInstalled := safetyFileExists(rmWrapper)
 
-	// Check if Claude Code hook is installed
-	hookPath := filepath.Join(home, ".claude", "hooks", "PreToolUse", "ntm-safety.sh")
-	hookInstalled := safetyFileExists(hookPath)
+	hookPath := policy.ClaudeHookScriptPath(home)
+	settingsPath := policy.ClaudeUserSettingsPath(home)
+	hookScriptPresent := safetyFileExists(hookPath)
+	hookRegistered, registeredErr := policy.ClaudeHookRegistered(settingsPath, hookPath)
+	hookInstalled := hookScriptPresent && hookRegistered
 
 	// Load policy
 	p, err := policy.LoadOrDefault()
@@ -120,6 +128,12 @@ func (s *Server) handleSafetyStatusV1(w http.ResponseWriter, r *http.Request) {
 		GitWrapperInstalled: gitWrapperInstalled,
 		RmWrapperInstalled:  rmWrapperInstalled,
 		HookInstalled:       hookInstalled,
+		HookScriptPresent:   hookScriptPresent,
+		HookRegistered:      hookRegistered,
+		HookSettingsPath:    settingsPath,
+	}
+	if registeredErr != nil {
+		resp.HookSettingsError = registeredErr.Error()
 	}
 
 	data, err := toJSONMap(resp)
@@ -260,6 +274,7 @@ type SafetyInstallResponse struct {
 	GitWrapper string `json:"git_wrapper"`
 	RmWrapper  string `json:"rm_wrapper"`
 	Hook       string `json:"hook"`
+	Settings   string `json:"settings"`
 	Policy     string `json:"policy"`
 }
 
@@ -295,29 +310,34 @@ func (s *Server) handleSafetyInstallV1(w http.ResponseWriter, r *http.Request) {
 
 	// Install git wrapper
 	gitWrapper := filepath.Join(binDir, "git")
-	if err := installWrapperFile(gitWrapper, gitWrapperScript, req.Force); err != nil {
+	if err := installWrapperFile(gitWrapper, policy.GitWrapperScript, req.Force); err != nil {
 		writeErrorResponse(w, http.StatusConflict, ErrCodeConflict, err.Error(), nil, reqID)
 		return
 	}
 
 	// Install rm wrapper
 	rmWrapper := filepath.Join(binDir, "rm")
-	if err := installWrapperFile(rmWrapper, rmWrapperScript, req.Force); err != nil {
+	if err := installWrapperFile(rmWrapper, policy.RmWrapperScript, req.Force); err != nil {
 		writeErrorResponse(w, http.StatusConflict, ErrCodeConflict, err.Error(), nil, reqID)
 		return
 	}
 
-	// Install Claude Code hook
-	hookDir := filepath.Join(home, ".claude", "hooks", "PreToolUse")
-	if err := os.MkdirAll(hookDir, 0755); err != nil {
+	// Install the Claude Code hook script and register it in Claude's
+	// settings: Claude Code runs only hooks a settings file lists.
+	hookPath := policy.ClaudeHookScriptPath(home)
+	if err := os.MkdirAll(filepath.Dir(hookPath), 0755); err != nil {
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
 			"failed to create hook directory", nil, reqID)
 		return
 	}
-
-	hookPath := filepath.Join(hookDir, "ntm-safety.sh")
-	if err := installWrapperFile(hookPath, claudeHookScript, req.Force); err != nil {
+	if err := installWrapperFile(hookPath, policy.ClaudeHookScript, req.Force); err != nil {
 		writeErrorResponse(w, http.StatusConflict, ErrCodeConflict, err.Error(), nil, reqID)
+		return
+	}
+	settingsPath := policy.ClaudeUserSettingsPath(home)
+	if _, err := policy.RegisterClaudeHook(settingsPath, hookPath); err != nil {
+		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
+			fmt.Sprintf("failed to register Claude Code hook: %v", err), nil, reqID)
 		return
 	}
 
@@ -335,6 +355,7 @@ func (s *Server) handleSafetyInstallV1(w http.ResponseWriter, r *http.Request) {
 		GitWrapper: gitWrapper,
 		RmWrapper:  rmWrapper,
 		Hook:       hookPath,
+		Settings:   settingsPath,
 		Policy:     policyPath,
 	}
 
@@ -379,8 +400,17 @@ func (s *Server) handleSafetyUninstallV1(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	// Remove hook
-	hookPath := filepath.Join(home, ".claude", "hooks", "PreToolUse", "ntm-safety.sh")
+	// Unregister the hook before removing its script, so Claude Code is never
+	// left pointing at a missing file.
+	hookPath := policy.ClaudeHookScriptPath(home)
+	settingsPath := policy.ClaudeUserSettingsPath(home)
+	if changed, err := policy.UnregisterClaudeHook(settingsPath, hookPath); err != nil {
+		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
+			fmt.Sprintf("failed to unregister Claude Code hook: %v", err), nil, reqID)
+		return
+	} else if changed {
+		removed = append(removed, settingsPath+" (hooks.PreToolUse entry)")
+	}
 	if safetyFileExists(hookPath) {
 		if err := os.Remove(hookPath); err != nil {
 			writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError,
@@ -539,6 +569,15 @@ type PolicyUpdateRequest struct {
 	Content string `json:"content"` // YAML content
 }
 
+func (s *Server) policyYAMLDiagnostic(r *http.Request, err error) string {
+	if enforcesRequestRedaction(s.requestRedactionConfig(r)) {
+		// Decoder errors can quote a decoded scalar or a truncated secret that
+		// output detection cannot recognize. No typed value exists to inspect.
+		return "invalid YAML: check policy syntax, field names, and value types"
+	}
+	return fmt.Sprintf("invalid YAML: %v", err)
+}
+
 // PolicyUpdateResponse is the REST response for policy update.
 type PolicyUpdateResponse struct {
 	PolicyPath string              `json:"policy_path"`
@@ -565,7 +604,14 @@ func (s *Server) handlePolicyUpdateV1(w http.ResponseWriter, r *http.Request) {
 	p, err := policy.DecodeYAML([]byte(req.Content))
 	if err != nil {
 		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest,
-			fmt.Sprintf("invalid YAML: %v", err), nil, reqID)
+			s.policyYAMLDiagnostic(r, err), nil, reqID)
+		return
+	}
+
+	// YAML escapes and binary scalars can reveal credentials that were not
+	// present in the outer JSON. Inspect before validation can quote a value,
+	// and before resolving paths, creating directories, or saving the YAML.
+	if !s.admitDecodedRequest(w, r, p, "policy") {
 		return
 	}
 
@@ -650,13 +696,17 @@ func (s *Server) handlePolicyValidateV1(w http.ResponseWriter, r *http.Request) 
 		// Validate provided content
 		p, err := policy.DecodeYAML([]byte(req.Content))
 		if err != nil {
-			errors = append(errors, fmt.Sprintf("invalid YAML: %v", err))
+			errors = append(errors, s.policyYAMLDiagnostic(r, err))
 			data, _ := toJSONMap(PolicyValidateResponse{
 				Valid:    false,
 				Errors:   errors,
 				Warnings: warnings,
 			})
 			writeSuccessResponse(w, http.StatusOK, data, reqID)
+			return
+		}
+
+		if !s.admitDecodedRequest(w, r, p, "policy") {
 			return
 		}
 
@@ -711,7 +761,7 @@ func (s *Server) handlePolicyValidateV1(w http.ResponseWriter, r *http.Request) 
 
 	p, err := policy.DecodeYAML(fileData)
 	if err != nil {
-		errors = append(errors, fmt.Sprintf("invalid YAML: %v", err))
+		errors = append(errors, s.policyYAMLDiagnostic(r, err))
 		data, _ := toJSONMap(PolicyValidateResponse{
 			Valid:      false,
 			PolicyPath: policyPath,
@@ -1609,149 +1659,3 @@ func safetyEscapeYAMLDoubleQuote(s string) string {
 	s = strings.ReplaceAll(s, "\t", "\\t")
 	return s
 }
-
-// Wrapper scripts (same as CLI)
-
-const gitWrapperScript = `#!/bin/bash
-# NTM Safety Wrapper for git
-# Intercepts destructive git commands
-
-REAL_GIT=$(which -a git | grep -v "$HOME/.ntm/bin" | head -1)
-if [ -z "$REAL_GIT" ]; then
-    REAL_GIT="/usr/bin/git"
-fi
-
-# Check command against policy (include "git" in the command string)
-check_result=$(ntm safety check "git $*" --json 2>&1)
-exit_code=$?
-
-# ntm safety check exits 0 for allow/approve, 1 for block
-if [ $exit_code -eq 1 ]; then
-    # Command was blocked
-    reason=$(echo "$check_result" | jq -r '.reason // "Policy violation"' 2>/dev/null)
-    echo "NTM Safety: Command blocked" >&2
-    echo "  Reason: $reason" >&2
-    echo "  Command: git $*" >&2
-
-    # Log the blocked command (use jq for proper JSON escaping)
-    mkdir -p "$HOME/.ntm/logs"
-    if command -v jq >/dev/null 2>&1; then
-        jq -n --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              --arg cmd "git $*" \
-              --arg reason "${reason:-Policy violation}" \
-              '{timestamp: $ts, command: $cmd, reason: $reason, action: "block"}' >> "$HOME/.ntm/logs/blocked.jsonl"
-    else
-        # Fallback without proper escaping (best effort)
-        echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"action\":\"block\"}" >> "$HOME/.ntm/logs/blocked.jsonl"
-    fi
-
-    exit 1
-fi
-
-# Pass through to real git
-exec "$REAL_GIT" "$@"
-`
-
-const rmWrapperScript = `#!/bin/bash
-# NTM Safety Wrapper for rm
-# Intercepts destructive rm commands
-
-REAL_RM=$(which -a rm | grep -v "$HOME/.ntm/bin" | head -1)
-if [ -z "$REAL_RM" ]; then
-    REAL_RM="/bin/rm"
-fi
-
-# Check command against policy
-check_result=$(ntm safety check "rm $*" --json 2>&1)
-exit_code=$?
-
-# ntm safety check exits 0 for allow/approve, 1 for block
-if [ $exit_code -eq 1 ]; then
-    # Command was blocked
-    reason=$(echo "$check_result" | jq -r '.reason // "Policy violation"' 2>/dev/null)
-    echo "NTM Safety: Command blocked" >&2
-    echo "  Reason: $reason" >&2
-    echo "  Command: rm $*" >&2
-
-    # Log the blocked command (use jq for proper JSON escaping)
-    mkdir -p "$HOME/.ntm/logs"
-    if command -v jq >/dev/null 2>&1; then
-        jq -n --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              --arg cmd "rm $*" \
-              --arg reason "${reason:-Policy violation}" \
-              '{timestamp: $ts, command: $cmd, reason: $reason, action: "block"}' >> "$HOME/.ntm/logs/blocked.jsonl"
-    else
-        # Fallback without proper escaping (best effort)
-        echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"action\":\"block\"}" >> "$HOME/.ntm/logs/blocked.jsonl"
-    fi
-
-    exit 1
-fi
-
-# Pass through to real rm
-exec "$REAL_RM" "$@"
-`
-
-const claudeHookScript = `#!/bin/bash
-# NTM Safety Hook for Claude Code
-# PreToolUse hook that validates Bash commands
-
-# Claude Code command hooks receive the event payload as JSON on stdin.
-HOOK_INPUT="$(cat)"
-if [ -n "$HOOK_INPUT" ] && command -v jq >/dev/null 2>&1; then
-    TOOL_NAME="$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_name // empty' 2>/dev/null)"
-    COMMAND="$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)"
-else
-    TOOL_NAME=""
-    COMMAND=""
-fi
-
-# Fall back to legacy env vars if a caller still provides them directly.
-if [ -z "$TOOL_NAME" ]; then
-    TOOL_NAME="${CLAUDE_TOOL_NAME:-}"
-fi
-if [ -z "$COMMAND" ]; then
-    COMMAND="${CLAUDE_TOOL_INPUT_command:-}"
-fi
-
-# Only process Bash tool calls
-if [ "$TOOL_NAME" != "Bash" ]; then
-    exit 0
-fi
-
-if [ -z "$COMMAND" ]; then
-    exit 0
-fi
-
-# Check against policy
-check_result=$(ntm safety check "$COMMAND" --json 2>&1)
-exit_code=$?
-
-# ntm safety check exits 0 for allow/approve, 1 for block
-if [ $exit_code -eq 1 ]; then
-    # Command was blocked
-    reason=$(echo "$check_result" | jq -r '.reason // "Policy violation"' 2>/dev/null)
-
-    # Log the blocked command (use jq for proper JSON escaping)
-    mkdir -p "$HOME/.ntm/logs"
-    session="${NTM_SESSION:-unknown}"
-    agent="${CLAUDE_AGENT_TYPE:-claude}"
-    if command -v jq >/dev/null 2>&1; then
-        jq -n --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              --arg session "$session" \
-              --arg agent "$agent" \
-              --arg cmd "$COMMAND" \
-              --arg reason "${reason:-Policy violation}" \
-              '{timestamp: $ts, session: $session, agent: $agent, command: $cmd, reason: $reason, action: "block"}' >> "$HOME/.ntm/logs/blocked.jsonl"
-    else
-        # Fallback without proper escaping (best effort)
-        echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"action\":\"block\"}" >> "$HOME/.ntm/logs/blocked.jsonl"
-    fi
-
-    # Return error to Claude Code
-    echo "BLOCKED: $reason" >&2
-    exit 2
-fi
-
-exit 0
-`

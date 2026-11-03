@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -18,21 +17,15 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/events"
-	ntmgit "github.com/Dicklesworthstone/ntm/internal/git"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
-	"github.com/Dicklesworthstone/ntm/internal/util"
 )
 
 var (
-	getPanesWithActivity         = tmux.GetPanesWithActivity
-	getAllPanesContext           = tmux.GetAllPanesContext
+	getPanesWithActivity         = tmux.GetPanesWithActivityContext
 	captureForHealthCheckWithCtx = tmux.CaptureForHealthCheckContext
-	coordinatorPaneCurrentDir    = func(ctx context.Context, paneID string) (string, error) {
-		return tmux.DefaultClient.RunContext(ctx, "display-message", "-p", "-t", tmux.ExactTarget(paneID), "#{pane_current_path}")
-	}
 )
 
 // SessionCoordinator manages agent coordination for a tmux session.
@@ -41,15 +34,9 @@ type SessionCoordinator struct {
 	lifecycleMu sync.Mutex
 
 	// Identity
-	session        string // tmux session name
-	agentName      string // Agent Mail identity (e.g., "OrangeFox")
-	projectKey     string // Absolute path to physical working directory (bv/br/config)
-	mailProjectKey string // Canonical Agent Mail namespace; may be a virtual /repos key
-
-	// authoritativePaneBindings is set only from explicit coordinator
-	// bootstrap state. When true, legacy local pane registries are ignored.
-	authoritativePaneBindings bool
-	paneBindings              map[string]agentmail.CoordinatorPaneBinding
+	session    string // tmux session name
+	agentName  string // Agent Mail identity (e.g., "OrangeFox")
+	projectKey string // Absolute path to working directory
 
 	// Clients
 	mailClient        *agentmail.Client
@@ -60,14 +47,35 @@ type SessionCoordinator struct {
 	actionableRecommendationsFn func(context.Context, string, int) ([]bv.TriageRecommendation, error)
 	workItemStatusFn            func(context.Context, string) (string, error)
 	workItemDetailsFn           func(context.Context, string) (*bv.BeadAssignmentDetails, error)
-	assignmentPressureFn        func(context.Context) AssignmentPressure
 	claimBeadForAssignmentFn    func(context.Context, string, string, string, []string) (bv.BeadClaimResult, error)
 	releaseWorkItemClaimFn      func(context.Context, string, string, string) (bool, error)
+	allPanesForRecoveryFn       func(context.Context) (map[string][]tmux.Pane, error)
 	operatorGatedLabels         []string
+
+	// dispatchDeliveryProbeFn is the test seam for the mailbox probe that
+	// decides whether a stranded dispatch actually landed (ntm#304). Nil uses
+	// the real Agent Mail inbox probe.
+	dispatchDeliveryProbeFn dispatchDeliveryProbe
 
 	// Agent tracking
 	agents     map[string]*AgentState
 	lastUpdate time.Time
+
+	// Physical pane topology from the most recent *successful* whole-session
+	// observation: every pane tmux listed, including panes carrying no agent
+	// and panes whose agent type could not be identified. This is deliberately
+	// a different set from `agents`, which drops user/unknown panes and so
+	// cannot answer "does this pane still exist?" (ntm#304).
+	//
+	// livePaneTopologyValid is false until the first successful observation and
+	// is cleared again whenever a whole-session observation fails, so an
+	// absence is never inferred from a snapshot we could not take.
+	// deadPaneIDs records explicit pane_dead evidence from that same observation.
+	// Retained dead panes remain in physical topology but cannot receive work.
+	livePaneIDs           map[string]struct{}
+	deadPaneIDs           map[string]struct{}
+	livePaneTopologyAt    time.Time
+	livePaneTopologyValid bool
 
 	// Monitors
 	monitor *AgentMonitor
@@ -96,11 +104,21 @@ type SessionCoordinator struct {
 
 	// Configuration
 	config CoordinatorConfig
+	// completionEvents is enabled only by a caller with a durable event
+	// consumer, such as assign --watch. Standalone coordination has no such
+	// consumer and must not leave unacknowledgeable completion barriers.
+	completionEvents bool
 
 	// Full NTM config, when the caller has one loaded. Only used by the
 	// context rotation trigger (replacement launch commands and
 	// [context_rotation] tunables); nil is fine.
 	ntmConfig *config.Config
+
+	// promptContext enriches each fresh auto-assignment with CASS history
+	// and CM rules before its durable intent is recorded. The caller
+	// resolves it from [cass.context] and [memory] send_injection; the zero
+	// value disables enrichment.
+	promptContext robot.PromptContextOptions
 
 	// Event channel for coordination actions
 	events chan CoordinatorEvent
@@ -150,9 +168,6 @@ type CoordinatorConfig struct {
 	AutoAssign     bool    `toml:"auto_assign"`      // Automatically assign work to idle agents
 	IdleThreshold  float64 `toml:"idle_threshold"`   // Seconds of inactivity before considering idle
 	AssignOnlyIdle bool    `toml:"assign_only_idle"` // Only assign to truly idle agents
-	// AllowCriticalPressure is runtime-only and may be enabled only by the
-	// bounded `coordinator run --once --allow-critical-pressure` CLI path.
-	AllowCriticalPressure bool `toml:"-"`
 
 	// Conflict handling
 	ConflictNotify    bool `toml:"conflict_notify"`    // Notify when conflicts detected
@@ -187,7 +202,12 @@ const MinPollInterval = 100 * time.Millisecond
 // MinDigestInterval is the minimum allowed digest interval.
 const MinDigestInterval = 10 * time.Second
 
-// DefaultCoordinatorConfig returns sensible defaults.
+// DefaultCoordinatorConfig returns sensible defaults. Every action that
+// messages agents or admits work is opt-in: each session monitor hosts a
+// coordinator, so a default-on action would run in every spawned session.
+// ConflictNotify in particular mails every holder of overlapping reservations
+// project-wide (other sessions' agents included) at high importance, again
+// per persisting pair after each cooldown.
 func DefaultCoordinatorConfig() CoordinatorConfig {
 	return CoordinatorConfig{
 		PollInterval:      5 * time.Second,
@@ -195,7 +215,7 @@ func DefaultCoordinatorConfig() CoordinatorConfig {
 		AutoAssign:        false, // Disabled by default - opt-in
 		IdleThreshold:     30.0,
 		AssignOnlyIdle:    true,
-		ConflictNotify:    true,
+		ConflictNotify:    false, // Disabled by default - opt-in
 		ConflictNegotiate: false, // Manual resolution by default
 		SendDigests:       false, // Disabled by default
 		HumanAgent:        "Human",
@@ -244,32 +264,16 @@ type busCoordinatorEvent struct {
 // New creates a new SessionCoordinator.
 func New(session, projectKey string, mailClient *agentmail.Client, agentName string) *SessionCoordinator {
 	c := &SessionCoordinator{
-		session:              session,
-		agentName:            agentName,
-		projectKey:           projectKey,
-		mailProjectKey:       projectKey,
-		mailClient:           mailClient,
-		reservationClient:    mailClient,
-		operatorGatedLabels:  append([]string(nil), bv.OperatorGatedLabelsForProject(projectKey)...),
-		assignmentPressureFn: liveCoordinatorAssignmentPressure,
-		agents:               make(map[string]*AgentState),
-		config:               DefaultCoordinatorConfig(),
-		events:               make(chan CoordinatorEvent, 100),
-		stopCh:               make(chan struct{}),
-	}
-	return c
-}
-
-// WithAgentMailScope separates the physical checkout used by local project
-// tools from the canonical Agent Mail namespace and installs only the pane
-// bindings explicitly verified by `ntm coordinator bootstrap`.
-func (c *SessionCoordinator) WithAgentMailScope(mailProjectKey, agentName string, bindings map[string]agentmail.CoordinatorPaneBinding) *SessionCoordinator {
-	c.mailProjectKey = strings.TrimSpace(mailProjectKey)
-	c.agentName = strings.TrimSpace(agentName)
-	c.authoritativePaneBindings = true
-	c.paneBindings = make(map[string]agentmail.CoordinatorPaneBinding, len(bindings))
-	for paneID, binding := range bindings {
-		c.paneBindings[paneID] = binding
+		session:             session,
+		agentName:           agentName,
+		projectKey:          projectKey,
+		mailClient:          mailClient,
+		reservationClient:   mailClient,
+		operatorGatedLabels: append([]string(nil), bv.OperatorGatedLabelsForProject(projectKey)...),
+		agents:              make(map[string]*AgentState),
+		config:              DefaultCoordinatorConfig(),
+		events:              make(chan CoordinatorEvent, 100),
+		stopCh:              make(chan struct{}),
 	}
 	return c
 }
@@ -285,6 +289,23 @@ func (c *SessionCoordinator) WithConfig(cfg CoordinatorConfig) *SessionCoordinat
 // is accepted and keeps built-in defaults.
 func (c *SessionCoordinator) WithNTMConfig(cfg *config.Config) *SessionCoordinator {
 	c.ntmConfig = cfg
+	return c
+}
+
+// WithPromptContext enables CASS history and CM rule enrichment of fresh
+// auto-assignment prompts, using the same resolved options as --robot-send.
+// Recovery of a recorded intent always replays its recorded prompt.
+func (c *SessionCoordinator) WithPromptContext(opts robot.PromptContextOptions) *SessionCoordinator {
+	c.promptContext = opts
+	return c
+}
+
+// WithCompletionEvents preserves task completion in the assignment outbox
+// before maintenance releases its leases. Only callers that consume and
+// acknowledge those events may enable this option. Set it before maintenance
+// starts; ordinary coordinator commands leave it disabled.
+func (c *SessionCoordinator) WithCompletionEvents() *SessionCoordinator {
+	c.completionEvents = true
 	return c
 }
 
@@ -318,12 +339,9 @@ func (c *SessionCoordinator) Start(ctx context.Context) error {
 	c.stopping = false
 	c.mu.Unlock()
 
-	// Initialize monitor
-	c.monitor = NewAgentMonitor(c.session, c.mailClient, c.projectKey)
-
 	// Perform initial update synchronously to ensure state is ready. A coordinator
 	// that cannot observe its target session must not announce a healthy runtime.
-	if err := c.updateAgentStatesContext(ctx); err != nil {
+	if err := c.Observe(ctx); err != nil {
 		c.mu.Lock()
 		c.started = false
 		c.stopCh = nil
@@ -448,16 +466,52 @@ func (c *SessionCoordinator) monitorLoop(ctx context.Context, stopCh <-chan stru
 	}
 }
 
-// RunCycle refreshes the canonical session observation and, when enabled,
-// performs one auto-assignment pass from that exact fresh snapshot.
+// Observe refreshes agent state once without starting background coordination,
+// sending messages, or changing assignments and reservations. Inspection
+// surfaces can use it even when automatic actions are enabled in the config.
+func (c *SessionCoordinator) Observe(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.mu.Lock()
+	if c.monitor == nil {
+		c.monitor = NewAgentMonitor(c.session, c.mailClient, c.projectKey)
+	}
+	c.mu.Unlock()
+	return c.updateAgentStatesContext(ctx)
+}
+
+// MaintainAssignments observes the session and maintains only existing durable
+// assignments. A failed pane observation does not prevent terminal cleanup or
+// renewal for independently verified healthy panes. Missing or stale target
+// evidence never authorizes renewal. Observation and maintenance failures are
+// returned together so callers can report degraded protection without stopping
+// unrelated cleanup. This entry point never starts background coordination,
+// sends digests or nudges, rotates agents, or admits new work.
+func (c *SessionCoordinator) MaintainAssignments(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	observationErr := c.Observe(ctx)
+	if err := ctx.Err(); err != nil {
+		return errors.Join(observationErr, err)
+	}
+	return errors.Join(observationErr, c.maintainAssignments(ctx))
+}
+
+// RunCycle refreshes the canonical session observation, maintains existing
+// assignments, and, when enabled, performs one auto-assignment pass.
 func (c *SessionCoordinator) RunCycle(ctx context.Context) ([]AssignmentResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if c.monitor == nil {
-		c.monitor = NewAgentMonitor(c.session, c.mailClient, c.projectKey)
-	}
-	if err := c.updateAgentStatesContext(ctx); err != nil {
+	// Protect existing work before potentially slow agent recovery and before
+	// admitting new work. Degraded observation still permits independently
+	// authorized maintenance, but blocks the other automatic actions below.
+	if err := c.MaintainAssignments(ctx); err != nil {
 		return nil, err
 	}
 	c.maybeCheckMailNudge(ctx)
@@ -509,6 +563,10 @@ func (c *SessionCoordinator) maybeCheckCaamFailover(ctx context.Context) {
 	}
 	if c.caamFailover == nil {
 		c.caamFailover = newFailoverChecker(c.session, c.projectKey, c.ntmConfig.Integrations.CAAM)
+		if c.caamFailover != nil {
+			c.caamFailover.config = c.ntmConfig
+			c.caamFailover.forceGlobal = c.ntmConfig.Swarm.ForceGlobalAuthClobber
+		}
 	}
 	checker := c.caamFailover
 	c.mu.Unlock()
@@ -528,7 +586,7 @@ func (c *SessionCoordinator) maybeCheckMailNudge(ctx context.Context) {
 		return
 	}
 	if c.mailNudge == nil {
-		c.mailNudge = newMailNudgeChecker(c.session, c.mailProjectKey, c.config, c.mailClient)
+		c.mailNudge = newMailNudgeChecker(c.session, c.projectKey, c.config, c.mailClient)
 	}
 	checker := c.mailNudge
 	c.mu.Unlock()
@@ -545,10 +603,6 @@ func (c *SessionCoordinator) reportAssignmentCycle(results []AssignmentResult, e
 		return
 	}
 	for _, result := range results {
-		if result.Deferred {
-			slog.Info("coordinator auto-assignment deferred", "session", c.session, "reason", result.ReasonCode, "pressure", result.PressureLevel, "limiting", result.PressureLimit)
-			continue
-		}
 		if !result.Success {
 			beadID := ""
 			if result.Assignment != nil {
@@ -597,9 +651,6 @@ func (c *SessionCoordinator) updateAgentStatesContext(ctx context.Context) error
 	if c.monitor == nil {
 		return errors.New("agent monitor is not configured")
 	}
-	if c.authoritativePaneBindings {
-		c.monitor.SetPaneBindings(c.paneBindings)
-	}
 	observation, err := c.monitor.ObserveSession(ctx)
 	if err != nil {
 		c.markAgentObservationsUnavailable(observation.ObservedAt, err)
@@ -614,25 +665,29 @@ func (c *SessionCoordinator) updateAgentStatesContext(ctx context.Context) error
 		status    AgentStatusResult
 	}
 	updates := make([]agentUpdate, 0, len(observation.Panes))
+	// Physical topology is captured from every listed pane, before the
+	// agent-type filter below drops user/unknown panes. A pane whose agent
+	// went unrecognized still exists, and treating it as gone would be a
+	// license to re-dispatch work that may already be sitting in it (ntm#304).
+	livePaneIDs := make(map[string]struct{}, len(observation.Panes))
+	deadPaneIDs := make(map[string]struct{})
+	topologyComplete := true
 	var observationErrors []error
 	for _, pane := range observation.Panes {
-		if pane.AgentType == string(tmux.AgentUser) || pane.AgentType == string(tmux.AgentUnknown) {
+		paneID := strings.TrimSpace(pane.Pane.ID)
+		if _, duplicate := livePaneIDs[paneID]; paneID == "" || duplicate {
+			topologyComplete = false
+			observationErrors = append(observationErrors, fmt.Errorf("incomplete physical pane topology: empty or repeated pane ID %q", paneID))
 			continue
 		}
-		if c.authoritativePaneBindings {
-			binding, ok := c.paneBindings[pane.Pane.ID]
-			if !ok || binding.PanePID <= 0 || pane.Metadata.PID != binding.PanePID {
-				continue
-			}
-			currentDir, pathErr := coordinatorPaneCurrentDir(ctx, pane.Pane.ID)
-			if pathErr != nil {
-				slog.Warn("coordinator skipped pane with unreadable project", "session", c.session, "pane_id", pane.Pane.ID, "error", pathErr)
-				continue
-			}
-			belongs, pathErr := coordinatorProjectsMatch(ctx, c.projectKey, currentDir)
-			if pathErr != nil || !belongs {
-				continue
-			}
+		livePaneIDs[paneID] = struct{}{}
+		if pane.Metadata.Dead {
+			deadPaneIDs[paneID] = struct{}{}
+		}
+	}
+	for _, pane := range observation.Panes {
+		if pane.Metadata.Dead || pane.AgentType == string(tmux.AgentUser) || pane.AgentType == string(tmux.AgentUnknown) {
+			continue
 		}
 		state := c.monitor.resultFromPaneObservation(pane)
 		updates = append(updates, agentUpdate{
@@ -650,13 +705,9 @@ func (c *SessionCoordinator) updateAgentStatesContext(ctx context.Context) error
 			observationErrors = append(observationErrors, coordinatorPaneObservationError(pane.Pane.ID, message))
 		}
 	}
-	var registry *agentmail.SessionAgentRegistry
-	if !c.authoritativePaneBindings {
-		var registryErr error
-		registry, registryErr = agentmail.LoadSessionAgentRegistry(c.session, c.mailProjectKey)
-		if registryErr != nil {
-			slog.Warn("coordinator could not load Agent Mail pane registry", "session", c.session, "error", registryErr)
-		}
+	registry, registryErr := agentmail.LoadSessionAgentRegistry(c.session, c.projectKey)
+	if registryErr != nil {
+		slog.Warn("coordinator could not load Agent Mail pane registry", "session", c.session, "error", registryErr)
 	}
 
 	c.mu.Lock()
@@ -709,9 +760,7 @@ func (c *SessionCoordinator) updateAgentStatesContext(ctx context.Context) error
 		agent.ObservationError = state.ErrorMessage
 		agent.SafeToDispatch = state.SafeToDispatch
 		agent.Healthy = state.Healthy
-		if c.authoritativePaneBindings {
-			agent.AgentMailName = c.paneBindings[update.paneID].AgentName
-		} else if registry != nil {
+		if registry != nil {
 			if agentName, ok := registry.GetAgent(update.paneTitle, update.paneID); ok {
 				agent.AgentMailName = agentName
 			} else {
@@ -738,6 +787,10 @@ func (c *SessionCoordinator) updateAgentStatesContext(ctx context.Context) error
 	}
 
 	c.lastUpdate = observation.ObservedAt
+	c.livePaneIDs = livePaneIDs
+	c.deadPaneIDs = deadPaneIDs
+	c.livePaneTopologyAt = observation.ObservedAt
+	c.livePaneTopologyValid = topologyComplete
 	c.mu.Unlock()
 
 	// Emit events outside the lock to prevent deadlocks if the event bus
@@ -746,28 +799,6 @@ func (c *SessionCoordinator) updateAgentStatesContext(ctx context.Context) error
 		c.emitEvent(transition.agent, transition.prevStatus)
 	}
 	return errors.Join(observationErrors...)
-}
-
-func coordinatorProjectsMatch(ctx context.Context, targetDir, paneDir string) (bool, error) {
-	targetDir = strings.TrimSpace(targetDir)
-	paneDir = strings.TrimSpace(paneDir)
-	if !filepath.IsAbs(targetDir) || !filepath.IsAbs(paneDir) {
-		return false, nil
-	}
-	targetRoot := filepath.Clean(util.ResolveProjectDir(targetDir))
-	paneRoot := filepath.Clean(util.ResolveProjectDir(paneDir))
-	if targetRoot == paneRoot {
-		return true, nil
-	}
-	targetCommon, targetErr := ntmgit.CommonDir(ctx, targetRoot)
-	paneCommon, paneErr := ntmgit.CommonDir(ctx, paneRoot)
-	if targetErr != nil || paneErr != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return false, ctxErr
-		}
-		return false, nil
-	}
-	return targetCommon != "" && targetCommon == paneCommon, nil
 }
 
 // markAgentObservationsUnavailable makes a whole-session observation failure
@@ -779,6 +810,13 @@ func (c *SessionCoordinator) markAgentObservationsUnavailable(observedAt time.Ti
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// The observation failed, so we know nothing about the current pane set.
+	// Retaining the previous snapshot would let a pane that merely became
+	// unobservable be read as a pane that no longer exists.
+	c.livePaneIDs = nil
+	c.deadPaneIDs = nil
+	c.livePaneTopologyAt = time.Time{}
+	c.livePaneTopologyValid = false
 	for _, agent := range c.agents {
 		if agent.ObservationFreshness == status.FreshnessFresh && agent.Status != robot.StateUnknown {
 			agent.LastKnownStatus = agent.Status

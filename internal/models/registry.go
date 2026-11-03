@@ -23,17 +23,27 @@ var dateSuffixRe = regexp.MustCompile(`-\d{8}$`)
 // ContextLimits maps canonical model names to their context window sizes in tokens.
 // These are approximate values based on published specifications.
 var ContextLimits = map[string]int{
-	// Anthropic Claude models
+	// Anthropic Claude models. Current models default to a 1M window; each
+	// is listed explicitly so the longest-prefix fallback can never resolve
+	// a newer point release to an older 200K sibling (claude-opus-4-8 to
+	// claude-opus-4, claude-sonnet-5-5 to claude-sonnet-5). GH #338: a 200K
+	// window made 1M sessions read as over-full.
+	"claude-fable-5":    1000000,
+	"claude-fable-5-1":  1000000,
+	"claude-mythos-5":   1000000,
+	"claude-mythos-5-1": 1000000,
+	"claude-opus-5":     1000000,
+	"claude-opus-5-5":   1000000,
+	"claude-opus-4-8":   1000000,
+	"claude-opus-4-7":   1000000,
+	"claude-opus-4-6":   1000000,
+	"claude-sonnet-5":   1000000,
+	"claude-sonnet-5-5": 1000000,
+	"claude-sonnet-4-6": 1000000,
 	"claude-sonnet-4":   200000,
 	"claude-sonnet-4-5": 200000,
-	"claude-sonnet-4-6": 200000,
 	"claude-opus-4":     200000,
 	"claude-opus-4-5":   200000,
-	"claude-opus-4-6":   200000,
-	"claude-opus-5":     200000,
-	"claude-sonnet-5":   200000,
-	"claude-fable-5":    200000,
-	"claude-mythos-5":   200000,
 	"claude-haiku":      200000,
 	"claude-haiku-4-5":  200000,
 	"claude-3-opus":     200000,
@@ -67,8 +77,10 @@ var ContextLimits = map[string]int{
 	"gemini-1.5-flash":      1000000,
 	"gemini-3-pro-preview":  1000000,
 	"gemini-3-flash":        1000000,
-	"gemini-3.7-flash":      1000000,
-	"gemini-pro":            32000,
+	// Gemini 4 Argon: 1M per Artificial Analysis; Google had not published
+	// the input limit when agy was pinned to it (2026-10-13).
+	"gemini-4-argon": 1000000,
+	"gemini-pro":     32000,
 }
 
 // Aliases maps short names and common variants to canonical model names.
@@ -373,7 +385,7 @@ var agentTypeDefaultModels = map[string]string{
 	"cc":       "claude-opus-4",
 	"cod":      "gpt-5-codex",
 	"gmi":      "gemini-2.0-flash",
-	"agy":      "gemini-3.7-flash", // Antigravity pins Gemini 3.7 Flash
+	"agy":      "gemini-4-argon", // Antigravity pins Gemini 4 Argon (High)
 	"cursor":   "claude-3.5-sonnet",
 	"windsurf": "claude-3.5-sonnet",
 	"aider":    "claude-3.5-sonnet",

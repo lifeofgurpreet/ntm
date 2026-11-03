@@ -1521,8 +1521,10 @@ func TestExecutor_Resume_NilState(t *testing.T) {
 	}
 }
 
-// TestExecutor_sendNotification tests notification sending
-func TestExecutor_sendNotification(t *testing.T) {
+// TestExecutor_prepareAndDeliverNotification tests notification sending.
+// Production prepares under stateMu and delivers after releasing it; this
+// single-goroutine test composes the two phases directly.
+func TestExecutor_prepareAndDeliverNotification(t *testing.T) {
 	cfg := DefaultExecutorConfig("test-session")
 	e := NewExecutor(cfg)
 
@@ -1545,7 +1547,7 @@ func TestExecutor_sendNotification(t *testing.T) {
 	}
 
 	// Test with nil notifier (should not panic)
-	e.sendNotification(t.Context(), workflow, NotifyCompleted)
+	e.deliverNotification(e.prepareNotification(workflow, NotifyCompleted))
 
 	type webhookRequest struct {
 		payload     NotificationPayload
@@ -1575,7 +1577,7 @@ func TestExecutor_sendNotification(t *testing.T) {
 	})
 	e.SetNotifier(notifier)
 
-	e.sendNotification(t.Context(), workflow, NotifyCompleted)
+	e.deliverNotification(e.prepareNotification(workflow, NotifyCompleted))
 	var request webhookRequest
 	select {
 	case request = <-received:
@@ -1594,7 +1596,7 @@ func TestExecutor_sendNotification(t *testing.T) {
 
 	// Test with event that shouldn't notify
 	workflow.Settings.NotifyOnComplete = false
-	e.sendNotification(t.Context(), workflow, NotifyCompleted)
+	e.deliverNotification(e.prepareNotification(workflow, NotifyCompleted))
 	select {
 	case request := <-received:
 		t.Fatalf("notification disabled but webhook received %+v", request.payload)
@@ -4101,8 +4103,14 @@ func TestLimitsConfig_EffectiveLimits_Defaults(t *testing.T) {
 	if lc.MaxCommandStdoutBytes != DefaultMaxCommandStdoutBytes {
 		t.Errorf("MaxCommandStdoutBytes=%d, want %d", lc.MaxCommandStdoutBytes, DefaultMaxCommandStdoutBytes)
 	}
+	if lc.MaxSelectorOutputBytesTotal != 32*1024*1024 {
+		t.Errorf("MaxSelectorOutputBytesTotal=%d, want 32 MiB", lc.MaxSelectorOutputBytesTotal)
+	}
 	if lc.MaxTemplateBytes != DefaultMaxTemplateBytes {
 		t.Errorf("MaxTemplateBytes=%d, want %d", lc.MaxTemplateBytes, DefaultMaxTemplateBytes)
+	}
+	if lc.MaxStepCountTotal != 100000 || lc.MaxMaterializedStepNodes != 100000 {
+		t.Errorf("unexpected default admission limits: %+v", lc)
 	}
 	if lc.MaxSubstitutionDepth != DefaultMaxSubstitutionDepth {
 		t.Errorf("MaxSubstitutionDepth=%d, want %d", lc.MaxSubstitutionDepth, DefaultMaxSubstitutionDepth)
@@ -4114,8 +4122,11 @@ func TestLimitsConfig_EffectiveLimits_Defaults(t *testing.T) {
 
 func TestLimitsConfig_EffectiveLimits_Override(t *testing.T) {
 	lc := LimitsConfig{
-		MaxForeachIterations:  50000,
-		MaxCommandStdoutBytes: 32 * 1024 * 1024,
+		MaxForeachIterations:        50000,
+		MaxCommandStdoutBytes:       32 * 1024 * 1024,
+		MaxSelectorOutputBytesTotal: 128 * 1024 * 1024,
+		MaxStepCountTotal:           64,
+		MaxMaterializedStepNodes:    128,
 	}.EffectiveLimits()
 
 	if lc.MaxForeachIterations != 50000 {
@@ -4123,6 +4134,12 @@ func TestLimitsConfig_EffectiveLimits_Override(t *testing.T) {
 	}
 	if lc.MaxCommandStdoutBytes != 32*1024*1024 {
 		t.Errorf("MaxCommandStdoutBytes=%d, want %d", lc.MaxCommandStdoutBytes, 32*1024*1024)
+	}
+	if lc.MaxSelectorOutputBytesTotal != 128*1024*1024 {
+		t.Errorf("MaxSelectorOutputBytesTotal=%d, want 128 MiB", lc.MaxSelectorOutputBytesTotal)
+	}
+	if lc.MaxStepCountTotal != 64 || lc.MaxMaterializedStepNodes != 128 {
+		t.Errorf("admission overrides were not retained: %+v", lc)
 	}
 	if lc.MaxTemplateBytes != DefaultMaxTemplateBytes {
 		t.Errorf("other defaults should be preserved: MaxTemplateBytes=%d", lc.MaxTemplateBytes)

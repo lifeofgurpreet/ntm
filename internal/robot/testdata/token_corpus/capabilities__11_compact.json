@@ -320,7 +320,7 @@
       "name": "metrics",
       "flag": "--robot-metrics",
       "category": "state",
-      "summary": "Session metrics export for analysis.",
+      "summary": "Per-agent session metrics: prompts received, crashes and restarts in the period; current context tokens, context percent and uptime.",
       "output_formats": [
         "json"
       ],
@@ -746,7 +746,7 @@
       "name": "send-receipt",
       "flag": "--robot-send-receipt",
       "category": "control",
-      "summary": "Query the durable receipt of an idempotent send by operation ID: binding digest, byte count, per-target admission states, and the recorded outcome.",
+      "summary": "Query the durable receipt of an idempotent --robot-send or --robot-interrupt by operation ID: operation kind, payload digest, byte count, per-target admission states, and the recorded outcome (outcome for sends, interrupt_outcome for interrupts).",
       "output_formats": [
         "json"
       ],
@@ -1082,7 +1082,7 @@
       "name": "cass-insights",
       "flag": "--robot-cass-insights",
       "category": "cass",
-      "summary": "Get aggregated CASS insights about topics, patterns, and agent activity.",
+      "summary": "Get CASS session counts per agent and workspace over a recent window.",
       "output_formats": [
         "json"
       ],
@@ -1401,32 +1401,6 @@
       "default_output_format": "json",
       "schema_id": "ntm:robot:jfp-export:v1",
       "schema_type": "jfp_export",
-      "schema_source": "built_in"
-    },
-    {
-      "name": "jfp-install",
-      "flag": "--robot-jfp-install",
-      "category": "utility",
-      "summary": "Install JFP prompt(s) by ID.",
-      "output_formats": [
-        "json"
-      ],
-      "default_output_format": "json",
-      "schema_id": "ntm:robot:jfp-install:v1",
-      "schema_type": "jfp_install",
-      "schema_source": "built_in"
-    },
-    {
-      "name": "jfp-installed",
-      "flag": "--robot-jfp-installed",
-      "category": "utility",
-      "summary": "List installed Claude Code skills from JFP.",
-      "output_formats": [
-        "json"
-      ],
-      "default_output_format": "json",
-      "schema_id": "ntm:robot:jfp-installed:v1",
-      "schema_type": "jfp_installed",
       "schema_source": "built_in"
     },
     {
@@ -1780,7 +1754,7 @@
       "name": "slb-approve",
       "flag": "--robot-slb-approve",
       "category": "utility",
-      "summary": "Approve an SLB request by ID.",
+      "summary": "Approve an SLB request by ID, signed by the reviewer session in SLB_SESSION_ID/SLB_SESSION_KEY.",
       "output_formats": [
         "json"
       ],
@@ -1793,7 +1767,7 @@
       "name": "slb-deny",
       "flag": "--robot-slb-deny",
       "category": "utility",
-      "summary": "Deny an SLB request by ID.",
+      "summary": "Reject an SLB request by ID, signed by the reviewer session in SLB_SESSION_ID/SLB_SESSION_KEY.",
       "output_formats": [
         "json"
       ],

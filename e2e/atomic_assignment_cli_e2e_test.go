@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -435,6 +436,7 @@ func (s *atomicAssignmentMailStub) handle(w http.ResponseWriter, r *http.Request
 		Method  string `json:"method"`
 		Params  struct {
 			Name      string         `json:"name"`
+			URI       string         `json:"uri"`
 			Arguments map[string]any `json:"arguments"`
 		} `json:"params"`
 	}
@@ -447,6 +449,16 @@ func (s *atomicAssignmentMailStub) handle(w http.ResponseWriter, r *http.Request
 		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
 	}
 	if request.JSONRPC == "2.0" && request.Method == "resources/read" {
+		if writeAgentMailReadbackResource(w, request.ID, request.Params.URI, s.projectDir, func() []map[string]any {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if strings.HasPrefix(request.Params.URI, "resource://file_reservations/") {
+				s.listCalls++
+			}
+			return append([]map[string]any(nil), s.active...)
+		}) {
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"jsonrpc": "2.0", "id": request.ID,
@@ -577,17 +589,75 @@ func (s *atomicAssignmentMailStub) handle(w http.ResponseWriter, r *http.Request
 	}
 }
 
+// writeAgentMailReadbackResource answers the read-only resources that Agent
+// Mail serves and that ntm reads to verify every reservation grant before it
+// trusts the receipt: resource://project/{key} (numeric identity) and
+// resource://file_reservations/{key}?... (the live rows, paginated with
+// limit/offset). active returns the rows the stub's list tool would return.
+// It reports false for any other resource URI.
+func writeAgentMailReadbackResource(w http.ResponseWriter, id any, uri, projectDir string, active func() []map[string]any) bool {
+	var payload any
+	switch {
+	case strings.HasPrefix(uri, "resource://project/"):
+		key, err := url.PathUnescape(strings.TrimPrefix(uri, "resource://project/"))
+		if err != nil || key != projectDir {
+			return false
+		}
+		payload = map[string]any{"id": 1, "slug": "atomic-e2e", "human_key": projectDir, "agents": []any{}}
+	case strings.HasPrefix(uri, "resource://file_reservations/"):
+		parsed, err := url.Parse(uri)
+		if err != nil {
+			return false
+		}
+		key, err := url.PathUnescape(strings.TrimPrefix(strings.SplitN(uri, "?", 2)[0], "resource://file_reservations/"))
+		if err != nil || key != projectDir {
+			return false
+		}
+		rows := active()
+		offset, _ := strconv.Atoi(parsed.Query().Get("offset"))
+		limit, _ := strconv.Atoi(parsed.Query().Get("limit"))
+		if limit <= 0 {
+			limit = 20
+		}
+		page := make([]map[string]any, 0, limit)
+		for index := offset; index >= 0 && index < len(rows) && len(page) < limit; index++ {
+			page = append(page, rows[index])
+		}
+		payload = page
+	default:
+		return false
+	}
+	text, err := json.Marshal(payload)
+	if err != nil {
+		return false
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"jsonrpc": "2.0", "id": id,
+		"result": map[string]any{"contents": []map[string]any{{"uri": uri, "mimeType": "application/json", "text": string(text)}}},
+	})
+	return true
+}
+
 func TestE2EAtomicAssignmentIsolatedEnvScrubsHostOverrides(t *testing.T) {
 	for _, key := range []string{"BR_DB", "BD_DB", "BEADS_DB", "GIT_DIR", "GIT_WORK_TREE", "AGENT_NAME", "PWD", "OLDPWD", "NTM_TEST_ASSIGNMENT_SAVE_FAIL_AFTER_BACKUP", "NTM_TEST_COMPLETION_ACK_FAIL_ONCE", "NTM_TEST_COMPLETION_LEASE_DURATION", "NTM_TEST_COMPLETION_HANDLER_DELAY"} {
 		t.Setenv(key, "/should/not/escape")
 	}
+	t.Setenv("BR_NO_DAEMON", "0") // host value must not survive either
 	env := atomicAssignmentIsolatedEnv(map[string]string{"HOME": t.TempDir()})
+	daemonPins := map[string]string{}
 	for _, entry := range env {
-		key, _, _ := strings.Cut(entry, "=")
+		key, value, _ := strings.Cut(entry, "=")
 		switch key {
 		case "BR_DB", "BD_DB", "BEADS_DB", "GIT_DIR", "GIT_WORK_TREE", "AGENT_NAME", "PWD", "OLDPWD", "NTM_TEST_ASSIGNMENT_SAVE_FAIL_AFTER_BACKUP", "NTM_TEST_COMPLETION_ACK_FAIL_ONCE", "NTM_TEST_COMPLETION_LEASE_DURATION", "NTM_TEST_COMPLETION_HANDLER_DELAY":
 			t.Fatalf("isolated process environment retained %s", key)
+		case "BR_NO_DAEMON", "BD_NO_DAEMON":
+			daemonPins[key] = value
 		}
+	}
+	// Hermetic br: the fixture environment must pin daemons off (#263).
+	if daemonPins["BR_NO_DAEMON"] != "1" || daemonPins["BD_NO_DAEMON"] != "1" {
+		t.Fatalf("daemon pins = %v, want BR_NO_DAEMON=1 and BD_NO_DAEMON=1", daemonPins)
 	}
 }
 
@@ -1080,6 +1150,7 @@ func TestE2EAtomicAssignmentReservationRecoveryBuiltProcess(t *testing.T) {
 			Method  string `json:"method"`
 			Params  struct {
 				Name      string         `json:"name"`
+				URI       string         `json:"uri"`
 				Arguments map[string]any `json:"arguments"`
 			} `json:"params"`
 		}
@@ -1088,6 +1159,17 @@ func TestE2EAtomicAssignmentReservationRecoveryBuiltProcess(t *testing.T) {
 			return
 		}
 		if request.JSONRPC == "2.0" && request.Method == "resources/read" {
+			if writeAgentMailReadbackResource(w, request.ID, request.Params.URI, fixture.projectDir, func() []map[string]any {
+				stubMu.Lock()
+				defer stubMu.Unlock()
+				var active []map[string]any
+				for _, reservations := range activeReservations {
+					active = append(active, reservations...)
+				}
+				return active
+			}) {
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"jsonrpc": "2.0", "id": request.ID,
@@ -2414,6 +2496,253 @@ func TestE2EAtomicAssignmentClearFailedBuiltProcess(t *testing.T) {
 	fixture.assertMarkerCounts(t, retainedPrompt, map[int]int{0: 0, 1: 1})
 }
 
+func TestE2EAtomicAssignmentWorkingHistoryRetainsClaimAndReservationsBuiltProcess(t *testing.T) {
+	CommonE2EPrerequisites(t)
+	testutil.RequireTmuxThrottled(t)
+
+	fixture := newAtomicAssignmentCLIFixture(t)
+	mail := newAtomicAssignmentMailStub(fixture.projectDir)
+	defer mail.close()
+	pane := fixture.panes[0]
+	beadID, prompt, before := seedReservedWorkingAssignment(t, fixture, mail, pane,
+		"Active work retains its ownership internal/completion/working_history.go")
+
+	// These are ordinary tool-history lines, followed by the agent's CURRENT
+	// working footer. Matching either sentence must not retire the assignment
+	// or release its protection while the same agent is still doing the work.
+	const workingFrame = "Earlier command failed to fetch a dependency; the retry succeeded.\n" +
+		"The build was blocked by a transient lock, now cleared.\n" +
+		"• Working (4m 51s • esc to interrupt)\n" +
+		"›\n47% context left · ? for shortcuts"
+	fixture.mustTMUX(t, "send-keys", "-t", pane.ID, "-l", workingFrame)
+	fixture.mustTMUX(t, "send-keys", "-t", pane.ID, "Enter")
+	fixture.waitForEndpointMarkerCount(t, pane, "47% context left · ? for shortcuts", 1)
+
+	// Trace the real tracker subprocesses instead of merely sleeping. Only
+	// the watcher receives this wrapper. Several successive reads of the
+	// still-open bead prove the detector completed earlier observation passes.
+	tracePATH, tracePath := fixture.armBRInvocationTrace(t)
+	env := mail.env()
+	env["PATH"] = tracePATH
+	watch := fixture.startCompletionWatch(t, env)
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		current := fixture.readLedgerAssignment(t, beadID)
+		if current.Status != "working" || current.ClearState != "" || current.PendingTerminalStatus != "" ||
+			current.PendingCompletionEventID != "" || current.CompletedAt != nil || current.OccupancyKey != pane.ID ||
+			current.ReservationState != "reserved" || !current.ReservationCompleted ||
+			!reflect.DeepEqual(current.ReservationIDs, before.ReservationIDs) ||
+			!reflect.DeepEqual(current.ReservedPaths, before.ReservedPaths) {
+			stdout, stderr := watch.output(t)
+			t.Fatalf("working history retired or weakened protected assignment: before=%+v after=%+v stdout=%s stderr=%s",
+				before, current, stdout, stderr)
+		}
+		assertAtomicAssignmentReceiptUnchanged(t, before, current)
+		snapshot := mail.snapshot()
+		if snapshot.ReleaseCalls != 0 || snapshot.ReserveCalls != 1 || len(snapshot.Active) != len(before.ReservationIDs) {
+			t.Fatalf("working history changed reservation ownership: %+v", snapshot)
+		}
+
+		trace, err := os.ReadFile(tracePath)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("read completion observation trace: %v", err)
+		}
+		reads := 0
+		for _, line := range strings.Split(string(trace), "\n") {
+			if strings.TrimSpace(line) == "show "+beadID+" --json" {
+				reads++
+			}
+		}
+		if reads >= 4 {
+			break
+		}
+		if time.Now().After(deadline) {
+			stdout, stderr := watch.output(t)
+			t.Fatalf("watcher did not reobserve the protected working bead: reads=%d trace=%s stdout=%s stderr=%s",
+				reads, trace, stdout, stderr)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	fixture.assertBead(t, beadID, "in_progress", before.ClaimActor)
+	fixture.assertMarkerCounts(t, prompt, map[int]int{0: 1, 1: 0})
+
+	// Authoritative tracker completion still wins, even with the same working
+	// footer and historical failure text on screen. Its exact reservations and
+	// claim must be released once, with the delivery receipt retained.
+	fixture.mustBR(t, "close", beadID, "--reason=working-history-completed", "--json")
+	deadline = time.Now().Add(20 * time.Second)
+	for {
+		current := fixture.readLedgerAssignment(t, beadID)
+		if current.Status == "failed" || current.PendingTerminalStatus == "failed" {
+			t.Fatalf("tracker-confirmed completion became a historical-text failure: %+v", current)
+		}
+		if current.Status == "completed" && current.ClearState == "" && current.PendingCompletionEventID == "" &&
+			current.CompletionConsumerToken == "" && current.CompletionLeaseExpiresAt == nil {
+			if current.ReservationState != "released" || current.ReservationCompleted || len(current.ReservationIDs) != 0 ||
+				len(current.ReservedPaths) != 0 || current.PendingTerminalStatus != "" {
+				t.Fatalf("confirmed completion did not finish exact reservation cleanup: %+v", current)
+			}
+			assertAtomicAssignmentReceiptUnchanged(t, before, current)
+			break
+		}
+		if time.Now().After(deadline) {
+			stdout, stderr := watch.output(t)
+			t.Fatalf("watcher did not finish confirmed completion: assignment=%+v stdout=%s stderr=%s", current, stdout, stderr)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	snapshot := mail.snapshot()
+	if snapshot.ReleaseCalls != 1 || !reflect.DeepEqual(snapshot.ReleasedIDs, before.ReservationIDs) || len(snapshot.Active) != 0 {
+		t.Fatalf("confirmed completion did not release only its exact lease IDs once: %+v", snapshot)
+	}
+	fixture.assertBead(t, beadID, "closed", "")
+	stdout, stderr := watch.stopClean(t)
+	if unexpected := atomicAssignmentUnexpectedWatchStderr(stderr); unexpected != "" {
+		t.Fatalf("working-history watcher stderr=%s", unexpected)
+	}
+	if strings.Contains(stdout, "Failed: "+beadID) || strings.Count(stdout, "Completion: "+beadID) != 1 {
+		t.Fatalf("working-history watcher completion outcome = %s", stdout)
+	}
+	fixture.assertMarkerCounts(t, prompt, map[int]int{0: 1, 1: 0})
+}
+
+func TestE2EAtomicAssignmentForeignTrackerCannotCompleteTargetBuiltProcess(t *testing.T) {
+	CommonE2EPrerequisites(t)
+	testutil.RequireTmuxThrottled(t)
+
+	fixture := newAtomicAssignmentCLIFixture(t)
+	mail := newAtomicAssignmentMailStub(fixture.projectDir)
+	defer mail.close()
+	pane := fixture.panes[0]
+	beadID, prompt, before := seedReservedWorkingAssignment(t, fixture, mail, pane,
+		"Completion belongs to its project internal/completion/project_binding.go")
+
+	// Import the real target export into a separate tracker so both projects
+	// have exactly the same bead ID and claim actor, then close ONLY the foreign
+	// copy. A completion lookup in the wrong project must not release the live
+	// target's claim, occupancy, or file reservations.
+	foreignDir := filepath.Join(fixture.root, "foreign-project")
+	if err := os.MkdirAll(foreignDir, 0o700); err != nil {
+		t.Fatalf("create foreign project: %v", err)
+	}
+	fixture.mustBRAt(t, foreignDir, "init", "--prefix=ate2e", "--json")
+	fixture.mustBR(t, "sync", "--flush-only")
+	exported, err := os.ReadFile(filepath.Join(fixture.projectDir, ".beads", "issues.jsonl"))
+	if err != nil {
+		t.Fatalf("read target tracker export: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(foreignDir, ".beads", "issues.jsonl"), exported, 0o600); err != nil {
+		t.Fatalf("copy target export into independent tracker: %v", err)
+	}
+	fixture.mustBRAt(t, foreignDir, "sync", "--import-only")
+	fixture.mustBRAt(t, foreignDir, "close", beadID, "--reason=foreign-project-only", "--json")
+	fixture.assertBeadAt(t, foreignDir, beadID, "closed", before.ClaimActor)
+	fixture.assertBead(t, beadID, "in_progress", before.ClaimActor)
+
+	checks := []struct {
+		name       string
+		cwd        string
+		dbOverride string
+	}{
+		{name: "foreign working directory", cwd: foreignDir},
+		{name: "inherited foreign database", cwd: fixture.projectDir, dbOverride: filepath.Join(foreignDir, ".beads", "beads.db")},
+		{name: "foreign directory and database", cwd: foreignDir, dbOverride: filepath.Join(foreignDir, ".beads", "beads.db")},
+	}
+	for index, check := range checks {
+		if !t.Run(check.name, func(t *testing.T) {
+			tracePATH, tracePath := fixture.armBRInvocationTrace(t)
+			env := mail.env()
+			env["PATH"] = tracePATH
+			env["BEADS_DB"] = check.dbOverride
+			watch := fixture.startCompletionWatchInDir(t, env, 100*time.Millisecond, check.cwd)
+			deadline := time.Now().Add(20 * time.Second)
+			for {
+				current := fixture.readLedgerAssignment(t, beadID)
+				if current.Status != "working" || current.ClearState != "" || current.PendingTerminalStatus != "" ||
+					current.PendingCompletionEventID != "" || current.CompletedAt != nil || current.OccupancyKey != pane.ID ||
+					current.ReservationState != "reserved" || !current.ReservationCompleted ||
+					!reflect.DeepEqual(current.ReservationIDs, before.ReservationIDs) ||
+					!reflect.DeepEqual(current.ReservedPaths, before.ReservedPaths) {
+					stdout, stderr := watch.output(t)
+					t.Fatalf("foreign tracker changed protected target assignment: before=%+v after=%+v stdout=%s stderr=%s",
+						before, current, stdout, stderr)
+				}
+				assertAtomicAssignmentReceiptUnchanged(t, before, current)
+				snapshot := mail.snapshot()
+				if snapshot.ReleaseCalls != 0 || snapshot.ReserveCalls != 1 || len(snapshot.Active) != len(before.ReservationIDs) {
+					t.Fatalf("foreign tracker changed target reservation ownership: %+v", snapshot)
+				}
+
+				trace, err := os.ReadFile(tracePath)
+				if err != nil && !os.IsNotExist(err) {
+					t.Fatalf("read project-bound completion observation trace: %v", err)
+				}
+				reads := 0
+				for _, line := range strings.Split(string(trace), "\n") {
+					if strings.TrimSpace(line) == "show "+beadID+" --json" {
+						reads++
+					}
+				}
+				if reads >= 4 {
+					break
+				}
+				if time.Now().After(deadline) {
+					stdout, stderr := watch.output(t)
+					t.Fatalf("watcher did not reobserve target while foreign tracker was closed: reads=%d trace=%s stdout=%s stderr=%s",
+						reads, trace, stdout, stderr)
+				}
+				time.Sleep(25 * time.Millisecond)
+			}
+			fixture.assertBead(t, beadID, "in_progress", before.ClaimActor)
+			fixture.assertMarkerCounts(t, prompt, map[int]int{0: 1, 1: 0})
+
+			if index == len(checks)-1 {
+				// Keep both misleading ambient sources in place. Only closing the
+				// actual --repo target may now trigger exact terminal cleanup.
+				fixture.mustBR(t, "close", beadID, "--reason=target-project-completed", "--json")
+				deadline = time.Now().Add(20 * time.Second)
+				for {
+					current := fixture.readLedgerAssignment(t, beadID)
+					if current.Status == "completed" && current.ClearState == "" && current.PendingCompletionEventID == "" &&
+						current.CompletionConsumerToken == "" && current.CompletionLeaseExpiresAt == nil {
+						if current.ReservationState != "released" || current.ReservationCompleted || len(current.ReservationIDs) != 0 ||
+							len(current.ReservedPaths) != 0 || current.PendingTerminalStatus != "" {
+							t.Fatalf("target completion did not finish exact cleanup: %+v", current)
+						}
+						assertAtomicAssignmentReceiptUnchanged(t, before, current)
+						break
+					}
+					if time.Now().After(deadline) {
+						stdout, stderr := watch.output(t)
+						t.Fatalf("watcher did not complete the actual target: assignment=%+v stdout=%s stderr=%s", current, stdout, stderr)
+					}
+					time.Sleep(25 * time.Millisecond)
+				}
+				snapshot := mail.snapshot()
+				if snapshot.ReleaseCalls != 1 || !reflect.DeepEqual(snapshot.ReleasedIDs, before.ReservationIDs) || len(snapshot.Active) != 0 {
+					t.Fatalf("target completion did not release only its exact lease IDs once: %+v", snapshot)
+				}
+				fixture.assertBead(t, beadID, "closed", "")
+				fixture.assertBeadAt(t, foreignDir, beadID, "closed", before.ClaimActor)
+			}
+			stdout, stderr := watch.stopClean(t)
+			if unexpected := atomicAssignmentUnexpectedWatchStderr(stderr); unexpected != "" {
+				t.Fatalf("project-bound watcher stderr=%s", unexpected)
+			}
+			wantCompletions := 0
+			if index == len(checks)-1 {
+				wantCompletions = 1
+			}
+			if strings.Count(stdout, "Completion: "+beadID) != wantCompletions || strings.Contains(stdout, "Failed: "+beadID) {
+				t.Fatalf("project-bound watcher reported the wrong outcome: %s", stdout)
+			}
+		}) {
+			return
+		}
+	}
+	fixture.assertMarkerCounts(t, prompt, map[int]int{0: 1, 1: 0})
+}
+
 func TestE2EAtomicCompletionOutboxRestartReplayAckRetryAndFinalAckBuiltProcess(t *testing.T) {
 	CommonE2EPrerequisites(t)
 	testutil.RequireTmuxThrottled(t)
@@ -3095,6 +3424,10 @@ func TestE2EAtomicAssignmentObservationDeadlineContracts(t *testing.T) {
 		beadID := fixture.createBead(t, "Delayed assignment observation")
 		prompt := fmt.Sprintf("NTM_ATOMIC_DELAYED_OBSERVATION_%d", time.Now().UnixNano())
 		tmuxBinary, reached := fixture.armTMUXCaptureDelay(t, 2500*time.Millisecond)
+		// Every capture-pane takes 2.5s here. Delivery captures the pane for
+		// the workspace-trust gate (d6d088e9) and again for composer readiness,
+		// on top of the pre-claim observation, so the command budget must
+		// cover four slow captures; 8s only ever covered three.
 		result := fixture.runNTM(t, map[string]string{"NTM_TMUX_BINARY": tmuxBinary},
 			"assign", fixture.session,
 			"--repo="+fixture.projectDir,
@@ -3104,7 +3437,7 @@ func TestE2EAtomicAssignmentObservationDeadlineContracts(t *testing.T) {
 			"--force",
 			"--ignore-deps",
 			"--reserve-files=false",
-			"--timeout=8s",
+			"--timeout=15s",
 			"--json",
 		)
 		if result.exitCode != 0 || len(bytes.TrimSpace(result.stderr)) != 0 {
@@ -3699,6 +4032,7 @@ esac
 			Method string `json:"method"`
 			Params struct {
 				Name      string         `json:"name"`
+				URI       string         `json:"uri"`
 				Arguments map[string]any `json:"arguments"`
 			} `json:"params"`
 		}
@@ -3723,6 +4057,13 @@ esac
 			})
 			return
 		}
+		if request.Method == "resources/read" && writeAgentMailReadbackResource(w, request.ID, request.Params.URI, fixture.projectDir, func() []map[string]any {
+			reservationMu.Lock()
+			defer reservationMu.Unlock()
+			return append([]map[string]any(nil), activeCoordinatorReservations...)
+		}) {
+			return
+		}
 		if request.Method != "tools/call" {
 			http.Error(w, "unexpected Agent Mail method", http.StatusNotFound)
 			return
@@ -3742,14 +4083,6 @@ esac
 			recipients, _ := request.Params.Arguments["to"].([]any)
 			if len(recipients) != 1 {
 				http.Error(w, "expected one recipient", http.StatusBadRequest)
-				return
-			}
-			if request.Method == "resources/read" {
-				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"jsonrpc": "2.0", "id": request.ID,
-					"error": map[string]any{"code": -32601, "message": "resource view not supported"},
-				})
 				return
 			}
 			recipient, _ := recipients[0].(string)
@@ -4375,11 +4708,19 @@ func TestE2EAtomicAssignmentEligibleBelowFormerPlanCapBuiltProcess(t *testing.T)
 	labelRows := make([]map[string]any, 0, 102)
 	gatedIDs := make(map[string]struct{}, 101)
 	for index := 0; index < 101; index++ {
-		beadID := fmt.Sprintf("ntm-e2e-gated-%03d", index)
+		// The gated rows must exist in the canonical tracker: candidates that
+		// are absent from .beads/issues.jsonl are excluded as source_missing
+		// before assignment (5c3aae2e) and would never reach the gate check.
+		title := fmt.Sprintf("Operator-gated plan row %03d", index)
+		output := fixture.mustBR(t, "create", title, "--type=task", "--priority=1", "--labels=operator-gated", "--silent")
+		beadID := strings.TrimSpace(string(output))
+		if beadID == "" || strings.ContainsAny(beadID, " \t\r\n") {
+			t.Fatalf("unexpected gated br create output %q", output)
+		}
 		gatedIDs[beadID] = struct{}{}
 		planItems = append(planItems, map[string]any{
 			"id":       beadID,
-			"title":    fmt.Sprintf("Operator-gated plan row %03d", index),
+			"title":    title,
 			"status":   "open",
 			"priority": 1,
 		})
@@ -5087,12 +5428,17 @@ func TestE2EAtomicAssignmentLabelEnrichmentFailuresFailClosedBuiltProcess(t *tes
 		`for arg in "$@"; do`,
 		`  case "$arg" in ready|list) command="$arg"; break ;; esac`,
 		`done`,
+		`for arg in "$@"; do`,
+		`  [ "$arg" = "--all" ] && [ "$command" = "list" ] && command=list_all`,
+		`done`,
 		`case "$NTM_E2E_BR_MODE:$command" in`,
 		`  ready_failure:ready) printf 'injected br ready failure\n' >&2; exit 70 ;;`,
 		`  list_failure:list) printf 'injected br list failure\n' >&2; exit 71 ;;`,
 		`  malformed_ready:ready) printf '{\n'; exit 0 ;;`,
 		`  malformed_list:list) printf '{\n'; exit 0 ;;`,
-		`  absent:ready|absent:list) printf '[]\n'; exit 0 ;;`,
+		`  absent:ready|absent:list|absent:list_all) printf '[]\n'; exit 0 ;;`,
+		`  stale_closed:ready|stale_closed:list) printf '[]\n'; exit 0 ;;`,
+		`  stale_closed:list_all) printf '[{"id":"%s","status":"closed"}]\n' "$NTM_E2E_BEAD_ID"; exit 0 ;;`,
 		"esac",
 		"real_br=" + tmux.ShellQuote(fixture.brPath),
 		`exec "$real_br" "$@"`,
@@ -5113,6 +5459,7 @@ func TestE2EAtomicAssignmentLabelEnrichmentFailuresFailClosedBuiltProcess(t *tes
 		mode              string
 		wantDiagnostic    string
 		wantBRInvocations []string
+		wantStaleSkip     bool
 	}{
 		{
 			name: "br ready failure", mode: "ready_failure",
@@ -5135,9 +5482,22 @@ func TestE2EAtomicAssignmentLabelEnrichmentFailuresFailClosedBuiltProcess(t *tes
 			wantBRInvocations: []string{"--lock-timeout 5000 ready --json --limit 100000", "--lock-timeout 5000 list --json --status open --limit 100000"},
 		},
 		{
-			name: "plan item absent from both label sources", mode: "absent",
-			wantDiagnostic:    "absent from both br ready and br list --status open",
-			wantBRInvocations: []string{"--lock-timeout 5000 ready --json --limit 100000", "--lock-timeout 5000 list --json --status open --limit 100000"},
+			name: "plan item absent from every tracker surface", mode: "absent",
+			wantDiagnostic: "absent from br ready, br list --status open, and br list --all",
+			wantBRInvocations: []string{
+				"--lock-timeout 5000 ready --json --limit 100000",
+				"--lock-timeout 5000 list --json --status open --limit 100000",
+				"--lock-timeout 5000 list --json --all --limit 100000",
+			},
+		},
+		{
+			name: "plan item closed since the bv snapshot is skipped", mode: "stale_closed",
+			wantStaleSkip: true,
+			wantBRInvocations: []string{
+				"--lock-timeout 5000 ready --json --limit 100000",
+				"--lock-timeout 5000 list --json --status open --limit 100000",
+				"--lock-timeout 5000 list --json --all --limit 100000",
+			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -5175,6 +5535,7 @@ func TestE2EAtomicAssignmentLabelEnrichmentFailuresFailClosedBuiltProcess(t *tes
 			env["NTM_E2E_PLAN_PAYLOAD"] = planPath
 			env["NTM_E2E_BR_TRACE"] = brTrace
 			env["NTM_E2E_BR_MODE"] = tc.mode
+			env["NTM_E2E_BEAD_ID"] = beadID
 			result := fixture.runNTM(t, env,
 				"--json", "assign", fixture.session,
 				"--repo="+fixture.projectDir,
@@ -5187,10 +5548,29 @@ func TestE2EAtomicAssignmentLabelEnrichmentFailuresFailClosedBuiltProcess(t *tes
 				"--timeout=15s",
 				"--quiet",
 			)
-			code, message := assertAtomicAssignmentSingleFailureJSON(t, result)
-			if code != "ASSIGN_ERROR" || !strings.Contains(message, "actionable bead labels could not be verified") ||
-				!strings.Contains(message, tc.wantDiagnostic) {
-				t.Fatalf("label-enrichment failure code=%q message=%q, want ASSIGN_ERROR containing %q", code, message, tc.wantDiagnostic)
+			if tc.wantStaleSkip {
+				// A plan row that Beads reports closed is satisfied, not an
+				// error: the run must succeed cleanly with zero assignments.
+				if result.exitCode != 0 || len(bytes.TrimSpace(result.stderr)) != 0 {
+					t.Fatalf("stale-skip exit=%d stdout=%s stderr=%s, want clean success", result.exitCode, result.stdout, result.stderr)
+				}
+				var envelope struct {
+					Success bool `json:"success"`
+					Summary struct {
+						Assigned int `json:"assigned"`
+						Failed   int `json:"failed"`
+					} `json:"summary"`
+				}
+				decodeAtomicAssignmentJSON(t, result.stdout, &envelope)
+				if !envelope.Success || envelope.Summary.Assigned != 0 || envelope.Summary.Failed != 0 {
+					t.Fatalf("stale-skip envelope=%+v raw=%s", envelope, result.stdout)
+				}
+			} else {
+				code, message := assertAtomicAssignmentSingleFailureJSON(t, result)
+				if code != "ASSIGN_ERROR" || !strings.Contains(message, "actionable bead labels could not be verified") ||
+					!strings.Contains(message, tc.wantDiagnostic) {
+					t.Fatalf("label-enrichment failure code=%q message=%q, want ASSIGN_ERROR containing %q", code, message, tc.wantDiagnostic)
+				}
 			}
 
 			trace, err := os.ReadFile(brTrace)
@@ -5697,6 +6077,163 @@ func TestE2EAtomicAssignmentSameSessionInvalidPolicyIsMutationFreeBuiltProcess(t
 			fixture.assertMarkerCounts(t, marker, map[int]int{0: 0, 1: 0})
 			assertAtomicAssignmentMailUntouched(t, mail.snapshot())
 		})
+	}
+}
+
+func TestE2EAtomicAssignmentWatchRecoversFromTrackerChangesBuiltProcess(t *testing.T) {
+	CommonE2EPrerequisites(t)
+	testutil.RequireTmuxThrottled(t)
+
+	fixture := newAtomicAssignmentCLIFixture(t)
+	const title = "Watch resumes after tracker changes"
+	beadID := fixture.createBead(t, title)
+	fixture.mustBR(t, "sync", "--flush-only")
+
+	binDir := filepath.Join(fixture.root, "source-change-watch-bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatalf("create source-change watch fixture bin directory: %v", err)
+	}
+	counterPath := filepath.Join(fixture.root, "source-change-triage-count")
+	retryReachedPath := filepath.Join(fixture.root, "verified-retry-reached")
+	releaseRetryPath := filepath.Join(fixture.root, "release-verified-retry")
+	triagePath := filepath.Join(fixture.root, "source-change-triage.json")
+	planPath := filepath.Join(fixture.root, "source-change-plan.json")
+	for path, payload := range map[string]any{
+		triagePath: map[string]any{
+			"triage": map[string]any{"recommendations": []map[string]any{{
+				"id": beadID, "title": title, "type": "task", "status": "open",
+				"priority": 1, "score": 100, "action": "assign", "reasons": []string{}, "labels": []string{},
+			}}},
+		},
+		planPath: map[string]any{
+			"plan": map[string]any{"tracks": []map[string]any{{
+				"track_id": "source-change-watch",
+				"items": []map[string]any{{
+					"id": beadID, "title": title, "status": "open", "priority": 1,
+				}},
+			}}},
+		},
+	} {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("marshal source-change watch payload: %v", err)
+		}
+		if err := os.WriteFile(path, encoded, 0o600); err != nil {
+			t.Fatalf("write source-change watch payload: %v", err)
+		}
+	}
+
+	// The first two triage reads race actual tracker updates after NTM captures
+	// their source identities: once during the initial pass, then in scanDone.
+	// The third read waits for the test to inspect all dispatch side effects.
+	// Its file handshake makes those assertions independent of scan timing.
+	bvScript := strings.Join([]string{
+		"#!/bin/sh",
+		"set -eu",
+		"real_br=" + tmux.ShellQuote(fixture.brPath),
+		"bead_id=" + tmux.ShellQuote(beadID),
+		"counter=" + tmux.ShellQuote(counterPath),
+		"reached=" + tmux.ShellQuote(retryReachedPath),
+		"release=" + tmux.ShellQuote(releaseRetryPath),
+		"triage=" + tmux.ShellQuote(triagePath),
+		"plan=" + tmux.ShellQuote(planPath),
+		`case "$1" in`,
+		`  --robot-triage)`,
+		`    count=0`,
+		`    if [ -e "$counter" ]; then count=$(cat "$counter"); fi`,
+		`    count=$((count + 1))`,
+		`    printf '%s\n' "$count" > "$counter"`,
+		`    if [ "$count" -le 2 ]; then`,
+		`      "$real_br" update "$bead_id" --description="watch source change $count" --json >/dev/null`,
+		`      "$real_br" sync --flush-only >/dev/null`,
+		`    elif [ "$count" -eq 3 ]; then`,
+		`      printf 'retry reached\n' > "$reached"`,
+		`      while [ ! -e "$release" ]; do sleep 0.01; done`,
+		`    fi`,
+		`    cat "$triage" ;;`,
+		`  --robot-plan) cat "$plan" ;;`,
+		`  --robot-insights) printf '%s\n' '{"Cycles":[]}' ;;`,
+		`  *) printf 'unexpected bv args: %s\n' "$*" >&2; exit 64 ;;`,
+		"esac",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(binDir, "bv"), []byte(bvScript), 0o700); err != nil {
+		t.Fatalf("write source-change watch bv fixture: %v", err)
+	}
+	marker := fmt.Sprintf("NTM_WATCH_SOURCE_RECOVERY_%d", time.Now().UnixNano())
+	templatePath := filepath.Join(fixture.projectDir, "source-change-watch-template.txt")
+	if err := os.WriteFile(templatePath, []byte(marker+"::{BEAD_ID}::{TITLE}"), 0o600); err != nil {
+		t.Fatalf("write source-change watch template: %v", err)
+	}
+	prompt := marker + "::" + beadID + "::" + title
+	fixture.primePaneForSafeDispatch(t, 0)
+	fixture.waitForEndpointIdle(t, fixture.panes[0], 6*time.Second, 60*time.Second)
+
+	result := fixture.runNTMInterrupted(t, map[string]string{
+		"PATH": binDir + string(os.PathListSeparator) + atomicAssignmentEnvValue(fixture.env, "PATH"),
+	}, func(pid int) {
+		waitForAtomicAssignmentPath(t, retryReachedPath, pid)
+		counter, err := os.ReadFile(counterPath)
+		if err != nil || strings.TrimSpace(string(counter)) != "3" {
+			t.Fatalf("watch retry triage counter=%q error=%v, want third scan at barrier", counter, err)
+		}
+		fixture.assertBead(t, beadID, "open", "")
+		fixture.assertLedgerReplicasHaveNoAssignment(t, beadID)
+		fixture.assertMarkerCounts(t, marker, map[int]int{0: 0, 1: 0})
+		if err := os.WriteFile(releaseRetryPath, []byte("release\n"), 0o600); err != nil {
+			t.Fatalf("release verified watch retry: %v", err)
+		}
+		fixture.waitForMarkerCount(t, 0, marker, 1)
+		// Pane delivery precedes the durable receipt by a small amount. Wait
+		// for that receipt before interrupting the watcher so cancellation is
+		// exercised while idle, rather than interrupting an assignment commit.
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			ledger, readErr := fixture.readLedger()
+			if readErr == nil {
+				record := ledger.Assignments[beadID]
+				if record != nil && record.DispatchState == "sent" && record.DispatchReceiptID != "" {
+					break
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("watch did not persist recovered dispatch receipt: ledger=%+v error=%v", ledger, readErr)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	},
+		"assign", fixture.session,
+		"--repo="+fixture.projectDir,
+		"--watch", "--auto", "--strategy=dependency",
+		"--watch-interval=200ms", "--auto-reassign=false",
+		"--limit=1", "--cod-only",
+		"--template=custom", "--template-file="+templatePath,
+		"--reserve-files=false", "--timeout=15s",
+	)
+	if result.exitCode != 0 || len(bytes.TrimSpace(result.stderr)) != 0 {
+		t.Fatalf("source-change watch exit=%d stdout=%s stderr=%s", result.exitCode, result.stdout, result.stderr)
+	}
+	for _, message := range []string{
+		"Deferred initial assignment after tracker or checkout changed",
+		"Deferred ready-work scan after tracker or checkout changed",
+		"STALE_WORK_COORDINATION",
+		"Received interrupt signal, shutting down gracefully",
+		"source verification deferred 2 times",
+	} {
+		if !bytes.Contains(result.stdout, []byte(message)) {
+			t.Fatalf("source-change watch did not report %q: stdout=%s", message, result.stdout)
+		}
+	}
+	fixture.assertMarkerCounts(t, marker, map[int]int{0: 1, 1: 0})
+	record := fixture.readLedgerAssignment(t, beadID)
+	assertAtomicAssignmentRecord(t, record, beadID, prompt, fixture.panes[0], "codex")
+	if record.ClaimAttempts != 1 {
+		t.Fatalf("recovered watch claimed the bead %d times, want once", record.ClaimAttempts)
+	}
+	fixture.assertBead(t, beadID, "in_progress", record.ClaimActor)
+	ledger, err := fixture.readLedger()
+	if err != nil || len(ledger.Assignments) != 1 {
+		t.Fatalf("recovered watch ledger=%+v error=%v, want one assignment", ledger, err)
 	}
 }
 
@@ -6807,6 +7344,7 @@ func TestE2EAtomicAssignmentReassignTransfersReservation(t *testing.T) {
 			Method  string `json:"method"`
 			Params  struct {
 				Name      string         `json:"name"`
+				URI       string         `json:"uri"`
 				Arguments map[string]any `json:"arguments"`
 			} `json:"params"`
 		}
@@ -6819,6 +7357,13 @@ func TestE2EAtomicAssignmentReassignTransfersReservation(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
 		}
 		if request.Method == "resources/read" {
+			if writeAgentMailReadbackResource(w, request.ID, request.Params.URI, fixture.projectDir, func() []map[string]any {
+				reservationMu.Lock()
+				defer reservationMu.Unlock()
+				return append([]map[string]any(nil), activeReservations...)
+			}) {
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"jsonrpc": "2.0", "id": request.ID,
@@ -8170,6 +8715,7 @@ func TestE2EAtomicBulkAssignmentCanonicalMultiWindow(t *testing.T) {
 			"--robot-bulk-assign=" + fixture.session,
 			"--allocation=" + string(encoded),
 			"--template=" + templatePath,
+			"--reserve-files=false",
 		}
 		args = append(args, extra...)
 		result := fixture.runNTM(tb, nil, args...)
@@ -8932,6 +9478,7 @@ func TestE2EAtomicRobotBulkSecretSafety(t *testing.T) {
 			"--robot-bulk-assign="+fixture.session,
 			"--allocation="+string(allocation),
 			"--template="+templatePath,
+			"--reserve-files=false",
 		)
 		if result.exitCode != 0 || len(bytes.TrimSpace(result.stderr)) != 0 {
 			t.Fatalf("robot title-secret assignment exit=%d stdout=%s stderr=%s", result.exitCode, result.stdout, result.stderr)
@@ -9334,6 +9881,9 @@ func (f *atomicAssignmentCLIFixture) createClaimedPendingViaTmuxOutage(t *testin
 	return beadID, pending
 }
 
+// atomicBulkArgs opts out of the default file reservation, as the `ntm
+// assign` scenarios here pass --reserve-files=false: these beads name no
+// files and most scenarios run without Agent Mail.
 func atomicBulkArgs(f *atomicAssignmentCLIFixture, beadID, templatePath string) []string {
 	allocation, _ := json.Marshal(map[string]string{"1": beadID})
 	return []string{
@@ -9341,6 +9891,7 @@ func atomicBulkArgs(f *atomicAssignmentCLIFixture, beadID, templatePath string) 
 		"--robot-bulk-assign=" + f.session,
 		"--allocation=" + string(allocation),
 		"--template=" + templatePath,
+		"--reserve-files=false",
 	}
 }
 
@@ -10444,6 +10995,11 @@ func (f *atomicAssignmentCLIFixture) completionWatchEnv(t *testing.T, overrides 
 
 func (f *atomicAssignmentCLIFixture) startCompletionWatchWithInterval(t *testing.T, env map[string]string, watchInterval time.Duration) *atomicCompletionWatchProcess {
 	t.Helper()
+	return f.startCompletionWatchInDir(t, env, watchInterval, f.projectDir)
+}
+
+func (f *atomicAssignmentCLIFixture) startCompletionWatchInDir(t *testing.T, env map[string]string, watchInterval time.Duration, dir string) *atomicCompletionWatchProcess {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	cmd := exec.CommandContext(ctx, f.ntmPath,
 		"assign", f.session,
@@ -10454,7 +11010,7 @@ func (f *atomicAssignmentCLIFixture) startCompletionWatchWithInterval(t *testing
 		"--auto-reassign=false",
 		"--reserve-files=false",
 	)
-	cmd.Dir = f.projectDir
+	cmd.Dir = dir
 	cmd.Env = atomicAssignmentMergeEnv(f.env, f.completionWatchEnv(t, env))
 	stdout, err := os.CreateTemp(f.root, "completion-watch-stdout-*.log")
 	if err != nil {
@@ -11144,6 +11700,7 @@ func atomicAssignmentIsolatedEnv(overrides map[string]string) []string {
 	replaced := map[string]struct{}{
 		"HOME": {}, "XDG_CONFIG_HOME": {}, "XDG_DATA_HOME": {}, "XDG_STATE_HOME": {}, "XDG_CACHE_HOME": {}, "PWD": {}, "OLDPWD": {},
 		"GIT_DIR": {}, "GIT_WORK_TREE": {}, "BR_DB": {}, "BD_DB": {}, "BEADS_DB": {}, "AGENT_NAME": {},
+		"BR_NO_DAEMON": {}, "BD_NO_DAEMON": {},
 		"TMUX": {}, "TMUX_PANE": {}, "TMUX_TMPDIR": {},
 		"NTM_CONFIG": {}, "NTM_OUTPUT_FORMAT": {}, "NTM_ROBOT_FORMAT": {}, "NTM_TEST_ASSIGNMENT_SAVE_FAIL_AFTER_BACKUP": {}, "NTM_TEST_COMPLETION_ACK_FAIL_ONCE": {}, "NTM_TEST_COMPLETION_LEASE_DURATION": {}, "NTM_TEST_COMPLETION_HANDLER_DELAY": {}, "TOON_DEFAULT_FORMAT": {},
 		"AGENT_MAIL_URL": {}, "AGENT_MAIL_TOKEN": {},
@@ -11161,6 +11718,19 @@ func atomicAssignmentIsolatedEnv(overrides map[string]string) []string {
 	}
 	for key, value := range overrides {
 		result = append(result, key+"="+value)
+	}
+	// Hermetic br: host-level br daemons must not answer reads for beads the
+	// fixture seeded through its own isolated state — on hosts running an
+	// older br (0.3.x/0.4.x) daemon, seeded beads came back invisible to
+	// `br ready`/`br list` and the assign-family e2e suites failed (#263).
+	// br >=0.5 documents BR_NO_DAEMON as an effective no-op, so pinning it is
+	// free there and the discriminator where it matters. Both the seeding
+	// writes (mustBR) and the built ntm process run with this environment.
+	if _, ok := overrides["BR_NO_DAEMON"]; !ok {
+		result = append(result, "BR_NO_DAEMON=1")
+	}
+	if _, ok := overrides["BD_NO_DAEMON"]; !ok {
+		result = append(result, "BD_NO_DAEMON=1")
 	}
 	sort.Strings(result)
 	return result

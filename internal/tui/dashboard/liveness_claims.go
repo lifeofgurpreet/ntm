@@ -1,3 +1,5 @@
+//go:build !liveness_audit
+
 package dashboard
 
 import (
@@ -15,15 +17,6 @@ func init() {
 	// Rano network stats polling (dashboard.go).
 	config.RegisterReader("integrations.rano.enabled", (*Model).fetchRanoNetworkStats)
 	config.RegisterReader("integrations.rano.poll_interval_ms", (*Model).fetchRanoNetworkStats)
-
-	// Compaction recovery wiring (dashboard.go).
-	for _, key := range []string{
-		"context_rotation.recovery.enabled",
-		"context_rotation.recovery.cooldown_seconds",
-		"context_rotation.recovery.max_recoveries_per_pane",
-		"context_rotation.recovery.prompt",
-		"context_rotation.recovery.include_bead_context",
-	} {
-		config.RegisterReader(key, compactionRecoveryConfigToRuntime)
-	}
+	// Also read by --robot-rano-stats (cli root) and the PT monitor's rano input.
+	config.RegisterReader("integrations.rano.sqlite_path", (*Model).fetchRanoNetworkStats)
 }

@@ -2,6 +2,7 @@ package events
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -42,6 +43,7 @@ type Logger struct {
 	lastRotation  time.Time
 	closed        bool
 	rotationWg    sync.WaitGroup
+	rotationMu    sync.Mutex // Serializes snapshot/filter/commit cycles.
 }
 
 // LoggerOptions configures the event logger.
@@ -85,9 +87,21 @@ func NewLogger(opts LoggerOptions) (*Logger, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("creating log directory: %w", err)
 	}
+	// All processes, including those using a symlinked project/home path,
+	// must lock the same sidecar and rotate the actual file, not its alias.
+	path, err := canonicalEventLogPath(l.path)
+	if err != nil {
+		return nil, err
+	}
+	l.path = path
+	lock, err := lockEventLog(l.path)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseEventLogLock(lock)
 
 	// Open file for appending
-	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	f, err := openEventLogWriter(l.path)
 	if err != nil {
 		return nil, fmt.Errorf("opening log file: %w", err)
 	}
@@ -97,8 +111,20 @@ func NewLogger(opts LoggerOptions) (*Logger, error) {
 }
 
 // Log writes an event to the log file.
+// Privacy policy is enforced here so direct callers and convenience emitters
+// cannot bypass it. Events denied by policy are intentionally not persisted.
 // If redaction is configured via SetRedactionConfig, sensitive data is redacted before storage.
 func (l *Logger) Log(event *Event) error {
+	if event == nil {
+		return fmt.Errorf("cannot log a nil event")
+	}
+	// Use the original session identity before redaction, including an empty
+	// identity so global privacy applies to sessionless events. Session lookup
+	// can invoke external code; do not hold the logger mutex while it runs.
+	if err := privacy.GetDefaultManager().CanPersist(event.Session, privacy.OpEventLog); err != nil {
+		return nil
+	}
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if !l.enabled || l.closed || l.file == nil {
@@ -118,6 +144,25 @@ func (l *Logger) Log(event *Event) error {
 	data, err = encryptJSONLine(data)
 	if err != nil {
 		return fmt.Errorf("encrypting event: %w", err)
+	}
+	// Include room for the newline in the scanner's buffer limit. Reject the
+	// final stored representation, since encryption can increase its size.
+	if len(data) >= maxEventLineBytes {
+		return fmt.Errorf("event exceeds log line limit of %d bytes", maxEventLineBytes-1)
+	}
+
+	// Rotation in another process replaces the inode. Take the same stable
+	// lock used by rotation, then reopen a stale descriptor BEFORE writing.
+	lock, err := lockEventLog(l.path)
+	if err != nil {
+		return err
+	}
+	defer releaseEventLogLock(lock)
+	if err := l.refreshWriter(); err != nil {
+		return err
+	}
+	if err := ensureEventLogNewline(l.file); err != nil {
+		return err
 	}
 
 	// Write to file with newline
@@ -141,13 +186,6 @@ func (l *Logger) Log(event *Event) error {
 
 // LogEvent is a convenience method to create and log an event in one call.
 func (l *Logger) LogEvent(eventType EventType, session string, data interface{}) error {
-	// Check privacy mode before logging
-	if session != "" {
-		if err := privacy.GetDefaultManager().CanPersist(session, privacy.OpEventLog); err != nil {
-			// Silently skip logging in privacy mode (don't propagate error)
-			return nil
-		}
-	}
 	event := NewEvent(eventType, session, ToMap(data))
 	return l.Log(event)
 }
@@ -175,55 +213,139 @@ func (l *Logger) maybeRotate() {
 	}
 }
 
-// rotateOldEntries removes entries older than retention period using streaming.
-// It avoids blocking concurrent LogEvent calls and guarantees no events are lost.
+// rotateOldEntries filters a bounded snapshot without moving the active log.
+// Writes from all cooperating loggers continue during filtering and are merged before
+// replacement. Any pre-commit failure leaves both the log and its writer intact.
 func (l *Logger) rotateOldEntries() error {
-	oldPath := l.path + ".old"
-	tmpPath := l.path + ".tmp"
+	l.rotationMu.Lock()
+	defer l.rotationMu.Unlock()
 
-	// 1. Swap the active log file out quickly
-	l.mu.Lock()
-	if l.file != nil {
-		l.file.Close()
-		l.file = nil
-	}
-	if err := os.Rename(l.path, oldPath); err != nil && !os.IsNotExist(err) {
-		l.mu.Unlock()
-		return fmt.Errorf("renaming to old path: %w", err)
-	}
-	// Create fresh log file for incoming events
-	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	srcFile, snapshot, err := l.rotationSnapshot()
 	if err != nil {
-		l.mu.Unlock()
-		return fmt.Errorf("reopening active log file: %w", err)
+		return err
 	}
-	l.file = f
-	l.mu.Unlock()
+	if srcFile == nil {
+		return nil
+	}
+	defer srcFile.Close()
 
-	// Ensure cleanup of oldPath if something panics
-	defer os.Remove(oldPath)
-	defer os.Remove(tmpPath)
-
-	// 2. Filter old events into tmpPath (can take a long time, lock is NOT held)
-	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	// A private, uniquely named staging file cannot truncate another rotation
+	// or a recovery artifact left by an earlier version of the logger.
+	tmpFile, err := os.CreateTemp(filepath.Dir(l.path), "."+filepath.Base(l.path)+".rotate-*")
 	if err != nil {
-		return fmt.Errorf("creating temp file: %w", err)
+		return fmt.Errorf("creating rotation file: %w", err)
 	}
-
-	srcFile, err := os.Open(oldPath)
-	if err != nil {
-		tmpFile.Close()
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("opening old log file: %w", err)
-	}
+	defer func() {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFile.Name())
+	}()
 
 	cutoff := time.Now().AddDate(0, 0, -l.retentionDays)
-	scanner := bufio.NewScanner(srcFile)
-	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
-	writer := bufio.NewWriter(tmpFile)
+	if err := filterRetainedEvents(io.NewSectionReader(srcFile, 0, snapshot.Size()), tmpFile, cutoff); err != nil {
+		return err
+	}
+	return l.commitRotation(srcFile, snapshot, tmpFile)
+}
 
+// rotationSnapshot holds the process lock only while selecting a complete
+// append boundary. Filtering never blocks writers in another NTM process.
+func (l *Logger) rotationSnapshot() (*os.File, os.FileInfo, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed || !l.enabled || l.file == nil {
+		return nil, nil, nil
+	}
+	lock, err := lockEventLog(l.path)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer releaseEventLogLock(lock)
+	// A stale appender may rebind on its next Log, but retention must not
+	// adopt and rewrite an unrelated replacement merely because it exists.
+	active, err := l.file.Stat()
+	if err != nil {
+		return nil, nil, fmt.Errorf("stat active log: %w", err)
+	}
+	src, err := os.Open(l.path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("opening log snapshot: %w", err)
+	}
+	info, err := src.Stat()
+	if err != nil {
+		_ = src.Close()
+		return nil, nil, fmt.Errorf("stat log snapshot: %w", err)
+	}
+	if !os.SameFile(active, info) {
+		_ = src.Close()
+		return nil, nil, fmt.Errorf("active log changed before rotation")
+	}
+	if err := verifyEventLogFile(src, l.path); err != nil {
+		_ = src.Close()
+		return nil, nil, err
+	}
+	return src, info, nil
+}
+
+// ensureEventLogNewline preserves an interrupted final record verbatim and
+// separates it from the next append. Never truncate crash evidence or let a
+// malformed tail swallow a newly acknowledged event. The caller holds the
+// process lock, so another cooperating writer cannot race the tail check.
+func ensureEventLogNewline(f *os.File) error {
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat event log tail: %w", err)
+	}
+	if info.Size() == 0 {
+		return nil
+	}
+	var last [1]byte
+	if _, err := f.ReadAt(last[:], info.Size()-1); err != nil {
+		return fmt.Errorf("read event log tail: %w", err)
+	}
+	if last[0] != '\n' {
+		if _, err := f.Write([]byte{'\n'}); err != nil {
+			return fmt.Errorf("separate interrupted event log tail: %w", err)
+		}
+	}
+	return nil
+}
+
+// refreshWriter requires both l.mu and the stable cross-process log lock.
+func (l *Logger) refreshWriter() error {
+	current, err := l.file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat active log: %w", err)
+	}
+	visible, err := os.Lstat(l.path)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("stat log path: %w", err)
+	}
+	if err == nil {
+		if !visible.Mode().IsRegular() {
+			return fmt.Errorf("event log path is no longer a regular file")
+		}
+		if os.SameFile(current, visible) {
+			return nil
+		}
+	}
+	writer, err := openEventLogWriter(l.path)
+	if err != nil {
+		return fmt.Errorf("reopening rotated event log: %w", err)
+	}
+	previous := l.file
+	l.file = writer
+	if err := previous.Close(); err != nil {
+		return fmt.Errorf("closing stale event log writer: %w", err)
+	}
+	return nil
+}
+
+// filterRetainedEvents expires only records with a known, old timestamp.
+// Malformed or undecryptable records must not silently disappear on rotation.
+func filterRetainedEvents(src io.Reader, dst io.Writer, cutoff time.Time) error {
+	scanner := bufio.NewScanner(src)
+	scanner.Buffer(make([]byte, 64*1024), maxEventLineBytes)
+	writer := bufio.NewWriter(dst)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -231,65 +353,84 @@ func (l *Logger) rotateOldEntries() error {
 		}
 
 		plain, decErr := decryptJSONLine(line)
-		if decErr != nil {
-			writer.Write(line)
-			writer.WriteByte('\n')
-			continue
-		}
-
 		var event Event
-		if err := json.Unmarshal(plain, &event); err != nil {
-			writer.Write(line)
-			writer.WriteByte('\n')
+		if decErr == nil && json.Unmarshal(plain, &event) == nil &&
+			!event.Timestamp.IsZero() && !event.Timestamp.After(cutoff) {
 			continue
 		}
-
-		if event.Timestamp.After(cutoff) {
-			writer.Write(line)
-			writer.WriteByte('\n')
+		if _, err := writer.Write(line); err != nil {
+			return fmt.Errorf("writing retained event: %w", err)
+		}
+		if err := writer.WriteByte('\n'); err != nil {
+			return fmt.Errorf("writing retained event newline: %w", err)
 		}
 	}
-
-	srcFile.Close()
 	if err := scanner.Err(); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("scanning old log file: %w", err)
+		return fmt.Errorf("scanning log snapshot: %w", err)
 	}
 	if err := writer.Flush(); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("flushing temp file: %w", err)
+		return fmt.Errorf("flushing retained events: %w", err)
 	}
+	return nil
+}
 
-	// 3. Merge the newly arrived events from active l.path into tmpPath and swap back
+// commitRotation merges writes accepted after the snapshot, then replaces the
+// file only after every read, write, sync, and replacement-writer open succeeds.
+func (l *Logger) commitRotation(src *os.File, snapshot os.FileInfo, tmp *os.File) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
-	// Sync and close active file
-	l.file.Sync()
-	l.file.Close()
-
-	// Open active file to read new events
-	activeReader, err := os.Open(l.path)
-	if err == nil {
-		_, _ = io.Copy(tmpFile, activeReader)
-		activeReader.Close()
+	if l.closed || !l.enabled || l.file == nil {
+		return nil
 	}
-
-	tmpFile.Close()
-
-	// Swap tmp file to become the new active log file
-	if err := os.Rename(tmpPath, l.path); err != nil {
-		// Recovery fallback
-		l.file, _ = os.OpenFile(l.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-		return fmt.Errorf("renaming tmp to active: %w", err)
-	}
-
-	// Reopen active file
-	l.file, err = os.OpenFile(l.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	// The lock spans the final tail measurement, tail copy and rename. A
+	// process waiting to append will then rebind its writer to the new inode.
+	lock, err := lockEventLog(l.path)
 	if err != nil {
-		return fmt.Errorf("reopening final log file: %w", err)
+		return err
+	}
+	defer releaseEventLogLock(lock)
+	if err := l.refreshWriter(); err != nil {
+		return err
 	}
 
+	activeInfo, err := l.file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat active log before rotation commit: %w", err)
+	}
+	pathInfo, err := os.Stat(l.path)
+	if err != nil {
+		return fmt.Errorf("stat log path before rotation commit: %w", err)
+	}
+	if !os.SameFile(snapshot, activeInfo) || !os.SameFile(snapshot, pathInfo) || activeInfo.Size() < snapshot.Size() {
+		return fmt.Errorf("active log changed during rotation")
+	}
+	added := activeInfo.Size() - snapshot.Size()
+	if _, err := io.CopyN(tmp, io.NewSectionReader(src, snapshot.Size(), added), added); err != nil {
+		return fmt.Errorf("merging new log events: %w", err)
+	}
+	if err := tmp.Chmod(activeInfo.Mode().Perm()); err != nil {
+		return fmt.Errorf("preserving log permissions: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("syncing rotated log: %w", err)
+	}
+	writer, err := os.OpenFile(tmp.Name(), os.O_APPEND|os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("opening rotated log writer: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = writer.Close()
+		return fmt.Errorf("closing rotation file: %w", err)
+	}
+	if err := os.Rename(tmp.Name(), l.path); err != nil {
+		_ = writer.Close()
+		return fmt.Errorf("replacing active log: %w", err)
+	}
+	previous := l.file
+	l.file = writer
+	if err := previous.Close(); err != nil {
+		return fmt.Errorf("closing previous log after rotation: %w", err)
+	}
 	return nil
 }
 
@@ -345,13 +486,70 @@ func EmitPromptSend(session string, targetCount, promptLength int, template, tar
 // Unlike Replay this never opens the log for writing, so callers that only
 // display events do not create the log file or its directory as a side effect.
 func ReadSince(path string, since time.Time) ([]Event, error) {
+	return readLogSince(path, since, nil)
+}
+
+// ReadTypesSince is ReadSince restricted to the given event types. The log
+// holds a month of prompt traffic, so a reader after a few rare types (the
+// session monitor's agent_crash and agent_restart records) skips every
+// plaintext line naming none of them before decoding it.
+func ReadTypesSince(path string, since time.Time, types ...EventType) ([]Event, error) {
+	if len(types) == 0 {
+		return []Event{}, nil
+	}
+	markers := make([][]byte, 0, len(types))
+	wanted := make(map[EventType]struct{}, len(types))
+	for _, eventType := range types {
+		// json.Marshal writes the type field with no whitespace; Log never
+		// re-indents a line.
+		markers = append(markers, []byte(`"type":"`+string(eventType)+`"`))
+		wanted[eventType] = struct{}{}
+	}
+	matches := func(plain []byte) bool {
+		for _, marker := range markers {
+			if bytes.Contains(plain, marker) {
+				return true
+			}
+		}
+		return false
+	}
+	all, err := readLogSince(path, since, matches)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]Event, 0, len(all))
+	for _, event := range all {
+		// The byte prefilter could match a payload that merely quotes a
+		// type; the decoded type is authoritative.
+		if _, ok := wanted[event.Type]; ok {
+			result = append(result, event)
+		}
+	}
+	return result, nil
+}
+
+func readLogSince(path string, since time.Time, keep func(plain []byte) bool) ([]Event, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("event log must be a regular file")
+	}
+	return readEventSnapshot(f, info.Size(), path, since, keep)
+}
 
-	scanner := bufio.NewScanner(f)
+// Bound each read to the observed file size. An active swarm can append
+// indefinitely; a history query must not chase a moving EOF. Later appends
+// belong to the next query, and replacement leaves this descriptor intact.
+// Only the (decrypted) lines keep accepts are decoded; nil keeps every line.
+func readEventSnapshot(src io.ReaderAt, size int64, path string, since time.Time, keep func(plain []byte) bool) ([]Event, error) {
+	scanner := bufio.NewScanner(io.NewSectionReader(src, 0, size))
 	scanner.Buffer(make([]byte, 64*1024), maxEventLineBytes)
 
 	var result []Event
@@ -364,6 +562,9 @@ func ReadSince(path string, since time.Time) ([]Event, error) {
 		plain, err := decryptJSONLine(line)
 		if err != nil {
 			slog.Warn("event read: skipping unreadable line", "path", path, "error", err)
+			continue
+		}
+		if keep != nil && !keep(plain) {
 			continue
 		}
 

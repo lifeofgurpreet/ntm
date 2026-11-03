@@ -1,174 +1,14 @@
 package cli
 
 import (
-	"context"
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"os"
 	"path/filepath"
-	"reflect"
-	"runtime"
 	"strings"
 	"testing"
 
-	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
-
-// TestControllerBootstrapsIdentityBeforeAgentCommand prevents controller
-// launches from regressing to the old post-launch registration race. The
-// check is structural because the production dispatch is a real tmux command:
-// the identity coordinator must run before controller SendKeys.
-func TestControllerBootstrapsIdentityBeforeAgentCommand(t *testing.T) {
-	_, testFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("locate controller test source")
-	}
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(testFile), "controller.go"), nil, 0)
-	if err != nil {
-		t.Fatalf("parse controller.go: %v", err)
-	}
-
-	var fn *ast.FuncDecl
-	for _, decl := range file.Decls {
-		if candidate, ok := decl.(*ast.FuncDecl); ok && candidate.Name.Name == "buildControllerResponse" {
-			fn = candidate
-			break
-		}
-	}
-	if fn == nil {
-		t.Fatal("buildControllerResponse not found")
-	}
-
-	var prepare, launch token.Pos
-	ast.Inspect(fn, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		selector, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok {
-			return true
-		}
-		switch selector.Sel.Name {
-		case "prepareAgent":
-			prepare = call.Pos()
-		case "SendKeys":
-			if launch == token.NoPos {
-				launch = call.Pos()
-			}
-		}
-		return true
-	})
-	if prepare == token.NoPos || launch == token.NoPos {
-		t.Fatalf("controller bootstrap/launch calls missing: prepare=%v launch=%v", prepare, launch)
-	}
-	if fset.Position(prepare).Offset >= fset.Position(launch).Offset {
-		t.Fatalf("controller identity bootstrap at %v must precede agent command at %v", fset.Position(prepare), fset.Position(launch))
-	}
-}
-
-func TestControllerUsesDetachedDedicatedWindowWithoutTargetingExistingPanes(t *testing.T) {
-	existing := []tmux.Pane{
-		{ID: "%44", Index: 1, WindowIndex: 1, PID: 4400, Title: "bbi-infrastructure__cod_1"},
-		{ID: "%51", Index: 0, WindowIndex: 2, PID: 5100, Title: "bbi-infrastructure__cod_2"},
-	}
-	before := append([]tmux.Pane(nil), existing...)
-	previousCreate := controllerCreateDetachedWindow
-	controllerCreateDetachedWindow = func(_ context.Context, session, directory string) (string, error) {
-		if session != "bbi-infrastructure" || directory != "/home/ubuntu/work/bbi-infrastructure" {
-			t.Fatalf("detached window target = %q %q", session, directory)
-		}
-		return "%200", nil
-	}
-	t.Cleanup(func() { controllerCreateDetachedWindow = previousCreate })
-	newPaneID, err := createDedicatedControllerPane(t.Context(), "bbi-infrastructure", "/home/ubuntu/work/bbi-infrastructure", existing)
-	if err != nil {
-		t.Fatalf("createDedicatedControllerPane: %v", err)
-	}
-	if newPaneID != "%200" {
-		t.Fatalf("controller pane = %q, want newly-created %%200", newPaneID)
-	}
-	args := newControllerWindowArgs("bbi-infrastructure", "/home/ubuntu/work/bbi-infrastructure")
-
-	want := []string{
-		"new-window", "-d", "-t", "=bbi-infrastructure", "-c", "/home/ubuntu/work/bbi-infrastructure",
-		"-n", "ntm-controller", "-P", "-F", "#{pane_id}",
-	}
-	if !reflect.DeepEqual(args, want) {
-		t.Fatalf("controller window args = %#v, want %#v", args, want)
-	}
-	if !reflect.DeepEqual(existing, before) {
-		t.Fatalf("controller planning mutated existing panes: got %+v want %+v", existing, before)
-	}
-	for _, arg := range args {
-		if arg == "%44" || arg == "%51" || arg == "split-window" || arg == "send-keys" {
-			t.Fatalf("detached controller creation targets an existing pane/process via %q", arg)
-		}
-	}
-}
-
-func TestResolveControllerProjectDirPreservesConfiguredTargetInMixedSession(t *testing.T) {
-	projectsBase := t.TempDir()
-	target := filepath.Join(projectsBase, "bbi-infrastructure")
-	if err := os.MkdirAll(filepath.Join(target, ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	previousCfg := cfg
-	configured := config.Default()
-	configured.ProjectsBase = projectsBase
-	cfg = configured
-	t.Cleanup(func() { cfg = previousCfg })
-
-	previousCurrentDir := controllerPaneCurrentDir
-	controllerPaneCurrentDir = func(paneID string) (string, error) {
-		switch paneID {
-		case "%44":
-			return target, nil
-		case "%66":
-			return "/home/ubuntu/work/mereka-lms", nil
-		default:
-			return "", os.ErrNotExist
-		}
-	}
-	t.Cleanup(func() { controllerPaneCurrentDir = previousCurrentDir })
-
-	panes := []tmux.Pane{
-		{ID: "%44", PID: 4400, Title: "bbi-infrastructure__cod_1"},
-		{ID: "%66", PID: 6600, Title: "mereka-lms__cc_1"},
-	}
-	got, err := resolveControllerProjectDir(t.Context(), "bbi-infrastructure", panes)
-	if err != nil {
-		t.Fatalf("resolveControllerProjectDir: %v", err)
-	}
-	if got != target {
-		t.Fatalf("controller project dir = %q, want configured BBI checkout %q", got, target)
-	}
-}
-
-func TestRenderControllerAgentCommandCarriesExplicitSolUltraAndProfile(t *testing.T) {
-	t.Setenv("NTM_CODEX_PROFILE", "g1")
-	template := `exec /opt/ntm/codex ${NTM_CODEX_PROFILE:-g3} -m {{shellQuote .Model}} -c model_reasoning_effort={{shellQuote .ReasoningEffort}}`
-	opts := ControllerInput{Model: "gpt-5.6-sol", ReasoningEffort: "ultra"}
-
-	got, err := renderControllerAgentCommand(template, opts, "cod", "codex", "bbi-infrastructure", "/home/ubuntu/work/bbi-infrastructure")
-	if err != nil {
-		t.Fatalf("renderControllerAgentCommand: %v", err)
-	}
-	for _, want := range []string{
-		"export NTM_CODEX_PROFILE='g1';",
-		"'gpt-5.6-sol'",
-		"model_reasoning_effort='ultra'",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("rendered controller command %q does not contain %q", got, want)
-		}
-	}
-}
 
 // ---------------------------------------------------------------------------
 // resolveControllerPrompt – template variable substitution
@@ -546,23 +386,6 @@ func TestControllerCmdFlags(t *testing.T) {
 		t.Errorf("--agent-type default = %q, want 'cc'", f.DefValue)
 	}
 
-	// Explicit model and effort flags must reach AgentTemplateVars rather than
-	// silently falling back to the controller template's defaults.
-	f = cmd.Flags().Lookup("model")
-	if f == nil {
-		t.Fatal("--model flag not found")
-	}
-	if f.DefValue != "" {
-		t.Errorf("--model default = %q, want ''", f.DefValue)
-	}
-	f = cmd.Flags().Lookup("reasoning-effort")
-	if f == nil {
-		t.Fatal("--reasoning-effort flag not found")
-	}
-	if f.DefValue != "" {
-		t.Errorf("--reasoning-effort default = %q, want ''", f.DefValue)
-	}
-
 	// Check --prompt flag
 	f = cmd.Flags().Lookup("prompt")
 	if f == nil {
@@ -607,15 +430,13 @@ func TestControllerCmdRequiresExactlyOneArg(t *testing.T) {
 
 func TestControllerResponseFields(t *testing.T) {
 	resp := ControllerResponse{
-		Session:         "test-proj",
-		PaneID:          "%5",
-		PaneIndex:       1,
-		AgentType:       "codex",
-		Model:           "gpt-5.6-sol",
-		ReasoningEffort: "ultra",
-		PromptUsed:      "default",
-		AgentCount:      3,
-		AgentList:       "- Pane 2: cc\n- Pane 3: cod\n- Pane 4: gmi",
+		Session:    "test-proj",
+		PaneID:     "%5",
+		PaneIndex:  1,
+		AgentType:  "claude",
+		PromptUsed: "default",
+		AgentCount: 3,
+		AgentList:  "- Pane 2: cc\n- Pane 3: cod\n- Pane 4: gmi",
 	}
 
 	if resp.Session != "test-proj" {
@@ -624,11 +445,8 @@ func TestControllerResponseFields(t *testing.T) {
 	if resp.PaneIndex != 1 {
 		t.Errorf("PaneIndex = %d, want 1", resp.PaneIndex)
 	}
-	if resp.AgentType != "codex" {
-		t.Errorf("AgentType = %q, want 'codex'", resp.AgentType)
-	}
-	if resp.Model != "gpt-5.6-sol" || resp.ReasoningEffort != "ultra" {
-		t.Errorf("controller model/effort = %q/%q, want gpt-5.6-sol/ultra", resp.Model, resp.ReasoningEffort)
+	if resp.AgentType != "claude" {
+		t.Errorf("AgentType = %q, want 'claude'", resp.AgentType)
 	}
 	if resp.AgentCount != 3 {
 		t.Errorf("AgentCount = %d, want 3", resp.AgentCount)
@@ -717,5 +535,62 @@ func TestRobotControllerNoPromptFlagRegistered(t *testing.T) {
 	}
 	if f.DefValue != "false" {
 		t.Errorf("--controller-no-prompt default = %q, want 'false'", f.DefValue)
+	}
+}
+
+// TestControllerReusablePane: the controller may take over pane 1 of the
+// session's first window only when that pane is verifiably a bare shell.
+// Running agents, wrapper commands, panes in later windows, and sessions with
+// no pane 1 all force a fresh pane instead of a hijack.
+func TestControllerReusablePane(t *testing.T) {
+	tests := []struct {
+		name   string
+		panes  []tmux.Pane
+		wantID string
+		wantOK bool
+	}{
+		{
+			name: "bare shell pane 1 is reused",
+			panes: []tmux.Pane{
+				{ID: "%1", Index: 0, WindowIndex: 0, Command: "zsh"},
+				{ID: "%2", Index: 1, WindowIndex: 0, Title: "work", Command: "zsh"},
+			},
+			wantID: "%2", wantOK: true,
+		},
+		{
+			name: "running agent in pane 1 is never taken over",
+			panes: []tmux.Pane{
+				{ID: "%1", Index: 0, WindowIndex: 0, Command: "zsh"},
+				{ID: "%2", Index: 1, WindowIndex: 0, Title: "sess__cc_1", Type: tmux.AgentClaude, Command: "claude"},
+			},
+		},
+		{
+			name: "agent-titled pane with shell command still refused",
+			panes: []tmux.Pane{
+				{ID: "%2", Index: 1, WindowIndex: 0, Title: "sess__cc_1", Type: tmux.AgentClaude, Command: "zsh"},
+			},
+		},
+		{
+			name: "non-shell foreground command refused",
+			panes: []tmux.Pane{
+				{ID: "%2", Index: 1, WindowIndex: 0, Title: "logs", Command: "tail"},
+			},
+		},
+		{
+			name: "index 1 in a later window is not the controller slot",
+			panes: []tmux.Pane{
+				{ID: "%1", Index: 0, WindowIndex: 0, Command: "zsh"},
+				{ID: "%9", Index: 1, WindowIndex: 3, Command: "zsh"},
+			},
+		},
+		{name: "no panes", panes: nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pane, ok := controllerReusablePane(tc.panes)
+			if ok != tc.wantOK || (ok && pane.ID != tc.wantID) {
+				t.Fatalf("controllerReusablePane = %+v,%v want id=%q ok=%v", pane, ok, tc.wantID, tc.wantOK)
+			}
+		})
 	}
 }

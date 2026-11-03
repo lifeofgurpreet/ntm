@@ -2,9 +2,1037 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
+
+// Produce an actual uncertain delivery through the executor. The verifier
+// fails after the one paste, so recovery cannot confuse a synthetic journal
+// row with work that never crossed the transport boundary.
+func uncertainRecoveryFixture(t *testing.T, shape string, agentTypes ...tmux.AgentType) (ExecutorConfig, *Workflow, *ExecutionState, *MockTmuxClient, string, string) {
+	t.Helper()
+	cfg := DefaultExecutorConfig("operator-recovery")
+	cfg.ProjectDir, cfg.RunID = t.TempDir(), GenerateRunID()
+	cfg.DefaultTimeout, cfg.GlobalTimeout = time.Second, 5*time.Second
+	leaf := Step{ID: "agent", Pane: PaneSpec{Index: 1}, Prompt: "SECRET-TASK ${vars.subject}", Wait: WaitTime, Timeout: Duration{Duration: time.Millisecond}}
+	if strings.HasPrefix(shape, "fallback") {
+		if err := os.WriteFile(filepath.Join(cfg.ProjectDir, "recover.md"), []byte("SECRET-TASK <SUBJECT> <ROUND>"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		leaf = Step{ID: "work", Command: "printf 'once\\n' >> parent-effects; exit 7", OnFailure: OnFailureSpec{Fallback: map[string]interface{}{
+			"pane": 1, "template": "recover.md", "wait": string(WaitNone), "suppress_failure": true,
+			"params": map[string]interface{}{"SUBJECT": "${vars.subject}", "ROUND": "single"},
+		}}}
+		if strings.Contains(shape, "static") {
+			leaf.OnFailure.Fallback["params"].(map[string]interface{})["SUBJECT"] = "original"
+		}
+		if shape == "fallback-prelaunch" {
+			leaf.Command = "printf 'once\\n' >> parent-effects; ${vars.undefined}"
+		}
+		if shape == "fallback-rounds" {
+			leaf.Command = "printf '%s\\n' '${round}' >> parent-effects; exit 7"
+			leaf.OnFailure.Fallback["params"].(map[string]interface{})["ROUND"] = "${round}"
+		}
+	}
+	root := leaf
+	switch shape {
+	case "fire-and-forget":
+		root.Wait, root.Prompt = WaitNone, "Review [the changes](https://example.com/changes)"
+	case "foreach":
+		root = Step{ID: "outer", Foreach: &ForeachConfig{Items: `["outer"]`, Steps: []Step{
+			{ID: "inner", Foreach: &ForeachConfig{Items: `["inner"]`, Steps: []Step{leaf}}},
+		}}}
+	case "branch", "fallback-branch", "fallback-branch-static":
+		other := cloneStep(leaf)
+		if shape == "branch" {
+			other.Prompt = "UNSELECTED-TASK"
+		} else {
+			other.Command = "printf wrong >> parent-effects; exit 9"
+			other.OnFailure.Fallback["params"].(map[string]interface{})["SUBJECT"] = "UNSELECTED-TASK"
+		}
+		root = Step{ID: "route", Branch: "z", Branches: map[string]interface{}{"a": []Step{other}, "z": []Step{leaf}}}
+	case "fallback-rounds":
+		root = Step{ID: "outer", Foreach: &ForeachConfig{Items: `["outer"]`, Steps: []Step{
+			{ID: "inner", Foreach: &ForeachConfig{Items: `["inner"]`, MaxRounds: IntOrExpr{Value: 2}, Steps: []Step{leaf}}},
+		}}}
+	}
+	workflow := &Workflow{SchemaVersion: SchemaVersion, Name: "operator-recovery", Settings: DefaultWorkflowSettings(), Steps: []Step{
+		root, {ID: "after", Command: "printf resumed", DependsOn: []string{root.ID}},
+	}}
+	if shape == "fallback-post" {
+		workflow.PostPipelineSteps = workflow.Steps
+		workflow.Steps = []Step{{ID: "prefix", Command: "printf prefix"}}
+	}
+	frozen, path, err := SnapshotWorkflow(context.Background(), cfg.ProjectDir, workflow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.WorkflowFile = path
+	agentType, command := tmux.AgentClaude, "claude"
+	if len(agentTypes) > 0 {
+		agentType, command = agentTypes[0], string(agentTypes[0])
+	}
+	client := NewMockTmuxClient(tmux.Pane{ID: "%17", PID: 2718, Index: 1, NTMIndex: 1, Type: agentType, Command: command, Width: 120})
+	t.Cleanup(client.Reset)
+	initial := "OLD-BOUNDARY\n"
+	if agentType == tmux.AgentType("pi") {
+		initial = piStagePane(initial, "")
+	}
+	if err := client.SetPaneOutput("%17", initial); err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+	client.SetSubmissionVerifier(func(string, string, string) error {
+		if shape == "fallback-post" {
+			// Ordinary post-hook failures are warnings. Interrupt the actual
+			// finalization after delivery so its unfinished tail is resumable.
+			cancelRun()
+		}
+		return errors.New("submission observation was interrupted")
+	})
+	executor := NewExecutor(cfg)
+	executor.SetTmuxClient(client)
+	state, runErr := executor.Run(runCtx, frozen, map[string]interface{}{"subject": "original"}, nil)
+	wantStatus := StatusFailed
+	if shape == "fallback-post" {
+		wantStatus = StatusCancelled
+	}
+	if runErr == nil || state == nil || state.Status != wantStatus {
+		t.Fatalf("fixture did not stop at an uncertain delivery: %+v %v", state, runErr)
+	}
+	state, err = LoadState(cfg.ProjectDir, cfg.RunID)
+	if err != nil || len(state.AgentDeliveries) != 1 {
+		t.Fatalf("fixture did not persist exactly one delivery: %+v %v", state, err)
+	}
+	var stepID string
+	for id, record := range state.AgentDeliveries {
+		stepID = id
+		if record.Status != agentDeliverySending {
+			t.Fatalf("fixture receipt is not uncertain: %+v", record)
+		}
+		current := record.BeforeOutput + "\nFRESH-RESPONSE\n"
+		if agentType == tmux.AgentType("pi") {
+			current = piStagePane(current, "")
+		}
+		if err := client.SetPaneOutput("%17", current); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := os.ReadFile(pipelineStatePath(cfg.ProjectDir, cfg.RunID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := InspectAgentDeliveryRecovery(context.Background(), cfg.ProjectDir, cfg.RunID)
+	if err != nil || len(inspection.Deliveries) != 1 || !inspection.Deliveries[0].CanAccept {
+		t.Fatalf("uncertain delivery cannot be inspected: %+v %v", inspection, err)
+	}
+	encoded, err := json.Marshal(inspection)
+	if err != nil || strings.Contains(string(encoded), "SECRET-TASK") || strings.Contains(string(encoded), "OLD-BOUNDARY") || strings.Contains(string(encoded), "FRESH-RESPONSE") {
+		t.Fatalf("inspection exposed prompt or transcript: %s %v", encoded, err)
+	}
+	after, err := os.ReadFile(pipelineStatePath(cfg.ProjectDir, cfg.RunID))
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("inspection changed the checkpoint: %v", err)
+	}
+	return cfg, frozen, state, client, stepID, inspection.Deliveries[0].ReceiptToken
+}
+
+func TestPiAgentDeliveryRecoveryAfterRepaint(t *testing.T) {
+	cfg, workflow, prior, client, stepID, token := uncertainRecoveryFixture(t, "plain", tmux.AgentType("pi"))
+	original := prior.AgentDeliveries[stepID]
+	const response = "SECRET-TASK original\nFRESH-RESPONSE after the pane repaint"
+	if err := client.SetPaneOutput("%17", piStagePane(response, "UNSENT-DRAFT is not the response")); err != nil {
+		t.Fatal(err)
+	}
+	resolver := NewExecutor(cfg)
+	resolver.SetTmuxClient(client)
+	const reason = "Confirmed the original submitted task in the repainted pi pane"
+	accepted, err := resolver.acceptAgentDeliveryContext(context.Background(), stepID, token, reason)
+	if err != nil || accepted.Replayed || accepted.Delivery.Status != agentDeliveryDelivered || accepted.Delivery.ReceiptToken != token {
+		t.Fatalf("accept original pi delivery after repaint: %+v %v", accepted, err)
+	}
+	acceptedState, err := LoadState(cfg.ProjectDir, cfg.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := acceptedState.AgentDeliveries[stepID]
+	if receipt.BeforeOutput != original.BeforeOutput || receipt.Output != original.Output || acceptedState.Steps["after"].Status == StatusCompleted {
+		t.Fatalf("operator acceptance collected output or ran downstream work: %+v", acceptedState)
+	}
+	pastes, err := client.PasteHistory("%17")
+	if err != nil || len(pastes) != 1 || len(client.VerificationHistory()) != 1 {
+		t.Fatalf("pi acceptance repeated the uncertain send: %+v %v", pastes, err)
+	}
+	resumed := NewExecutor(cfg)
+	resumed.SetTmuxClient(client)
+	final, err := resumed.Resume(context.Background(), workflow, acceptedState, nil)
+	if err != nil || final.Status != StatusCompleted || final.Steps["after"].Output != "resumed" {
+		t.Fatalf("accepted pi turn did not progress through the pipeline: %+v %v", final, err)
+	}
+	if output := final.Steps[stepID].Output; output != response || strings.Contains(output, "UNSENT-DRAFT") {
+		t.Fatalf("pi recovery lost the response or included composer text: %q", output)
+	}
+	pastes, err = client.PasteHistory("%17")
+	if err != nil || len(pastes) != 1 || len(client.VerificationHistory()) != 1 {
+		t.Fatalf("pi resume repeated the accepted delivery: %+v %v", pastes, err)
+	}
+	completed := final.AgentDeliveries[stepID]
+	if completed.Status != agentDeliveryCompleted || completed.ResolutionToken != token || completed.ResolutionBoundaryHash != receipt.ResolutionBoundaryHash {
+		t.Fatalf("pi completion lost the original accepted receipt: %+v", completed)
+	}
+	replay, err := resolver.acceptAgentDeliveryContext(context.Background(), stepID, token, reason)
+	if err != nil || !replay.Replayed || replay.Delivery.Status != agentDeliveryCompleted {
+		t.Fatalf("completed pi acceptance is not idempotent: %+v %v", replay, err)
+	}
+}
+
+func TestPiFireAndForgetRecoveryDoesNotRequireResponseEvidence(t *testing.T) {
+	cfg, workflow, _, client, stepID, token := uncertainRecoveryFixture(t, "fire-and-forget", tmux.AgentType("pi"))
+	// This prompt's link rendering is unsupported for response attribution.
+	// Its explicit wait:none contract only requires confirmed delivery.
+	if err := client.SetPaneOutput("%17", "Pi is redrawing; no response frame is available"); err != nil {
+		t.Fatal(err)
+	}
+	resolver := NewExecutor(cfg)
+	resolver.SetTmuxClient(client)
+	accepted, err := resolver.acceptAgentDeliveryContext(context.Background(), stepID, token, "Observed the submitted task before the repaint")
+	if err != nil || accepted.Delivery.Status != agentDeliveryDelivered {
+		t.Fatalf("fire-and-forget acceptance required a response: %+v %v", accepted, err)
+	}
+	prior, err := LoadState(cfg.ProjectDir, cfg.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed := NewExecutor(cfg)
+	resumed.SetTmuxClient(client)
+	final, err := resumed.Resume(context.Background(), workflow, prior, nil)
+	if err != nil || final.Status != StatusCompleted || final.Steps["after"].Output != "resumed" || final.Steps[stepID].Output != "" {
+		t.Fatalf("fire-and-forget resume inferred a response or failed to continue: %+v %v", final, err)
+	}
+	pastes, err := client.PasteHistory("%17")
+	if err != nil || len(pastes) != 1 || len(client.VerificationHistory()) != 1 {
+		t.Fatalf("fire-and-forget recovery repeated delivery: %+v %v", pastes, err)
+	}
+}
+
+func TestPiAgentDeliveryRecoveryRejectsUnattributedRepaints(t *testing.T) {
+	const prompt = "SECRET-TASK original"
+	for _, tc := range []struct {
+		name, transcript, draft string
+		mutate                  func(*AgentDeliveryState)
+		incomplete              bool
+	}{
+		{name: "unrelated turn", transcript: "Another request\nAnother answer"},
+		{name: "duplicate current echo", transcript: prompt + "\nFirst answer\n" + prompt + "\nSecond answer"},
+		{name: "echo and answer only in composer", transcript: "Another turn", draft: prompt + "\nFRESH-RESPONSE"},
+		{name: "blank redraw"},
+		{name: "partial original frame", transcript: "OLD"},
+		{name: "incomplete composer", transcript: prompt + "\nFRESH-RESPONSE", draft: "UNSENT-DRAFT", incomplete: true},
+		{name: "legacy receipt without echo length", transcript: prompt + "\nFRESH-RESPONSE", mutate: func(r *AgentDeliveryState) { r.PromptEchoLength = 0 }},
+		{name: "legacy receipt without rendered identity", transcript: prompt + "\nFRESH-RESPONSE", mutate: func(r *AgentDeliveryState) { r.PiPromptEchoHash, r.PiPromptEchoLength = "", 0 }},
+		{name: "echo already in old transcript", transcript: prompt + "\nFRESH-RESPONSE", mutate: func(r *AgentDeliveryState) { r.BeforeOutput = prompt + "\nOLD-BOUNDARY" }},
+		{name: "replacement after partial response", transcript: prompt + "\nReplacement answer", mutate: func(r *AgentDeliveryState) {
+			r.BeforeOutput, r.Output = prompt+"\nPartial original response", prompt+"\nPartial original response"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, _, prior, client, stepID, token := uncertainRecoveryFixture(t, "plain", tmux.AgentType("pi"))
+			if tc.mutate != nil {
+				record := prior.AgentDeliveries[stepID]
+				tc.mutate(&record)
+				prior.AgentDeliveries[stepID] = record
+				if err := SaveState(cfg.ProjectDir, prior); err != nil {
+					t.Fatal(err)
+				}
+				inspection, err := InspectAgentDeliveryRecovery(context.Background(), cfg.ProjectDir, cfg.RunID)
+				if err != nil || len(inspection.Deliveries) != 1 {
+					t.Fatalf("inspect fixture receipt: %+v %v", inspection, err)
+				}
+				token = inspection.Deliveries[0].ReceiptToken
+			}
+			frame := piStagePane(tc.transcript, tc.draft)
+			if tc.incomplete {
+				frame = strings.TrimSuffix(frame, "0.0%/1.0M (auto)  DeepSeek-V4.1-Flash")
+			}
+			if err := client.SetPaneOutput("%17", frame); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(pipelineStatePath(cfg.ProjectDir, cfg.RunID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolver := NewExecutor(cfg)
+			resolver.SetTmuxClient(client)
+			if result, err := resolver.acceptAgentDeliveryContext(context.Background(), stepID, token, "Confirmed original delivery"); err == nil || result != nil {
+				t.Fatalf("unattributed pi repaint authorized acceptance: %+v %v", result, err)
+			}
+			after, err := os.ReadFile(pipelineStatePath(cfg.ProjectDir, cfg.RunID))
+			if err != nil || string(after) != string(before) || len(client.VerificationHistory()) != 1 {
+				t.Fatalf("refused pi recovery changed its receipt or repeated transport: %v", err)
+			}
+		})
+	}
+}
+
+func TestAgentDeliveryRecoveryScopedContinuation(t *testing.T) {
+	for _, tc := range []struct {
+		name, shape string
+		drift       bool
+	}{{"nested foreach", "foreach", false}, {"selected branch with reused child ID", "branch", false}, {"changed materialized foreach definition", "foreach", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, workflow, prior, client, stepID, token := uncertainRecoveryFixture(t, tc.shape)
+			original := prior.AgentDeliveries[stepID]
+			resolver := NewExecutor(cfg)
+			resolver.SetTmuxClient(client)
+			accepted, err := resolver.acceptAgentDeliveryContext(context.Background(), stepID, token, "Observed the original agent working on the submitted task")
+			if err != nil || accepted.Replayed || accepted.Delivery.Status != agentDeliveryDelivered || accepted.Delivery.ReceiptToken != token {
+				t.Fatalf("accept scoped delivery: %+v %v", accepted, err)
+			}
+			acceptedState, err := LoadState(cfg.ProjectDir, cfg.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt := acceptedState.AgentDeliveries[stepID]
+			if receipt.BeforeOutput != original.BeforeOutput || receipt.Output != original.Output || !receipt.StartedAt.Equal(original.StartedAt) || acceptedState.Steps["after"].Status == StatusCompleted {
+				t.Fatalf("acceptance changed observation evidence or executed downstream work: %+v", acceptedState)
+			}
+			pastes, err := client.PasteHistory("%17")
+			if err != nil || len(pastes) != 1 || len(client.VerificationHistory()) != 1 {
+				t.Fatalf("acceptance actuated transport: %+v %v", pastes, err)
+			}
+			if tc.drift {
+				acceptedState.Variables["subject"] = "changed-after-inspection"
+			}
+			resumed := NewExecutor(cfg)
+			resumed.SetTmuxClient(client)
+			final, resumeErr := resumed.Resume(context.Background(), workflow, acceptedState, nil)
+			pastes, err = client.PasteHistory("%17")
+			if err != nil || len(pastes) != 1 {
+				t.Fatalf("resume resent an accepted delivery: %+v %v", pastes, err)
+			}
+			if tc.drift {
+				if resumeErr == nil || final.Steps["after"].Status == StatusCompleted || final.AgentDeliveries[stepID] != receipt {
+					t.Fatalf("changed materialized definition escaped canonical resume gate: %+v %v", final, resumeErr)
+				}
+			} else {
+				if resumeErr != nil || final.Status != StatusCompleted || final.Steps["after"].Output != "resumed" || strings.TrimSpace(final.Steps[stepID].Output) != "FRESH-RESPONSE" {
+					t.Fatalf("accepted scoped work did not continue with original response: %+v %v", final, resumeErr)
+				}
+				completed := final.AgentDeliveries[stepID]
+				if completed.Status != agentDeliveryCompleted || completed.ResolutionToken != token || completed.ResolutionReason != receipt.ResolutionReason || !completed.ResolvedAt.Equal(receipt.ResolvedAt) {
+					t.Fatalf("completion lost immutable acceptance: %+v", completed)
+				}
+				// Settled replay must not depend on a still-live historical pane.
+				client.AddPane("", tmux.Pane{ID: "%17", PID: 9999, Index: 1, Type: tmux.AgentClaude})
+				replay, err := resolver.acceptAgentDeliveryContext(context.Background(), stepID, token, receipt.ResolutionReason)
+				if err != nil || !replay.Replayed || replay.Delivery.Status != agentDeliveryCompleted {
+					t.Fatalf("completed acceptance is not idempotent: %+v %v", replay, err)
+				}
+			}
+			// AddPane resets its fixture's history, so assert the no-repeat
+			// invariant against the verifier too; resume never verifies a send.
+			if len(client.VerificationHistory()) != 1 {
+				t.Fatalf("recovery repeated submission: %+v", client.VerificationHistory())
+			}
+		})
+	}
+}
+
+func TestFailureFallbackRecoveryContinuesOriginalAttempt(t *testing.T) {
+	for _, shape := range []string{"fallback-branch", "fallback-rounds", "fallback-post", "fallback-prelaunch"} {
+		t.Run(shape, func(t *testing.T) {
+			cfg, workflow, prior, client, stepID, token := uncertainRecoveryFixture(t, shape)
+			parentID := strings.TrimSuffix(stepID, onFailureStepSuffix)
+			originalCommand, exists := prior.CommandExecutions[parentID]
+			if !exists || originalCommand.Status != commandExecutionSettled || originalCommand.Result.Status != StatusFailed {
+				t.Fatalf("fallback has no settled original failure: %+v", prior.CommandExecutions)
+			}
+			if shape == "fallback-prelaunch" && (originalCommand.ProcessID != 0 || originalCommand.Result.Error.Type != "substitution") {
+				t.Fatalf("prelaunch failure lost its no-process proof: %+v", originalCommand)
+			}
+			originalDelivery := prior.AgentDeliveries[stepID]
+			before, err := os.ReadFile(pipelineStatePath(cfg.ProjectDir, cfg.RunID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			unresolved := NewExecutor(cfg)
+			unresolved.SetTmuxClient(client)
+			if _, err := unresolved.Resume(context.Background(), workflow, prior, nil); err == nil || !strings.Contains(err.Error(), "delivery outcome is unknown") {
+				t.Fatalf("ordinary resume admitted an uncertain fallback: %v", err)
+			}
+			after, err := os.ReadFile(pipelineStatePath(cfg.ProjectDir, cfg.RunID))
+			if err != nil || string(after) != string(before) || len(client.VerificationHistory()) != 1 {
+				t.Fatalf("refused fallback resume rewrote the checkpoint or repeated transport: %v", err)
+			}
+			resolver := NewExecutor(cfg)
+			resolver.SetTmuxClient(client)
+			if accepted, err := resolver.acceptAgentDeliveryContext(context.Background(), stepID, token, "Confirmed the original fallback submission"); err != nil || accepted.Replayed {
+				t.Fatalf("accept fallback delivery: %+v %v", accepted, err)
+			}
+			acceptedState, err := LoadState(cfg.ProjectDir, cfg.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if shape == "fallback-prelaunch" {
+				// Repairing the input cannot turn recovery of the old failure
+				// into permission to launch the original command for the first time.
+				acceptedState.Variables["undefined"] = "printf replayed"
+			}
+			client.SetSubmissionVerifier(nil)
+			resumed := NewExecutor(cfg)
+			resumed.SetTmuxClient(client)
+			final, err := resumed.Resume(context.Background(), workflow, acceptedState, nil)
+			if err != nil || final.Status != StatusCompleted || final.Steps["after"].Output != "resumed" {
+				t.Fatalf("fallback did not continue the original attempt: %+v %v", final, err)
+			}
+			if got := final.CommandExecutions[parentID]; !reflect.DeepEqual(got, originalCommand) {
+				t.Fatalf("recovery replaced the original command receipt: %+v; want %+v", got, originalCommand)
+			}
+			completed := final.AgentDeliveries[stepID]
+			if completed.Status != agentDeliveryCompleted || completed.StepHash != originalDelivery.StepHash || !completed.StartedAt.Equal(originalDelivery.StartedAt) || completed.ResolutionToken != token {
+				t.Fatalf("fallback completion lost the original receipt: %+v", completed)
+			}
+			wantPastes, wantEffects := 1, "once\n"
+			if shape == "fallback-rounds" {
+				wantPastes, wantEffects = 2, "1\n2\n"
+			}
+			pastes, err := client.PasteHistory("%17")
+			if err != nil || len(pastes) != wantPastes || len(client.VerificationHistory()) != wantPastes {
+				t.Fatalf("recovery repeated a delivery: %+v %v; verifications=%+v", pastes, err, client.VerificationHistory())
+			}
+			if shape == "fallback-rounds" && (pastes[0].Content != "SECRET-TASK original 1" || pastes[1].Content != "SECRET-TASK original 2") {
+				t.Fatalf("fallback was reconstructed in the wrong round scope: %+v", pastes)
+			}
+			effects, err := os.ReadFile(filepath.Join(cfg.ProjectDir, "parent-effects"))
+			if shape == "fallback-prelaunch" {
+				if !os.IsNotExist(err) {
+					t.Fatalf("recovery launched a command that originally failed preflight: %q %v", effects, err)
+				}
+			} else if err != nil || string(effects) != wantEffects {
+				t.Fatalf("recovery repeated a failed command effect: %q %v; want %q", effects, err, wantEffects)
+			}
+		})
+	}
+}
+
+func TestFailureFallbackRecoveryRefusesChangedEvidence(t *testing.T) {
+	for _, change := range []string{"parent definition", "fallback definition", "materialized fallback inputs", "missing parent receipt"} {
+		t.Run(change, func(t *testing.T) {
+			cfg, workflow, _, client, stepID, token := uncertainRecoveryFixture(t, "fallback")
+			resolver := NewExecutor(cfg)
+			resolver.SetTmuxClient(client)
+			if _, err := resolver.acceptAgentDeliveryContext(context.Background(), stepID, token, "Confirmed the original fallback submission"); err != nil {
+				t.Fatal(err)
+			}
+			prior, err := LoadState(cfg.ProjectDir, cfg.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt := prior.AgentDeliveries[stepID]
+			switch change {
+			case "parent definition":
+				workflow.Steps[0].Command = "printf repeated >> parent-effects; exit 9"
+			case "fallback definition":
+				workflow.Steps[0].OnFailure.Fallback["params"].(map[string]interface{})["SUBJECT"] = "different-request"
+			case "materialized fallback inputs":
+				prior.Variables["subject"] = "different-request"
+			case "missing parent receipt":
+				delete(prior.CommandExecutions, "work")
+			}
+			resumed := NewExecutor(cfg)
+			resumed.SetTmuxClient(client)
+			final, resumeErr := resumed.Resume(context.Background(), workflow, prior, nil)
+			if resumeErr == nil || (final != nil && (final.Status == StatusCompleted || final.Steps["after"].Status == StatusCompleted)) {
+				t.Fatalf("accepted fallback suppressed an identity failure: %+v %v", final, resumeErr)
+			}
+			if final != nil && final.AgentDeliveries[stepID] != receipt {
+				t.Fatalf("refused recovery rewrote accepted evidence: %+v; want %+v", final.AgentDeliveries[stepID], receipt)
+			}
+			effects, err := os.ReadFile(filepath.Join(cfg.ProjectDir, "parent-effects"))
+			if err != nil || string(effects) != "once\n" {
+				t.Fatalf("changed recovery evidence replayed its parent: %q %v", effects, err)
+			}
+			pastes, err := client.PasteHistory("%17")
+			if err != nil || len(pastes) != 1 || len(client.VerificationHistory()) != 1 {
+				t.Fatalf("changed recovery evidence repeated delivery: %+v %v", pastes, err)
+			}
+		})
+	}
+}
+
+func TestFailureFallbackAcceptanceChecksSelectedStaticDefinition(t *testing.T) {
+	for _, shape := range []string{"fallback-static", "fallback-branch-static"} {
+		t.Run(shape, func(t *testing.T) {
+			cfg, _, prior, client, stepID, _ := uncertainRecoveryFixture(t, shape)
+			record := prior.AgentDeliveries[stepID]
+			record.StepHash = strings.Repeat("f", 64)
+			prior.AgentDeliveries[stepID] = record
+			if err := SaveState(cfg.ProjectDir, prior); err != nil {
+				t.Fatal(err)
+			}
+			inspection, err := InspectAgentDeliveryRecovery(context.Background(), cfg.ProjectDir, cfg.RunID)
+			if err != nil || len(inspection.Deliveries) != 1 {
+				t.Fatalf("inspect changed fixture: %+v %v", inspection, err)
+			}
+			before, err := os.ReadFile(pipelineStatePath(cfg.ProjectDir, cfg.RunID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolver := NewExecutor(cfg)
+			resolver.SetTmuxClient(client)
+			accepted, err := resolver.acceptAgentDeliveryContext(context.Background(), stepID, inspection.Deliveries[0].ReceiptToken, "Confirmed the original fallback submission")
+			if err == nil || accepted != nil || !strings.Contains(err.Error(), "definition differs") {
+				t.Fatalf("static fallback mismatch was accepted: %+v %v", accepted, err)
+			}
+			after, err := os.ReadFile(pipelineStatePath(cfg.ProjectDir, cfg.RunID))
+			if err != nil || string(after) != string(before) || len(client.VerificationHistory()) != 1 {
+				t.Fatalf("rejected acceptance mutated evidence or repeated transport: %v", err)
+			}
+		})
+	}
+}
+
+func TestFailureFallbackCannotSuppressInvalidParentAcceptance(t *testing.T) {
+	cfg, workflow, _, client, stepID, token := uncertainRecoveryFixture(t, "fallback")
+	resolver := NewExecutor(cfg)
+	resolver.SetTmuxClient(client)
+	if _, err := resolver.acceptAgentDeliveryContext(context.Background(), stepID, token, "Confirmed the original fallback submission"); err != nil {
+		t.Fatal(err)
+	}
+	prior, err := LoadState(cfg.ProjectDir, cfg.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed := NewExecutor(cfg)
+	resumed.SetTmuxClient(client)
+	final, err := resumed.Resume(context.Background(), workflow, prior, nil)
+	if err != nil || final.Status != StatusCompleted {
+		t.Fatalf("complete original fallback: %+v %v", final, err)
+	}
+	original := final.CommandExecutions["work"]
+	outputHash := sha256.Sum256(nil)
+	original.ResolutionAction, original.ResolutionToken = CommandExecutionResolutionAccept, strings.Repeat("0", 64)
+	original.ResolutionReason, original.ResolutionExitCode = "Confirmed original failed command", 7
+	original.ResolutionOutputHash, original.ResolvedAt = hex.EncodeToString(outputHash[:]), original.SettledAt
+	original.Result = StepResult{StepID: "work", AgentType: "command", Status: StatusFailed, StartedAt: original.StartedAt, FinishedAt: original.SettledAt}
+	if err := validateCommandExecution("work", original); err != nil {
+		t.Fatalf("fixture does not isolate immutable receipt identity: %v", err)
+	}
+	final.CommandExecutions["work"] = original
+	guard := NewExecutor(cfg)
+	guard.SetTmuxClient(client)
+	guard.state = final
+	failed := StepResult{StepID: "work", Status: StatusFailed, Error: &StepError{Type: "recovery", Message: "original parent acceptance was rejected"}}
+	result := guard.executeOnFailureRecovery(context.Background(), &workflow.Steps[0], workflow, failed)
+	if result.Status != StatusFailed || result.Error == nil || !strings.Contains(result.Error.Details, "original receipt identity") {
+		t.Fatalf("completed fallback suppressed its parent's identity error: %+v", result)
+	}
+	if _, err := validateAgentRecoveryWorkflow(cfg.ProjectDir, final, final.AgentDeliveries[stepID]); err == nil || !strings.Contains(err.Error(), "original receipt identity") {
+		t.Fatalf("fallback acceptance ignored invalid parent acceptance: %v", err)
+	}
+}
+
+func TestFailureFallbackFinalizationResetPreservesPendingParent(t *testing.T) {
+	for _, phase := range []string{"on_cancel", "post_pipeline"} {
+		for _, status := range []string{agentDeliverySending, agentDeliveryDelivered, agentDeliveryCompleted} {
+			t.Run(phase+"/"+status, func(t *testing.T) {
+				cleanup := Step{ID: "cleanup", Command: "exit 7", OnFailure: OnFailureSpec{Fallback: map[string]interface{}{
+					"pane": 1, "template": "recover.md", "suppress_failure": true,
+				}}}
+				workflow := &Workflow{Steps: []Step{{ID: "main", Command: "true"}}}
+				if phase == "on_cancel" {
+					workflow.Settings.OnCancel = []Step{cleanup}
+				} else {
+					workflow.PostPipelineSteps = []Step{cleanup}
+				}
+				delivery := testAgentDelivery("cleanup.on_failure", status)
+				original := CommandExecutionState{StepID: "cleanup", Status: commandExecutionSettled}
+				executor := NewExecutor(DefaultExecutorConfig("resume-session"))
+				executor.graph = NewDependencyGraph(workflow)
+				executor.state = &ExecutionState{
+					Steps:             map[string]StepResult{"cleanup": {StepID: "cleanup", Status: StatusFailed}, "cleanup.on_failure": {StepID: "cleanup.on_failure", Status: StatusFailed}},
+					CommandExecutions: map[string]CommandExecutionState{"cleanup": original},
+					AgentDeliveries:   map[string]AgentDeliveryState{"cleanup.on_failure": delivery}, Variables: map[string]interface{}{},
+				}
+				if phase == "on_cancel" {
+					executor.resetSettledOnCancelState(workflow)
+				} else {
+					executor.resetPostPipelineForMainAttempt(workflow)
+				}
+				_, hasParent := executor.state.CommandExecutions["cleanup"]
+				retained, hasDelivery := executor.state.AgentDeliveries["cleanup.on_failure"]
+				if status == agentDeliveryCompleted {
+					if hasParent || hasDelivery {
+						t.Fatalf("new finalization attempt retained completed recovery: %+v", executor.state)
+					}
+				} else if !hasParent || !hasDelivery || retained != delivery {
+					t.Fatalf("finalization reset lost the parent of an unfinished fallback: %+v", executor.state)
+				}
+				if _, exists := executor.state.Steps["cleanup.on_failure"]; exists {
+					t.Fatal("finalization reset retained stale fallback scheduler bookkeeping")
+				}
+			})
+		}
+	}
+}
+
+func TestAgentDeliveryRecoveryRejectsChangedAcceptedIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*AgentDeliveryState)
+	}{
+		{"pane process", func(r *AgentDeliveryState) { r.PanePID++ }},
+		{"step definition", func(r *AgentDeliveryState) { r.StepHash = strings.Repeat("a", 64) }},
+		{"submitted prompt", func(r *AgentDeliveryState) { r.PromptHash = strings.Repeat("b", 64) }},
+		{"original boundary", func(r *AgentDeliveryState) { r.ResolutionBoundaryHash = strings.Repeat("c", 64) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, workflow, _, client, stepID, token := uncertainRecoveryFixture(t, "plain")
+			resolver := NewExecutor(cfg)
+			resolver.SetTmuxClient(client)
+			if _, err := resolver.acceptAgentDeliveryContext(context.Background(), stepID, token, "Confirmed delivery in original pane"); err != nil {
+				t.Fatal(err)
+			}
+			prior, err := LoadState(cfg.ProjectDir, cfg.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			record := prior.AgentDeliveries[stepID]
+			tc.mutate(&record)
+			prior.AgentDeliveries[stepID] = record
+			if err := SaveState(cfg.ProjectDir, prior); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(pipelineStatePath(cfg.ProjectDir, cfg.RunID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			resume := NewExecutor(cfg)
+			resume.SetTmuxClient(client)
+			if _, err := resume.Resume(context.Background(), workflow, prior, nil); err == nil || !strings.Contains(err.Error(), "original receipt identity") {
+				t.Fatalf("accepted identity change was not refused before resume: %v", err)
+			}
+			after, err := os.ReadFile(pipelineStatePath(cfg.ProjectDir, cfg.RunID))
+			if err != nil || string(after) != string(before) || len(client.VerificationHistory()) != 1 {
+				t.Fatalf("refused recovery changed evidence or repeated delivery: %v", err)
+			}
+		})
+	}
+}
+
+type recoveryCaptureClient struct {
+	*MockTmuxClient
+	onCapture func()
+}
+
+func (c *recoveryCaptureClient) CapturePaneOutput(target string, lines int) (string, error) {
+	if c.onCapture != nil {
+		c.onCapture()
+	}
+	return c.MockTmuxClient.CapturePaneOutput(target, lines)
+}
+
+func TestAgentDeliveryRecoveryInterruptedAcceptancePreservesReceipt(t *testing.T) {
+	for _, mode := range []string{"cancelled during observation", "persistence refused"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg, _, _, client, stepID, token := uncertainRecoveryFixture(t, "plain")
+			before, err := os.ReadFile(pipelineStatePath(cfg.ProjectDir, cfg.RunID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			resolver := NewExecutor(cfg)
+			capture := &recoveryCaptureClient{MockTmuxClient: client}
+			if mode == "cancelled during observation" {
+				capture.onCapture = cancel
+			} else {
+				blocked := filepath.Join(cfg.ProjectDir, "unwritable-state-root")
+				if err := os.WriteFile(blocked, []byte("not a directory"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				capture.onCapture = func() { resolver.config.ProjectDir = blocked }
+			}
+			resolver.SetTmuxClient(capture)
+			if result, err := resolver.acceptAgentDeliveryContext(ctx, stepID, token, "Confirmed original delivery"); err == nil || result != nil {
+				t.Fatalf("interrupted decision was reported accepted: %+v %v", result, err)
+			}
+			after, err := os.ReadFile(pipelineStatePath(cfg.ProjectDir, cfg.RunID))
+			if err != nil || string(after) != string(before) || len(client.VerificationHistory()) != 1 {
+				t.Fatalf("failed acceptance changed receipt or submitted work: %v", err)
+			}
+		})
+	}
+}
+
+func testAgentDelivery(stepID, status string) AgentDeliveryState {
+	started := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+	record := AgentDeliveryState{
+		Version: agentDeliveryVersion, StepID: stepID, Kind: StepKindPrompt,
+		Session: "resume-session", Endpoint: "local", PaneID: "%17", PanePID: 2718, AgentType: "claude",
+		StepHash: strings.Repeat("a", 64), PromptHash: strings.Repeat("b", 64),
+		PromptEchoHash: strings.Repeat("c", 64),
+		Status:         status, BeforeOutput: "previous task", StartedAt: started,
+	}
+	if status == agentDeliveryDelivered || status == agentDeliveryCompleted {
+		record.DeliveredAt = started.Add(time.Second)
+	}
+	if status == agentDeliveryCompleted {
+		record.CompletedAt = started.Add(2 * time.Second)
+		record.Output = "current result"
+	}
+	return record
+}
+
+func TestAgentDeliveryJournalPersistsAndReturnsCopies(t *testing.T) {
+	cfg := DefaultExecutorConfig("resume-session")
+	cfg.ProjectDir = t.TempDir()
+	executor := NewExecutor(cfg)
+	executor.state = &ExecutionState{
+		RunID: "agent-delivery-roundtrip", WorkflowID: "delivery-workflow", Session: cfg.Session,
+		Status: StatusRunning, Steps: map[string]StepResult{}, Variables: map[string]interface{}{},
+	}
+	for _, status := range []string{agentDeliverySending, agentDeliveryDelivered, agentDeliveryCompleted} {
+		record := testAgentDelivery("review", status)
+		if err := executor.saveAgentDelivery(record); err != nil {
+			t.Fatalf("save %s: %v", status, err)
+		}
+		persisted, err := LoadState(cfg.ProjectDir, executor.state.RunID)
+		if err != nil {
+			t.Fatalf("load %s: %v", status, err)
+		}
+		if got := persisted.AgentDeliveries["review"]; !reflect.DeepEqual(got, record) {
+			t.Fatalf("persisted %s receipt = %#v, want %#v", status, got, record)
+		}
+		loaded, ok := executor.loadAgentDelivery("review")
+		if !ok {
+			t.Fatal("saved delivery missing")
+		}
+		loaded.Status = "mutated"
+		loaded.Output = "mutated"
+		again, _ := executor.loadAgentDelivery("review")
+		if !reflect.DeepEqual(again, record) {
+			t.Fatalf("caller mutated journal through load: %#v", again)
+		}
+	}
+	if _, ok := executor.loadAgentDelivery("unknown"); ok {
+		t.Fatal("unknown step has a delivery")
+	}
+
+	// A failed durable write must propagate to the dispatch caller. Keeping the
+	// intent in memory still prevents another attempt from treating it as new.
+	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocked, []byte("blocked"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	executor.config.ProjectDir = blocked
+	if err := executor.saveAgentDelivery(testAgentDelivery("next", agentDeliverySending)); !errors.Is(err, ErrCheckpointFailed) {
+		t.Fatalf("failed save = %v, want ErrCheckpointFailed", err)
+	}
+	if _, ok := executor.loadAgentDelivery("next"); !ok {
+		t.Fatal("failed persistence erased in-memory dispatch intent")
+	}
+}
+
+func TestAgentStepHashUsesCompleteStableDefinition(t *testing.T) {
+	step := Step{ID: "review", Template: "review", Params: map[string]interface{}{"a": "first", "b": "second"}}
+	hash, err := agentStepHash(&step)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy := cloneStep(step)
+	copy.Params = map[string]interface{}{"b": "second", "a": "first"}
+	got, err := agentStepHash(&copy)
+	if err != nil || got != hash {
+		t.Fatalf("equivalent definition hash = %q, %v, want %q", got, err, hash)
+	}
+	copy.Params["a"] = "changed"
+	got, err = agentStepHash(&copy)
+	if err != nil || got == hash {
+		t.Fatalf("changed definition hash = %q, %v, original %q", got, err, hash)
+	}
+	copy.Params["unsupported"] = make(chan int)
+	if _, err := agentStepHash(&copy); err == nil {
+		t.Fatal("non-serializable definition was accepted")
+	}
+	if _, err := agentStepHash(nil); err == nil {
+		t.Fatal("nil definition was accepted")
+	}
+}
+
+func TestResumeRejectsInvalidAgentDeliveriesBeforeReset(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*AgentDeliveryState)
+	}{
+		{"unknown status", func(r *AgentDeliveryState) { r.Status = "maybe-sent" }},
+		{"unsupported version", func(r *AgentDeliveryState) { r.Version++ }},
+		{"different step", func(r *AgentDeliveryState) { r.StepID = "other" }},
+		{"different session", func(r *AgentDeliveryState) { r.Session = "other" }},
+		{"missing endpoint", func(r *AgentDeliveryState) { r.Endpoint = "" }},
+		{"empty remote endpoint", func(r *AgentDeliveryState) { r.Endpoint = "ssh: " }},
+		{"unsupported endpoint", func(r *AgentDeliveryState) { r.Endpoint = "socket:other" }},
+		{"command kind", func(r *AgentDeliveryState) { r.Kind = StepKindCommand }},
+		{"logical pane", func(r *AgentDeliveryState) { r.PaneID = "resume-session:0.1" }},
+		{"missing PID", func(r *AgentDeliveryState) { r.PanePID = 0 }},
+		{"missing agent", func(r *AgentDeliveryState) { r.AgentType = "" }},
+		{"invalid step hash", func(r *AgentDeliveryState) { r.StepHash = "broken" }},
+		{"invalid prompt hash", func(r *AgentDeliveryState) { r.PromptHash = strings.Repeat("z", 64) }},
+		{"negative prompt echo length", func(r *AgentDeliveryState) { r.PromptEchoLength = -1 }},
+		{"oversized prompt echo length", func(r *AgentDeliveryState) { r.PromptEchoLength = agentDeliveryMaxCaptureBytes + 1 }},
+		{"pi hash without length", func(r *AgentDeliveryState) { r.AgentType, r.PiPromptEchoHash = "pi", strings.Repeat("a", 64) }},
+		{"pi length without hash", func(r *AgentDeliveryState) { r.AgentType, r.PiPromptEchoLength = "pi", 12 }},
+		{"pi malformed rendered hash", func(r *AgentDeliveryState) {
+			r.AgentType, r.PiPromptEchoHash, r.PiPromptEchoLength = "pi", "broken", 12
+		}},
+		{"pi oversized rendered length", func(r *AgentDeliveryState) {
+			r.AgentType, r.PiPromptEchoHash, r.PiPromptEchoLength = "pi", strings.Repeat("a", 64), agentDeliveryMaxCaptureBytes+1
+		}},
+		{"pi identity on another agent", func(r *AgentDeliveryState) { r.PiPromptEchoHash, r.PiPromptEchoLength = strings.Repeat("a", 64), 12 }},
+		{"oversized baseline", func(r *AgentDeliveryState) { r.BeforeOutput = strings.Repeat("x", agentDeliveryMaxCaptureBytes+1) }},
+		{"oversized result", func(r *AgentDeliveryState) { r.Output = strings.Repeat("x", agentDeliveryMaxOutputBytes+1) }},
+		{"missing start", func(r *AgentDeliveryState) { r.StartedAt = time.Time{} }},
+		{"missing delivery", func(r *AgentDeliveryState) { r.DeliveredAt = time.Time{} }},
+		{"completion before delivery", func(r *AgentDeliveryState) { r.CompletedAt = r.StartedAt }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, opts := range []ResumeOptions{{Reset: true}, {Mode: ResumeModeRestartFailed}, {Mode: ResumeModeForceIter, StepID: "fanout", Iteration: 0}} {
+				executor := NewExecutor(DefaultExecutorConfig("resume-session"))
+				record := testAgentDelivery("fanout_iter0_work", agentDeliveryCompleted)
+				tc.mutate(&record)
+				executor.state = &ExecutionState{
+					Session: "resume-session", Steps: map[string]StepResult{record.StepID: {Status: StatusFailed}},
+					AgentDeliveries: map[string]AgentDeliveryState{"fanout_iter0_work": record},
+				}
+				err := executor.applyResumeOptions(nil, opts)
+				if err == nil || !strings.Contains(err.Error(), "invalid agent delivery") {
+					t.Fatalf("opts %#v: invalid journal accepted: %v", opts, err)
+				}
+				if tc.name == "unknown status" && !strings.Contains(err.Error(), "unknown delivery status") {
+					t.Fatalf("unknown status diagnosis = %v", err)
+				}
+				if got := executor.state.AgentDeliveries["fanout_iter0_work"]; !reflect.DeepEqual(got, record) {
+					t.Fatalf("opts %#v discarded invalid dispatch evidence", opts)
+				}
+				if len(executor.state.Steps) != 1 || executor.state.ForeachState != nil {
+					t.Fatalf("opts %#v mutated state before validation", opts)
+				}
+			}
+		})
+	}
+}
+
+func TestResumeAgentDeliveryPolicies(t *testing.T) {
+	for _, mode := range []ResumeMode{ResumeModeContinue, ResumeModeRestartFailed} {
+		t.Run(string(mode), func(t *testing.T) {
+			executor := NewExecutor(DefaultExecutorConfig("resume-session"))
+			executor.state = &ExecutionState{
+				Session: "resume-session", Steps: map[string]StepResult{},
+				InFlightSteps:   map[string]InFlightStepState{"inflight": {StepID: "inflight", Kind: StepKindPrompt}},
+				AgentDeliveries: map[string]AgentDeliveryState{},
+			}
+			for _, status := range []ExecutionStatus{StatusCompleted, StatusFailed, StatusCancelled, StatusRunning, StatusPending} {
+				id := string(status)
+				executor.state.Steps[id] = StepResult{StepID: id, Status: status}
+				executor.state.AgentDeliveries[id] = testAgentDelivery(id, agentDeliveryDelivered)
+			}
+			executor.state.AgentDeliveries["inflight"] = testAgentDelivery("inflight", agentDeliverySending)
+			executor.state.AgentDeliveries["receipt-only"] = testAgentDelivery("receipt-only", agentDeliverySending)
+			executor.state.AgentDeliveries["completed-receipt"] = testAgentDelivery("completed-receipt", agentDeliveryCompleted)
+			executor.state.Steps["completed-receipt"] = StepResult{Status: StatusRunning}
+			executor.state.InFlightSteps["completed-receipt"] = InFlightStepState{StepID: "completed-receipt", Kind: StepKindPrompt}
+			if err := executor.applyResumeOptions(nil, ResumeOptions{Mode: mode}); err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range []string{"completed", "failed", "cancelled", "running", "pending", "inflight", "receipt-only", "completed-receipt"} {
+				_, exists := executor.loadAgentDelivery(id)
+				want := mode == ResumeModeContinue || id == "completed" || id == "receipt-only" || id == "completed-receipt"
+				if exists != want {
+					t.Fatalf("receipt %q present = %t, want %t", id, exists, want)
+				}
+			}
+		})
+	}
+}
+
+func TestResumeAgentDeliveryCannotMoveSessionsWithoutReset(t *testing.T) {
+	for _, reset := range []bool{false, true} {
+		executor := NewExecutor(DefaultExecutorConfig("new-session"))
+		record := testAgentDelivery("review", agentDeliveryDelivered)
+		executor.state = &ExecutionState{
+			Session: "resume-session", Steps: map[string]StepResult{"review": {Status: StatusRunning}},
+			AgentDeliveries: map[string]AgentDeliveryState{"review": record},
+		}
+		err := executor.applyResumeOptions(nil, ResumeOptions{Reset: reset, OnRosterChange: ResumeRosterProceed})
+		if reset {
+			if err != nil || executor.state.Session != "new-session" || len(executor.state.AgentDeliveries) != 0 {
+				t.Fatalf("explicit reset failed to migrate: session=%q receipts=%#v err=%v", executor.state.Session, executor.state.AgentDeliveries, err)
+			}
+		} else {
+			if err == nil || !strings.Contains(err.Error(), "explicit reset") {
+				t.Fatalf("preserved delivery moved to another session: %v", err)
+			}
+			if executor.state.Session != "resume-session" || executor.state.AgentDeliveries["review"] != record {
+				t.Fatal("refused session migration mutated delivery identity")
+			}
+		}
+	}
+}
+
+func TestResumeLegacyExternalLeafRequiresExplicitRestart(t *testing.T) {
+	workflow := &Workflow{Name: "legacy", Steps: []Step{
+		{ID: "prompt", Prompt: "review"},
+		{ID: "template", Template: "review"},
+		{ID: "command", Command: "echo allowed"},
+		{ID: "group", Parallel: ParallelSpec{Steps: []Step{
+			{ID: "nested", Prompt: "review nested"},
+			{ID: "shell", Command: "echo allowed nested"},
+		}}},
+	}}
+	for _, stepID := range []string{"prompt", "template", "group_nested", "command", "group_shell"} {
+		t.Run(stepID, func(t *testing.T) {
+			for _, status := range []ExecutionStatus{StatusRunning, StatusPending, StatusFailed, StatusCancelled} {
+				t.Run(string(status), func(t *testing.T) {
+					for _, mode := range []ResumeMode{ResumeModeContinue, ResumeModeRestartFailed} {
+						executor := NewExecutor(DefaultExecutorConfig("resume-session"))
+						executor.graph = NewDependencyGraph(workflow)
+						executor.state = &ExecutionState{
+							Session: "resume-session", Steps: map[string]StepResult{stepID: {StepID: stepID, Status: status}},
+						}
+						err := executor.applyResumeOptions(workflow, ResumeOptions{Mode: mode})
+						wantErr := mode == ResumeModeContinue
+						if (err != nil) != wantErr {
+							t.Fatalf("mode %s error = %v, want error %t", mode, err, wantErr)
+						}
+						diagnosis := "no durable delivery evidence"
+						if stepID == "command" || stepID == "group_shell" {
+							diagnosis = "unresolved launch"
+						}
+						if wantErr && !strings.Contains(err.Error(), diagnosis) {
+							t.Fatalf("missing recovery diagnosis: %v", err)
+						}
+					}
+				})
+			}
+		})
+	}
+	executor := NewExecutor(DefaultExecutorConfig("resume-session"))
+	executor.graph = NewDependencyGraph(workflow)
+	executor.state = &ExecutionState{
+		Session:       "resume-session",
+		InFlightSteps: map[string]InFlightStepState{"group_nested": {StepID: "group_nested", Kind: StepKindPrompt}},
+	}
+	if err := executor.applyResumeOptions(workflow, ResumeOptions{}); err == nil || !strings.Contains(err.Error(), "no durable delivery evidence") {
+		t.Fatalf("legacy in-flight leaf without a StepResult was replayable: %v", err)
+	}
+}
+
+func TestResumeCancelledBeforeDispatchRequiresConsistentEvidence(t *testing.T) {
+	workflow := &Workflow{Name: "undispatched", Steps: []Step{{ID: "group", Parallel: ParallelSpec{Steps: []Step{
+		{ID: "command", Command: "printf work"},
+		{ID: "prompt", Prompt: "review"},
+		{ID: "template", Template: "review"},
+		{ID: "selector", Branch: "$(printf route)", Branches: map[string]interface{}{"route": []Step{{ID: "body", Command: "printf selected"}}}},
+	}}}}}
+	for _, stepID := range []string{"group_command", "group_prompt", "group_template", "group_selector"} {
+		t.Run(stepID, func(t *testing.T) {
+			for _, tc := range []struct {
+				name     string
+				mutate   func(*StepResult)
+				inFlight bool
+				wantErr  bool
+			}{
+				{name: "scheduler evidence"},
+				{name: "legacy cancellation reason", mutate: func(result *StepResult) {
+					result.SkipKind, result.SkipReason = SkipKindCancelled, "cancelled before parallel child dispatch"
+				}, wantErr: true},
+				{name: "attempted", mutate: func(result *StepResult) { result.Attempts = 1 }, wantErr: true},
+				{name: "in flight", inFlight: true, wantErr: true},
+				{name: "background replay marker", mutate: func(result *StepResult) { result.RerunOnResume = true }, wantErr: true},
+				{name: "failed", mutate: func(result *StepResult) { result.Status = StatusFailed }, wantErr: true},
+				{name: "running", mutate: func(result *StepResult) { result.Status = StatusRunning }, wantErr: true},
+				{name: "different step", mutate: func(result *StepResult) { result.StepID = "other" }, wantErr: true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					result := StepResult{StepID: stepID, Status: StatusCancelled, SkipKind: SkipKindCancelledBeforeDispatch}
+					if tc.mutate != nil {
+						tc.mutate(&result)
+					}
+					executor := NewExecutor(DefaultExecutorConfig("resume-session"))
+					executor.state = &ExecutionState{Session: "resume-session", Steps: map[string]StepResult{stepID: result}}
+					if tc.inFlight {
+						executor.state.InFlightSteps = map[string]InFlightStepState{stepID: {StepID: stepID}}
+					}
+					err := executor.applyResumeOptions(workflow, ResumeOptions{})
+					if (err != nil) != tc.wantErr {
+						t.Fatalf("ordinary resume error = %v, want refusal %t", err, tc.wantErr)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestResumeCancelledBeforeDispatchDoesNotBypassLaunchReceipts(t *testing.T) {
+	for _, kind := range []string{"command", "selector", "agent"} {
+		t.Run(kind, func(t *testing.T) {
+			step := Step{ID: "work", Command: "printf work"}
+			state := &ExecutionState{Session: "resume-session", Steps: map[string]StepResult{
+				"work": {StepID: "work", Status: StatusCancelled, SkipKind: SkipKindCancelledBeforeDispatch},
+			}}
+			wantError := "unresolved launch"
+			switch kind {
+			case "command":
+				state.CommandExecutions = map[string]CommandExecutionState{"work": {
+					Version: commandExecutionVersion, StepID: "work", StepHash: strings.Repeat("a", 64),
+					Status: commandExecutionStarting, StartedAt: time.Now(),
+				}}
+			case "selector":
+				step.Command, step.Branch = "", "$(printf route)"
+				step.Branches = map[string]interface{}{"route": []Step{{ID: "body", Command: "printf selected"}}}
+				state.CommandEvaluationVersion = commandEvaluationVersion
+				state.CommandEvaluations = map[string]CommandEvaluationState{"work": {
+					Version: commandEvaluationVersion, StepID: "work", StepHash: strings.Repeat("a", 64),
+					Status: commandExecutionStarting, StartedAt: time.Now(), InvocationHash: strings.Repeat("b", 64),
+					StdoutLimit: 1024, StderrLimit: 1024,
+				}}
+				wantError = errCommandOutputUnsettled.Error()
+			case "agent":
+				step.Command, step.Prompt = "", "review"
+				record := testAgentDelivery("work", agentDeliverySending)
+				record.Version++
+				state.AgentDeliveries = map[string]AgentDeliveryState{"work": record}
+				wantError = "invalid agent delivery"
+			}
+			before, err := json.Marshal(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			executor := NewExecutor(DefaultExecutorConfig("resume-session"))
+			executor.state = state
+			workflow := &Workflow{Name: "conflicting-dispatch", Steps: []Step{step}}
+			if err := executor.applyResumeOptions(workflow, ResumeOptions{}); err == nil || !strings.Contains(err.Error(), wantError) {
+				t.Fatalf("scheduler marker bypassed receipt validation: %v", err)
+			}
+			after, err := json.Marshal(state)
+			if err != nil || string(after) != string(before) {
+				t.Fatalf("refusal changed the saved evidence: %v", err)
+			}
+		})
+	}
+}
 
 func TestResumeResetClearsDurableWorkStateAndStepVariables(t *testing.T) {
 	executor := NewExecutor(DefaultExecutorConfig("resume-session"))
@@ -33,9 +1061,10 @@ func TestResumeResetClearsDurableWorkStateAndStepVariables(t *testing.T) {
 		ParallelState: map[string]ParallelGroupState{
 			"group": {StepID: "group", Total: 2, InFlightStepIDs: []string{"child"}},
 		},
-		ScopeStack:    []ScopeFrame{{Kind: StepKindLoop, Name: "item"}},
-		InFlightSteps: map[string]InFlightStepState{"fanout": {StepID: "fanout", Kind: "foreach"}},
-		Errors:        []ExecutionError{{StepID: "top", Message: "old failure"}},
+		ScopeStack:      []ScopeFrame{{Kind: StepKindLoop, Name: "item"}},
+		InFlightSteps:   map[string]InFlightStepState{"fanout": {StepID: "fanout", Kind: "foreach"}},
+		AgentDeliveries: map[string]AgentDeliveryState{"top": testAgentDelivery("top", agentDeliveryCompleted)},
+		Errors:          []ExecutionError{{StepID: "top", Message: "old failure"}},
 	}
 	workflow := &Workflow{
 		SchemaVersion: SchemaVersion,
@@ -59,6 +1088,9 @@ func TestResumeResetClearsDurableWorkStateAndStepVariables(t *testing.T) {
 	}
 	if len(executor.state.Steps) != 0 {
 		t.Fatalf("Steps = %#v, want empty map", executor.state.Steps)
+	}
+	if executor.state.AgentDeliveries != nil {
+		t.Fatalf("agent deliveries survived reset: %#v", executor.state.AgentDeliveries)
 	}
 	if executor.state.ForeachState != nil || executor.state.ParallelState != nil || executor.state.ScopeStack != nil || executor.state.InFlightSteps != nil || executor.state.Errors != nil {
 		t.Fatalf("resume bookkeeping not cleared: foreach=%#v parallel=%#v scopes=%#v in_flight=%#v errors=%#v",
@@ -90,6 +1122,12 @@ func TestForceResumeIterationPrunesFutureIterationState(t *testing.T) {
 			"fanout_iter3_work": {StepID: "fanout_iter3_work", Status: StatusCompleted},
 			"other_iter9":       {StepID: "other_iter9", Status: StatusCompleted},
 		},
+		AgentDeliveries: map[string]AgentDeliveryState{
+			"fanout_iter0":      testAgentDelivery("fanout_iter0", agentDeliveryCompleted),
+			"fanout_iter2":      testAgentDelivery("fanout_iter2", agentDeliveryCompleted),
+			"fanout_iter4_work": testAgentDelivery("fanout_iter4_work", agentDeliverySending),
+			"other_iter9":       testAgentDelivery("other_iter9", agentDeliveryDelivered),
+		},
 		// bd-a3fwf: seed flat substitution keys for both pre-pivot iterations
 		// (must survive) and post-pivot iterations (must be scrubbed).
 		Variables: map[string]interface{}{
@@ -112,6 +1150,13 @@ func TestForceResumeIterationPrunesFutureIterationState(t *testing.T) {
 	}
 
 	executor.forceResumeIteration("fanout", 2)
+	for _, id := range []string{"fanout_iter0", "fanout_iter2", "fanout_iter4_work", "other_iter9"} {
+		_, exists := executor.loadAgentDelivery(id)
+		want := id == "fanout_iter0" || id == "other_iter9"
+		if exists != want {
+			t.Fatalf("receipt %q present = %t after force iteration, want %t", id, exists, want)
+		}
+	}
 
 	state := executor.state.ForeachState["fanout"]
 	if state.CurrentIteration != 2 {

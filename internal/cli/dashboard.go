@@ -5,17 +5,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
-	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/integrations/pt"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/dashboard"
-	"github.com/Dicklesworthstone/ntm/internal/watcher"
 )
 
 func newDashboardCmd() *cobra.Command {
@@ -129,90 +128,6 @@ func isSessionMissingError(err error) bool {
 	return strings.Contains(msg, "can't find session") ||
 		strings.Contains(msg, "session not found") ||
 		strings.Contains(msg, "has-session")
-}
-
-func startDashboardReservationWatcher(session, projectDir string) func() {
-	if cfg == nil || !cfg.FileReservation.Enabled || !cfg.AgentMail.Enabled {
-		return nil
-	}
-
-	amOpts := []agentmail.Option{agentmail.WithProjectKey(projectDir)}
-	if cfg.AgentMail.URL != "" && os.Getenv("AGENT_MAIL_URL") == "" {
-		amOpts = append(amOpts, agentmail.WithBaseURL(cfg.AgentMail.URL))
-	}
-	if cfg.AgentMail.Token != "" && os.Getenv("AGENT_MAIL_TOKEN") == "" && os.Getenv("MCP_AGENT_MAIL_TOKEN") == "" {
-		amOpts = append(amOpts, agentmail.WithToken(cfg.AgentMail.Token))
-	}
-	amClient := agentmail.NewClient(amOpts...)
-
-	watcherCtx, cancelWatcher := context.WithCancel(context.Background())
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-
-		healthCtx, cancelHealth := context.WithTimeout(watcherCtx, 2*time.Second)
-		_, err := amClient.HealthCheck(healthCtx)
-		cancelHealth()
-		if err != nil || watcherCtx.Err() != nil {
-			return
-		}
-
-		cfgValues := watcher.FileReservationConfigValues{
-			Enabled:               cfg.FileReservation.Enabled,
-			AutoReserve:           cfg.FileReservation.AutoReserve,
-			AutoReleaseIdleMin:    cfg.FileReservation.AutoReleaseIdleMin,
-			NotifyOnConflict:      cfg.FileReservation.NotifyOnConflict,
-			ExtendOnActivity:      cfg.FileReservation.ExtendOnActivity,
-			DefaultTTLMin:         cfg.FileReservation.DefaultTTLMin,
-			PollIntervalSec:       cfg.FileReservation.PollIntervalSec,
-			CaptureLinesForDetect: cfg.FileReservation.CaptureLinesForDetect,
-			Debug:                 cfg.FileReservation.Debug,
-		}
-
-		conflictCallback := func(conflict watcher.FileConflict) {
-			if cfg.FileReservation.Debug {
-				log.Printf("[FileReservation] Conflict: %s requested by %s, held by %v",
-					conflict.Path, conflict.RequestorAgent, conflict.Holders)
-			}
-			// File reservation conflicts are surfaced via the event bus and
-			// displayed as toast notifications in the TUI dashboard when the
-			// dashboard subscribes to "file_reservation.conflict" events.
-		}
-
-		// Per-pane Agent Mail identity is resolved lazily from the canonical
-		// identity file written by spawn (see internal/agentmail/pane_identity.go
-		// and issue #107). Passing an empty fallback here means the watcher
-		// skips panes that do not yet have a registered identity instead of
-		// sending reservation calls under the tmux session name — which is
-		// almost never a registered Agent Mail agent and was the source of
-		// the red `file_reservation_paths` metrics reported in #107.
-		reservationWatcher := watcher.NewFileReservationWatcherFromConfig(
-			cfgValues,
-			amClient,
-			projectDir,
-			"",      // Fallback agent name (empty -> skip unresolved panes)
-			session, // Restrict watcher scans to this dashboard session
-			conflictCallback,
-		)
-		if reservationWatcher == nil {
-			return
-		}
-
-		reservationWatcher.Start(watcherCtx)
-		defer reservationWatcher.Stop()
-
-		if cfg.FileReservation.Debug {
-			log.Printf("[FileReservation] Watcher started for session %s", session)
-		}
-
-		<-watcherCtx.Done()
-	}()
-
-	return func() {
-		cancelWatcher()
-		<-done
-	}
 }
 
 // runDashboardJSON outputs dashboard data in JSON format
@@ -353,6 +268,7 @@ func dashboardPaneTypeSummary(panes []tmux.Pane) string {
 		"windsurf": 0,
 		"aider":    0,
 		"oc":       0,
+		"omp":      0,
 		"ollama":   0,
 		"user":     0,
 		"other":    0,
@@ -360,7 +276,7 @@ func dashboardPaneTypeSummary(panes []tmux.Pane) string {
 
 	for _, pane := range panes {
 		switch normalizedType := normalizeAgentType(string(pane.Type)); normalizedType {
-		case "claude", "codex", "gemini", "grok", "cursor", "windsurf", "aider", "oc", "ollama", "user":
+		case "claude", "codex", "gemini", "grok", "cursor", "windsurf", "aider", "oc", "omp", "ollama", "user":
 			counts[normalizedType]++
 		default:
 			counts["other"]++
@@ -368,7 +284,7 @@ func dashboardPaneTypeSummary(panes []tmux.Pane) string {
 	}
 
 	return fmt.Sprintf(
-		"Claude=%d Codex=%d Gemini=%d Grok=%d Cursor=%d Windsurf=%d Aider=%d Opencode=%d Ollama=%d User=%d Other=%d",
+		"Claude=%d Codex=%d Gemini=%d Grok=%d Cursor=%d Windsurf=%d Aider=%d Opencode=%d Omp=%d Ollama=%d User=%d Other=%d",
 		counts["claude"],
 		counts["codex"],
 		counts["gemini"],
@@ -377,6 +293,7 @@ func dashboardPaneTypeSummary(panes []tmux.Pane) string {
 		counts["windsurf"],
 		counts["aider"],
 		counts["oc"],
+		counts["omp"],
 		counts["ollama"],
 		counts["user"],
 		counts["other"],
@@ -448,16 +365,31 @@ func runDashboard(ctx context.Context, w io.Writer, errW io.Writer, session stri
 		}
 	}
 
-	if projectDir != "" {
-		if stopWatcher := startDashboardReservationWatcher(session, projectDir); stopWatcher != nil {
-			defer stopWatcher()
-		}
+	// Load the merged config up front so the first refresh already honors it
+	// (rano polling and interval, Agent Mail, model names, theme). The
+	// dashboard's file watcher only reports changes, so without this the
+	// user's config took effect only after they edited it mid-session (#317).
+	// Any parse warning prints here, before the TUI owns the terminal.
+	cfg := loadDashboardConfig(projectDir, errW)
+	// Reservation startup is a project-scoped side effect. Use the same
+	// merged settings as the UI, never the launch directory's global cfg.
+	// A failed config load leaves the read-only dashboard usable, but must
+	// not authorize reservations using unrelated settings or credentials.
+	if stopWatcher := startDashboardReservationWatcher(ctx, session, projectDir, cfg); stopWatcher != nil {
+		defer stopWatcher()
+	}
+
+	// The process-health panel reads the process-triage monitor, which only
+	// `ntm serve` started; in the dashboard's own process it stayed empty.
+	if stopPT := startDashboardProcessTriage(cfg); stopPT != nil {
+		defer stopPT()
 	}
 
 	action, err := dashboard.RunWithOptions(session, projectDir, dashboard.RunOptions{
 		PopupMode:       popup,
 		AttentionCursor: attentionCursor,
 		InitialPanes:    initialPanes,
+		Config:          cfg,
 	})
 	if err != nil {
 		return err
@@ -466,4 +398,43 @@ func runDashboard(ctx context.Context, w io.Writer, errW io.Writer, session stri
 		return tmux.AttachOrSwitch(action.AttachSession)
 	}
 	return nil
+}
+
+// loadDashboardConfig returns the merged global + project configuration for
+// the dashboard, resolving the project overlay from projectDir (or the
+// current directory when the session's project is unknown). A config that
+// cannot be loaded is reported on errW and yields nil, which keeps the
+// dashboard on built-in defaults exactly as before.
+// startDashboardProcessTriage starts the process-triage monitor for the
+// dashboard's process-health panel when [integrations.process_triage] is
+// enabled and pt is installed, and returns its stop function (nil otherwise;
+// the panel then reports pt unavailable).
+func startDashboardProcessTriage(cfg *config.Config) func() {
+	ptCfg := config.DefaultProcessTriageConfig()
+	ranoDatabase := config.DefaultRanoConfig().SQLitePath
+	if cfg != nil {
+		ptCfg = cfg.Integrations.ProcessTriage
+		ranoDatabase = cfg.Integrations.Rano.SQLitePath
+	}
+	if !ptCfg.Enabled {
+		return nil
+	}
+	monitor := pt.InitGlobalMonitor(&ptCfg, pt.WithRanoDatabase(ranoDatabase))
+	if err := monitor.Start(); err != nil {
+		return nil
+	}
+	return monitor.Stop
+}
+
+func loadDashboardConfig(projectDir string, errW io.Writer) *config.Config {
+	cwd := strings.TrimSpace(projectDir)
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
+	cfg, err := config.LoadMerged(cwd, selectedConfigPath())
+	if err != nil {
+		fmt.Fprintf(errW, "Warning: could not load config (%v); dashboard is using built-in defaults\n", err)
+		return nil
+	}
+	return cfg
 }

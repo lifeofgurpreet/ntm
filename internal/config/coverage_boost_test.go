@@ -182,7 +182,7 @@ func TestGetValue_ConfigServiceRemainingSections(t *testing.T) {
 		{"checkpoints.before_add_agents"},
 		{"notifications.webhook.method"},
 		{"resilience.rate_limit.detect"},
-		{"context_rotation.default_confirm_action"},
+		{"context_rotation.confirm_timeout_sec"},
 		{"recovery.max_recovery_tokens"},
 		{"cleanup.max_age_hours"},
 		{"assign.strategy"},
@@ -268,9 +268,10 @@ func TestGetValue_MemoryPrivacySwarmAndRano(t *testing.T) {
 	}{
 		{"memory"},
 		{"memory.enabled"},
-		{"memory.include_in_recovery"},
-		{"memory.max_rules"},
 		{"memory.query_timeout_seconds"},
+		{"memory.send_injection"},
+		{"memory.send_max_rules"},
+		{"memory.send_budget_tokens"},
 		{"privacy"},
 		{"privacy.enabled"},
 		{"privacy.disable_prompt_history"},
@@ -293,6 +294,7 @@ func TestGetValue_MemoryPrivacySwarmAndRano(t *testing.T) {
 		{"integrations.rano"},
 		{"integrations.rano.enabled"},
 		{"integrations.rano.poll_interval_ms"},
+		{"integrations.rano.sqlite_path"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
@@ -358,8 +360,8 @@ func TestGetValue_ContextRotation(t *testing.T) {
 		path string
 	}{
 		{"context_rotation"},
-		{"context_rotation.enabled"},
-		{"context_rotation.warning_threshold"},
+		{"context_rotation.try_compact_first"},
+		{"context_rotation.confirm_timeout_sec"},
 		{"context_rotation.rotate_threshold"},
 	}
 	for _, tt := range tests {
@@ -1186,7 +1188,7 @@ func TestValidate_TmuxPaneInitDelayNegative(t *testing.T) {
 func TestValidate_InvalidContextRotation(t *testing.T) {
 	t.Parallel()
 	cfg := Default()
-	cfg.ContextRotation.WarningThreshold = 2.0 // out of 0.0-1.0 range
+	cfg.ContextRotation.RotateThreshold = 2.0 // out of 0.0-1.0 range
 	errs := Validate(cfg)
 	found := false
 	for _, e := range errs {
@@ -1709,7 +1711,7 @@ func TestDiff_RecentConfigServiceSections(t *testing.T) {
 	cfg := Default()
 	defaults := Default()
 	cfg.FileReservation.Debug = !defaults.FileReservation.Debug
-	cfg.Memory.MaxRules = defaults.Memory.MaxRules + 1
+	cfg.Memory.SendMaxRules = defaults.Memory.SendMaxRules + 1
 	cfg.Privacy.Enabled = !defaults.Privacy.Enabled
 	cfg.Integrations.Rano.PollIntervalMs = defaults.Integrations.Rano.PollIntervalMs + 100
 	cfg.Swarm.DefaultScanDir = "/tmp/swarm-scan"
@@ -1717,7 +1719,7 @@ func TestDiff_RecentConfigServiceSections(t *testing.T) {
 	diffs := Diff(cfg)
 	wantPaths := []string{
 		"file_reservation.debug",
-		"memory.max_rules",
+		"memory.send_max_rules",
 		"privacy.enabled",
 		"integrations.rano.poll_interval_ms",
 		"swarm.default_scan_dir",
@@ -1740,7 +1742,7 @@ func TestDiff_ConfigServiceRemainingSections(t *testing.T) {
 	cfg.Integrations.ProcessTriage.UseRanoData = !defaults.Integrations.ProcessTriage.UseRanoData
 	cfg.Models.Codex = map[string]string{"max": "gpt-5.5-codex"}
 	cfg.Notifications.Webhook.Headers = map[string]string{"X-Test": "1"}
-	cfg.ContextRotation.DefaultConfirmAction = "compact"
+	cfg.ContextRotation.ConfirmTimeoutSec = defaults.ContextRotation.ConfirmTimeoutSec + 60
 	cfg.SessionRecovery.MaxRecoveryTokens = defaults.SessionRecovery.MaxRecoveryTokens + 500
 	cfg.Cleanup.MaxAgeHours = defaults.Cleanup.MaxAgeHours + 1
 	cfg.Assign.Strategy = "quality"
@@ -1760,7 +1762,7 @@ func TestDiff_ConfigServiceRemainingSections(t *testing.T) {
 		"integrations.process_triage.use_rano_data",
 		"models.codex",
 		"notifications.webhook.headers",
-		"context_rotation.default_confirm_action",
+		"context_rotation.confirm_timeout_sec",
 		"recovery.max_recovery_tokens",
 		"cleanup.max_age_hours",
 		"assign.strategy",

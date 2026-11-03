@@ -1,3 +1,5 @@
+//go:build !liveness_audit
+
 package robot
 
 import (
@@ -7,22 +9,25 @@ import (
 // WS0-G2 config-key liveness claims for keys consumed by internal/robot
 // (bd-g2-claims-backlog-o787y). Each claim references the real function on
 // the read path of the key; see internal/config/liveness.go for the
-// contract. Per-call-site claims that predate this file (retry.alerts.*,
-// integrations.xf.enabled) stay where they are.
+// contract. The liveness_audit tag drops this file for the dead-code gate
+// (bd-ir0li).
 func init() {
 	// Alert thresholds: copied from cfg.Alerts into alerts.Config by
-	// alertConfigForProject (robot.go), on the GetAlerts/status/snapshot path.
+	// AlertConfigForProject (robot.go), on the GetAlerts/status/snapshot and
+	// dashboard paths.
 	for _, key := range []string{
 		"alerts.enabled",
 		"alerts.agent_stuck_minutes",
 		"alerts.disk_low_threshold_gb",
 		"alerts.mail_backlog_threshold",
 		"alerts.bead_stale_hours",
-		"alerts.context_warning_threshold",
 		"alerts.resolved_prune_minutes",
 	} {
-		config.RegisterReader(key, alertConfigForProject)
+		config.RegisterReader(key, AlertConfigForProject)
 	}
+	// Acted on (not just copied) by the context-warning check; the usage it
+	// compares against comes from paneContextUsagePercents (bd-r0j1n).
+	config.RegisterReader("alerts.context_warning_threshold", paneContextUsagePercents)
 	// Disk-full trajectory horizon (disk.go).
 	config.RegisterReader("alerts.disk_full_horizon_hours", attachSnapshotDisk)
 
@@ -34,6 +39,8 @@ func init() {
 	config.RegisterReader("spawn_pacing.agent_caps.claude_max_concurrent", spawnAdmissionAgentLimit)
 	config.RegisterReader("spawn_pacing.agent_caps.codex_max_concurrent", spawnAdmissionAgentLimit)
 	config.RegisterReader("spawn_pacing.agent_caps.gemini_max_concurrent", spawnAdmissionAgentLimit)
+	config.RegisterReader("spawn_pacing.agent_caps.omp_max_concurrent", spawnAdmissionAgentLimit)
+	config.RegisterReader("spawn_pacing.agent_type_limits", spawnAdmissionAgentTypeLimits)
 
 	// Swarm snapshot surface (robot.go).
 	config.RegisterReader("swarm.enabled", buildSwarmSnapshot)
@@ -58,6 +65,17 @@ func init() {
 	config.RegisterReader("assign.prompt_template", GetBulkAssign)
 	config.RegisterReader("assign.prompt_template_file", GetBulkAssign)
 	config.RegisterReader("assign.operator_gated_labels", GetBulkAssign)
+
+	// [assign.work_source] dispatch policy, registered by every assignment
+	// path's policy loader and applied by the shared actionable reader
+	// (assign.go loadAuthoritativeAssignmentPolicy; bulk_assign.go; spawn.go).
+	for _, key := range []string{
+		"assign.work_source.required_ref",
+		"assign.work_source.require_clean",
+		"assign.work_source.program_labels",
+	} {
+		config.RegisterReader(key, loadAuthoritativeAssignmentPolicy)
+	}
 
 	// Command palette entries + persisted state (tui_parity.go).
 	for _, key := range []string{
@@ -84,6 +102,7 @@ func init() {
 		"models.windsurf",
 		"models.aider",
 		"models.opencode",
+		"models.omp",
 	} {
 		config.RegisterReader(key, restartModelVars)
 	}
@@ -92,6 +111,7 @@ func init() {
 	config.RegisterReader("models.default_grok", modelNameForPane)
 	config.RegisterReader("models.default_ollama", modelNameForPane)
 	config.RegisterReader("models.default_opencode", modelNameForPane)
+	config.RegisterReader("models.default_omp", modelNameForPane)
 
 	// DCG status surface (dcg_status.go).
 	config.RegisterReader("integrations.dcg.allow_override", resolveDCGSettings)
@@ -99,4 +119,13 @@ func init() {
 
 	// Safety profile echoed on the robot status/snapshot surfaces (robot.go).
 	config.RegisterReader("safety.profile", newStatusOutput)
+
+	// [retry.alerts] override, applied at startup (alerts.go).
+	config.RegisterReader("retry.alerts.max_attempts", ApplyAlertRetryPolicy)
+	config.RegisterReader("retry.alerts.initial_delay_ms", ApplyAlertRetryPolicy)
+
+	// integrations.xf.enabled is a LIVE knob, kept while the rest of
+	// [integrations.xf] was removed (bd-ws6-config-truth-ienmd.2): it gates
+	// the built-in xf-search entry in GetPalette output (tui_parity.go).
+	config.RegisterReader("integrations.xf.enabled", GetPalette)
 }

@@ -1,6 +1,7 @@
 package checkpoint
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -102,9 +103,9 @@ func TestRestorer_RestoreFromCheckpoint_DirectoryNotFound(t *testing.T) {
 		},
 	}
 
-	_, err = r.RestoreFromCheckpoint(cp, RestoreOptions{})
+	_, err = r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{})
 	if err == nil {
-		t.Error("RestoreFromCheckpoint should fail for nonexistent directory")
+		t.Error("RestoreFromCheckpointContext should fail for nonexistent directory")
 	}
 }
 
@@ -126,7 +127,7 @@ func TestRestorer_RestoreFromCheckpoint_NoPanes(t *testing.T) {
 		},
 	}
 
-	_, err = r.RestoreFromCheckpoint(cp, RestoreOptions{})
+	_, err = r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{})
 	if err != ErrNoAgentsToRestore {
 		t.Errorf("Expected ErrNoAgentsToRestore, got: %v", err)
 	}
@@ -166,12 +167,12 @@ func TestRestorer_RestoreFromCheckpointAcceptsGrokPanes(t *testing.T) {
 			// DryRun keeps the test off a real tmux server while still
 			// exercising the restore-planning admission that used to refuse
 			// grok before any pane was counted.
-			result, err := NewRestorerWithStorage(NewStorageWithDir(t.TempDir())).RestoreFromCheckpoint(cp, RestoreOptions{Force: true, DryRun: true})
+			result, err := NewRestorerWithStorage(NewStorageWithDir(t.TempDir())).RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{Force: true, DryRun: true})
 			if err != nil {
-				t.Fatalf("RestoreFromCheckpoint() error = %v, want grok batch accepted", err)
+				t.Fatalf("RestoreFromCheckpointContext() error = %v, want grok batch accepted", err)
 			}
 			if result == nil {
-				t.Fatal("RestoreFromCheckpoint() result = nil, want plan including grok panes")
+				t.Fatal("RestoreFromCheckpointContext() result = nil, want plan including grok panes")
 			}
 			if result.PanesRestored != tt.want {
 				t.Fatalf("PanesRestored = %d, want %d (grok panes must be included)", result.PanesRestored, tt.want)
@@ -236,9 +237,9 @@ func TestRestorer_RestoreFromCheckpoint_DryRun(t *testing.T) {
 		},
 	}
 
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{DryRun: true})
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{DryRun: true})
 	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint(DryRun) failed: %v", err)
+		t.Fatalf("RestoreFromCheckpointContext(DryRun) failed: %v", err)
 	}
 
 	if !result.DryRun {
@@ -268,12 +269,12 @@ func TestRestorer_RestoreFromCheckpoint_DryRun_CustomDirectory(t *testing.T) {
 	}
 
 	// Should succeed with custom directory override
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{
 		DryRun:          true,
 		CustomDirectory: tmpDir,
 	})
 	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint with CustomDirectory failed: %v", err)
+		t.Fatalf("RestoreFromCheckpointContext with CustomDirectory failed: %v", err)
 	}
 
 	if result.PanesRestored != 1 {
@@ -299,9 +300,9 @@ func TestRestorer_RestoreFromCheckpoint_WorkingDirNotDirectory(t *testing.T) {
 		},
 	}
 
-	_, err := r.RestoreFromCheckpoint(cp, RestoreOptions{})
+	_, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{})
 	if !errors.Is(err, ErrWorkingDirInvalid) {
-		t.Fatalf("RestoreFromCheckpoint should fail with ErrWorkingDirInvalid, got %v", err)
+		t.Fatalf("RestoreFromCheckpointContext should fail with ErrWorkingDirInvalid, got %v", err)
 	}
 }
 
@@ -343,9 +344,9 @@ func TestRestorer_RestoreFromCheckpoint_SkipsLegacyLayoutForMultiWindowSession(t
 		}
 	})
 
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{})
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{})
 	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint failed: %v", err)
+		t.Fatalf("RestoreFromCheckpointContext failed: %v", err)
 	}
 
 	found := false
@@ -669,9 +670,9 @@ func TestRestorer_RestoreFromCheckpoint_DryRun_SurfacesAssignments(t *testing.T)
 		},
 	}
 
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{DryRun: true})
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{DryRun: true})
 	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint(DryRun) failed: %v", err)
+		t.Fatalf("RestoreFromCheckpointContext(DryRun) failed: %v", err)
 	}
 
 	// Verify assignments are surfaced in result
@@ -717,9 +718,9 @@ func TestRestorer_RestoreFromCheckpoint_DryRun_NoAssignments(t *testing.T) {
 		// No Assignments or BVSummary
 	}
 
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{DryRun: true})
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{DryRun: true})
 	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint(DryRun) failed: %v", err)
+		t.Fatalf("RestoreFromCheckpointContext(DryRun) failed: %v", err)
 	}
 
 	if len(result.Assignments) != 0 {
@@ -888,6 +889,26 @@ func TestExpectedPaneCommand(t *testing.T) {
 	}
 }
 
+func TestIsBareAgentRuntimeCommand(t *testing.T) {
+	for _, command := range []string{
+		"node", "nodejs", "bun", "deno", "npx", "npm", "python", "python3", "python3.13", "ruby", "perl", "uv", "uvx",
+		"  /usr/bin/node  ", `"/opt/runtime dir/python3.14"`, `'/opt/bun'`,
+	} {
+		if !isBareAgentRuntimeCommand(command) {
+			t.Errorf("bare runtime %q was treated as a complete agent launch", command)
+		}
+	}
+	for _, command := range []string{
+		"", "claude", "codex", "sleep 30", "python-agent", "python3.13-config",
+		"node /opt/agent.js", `node "/path with spaces/agent.js"`, "bun run agent", "python3 -m aider",
+		"env FOO=bar node /opt/agent.js", "/opt/agent-launcher --fast", "exec node /opt/agent.js",
+	} {
+		if isBareAgentRuntimeCommand(command) {
+			t.Errorf("explicit command %q would lose its argv", command)
+		}
+	}
+}
+
 func TestSortedCheckpointPanes(t *testing.T) {
 	panes := []PaneState{
 		{WindowIndex: 2, Index: 0, Title: "w2p0"},
@@ -977,9 +998,9 @@ func TestRestorer_RestoreFromCheckpoint_RelaunchesCommandsAcrossWindows(t *testi
 		}
 	})
 
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{})
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{})
 	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint failed: %v", err)
+		t.Fatalf("RestoreFromCheckpointContext failed: %v", err)
 	}
 	if result.PanesRestored != 3 {
 		t.Fatalf("PanesRestored = %d, want 3 (warnings=%v)", result.PanesRestored, result.Warnings)
@@ -1109,9 +1130,9 @@ func TestRestorer_RestoreFromCheckpoint_PreservesSparseWindowIndexes(t *testing.
 		}
 	})
 
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{})
+	result, err := r.RestoreFromCheckpointContext(t.Context(), cp, RestoreOptions{})
 	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint failed: %v", err)
+		t.Fatalf("RestoreFromCheckpointContext failed: %v", err)
 	}
 	if result.PanesRestored != 3 {
 		t.Fatalf("PanesRestored = %d, want 3 (warnings=%v)", result.PanesRestored, result.Warnings)
@@ -1187,8 +1208,14 @@ func TestRestorer_RestoreFromCheckpoint_PreservesPerWindowLayouts(t *testing.T) 
 		t.Fatalf("GetFirstWindow(template) failed: %v", err)
 	}
 	firstTarget := fmt.Sprintf("%s:%d", templateSession, firstWindow)
-	if _, err := tmux.DefaultClient.Run("split-window", "-t", firstTarget, "-c", workDir, "-P", "-F", "#{pane_id}"); err != nil {
-		t.Fatalf("split-window first template window failed: %v", err)
+	const panesPerWindow = 8
+	for pane := 1; pane < panesPerWindow; pane++ {
+		if _, err := tmux.DefaultClient.Run("split-window", "-t", firstTarget, "-c", workDir, "-P", "-F", "#{pane_id}"); err != nil {
+			t.Fatalf("split-window first template window failed: %v", err)
+		}
+		if err := tmux.DefaultClient.RunSilent("select-layout", "-t", firstTarget, "tiled"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := tmux.DefaultClient.RunSilent("select-layout", "-t", firstTarget, "even-horizontal"); err != nil {
 		t.Fatalf("select-layout first template window failed: %v", err)
@@ -1199,8 +1226,13 @@ func TestRestorer_RestoreFromCheckpoint_PreservesPerWindowLayouts(t *testing.T) 
 		t.Fatalf("new-window template failed: %v", err)
 	}
 	secondTarget := fmt.Sprintf("%s:%s", templateSession, strings.TrimSpace(secondWindowIndex))
-	if _, err := tmux.DefaultClient.Run("split-window", "-t", secondTarget, "-c", workDir, "-P", "-F", "#{pane_id}"); err != nil {
-		t.Fatalf("split-window second template window failed: %v", err)
+	for pane := 1; pane < panesPerWindow; pane++ {
+		if _, err := tmux.DefaultClient.Run("split-window", "-t", secondTarget, "-c", workDir, "-P", "-F", "#{pane_id}"); err != nil {
+			t.Fatalf("split-window second template window failed: %v", err)
+		}
+		if err := tmux.DefaultClient.RunSilent("select-layout", "-t", secondTarget, "tiled"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := tmux.DefaultClient.RunSilent("select-layout", "-t", secondTarget, "main-vertical"); err != nil {
 		t.Fatalf("select-layout second template window failed: %v", err)
@@ -1214,6 +1246,12 @@ func TestRestorer_RestoreFromCheckpoint_PreservesPerWindowLayouts(t *testing.T) 
 	if len(sessionState.WindowLayouts) != 2 {
 		t.Fatalf("len(sessionState.WindowLayouts) = %d, want 2", len(sessionState.WindowLayouts))
 	}
+	if len(sessionState.Panes) != 2*panesPerWindow {
+		t.Fatalf("captured panes = %d, want %d", len(sessionState.Panes), 2*panesPerWindow)
+	}
+	for i := range sessionState.Panes {
+		sessionState.Panes[i].Title = fmt.Sprintf("%s__user_%d", restoreSession, i+1)
+	}
 
 	r := NewRestorerWithStorage(NewStorageWithDir(t.TempDir()))
 	cp := &Checkpoint{
@@ -1223,9 +1261,16 @@ func TestRestorer_RestoreFromCheckpoint_PreservesPerWindowLayouts(t *testing.T) 
 		Session:     sessionState,
 	}
 
-	result, err := r.RestoreFromCheckpoint(cp, RestoreOptions{})
+	var restoredPaneIDs []string
+	ctx := WithRestoreProgress(t.Context(), func(_ context.Context, event RestoreProgress) error {
+		if event.Outcome == "succeeded" && (event.Stage == "pane_identified" || event.Stage == "create_pane") {
+			restoredPaneIDs = append(restoredPaneIDs, event.PaneID)
+		}
+		return nil
+	})
+	result, err := r.RestoreFromCheckpointContext(ctx, cp, RestoreOptions{})
 	if err != nil {
-		t.Fatalf("RestoreFromCheckpoint failed: %v", err)
+		t.Fatalf("RestoreFromCheckpointContext failed: %v", err)
 	}
 	if result.PanesRestored != len(sessionState.Panes) {
 		t.Fatalf("PanesRestored = %d, want %d (warnings=%v)", result.PanesRestored, len(sessionState.Panes), result.Warnings)
@@ -1237,6 +1282,20 @@ func TestRestorer_RestoreFromCheckpoint_PreservesPerWindowLayouts(t *testing.T) 
 	}
 	if !windowLayoutsEqual(normalizeWindowLayouts(restoredLayouts), normalizeWindowLayouts(sessionState.WindowLayouts)) {
 		t.Fatalf("restored layouts = %#v, want %#v", restoredLayouts, sessionState.WindowLayouts)
+	}
+	panes, err := tmux.GetPanesContext(t.Context(), restoreSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	savedPanes := sortedCheckpointPanes(sessionState.Panes)
+	if len(panes) != len(savedPanes) || len(restoredPaneIDs) != len(savedPanes) {
+		t.Fatalf("physical recovery bindings incomplete: panes=%d targets=%d saved=%d", len(panes), len(restoredPaneIDs), len(savedPanes))
+	}
+	for i, pane := range sortedTmuxPanes(panes) {
+		saved := savedPanes[i]
+		if pane.ID != restoredPaneIDs[i] || pane.ID == saved.ID || pane.Title != saved.Title || pane.WindowIndex != saved.WindowIndex || pane.Index != saved.Index {
+			t.Errorf("pane %d lost its physical recovery binding: got=%+v saved=%+v target=%s", i, pane, saved, restoredPaneIDs[i])
+		}
 	}
 }
 

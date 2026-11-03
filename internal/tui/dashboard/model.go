@@ -45,8 +45,8 @@ type RoutingScore struct {
 type PaneHealthInfo struct {
 	Status       string   // "ok", "warning", "error", "unknown"
 	Issues       []string // Issue messages
-	RestartCount int      // Restarts in last hour
-	Uptime       int      // Seconds of uptime
+	RestartCount int      // Automatic restarts the session monitor recorded in the last hour
+	Uptime       int      // Seconds since the pane's shell incarnation started (0 = unknown)
 }
 
 // PanelID identifies a dashboard panel.
@@ -137,6 +137,7 @@ type Model struct {
 	codexCount       int
 	geminiCount      int
 	grokCount        int
+	ompCount         int
 	antigravityCount int
 	cursorCount      int
 	windsurfCount    int
@@ -148,8 +149,8 @@ type Model struct {
 	theme theme.Theme
 	icons icons.IconSet
 
-	// Compaction detection and recovery
-	compaction *status.CompactionRecoveryIntegration
+	// Compaction detection for display; recovery belongs to the session monitor
+	compaction *status.CompactionDetector
 
 	// Per-pane status tracking, keyed by tmux's stable physical pane identity.
 	// Pane.Index is window-local and therefore cannot distinguish 0.0 from 1.0.
@@ -467,7 +468,6 @@ type PostQuitAction struct {
 // PaneStatus tracks the status of a pane including compaction state.
 type PaneStatus struct {
 	LastCompaction *time.Time // When compaction was last detected
-	RecoverySent   bool       // Whether recovery prompt was sent
 	State          string     // "working", "idle", "error", "compacted"
 
 	// Context usage tracking
@@ -494,7 +494,7 @@ type PaneStatus struct {
 	HealthStatus  string   // "ok", "warning", "error", "unknown"
 	HealthIssues  []string // List of issue messages (rate limit, crash, etc.)
 	RestartCount  int      // Number of restarts in last hour
-	UptimeSeconds int      // Seconds since agent started (negative = uptime from tracker)
+	UptimeSeconds int      // Seconds since the pane's shell incarnation started (0 = unknown)
 
 	// Rotation tracking
 	IsRotating     bool       // True when agent rotation is in progress
@@ -561,7 +561,7 @@ func New(session, projectDir string) Model {
 		tier:                       layout.TierForWidth(80),
 		theme:                      t,
 		icons:                      ic,
-		compaction:                 status.NewCompactionRecoveryIntegrationDefault(),
+		compaction:                 status.NewCompactionDetector(5 * time.Minute),
 		paneStatus:                 make(map[string]PaneStatus),
 		observer:                   status.NewSessionObserver(detector),
 		agentStatuses:              make(map[string]status.AgentStatus),

@@ -41,16 +41,21 @@ import (
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/gorilla/websocket"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	approvalpkg "github.com/Dicklesworthstone/ntm/internal/approval"
+	"github.com/Dicklesworthstone/ntm/internal/assignment"
+	"github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/kernel"
+	"github.com/Dicklesworthstone/ntm/internal/pipeline"
 	"github.com/Dicklesworthstone/ntm/internal/policy"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/robot/adapters"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/internal/util"
 )
 
 // Server provides HTTP API and event streaming for NTM.
@@ -84,7 +89,8 @@ type Server struct {
 	idempotencyStore *IdempotencyStore
 
 	// Job management
-	jobStore *JobStore
+	jobStore    *JobStore
+	jobExecutor jobExecutor
 
 	// Chi router for /api/v1
 	router chi.Router
@@ -106,7 +112,16 @@ type Server struct {
 	interruptAgents func(robot.InterruptOptions) (*robot.InterruptOutput, error)
 	waitAgents      func(context.Context, robot.WaitOptions) (*robot.WaitResponse, int)
 	resolvePane     func(context.Context, string, int) (tmux.Pane, error)
-	sendPaneKeys    func(string, string, bool) error
+	// paneInputTimeout bounds lookup, ownership waits, and canonical delivery.
+	// Zero means defaultPaneInputTimeout; tests may shorten it.
+	paneInputTimeout time.Duration
+	// listLiveSessions lists the tmux sessions that are running right now.
+	// Nil in production (tmux.ListSessionsContext); tests inject fixtures.
+	listLiveSessions func(context.Context) ([]tmux.Session, error)
+	// liveSessionsTimeout bounds each live tmux session or pane listing made
+	// by the sessions and agents endpoints; zero means
+	// defaultLiveSessionsTimeout. Tests shorten it.
+	liveSessionsTimeout time.Duration
 	// policyWriteFile is optional test-only fault injection for policy updates.
 	// Production servers leave it nil and use os.WriteFile directly.
 	policyWriteFile func(string, []byte, os.FileMode) error
@@ -121,6 +136,13 @@ type Server struct {
 	// probe budget again. Guarded by mu.
 	mailUnavailableUntil time.Time
 	projectDir           string
+	// startupProjectDir is the project the server was started with (Config's
+	// ProjectDir; empty when none was given). It never changes after New. A
+	// configuration PATCH with an empty or null project_dir restores it.
+	startupProjectDir string
+	// pipelineScope is set only on an immutable per-operation execution view.
+	// It pins cwd fallback separately from configured file-workflow access.
+	pipelineScope *pipelineProjectScope
 	// auditStore persists REST/WS audit records. Nil when the store could not be
 	// opened, in which case the audit middleware is not installed.
 	auditStore *AuditStore
@@ -208,9 +230,15 @@ type Config struct {
 	// PublicBaseURL advertises the externally reachable base URL for clients.
 	// Optional: leave empty to derive from host/port in documentation or clients.
 	PublicBaseURL string
-	EventBus      *events.EventBus
-	StateStore    *state.Store
-	Auth          AuthConfig
+	// ProjectDir is the server-wide project used by mail, beads, and project-scoped
+	// jobs. Nonempty paths must name an existing directory. Empty leaves the
+	// server unscoped until a project is selected through the configuration API.
+	// It is also the value a configuration PATCH with an empty or null
+	// project_dir restores.
+	ProjectDir string
+	EventBus   *events.EventBus
+	StateStore *state.Store
+	Auth       AuthConfig
 	// AllowedOrigins controls CORS origin allowlist. Empty means default localhost only.
 	AllowedOrigins []string
 	// Version is the build version string (set via ldflags). Used by /api/v1/version.
@@ -226,6 +254,20 @@ type Config struct {
 	// no UI is mounted and non-API paths 404 as before (`ntm serve` default;
 	// `ntm web` and `ntm serve --web` set it).
 	WebUI fs.FS
+	// Redaction scrubs secrets/PII from REST bodies and WebSocket event frames.
+	// Nil disables it, which is what every caller effectively did until now:
+	// redactionMiddleware has been mounted since b5d45e20 but the field behind
+	// it had no production writer, so the G1 dead-code gate deleted the
+	// Set/GetRedactionConfig setters in 670f6380 rather than wiring them, and
+	// the middleware has been a permanent no-op ever since. Same failure the
+	// AuditMiddleware comment in buildRouter describes. Ownership of the
+	// contents transfers to New, which deep-copies before storing.
+	Redaction *RedactionConfig
+
+	// Async job limits. Zero selects the default; negative values are invalid.
+	// These limits are fixed for the server lifetime, including after Stop.
+	JobConcurrency   int
+	JobQueueCapacity int
 }
 
 const (
@@ -275,19 +317,21 @@ const (
 	ErrCodeJobPending       = "JOB_PENDING"
 )
 
+// Every body admission and replay check must use the same limit. Hashing only
+// a prefix of an accepted request can acknowledge a different mutation with a
+// cached success, without ever executing the submitted operation.
+const maxRequestBodyBytes = 10 << 20 // 10 MiB
+
 // Idempotency cache bounds (bd-vq37v). The 24h TTL alone left the cache
 // unbounded: a remote-auth caller sending unique keys could grow the map (and
 // full buffered response bodies) for a day. Entries are capped with
-// least-recently-used eviction, and oversized responses are never cached.
+// least-recently-used eviction. Oversized terminal responses retain a small
+// inspection receipt instead of permitting the original operation to run again.
 const (
 	// idempotencyMaxEntries caps the number of cached responses.
 	idempotencyMaxEntries = 4096
 	// idempotencyMaxBodyBytes caps a single cached (and buffered) response body.
 	idempotencyMaxBodyBytes = 1 << 20 // 1 MiB
-	// idempotencyFingerprintLimit bounds how much of a request body is hashed
-	// for replay fingerprinting. Bodies larger than this are fingerprinted by
-	// prefix, which is still deterministic for mismatch detection.
-	idempotencyFingerprintLimit = 8 << 20 // 8 MiB
 )
 
 // IdempotencyStore caches responses by idempotency key.
@@ -418,14 +462,19 @@ func (s *IdempotencyStore) evictLRULocked() {
 	}
 }
 
-// BeginFlight registers the caller as the executor for key if no request with
-// that key is currently in flight. It returns (nil, true) for the leader; a
-// follower receives a channel that closes when the leader finishes, plus
-// false. This closes the Get-miss..Set window in which two concurrent POSTs
-// with the same Idempotency-Key both executed (bd-vq37v).
+// BeginFlight registers the caller as the executor only if key has neither a
+// completed result nor an active request. It returns true for the leader;
+// a follower receives a channel that closes when it must recheck the cache.
+// A completed result gets an already-closed channel: the previous leader may
+// have stored it after this caller's cache miss but before flight acquisition.
 func (s *IdempotencyStore) BeginFlight(key string) (<-chan struct{}, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if entry, ok := s.entries[key]; ok && time.Since(entry.createdAt) <= s.ttl {
+		ready := make(chan struct{})
+		close(ready)
+		return ready, false
+	}
 	if ch, ok := s.flights[key]; ok {
 		return ch, false
 	}
@@ -457,6 +506,9 @@ type Job struct {
 	Error     string                 `json:"error,omitempty"`
 	CreatedAt string                 `json:"created_at"`
 	UpdatedAt string                 `json:"updated_at"`
+
+	// Admission-time namespace for queued pipeline execution and recovery.
+	ProjectDir string `json:"project_dir,omitempty"`
 }
 
 // JobStatus represents the state of a job.
@@ -489,8 +541,13 @@ func NewJobStore() *JobStore {
 // cancel actually stops the underlying work, not just the bookkeeping row.
 func (s *JobStore) SetCancel(id string, cancel context.CancelFunc) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.cancels[id] = cancel
+	job := s.jobs[id]
+	stopped := job == nil || job.Status == JobStatusCancelled || job.Status == JobStatusCompleted || job.Status == JobStatusFailed
+	s.mu.Unlock()
+	if stopped && cancel != nil {
+		cancel()
+	}
 }
 
 // ClearCancel drops the registered cancel func once dispatch has finished.
@@ -500,23 +557,14 @@ func (s *JobStore) ClearCancel(id string) {
 	delete(s.cancels, id)
 }
 
-// Cancel invokes the job's registered cancel func, if any.
-func (s *JobStore) Cancel(id string) {
-	s.mu.RLock()
-	cancel := s.cancels[id]
-	s.mu.RUnlock()
-	if cancel != nil {
-		cancel()
-	}
-}
-
 // maxRetainedJobs bounds the job store over the server's lifetime: once the
 // map reaches this size, Create evicts the oldest terminal (completed /
 // failed / cancelled) jobs. Pending and running jobs are never evicted.
 const maxRetainedJobs = 1000
 
-// Create creates a new job.
-func (s *JobStore) Create(jobType string) *Job {
+// Create installs optional execution ownership atomically with the pending row.
+// Terminal rows with live owners cannot be evicted before their final writes.
+func (s *JobStore) Create(jobType string, ownership ...jobOwnership) *Job {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.evictTerminalLocked(maxRetainedJobs - 1)
@@ -528,6 +576,12 @@ func (s *JobStore) Create(jobType string) *Job {
 		Status:    JobStatusPending,
 		CreatedAt: now,
 		UpdatedAt: now,
+	}
+	if len(ownership) > 0 {
+		job.ProjectDir = ownership[0].projectDir
+		if ownership[0].cancel != nil {
+			s.cancels[id] = ownership[0].cancel
+		}
 	}
 	s.jobs[id] = job
 	return s.cloneJob(job)
@@ -608,6 +662,11 @@ func (s *JobStore) evictTerminalLocked(limit int) {
 	type victim struct{ id, createdAt string }
 	terminal := make([]victim, 0, len(s.jobs))
 	for id, job := range s.jobs {
+		// Cancellation is not proof of worker completion. Retain its row and
+		// handle until the final checkpoint and worker fence are released.
+		if _, owned := s.cancels[id]; owned {
+			continue
+		}
 		switch job.Status {
 		case JobStatusCompleted, JobStatusFailed, JobStatusCancelled:
 			terminal = append(terminal, victim{id: id, createdAt: job.CreatedAt})
@@ -773,18 +832,22 @@ type WSHub struct {
 	// pendingDrops coalesces per-client dropped-event ranges. Owned
 	// exclusively by the Run goroutine; no locking.
 	pendingDrops map[*WSClient]map[string]*wsDropRange
+	// pendingResets blocks later events until a backpressured client receives
+	// the explicit resync signal. Owned by the Run goroutine.
+	pendingResets map[*WSClient][]byte
 }
 
 // NewWSHub creates a new WebSocket hub.
 func NewWSHub() *WSHub {
 	return &WSHub{
-		clients:      make(map[*WSClient]struct{}),
-		register:     make(chan *WSClient),
-		unregister:   make(chan *WSClient),
-		broadcast:    make(chan *WSEvent, 256),
-		done:         make(chan struct{}),
-		replayCh:     make(chan *wsReplayRequest),
-		pendingDrops: make(map[*WSClient]map[string]*wsDropRange),
+		clients:       make(map[*WSClient]struct{}),
+		register:      make(chan *WSClient),
+		unregister:    make(chan *WSClient),
+		broadcast:     make(chan *WSEvent, 256),
+		done:          make(chan struct{}),
+		replayCh:      make(chan *wsReplayRequest),
+		pendingDrops:  make(map[*WSClient]map[string]*wsDropRange),
+		pendingResets: make(map[*WSClient][]byte),
 	}
 }
 
@@ -805,6 +868,7 @@ func (h *WSHub) Run() {
 			log.Printf("ws client connected id=%s total=%d", client.id, total)
 		case client := <-h.unregister:
 			h.flushClientDrops(client, false)
+			delete(h.pendingResets, client)
 			h.clientsMu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
@@ -849,12 +913,23 @@ func (h *WSHub) nextSeq() int64 {
 func (h *WSHub) broadcastEvent(event *WSEvent) {
 	// Apply redaction first so the persisted copy matches the wire form and
 	// replay cannot leak content that live delivery would have redacted.
-	h.redactionMu.RLock()
-	cfg := h.redactionCfg
-	h.redactionMu.RUnlock()
-
-	if cfg != nil && cfg.Enabled && cfg.Config.Mode != redaction.ModeOff {
-		event.Data = redactWSEventData(event.Data, cfg.Config)
+	if err := h.redactEvent(event); err != nil {
+		// No cursor has been allocated and no data has been persisted. Signal
+		// the loss without copying untrusted payload, metadata or errors into
+		// the reset frame or logs.
+		log.Printf("ws redaction: event withheld; stream resynchronization required")
+		cursor := h.currentSeq()
+		if store := h.eventStore(); store != nil {
+			cursor = store.CurrentSeq()
+		}
+		h.clientsMu.RLock()
+		for client := range h.clients {
+			if client.isSubscribed(event.Topic) {
+				h.trySendReset(client, "", "redaction_failed", cursor, 0)
+			}
+		}
+		h.clientsMu.RUnlock()
+		return
 	}
 
 	// Assign the frame cursor. When an event store is attached the persisted
@@ -864,8 +939,18 @@ func (h *WSHub) broadcastEvent(event *WSEvent) {
 		if stored, err := store.Store(event.Topic, event.EventType, event.Data); err == nil {
 			event.Seq = stored.Seq
 		} else {
-			event.Seq = h.nextSeq()
-			log.Printf("ws_events: store failed, using ephemeral seq topic=%s: %v", event.Topic, err)
+			// A separate ephemeral counter would rewind or collide with the
+			// durable cursor and conceal a gap from reconnecting clients. Make
+			// the loss explicit so consumers can refresh their state instead.
+			log.Printf("ws_events: store failed, resetting stream topic=%s: %v", event.Topic, err)
+			h.clientsMu.RLock()
+			for client := range h.clients {
+				if client.isSubscribed(event.Topic) {
+					h.trySendReset(client, event.Topic, "persistence_failed", store.CurrentSeq(), 0)
+				}
+			}
+			h.clientsMu.RUnlock()
+			return
 		}
 	} else {
 		event.Seq = h.nextSeq()
@@ -881,6 +966,12 @@ func (h *WSHub) broadcastEvent(event *WSEvent) {
 	defer h.clientsMu.RUnlock()
 
 	for client := range h.clients {
+		if !h.flushClientReset(client) {
+			if client.isSubscribed(event.Topic) {
+				h.noteClientDrop(client, event.Topic, event.Seq)
+			}
+			continue
+		}
 		if client.isSubscribed(event.Topic) {
 			select {
 			case client.send <- data:
@@ -896,31 +987,60 @@ func (h *WSHub) broadcastEvent(event *WSEvent) {
 	}
 }
 
-// redactWSEventData recursively redacts sensitive content in event data.
-func redactWSEventData(data interface{}, cfg redaction.Config) interface{} {
-	if cfg.Mode == redaction.ModeOff {
-		return data
+// redactEvent protects each publication boundary, including historical replay
+// and attention frames that do not pass through broadcastEvent. Routing keys
+// must retain their identity; refuse a sensitive one instead of rewriting it.
+func (h *WSHub) redactEvent(event *WSEvent) error {
+	h.redactionMu.RLock()
+	cfg := h.redactionCfg
+	h.redactionMu.RUnlock()
+	if cfg == nil || !cfg.Enabled || cfg.Config.Mode == redaction.ModeOff || cfg.Config.Mode == redaction.ModeWarn {
+		return nil
 	}
 
-	switch v := data.(type) {
-	case string:
-		result := redaction.ScanAndRedact(v, cfg)
-		return result.Output
-	case map[string]interface{}:
-		redacted := make(map[string]interface{}, len(v))
-		for key, val := range v {
-			redacted[key] = redactWSEventData(val, cfg)
-		}
-		return redacted
-	case []interface{}:
-		redacted := make([]interface{}, len(v))
-		for i, val := range v {
-			redacted[i] = redactWSEventData(val, cfg)
-		}
-		return redacted
-	default:
-		return data
+	metadata, err := json.Marshal(struct {
+		Topic     string `json:"topic"`
+		EventType string `json:"event_type"`
+	}{Topic: event.Topic, EventType: event.EventType})
+	if err != nil {
+		return errors.New("cannot encode event metadata")
 	}
+	metadataCfg := cfg.Config
+	metadataCfg.Mode = redaction.ModeBlock
+	result := scanServerJSON(string(metadata), metadataCfg)
+	if result.LimitExceeded {
+		return errRedactionInspectionLimit
+	}
+	if result.Blocked {
+		return errors.New("event metadata contains sensitive content")
+	}
+	data, err := redactWSEventData(event.Data, cfg.Config)
+	if err != nil {
+		return err
+	}
+	event.Data = data
+	return nil
+}
+
+// redactWSEventData scans the complete JSON representation, preserving field
+// names as detection context and covering structs, typed maps/slices and raw
+// JSON alike. Freeze the encoded payload once: custom marshalers must not
+// produce different data for persistence and live delivery. Raw JSON also
+// preserves exact numbers without a float64 round trip.
+func redactWSEventData(data interface{}, cfg redaction.Config) (interface{}, error) {
+	if cfg.Mode == redaction.ModeOff || cfg.Mode == redaction.ModeWarn {
+		return data, nil
+	}
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		// MarshalJSON errors may themselves contain credentials.
+		return nil, errors.New("cannot encode event data for redaction")
+	}
+	output, _, err := redactJSONBytes(encoded, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(output), nil
 }
 
 // Publish publishes an event to a topic.
@@ -938,7 +1058,8 @@ func (h *WSHub) Publish(topic, eventType string, data interface{}) {
 	case h.broadcast <- event:
 	default:
 		dropped := h.dropped.Add(1)
-		log.Printf("ws broadcast buffer full, dropping event topic=%s surface=websocket session= pane= queue_depth=%d dropped_count=%d latency_ms=0 decision=coalesce reason_codes=queue_depth,dropped_output", topic, len(h.broadcast), dropped)
+		// The queue overflow occurs before redactEvent can inspect metadata.
+		log.Printf("ws broadcast buffer full, dropping event surface=websocket session= pane= queue_depth=%d dropped_count=%d latency_ms=0 decision=coalesce reason_codes=queue_depth,dropped_output", len(h.broadcast), dropped)
 	}
 }
 
@@ -1010,7 +1131,7 @@ func (c *WSClient) Subscribe(topics []string) {
 	for _, topic := range topics {
 		c.topics[topic] = struct{}{}
 	}
-	log.Printf("ws client subscribed id=%s topics=%v", c.id, topics)
+	log.Printf("ws client subscribed id=%s topic_count=%d", c.id, len(topics))
 }
 
 // Unsubscribe removes topics from the client's subscription.
@@ -1020,7 +1141,7 @@ func (c *WSClient) Unsubscribe(topics []string) {
 	for _, topic := range topics {
 		delete(c.topics, topic)
 	}
-	log.Printf("ws client unsubscribed id=%s topics=%v", c.id, topics)
+	log.Printf("ws client unsubscribed id=%s topic_count=%d", c.id, len(topics))
 }
 
 // Topics returns the client's subscribed topics.
@@ -1097,9 +1218,40 @@ func applyDefaults(cfg *Config) {
 	}
 }
 
+// ResolveProjectDir validates a server project and returns its absolute,
+// symlink-resolved path so every project-scoped route uses the same identity.
+// An empty path preserves the unscoped server default.
+func ResolveProjectDir(projectDir string) (string, error) {
+	if projectDir == "" {
+		return "", nil
+	}
+	abs, err := filepath.Abs(projectDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve project directory %q: %w", projectDir, err)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("resolve project directory %q: %w", projectDir, err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("inspect project directory %q: %w", projectDir, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("project directory %q is not a directory", projectDir)
+	}
+	return resolved, nil
+}
+
 // ValidateConfig checks server configuration for security and completeness.
 func ValidateConfig(cfg Config) error {
 	applyDefaults(&cfg)
+	if err := validateJobLimits(cfg.JobConcurrency, cfg.JobQueueCapacity); err != nil {
+		return err
+	}
+	if _, err := ResolveProjectDir(cfg.ProjectDir); err != nil {
+		return err
+	}
 
 	mode, err := ParseAuthMode(string(cfg.Auth.Mode))
 	if err != nil {
@@ -1139,10 +1291,18 @@ func ValidateConfig(cfg Config) error {
 // New creates a new HTTP server.
 func New(cfg Config) *Server {
 	applyDefaults(&cfg)
+	// New cannot return configuration errors; retain invalid paths so Start's
+	// validation rejects them. Valid paths are canonical even before Start,
+	// including for callers that embed Router directly.
+	if projectDir, err := ResolveProjectDir(cfg.ProjectDir); err == nil {
+		cfg.ProjectDir = projectDir
+	}
 	s := &Server{
 		host:               cfg.Host,
 		port:               cfg.Port,
 		publicBaseURL:      cfg.PublicBaseURL,
+		projectDir:         cfg.ProjectDir,
+		startupProjectDir:  cfg.ProjectDir,
 		version:            cfg.Version,
 		eventBus:           cfg.EventBus,
 		stateStore:         cfg.StateStore,
@@ -1154,11 +1314,29 @@ func New(cfg Config) *Server {
 		jwksCache:          newJWKSCache(cfg.Auth.OIDC.CacheTTL),
 		idempotencyStore:   NewIdempotencyStore(24 * time.Hour),
 		jobStore:           NewJobStore(),
+		jobExecutor:        jobExecutor{maxConcurrent: cfg.JobConcurrency, maxQueued: cfg.JobQueueCapacity},
 		wsHub:              NewWSHub(),
 		spawnAgents: func(ctx context.Context, opts robot.SpawnOptions) (*robot.SpawnOutput, error) {
 			return robot.GetSpawn(ctx, opts, nil)
 		},
 		waitAgents: robot.GetWaitContext,
+	}
+
+	// Wire redaction into both consumers: redactionMiddleware (REST bodies) and
+	// WSHub.broadcastEvent (event frames). Each gets its own deep copy so a
+	// caller mutating the config it passed in — or either consumer's reference
+	// typed Allowlist/ExtraPatterns/DisabledCategories — cannot reach the other
+	// (the hazard bd-oekc2 fixed in fa8045ea/0b0f0874). Assigning wsHub's field
+	// directly is safe without redactionMu: the hub's Run goroutine has not been
+	// started and s has not been published to any other goroutine yet.
+	if cfg.Redaction != nil {
+		restCfg := *cfg.Redaction
+		restCfg.Config = restCfg.Config.DeepCopy()
+		s.redactionCfg = &restCfg
+
+		hubCfg := *cfg.Redaction
+		hubCfg.Config = hubCfg.Config.DeepCopy()
+		s.wsHub.redactionCfg = &hubCfg
 	}
 
 	// Initialize pane output streaming
@@ -1192,8 +1370,19 @@ func DefaultAuditDir() (string, error) {
 func (s *Server) buildRouter() chi.Router {
 	r := chi.NewRouter()
 
-	// Base middleware stack
-	r.Use(chimw.RealIP)
+	// Base middleware stack.
+	//
+	// chimw.RealIP is deliberately NOT used. It rewrites r.RemoteAddr from
+	// True-Client-IP / X-Real-IP / the leftmost X-Forwarded-For of whatever
+	// client sent them, with no trusted-proxy allowlist — chi itself has
+	// deprecated it for that reason (GHSA-3fxj-6jh8-hvhx and siblings). The
+	// value lands in every AuditRecord.RemoteAddr and in the auth-failure log,
+	// so trusting it let any caller stamp a forged source address onto the
+	// audit trail of a dangerous or approval-gated action with one header.
+	// ntm terminates connections directly (local mode is loopback-only), so
+	// the socket address is the truthful answer. If NTM ever needs to run
+	// behind a reverse proxy, that needs a configured trusted-proxy list
+	// (chi's ClientIPFromXFFTrustedProxies), never blanket header trust.
 	r.Use(s.maxBytesMiddleware)
 	r.Use(s.requestIDMiddlewareFunc)
 	r.Use(s.recovererMiddleware)
@@ -1208,7 +1397,23 @@ func (s *Server) buildRouter() chi.Router {
 	if s.auditStore != nil {
 		r.Use(s.AuditMiddleware(s.auditStore))
 	}
-	r.Use(s.redactionMiddleware) // Redact sensitive content in requests/responses
+	// Capture before any middleware reads the body: redaction and replay may
+	// both wait for input while configuration changes in another request.
+	// Validation still follows each pipeline route's permission check.
+	r.Use(s.pipelineProjectScopeMiddleware)
+	// Jobs select their effective destination from the eventual JSON body.
+	// Pin configuration and cwd before redaction can wait on that body.
+	r.Use(s.jobProjectSelectionMiddleware)
+	// Reject sensitive JSON input before any handler or replay can act on it;
+	// redact response content. Inert unless Config.Redaction was supplied (see
+	// that field): no redaction config means untouched request/response bytes.
+	r.Use(s.redactionMiddleware)
+	// Freeze mail and reservation requests' projects before replay lookup.
+	// Validation errors follow each route's permission check.
+	r.Use(s.mailProjectScopeMiddleware)
+	// Classify the unchanged, admitted job request before cache lookup.
+	// Admission later uses the same captured selection and project resolver.
+	r.Use(s.jobHTTPReplayScopeMiddleware)
 	// Idempotency-Key replay for EVERY mutating route — the single mount point
 	// (D4, bd-ws3-contract-breadth-psvyu.4). Deleting this one line disables the
 	// feature (rollback lever). The middleware is inert for requests without an
@@ -1261,9 +1466,10 @@ func (s *Server) buildRouter() chi.Router {
 		// Sessions - read endpoints
 		r.With(s.RequirePermission(PermReadSessions)).Get("/sessions", s.handleSessionsV1)
 		r.With(s.RequirePermission(PermReadSessions)).Get("/sessions/{id}", s.handleSessionV1)
-		r.With(s.RequirePermission(PermReadAgents)).Get("/sessions/{id}/agents", func(w http.ResponseWriter, req *http.Request) {
-			s.handleSessionAgentsV1(w, req, chi.URLParam(req, "id"))
-		})
+		// GET /sessions/{id}/agents is served by the Agents API group below.
+		// Do not register it here as well: chi gives "{id}" and "{sessionId}"
+		// the same tree node, and mounting that group replaces every method
+		// on it, so a route registered here never runs.
 		r.With(s.RequirePermission(PermReadEvents)).Get("/sessions/{id}/events", func(w http.ResponseWriter, req *http.Request) {
 			s.handleSessionEventsV1(w, req, chi.URLParam(req, "id"))
 		})
@@ -1421,6 +1627,14 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Cleanup pane streaming on shutdown
 	defer s.streamManager.StopAll()
+	// Keep output consumers alive until accepted workers have checkpointed.
+	defer func() {
+		drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.drainJobWorkers(drainCtx); err != nil {
+			slog.Warn("job workers still shutting down", "error", err)
+		}
+	}()
 
 	// Subscribe to events for SSE and WebSocket broadcasting
 	if s.eventBus != nil {
@@ -1474,6 +1688,7 @@ func (s *Server) Start(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		log.Println("Shutting down server...")
+		s.jobExecutor.closeAdmission()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		return s.server.Shutdown(shutdownCtx)
@@ -1520,9 +1735,14 @@ func (s *Server) ensureWSEventStore() {
 }
 
 func (s *Server) validate() error {
+	limits := s.jobExecutor.snapshot()
+	if err := validateJobLimits(limits.MaxConcurrent, limits.QueueCapacity); err != nil {
+		return err
+	}
 	cfg := Config{
 		Host:           s.host,
 		Port:           s.port,
+		ProjectDir:     s.projectDirSnapshot(),
 		EventBus:       s.eventBus,
 		StateStore:     s.stateStore,
 		Auth:           s.auth,
@@ -1537,10 +1757,17 @@ func (s *Server) validate() error {
 	if err := ValidateConfig(cfg); err != nil {
 		return err
 	}
+	projectDir, err := ResolveProjectDir(cfg.ProjectDir)
+	if err != nil {
+		return err
+	}
 	s.host = cfg.Host
 	s.port = cfg.Port
 	s.auth = cfg.Auth
 	s.corsAllowedOrigins = cfg.AllowedOrigins
+	s.mu.Lock()
+	s.projectDir = projectDir
+	s.mu.Unlock()
 	return nil
 }
 
@@ -1567,7 +1794,7 @@ func (s *Server) buildMTLSConfig() (*tls.Config, error) {
 func (s *Server) maxBytesMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Limit to 10MB default
-		r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -1575,12 +1802,24 @@ func (s *Server) maxBytesMiddleware(next http.Handler) http.Handler {
 // requestIDMiddlewareFunc is the chi middleware version of requestIDMiddleware.
 func (s *Server) requestIDMiddlewareFunc(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reqID := sanitizeRequestID(r.Header.Get(requestIDHeader))
+		cfg := s.redactionConfigSnapshot()
+		originalID := r.Header.Get(requestIDHeader)
+		reqID := ""
+		// Screen the complete supplied value before sanitizing/truncating it:
+		// a truncated token can still disclose credential material in headers,
+		// early refusal bodies, and every downstream log or audit record.
+		if !scanRequestMetadata(originalID, cfg).Blocked {
+			reqID = sanitizeRequestID(originalID)
+			if scanRequestMetadata(reqID, cfg).Blocked {
+				reqID = ""
+			}
+		}
 		if reqID == "" {
 			reqID = generateRequestID()
 		}
 		w.Header().Set(requestIDHeader, reqID)
-		ctx := context.WithValue(r.Context(), requestIDKey, reqID)
+		ctx := context.WithValue(r.Context(), requestRedactionConfigKey{}, cfg)
+		ctx = context.WithValue(ctx, requestIDKey, reqID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -1591,8 +1830,10 @@ func (s *Server) recovererMiddleware(next http.Handler) http.Handler {
 		defer func() {
 			if rec := recover(); rec != nil {
 				reqID := requestIDFromContext(r.Context())
+				cfg := s.requestRedactionConfig(r)
 				stack := string(debug.Stack())
-				log.Printf("PANIC recovered: %v request_id=%s\n%s", rec, reqID, stack)
+				log.Printf("PANIC recovered: %s request_id=%s\n%s",
+					redactRequestDiagnostic(fmt.Sprint(rec), cfg), reqID, redactRequestDiagnostic(stack, cfg))
 				writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, "internal server error", nil, reqID)
 			}
 		}()
@@ -1604,10 +1845,12 @@ func (s *Server) recovererMiddleware(next http.Handler) http.Handler {
 func (s *Server) loggingMiddlewareFunc(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		cfg := s.requestRedactionConfig(r)
 		ww := chimw.NewWrapResponseWriter(w, r.ProtoMajor)
 		next.ServeHTTP(ww, r)
 		reqID := requestIDFromContext(r.Context())
-		log.Printf("%s %s %d %s request_id=%s", r.Method, r.URL.Path, ww.Status(), time.Since(start), reqID)
+		log.Printf("%s %s %d %s request_id=%s", redactRequestDiagnostic(r.Method, cfg),
+			redactRequestDiagnostic(r.URL.Path, cfg), ww.Status(), time.Since(start), reqID)
 	})
 }
 
@@ -1616,6 +1859,16 @@ func (s *Server) corsMiddlewareFunc(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		if origin != "" {
+			inspection := scanRequestMetadata(origin, s.requestRedactionConfig(r))
+			if inspection.Blocked {
+				message := "origin contains sensitive content"
+				if inspection.LimitExceeded {
+					message = "origin could not be completely inspected within redaction limits"
+				}
+				writeErrorResponse(w, http.StatusForbidden, ErrCodeForbidden,
+					message, nil, requestIDFromContext(r.Context()))
+				return
+			}
 			s.mu.RLock()
 			allowed := originAllowed(origin, s.corsAllowedOrigins)
 			s.mu.RUnlock()
@@ -1650,7 +1903,10 @@ func (s *Server) authMiddlewareFunc(next http.Handler) http.Handler {
 		claims, err := s.authenticateRequest(r)
 		if err != nil {
 			reqID := requestIDFromContext(r.Context())
-			log.Printf("auth failed mode=%s path=%s remote=%s request_id=%s err=%v", s.auth.Mode, r.URL.Path, r.RemoteAddr, reqID, err)
+			cfg := s.requestRedactionConfig(r)
+			log.Printf("auth failed mode=%s path=%s remote=%s request_id=%s err=%s", s.auth.Mode,
+				redactRequestDiagnostic(r.URL.Path, cfg), redactRequestDiagnostic(r.RemoteAddr, cfg),
+				reqID, redactRequestDiagnostic(err.Error(), cfg))
 			writeErrorResponse(w, http.StatusUnauthorized, ErrCodeUnauthorized, "unauthorized", nil, reqID)
 			return
 		}
@@ -1671,6 +1927,22 @@ func (s *Server) authMiddlewareFunc(next http.Handler) http.Handler {
 type idempotencyHandledKeyType struct{}
 
 var idempotencyHandledKey idempotencyHandledKeyType
+
+type idempotencyResultKey struct{}
+
+type idempotencyResultState struct {
+	retain atomic.Bool
+}
+
+// markIdempotencyResultRetained keeps a terminal outcome even when it is not a
+// successful HTTP response. A handler that has published work, or cannot prove
+// publication did not occur, must not let a same-key retry execute it again.
+// Only server code can mark this request; no client header selects this policy.
+func markIdempotencyResultRetained(r *http.Request) {
+	if result, ok := r.Context().Value(idempotencyResultKey{}).(*idempotencyResultState); ok {
+		result.retain.Store(true)
+	}
+}
 
 // idempotencyMiddleware handles Idempotency-Key header for mutating requests.
 func (s *Server) idempotencyMiddleware(next http.Handler) http.Handler {
@@ -1697,7 +1969,25 @@ func (s *Server) idempotencyMiddleware(next http.Handler) http.Handler {
 		// Fingerprint the request body so a replay with the same key but a
 		// DIFFERENT payload is rejected instead of silently echoing the first
 		// response (bd-vq37v).
-		fingerprint := idempotencyRequestFingerprint(r)
+		fingerprint, err := idempotencyRequestFingerprint(r)
+		if err != nil {
+			reqID := requestIDFromContext(r.Context())
+			var tooLarge *http.MaxBytesError
+			switch {
+			case errors.As(err, &tooLarge):
+				writeErrorResponse(w, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE",
+					"request body exceeds the 10 MiB limit", nil, reqID)
+			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+				writeErrorResponse(w, http.StatusRequestTimeout, ErrCodeTimeout,
+					"request canceled before its body could be verified", nil, reqID)
+			default:
+				// Reader errors can contain source credentials. Neither a cached
+				// response nor a handler may hide an incomplete read.
+				writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest,
+					"failed to read complete request body", nil, reqID)
+			}
+			return
+		}
 
 		// Single-flight per scoped key: concurrent duplicates wait for the
 		// first request instead of double-executing (bd-vq37v). The loop
@@ -1705,12 +1995,13 @@ func (s *Server) idempotencyMiddleware(next http.Handler) http.Handler {
 		// (nothing cached), the woken follower becomes the new leader.
 		for {
 			if cached, status, replayHeader, storedFP, ok := s.idempotencyStore.GetWithFingerprint(key); ok {
-				if storedFP != "" && fingerprint != "" && storedFP != fingerprint {
+				if storedFP != "" && storedFP != fingerprint {
 					reqID := requestIDFromContext(r.Context())
 					writeErrorResponse(w, http.StatusUnprocessableEntity, ErrCodeIdempotentReplay,
 						"Idempotency-Key reused with a different request body", nil, reqID)
 					return
 				}
+				protectReplayMetadata(replayHeader, s.requestRedactionConfig(r))
 				applyReplayHeaders(w.Header(), replayHeader)
 				w.Header().Set("X-Idempotent-Replay", "true")
 				w.WriteHeader(status)
@@ -1734,34 +2025,79 @@ func (s *Server) idempotencyMiddleware(next http.Handler) http.Handler {
 		defer s.idempotencyStore.EndFlight(key)
 
 		// Capture response
+		result := &idempotencyResultState{}
+		r = r.WithContext(context.WithValue(r.Context(), idempotencyResultKey{}, result))
 		rec := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(rec, r)
 
-		// Cache successful, non-hijacked, bounded responses
-		if rec.statusCode >= 200 && rec.statusCode < 300 && !rec.hijacked && !rec.overflow {
-			s.idempotencyStore.SetWithFingerprint(key, fingerprint, rec.body, rec.statusCode, rec.Header())
+		// A failure after publication is a terminal result too: replay the
+		// receipt instead of repeating work that may already have completed.
+		// Ordinary failures remain retryable. When the original representation
+		// exceeds the cache bound, retain a small receipt instead: discarding
+		// the result would let a retry repeat an already completed mutation.
+		if (rec.statusCode >= 200 && rec.statusCode < 300 || result.retain.Load()) && !rec.hijacked {
+			body, status, header := rec.body, rec.statusCode, rec.Header()
+			if rec.overflow {
+				receipt := APIError{
+					APIResponse: APIResponse{
+						Success: false, Timestamp: time.Now().UTC().Format(time.RFC3339),
+						RequestID: requestIDFromContext(r.Context()),
+					},
+					Error:     "The original request was handled, but its response is too large to replay",
+					ErrorCode: "IDEMPOTENCY_RESULT_UNAVAILABLE",
+					Details: map[string]interface{}{
+						"original_status":      rec.statusCode,
+						"response_unavailable": true,
+						"inspection_required":  true,
+						"retry_safe":           false,
+					},
+					Hint: "The handler has already run. Inspect the affected state before sending a new request; this retry did not repeat the operation.",
+				}
+				// Only fixed strings, booleans, and an HTTP status are encoded.
+				body, _ = json.Marshal(receipt)
+				body = append(body, '\n')
+				status = http.StatusConflict
+				header = cloneReplayHeaders(header)
+				if header == nil {
+					header = make(http.Header)
+				}
+				header.Set("Content-Type", "application/json")
+			}
+			s.idempotencyStore.SetWithFingerprint(key, fingerprint, body, status, header)
 		}
 	})
 }
 
-// idempotencyRequestFingerprint hashes the request body (bounded by
-// idempotencyFingerprintLimit) and restores r.Body for downstream handlers.
-// Returns a non-empty hash even for empty bodies so mismatch detection always
-// has something to compare.
-func idempotencyRequestFingerprint(r *http.Request) string {
-	h := sha256.New()
-	if r.Body != nil && r.Body != http.NoBody {
-		data, err := io.ReadAll(io.LimitReader(r.Body, idempotencyFingerprintLimit))
-		if err != nil {
-			// Body unreadable; hand the bytes read so far plus the original
-			// reader back to the handler, which will surface the read error.
-			r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(data), r.Body))
-			return ""
-		}
-		h.Write(data)
-		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(data), r.Body))
+// idempotencyRequestFingerprint verifies and hashes the complete admitted body,
+// then restores its exact bytes for the handler. A read failure must never turn
+// into an empty fingerprint that authorizes an unrelated cached success.
+func idempotencyRequestFingerprint(r *http.Request) (string, error) {
+	if err := r.Context().Err(); err != nil {
+		return "", err
 	}
-	return hex.EncodeToString(h.Sum(nil))
+	if scope, ok := r.Context().Value(jobHTTPReplayScopeKey{}).(jobHTTPReplayScope); ok {
+		// Jobs already verified the full body before binding its project. Keep
+		// that captured identity and canonical decoder's error semantics.
+		return scope.fingerprint, scope.requestErr
+	}
+	var data []byte
+	if r.Body != nil && r.Body != http.NoBody {
+		var err error
+		data, err = io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes+1))
+		_ = r.Body.Close()
+		if len(data) > maxRequestBodyBytes {
+			return "", &http.MaxBytesError{Limit: maxRequestBodyBytes}
+		}
+		if err != nil {
+			return "", err
+		}
+		r.Body = io.NopCloser(bytes.NewReader(data))
+	}
+	if err := r.Context().Err(); err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 // responseRecorder captures the response for idempotency caching.
@@ -1769,8 +2105,8 @@ type responseRecorder struct {
 	http.ResponseWriter
 	statusCode int
 	body       []byte
-	// overflow is set when the response exceeds idempotencyMaxBodyBytes; the
-	// buffer stops growing and the response is not cached (bd-vq37v).
+	// overflow is set when the response exceeds idempotencyMaxBodyBytes. The
+	// full body is discarded; terminal results retain a small inspection receipt.
 	overflow bool
 	// hijacked is set when the handler took over the connection; nothing
 	// meaningful can be cached afterwards.
@@ -1839,6 +2175,26 @@ func scopedIdempotencyKey(r *http.Request) string {
 	// Idempotency-Key on the same method+path — including a caller who lacked the
 	// permission the original request needed.
 	principal := idempotencyPrincipal(r)
+	scope, projectScoped := r.Context().Value(mailProjectScopeKey{}).(mailProjectScope)
+	project, scopeErr := scope.project, scope.err
+	projectMode := ""
+	if pipelineScope, ok := r.Context().Value(pipelineProjectScopeKey{}).(pipelineProjectScope); ok {
+		project, scopeErr, projectScoped = pipelineScope.projectDir, pipelineScope.err, true
+		projectMode = "configured"
+		if strings.TrimSpace(pipelineScope.configuredDir) == "" {
+			projectMode = "cwd-fallback"
+		}
+	}
+	if jobScope, ok := r.Context().Value(jobHTTPReplayScopeKey{}).(jobHTTPReplayScope); ok {
+		if jobScope.err != nil {
+			return "" // Preserve permission and canonical request errors.
+		}
+		project, projectScoped = jobScope.project, jobScope.project != ""
+		projectMode = "job-execution"
+	}
+	if projectScoped && scopeErr != nil {
+		return "" // Invalid scope must reach permission/validation, never replay.
+	}
 
 	var b strings.Builder
 	b.Grow(len(r.Method) + len(path) + len(r.URL.RawQuery) + len(rawKey) + len(principal) + 4)
@@ -1852,6 +2208,16 @@ func scopedIdempotencyKey(r *http.Request) string {
 	b.WriteByte('\x00')
 	b.WriteString(principal)
 	b.WriteByte('\x00')
+	if projectScoped {
+		b.WriteString(project)
+		b.WriteByte('\x00')
+		// A cleared configuration must not replay file-workflow access from a
+		// previously configured cwd, even when the effective roots coincide.
+		if projectMode != "" {
+			b.WriteString(projectMode)
+			b.WriteByte('\x00')
+		}
+	}
 	b.WriteString(rawKey)
 	return b.String()
 }
@@ -1869,56 +2235,15 @@ func idempotencyPrincipal(r *http.Request) string {
 	return "anonymous"
 }
 
-// sendReceiptAdmission derives the opaque send admission only from an
-// authenticated request RBAC context. It deliberately does not fall back to
-// NTM_USER or USER: a receipt is an operational audit artifact, not a
-// best-effort local attribution claim.
-func sendReceiptAdmission(r *http.Request, sessionID string) *robot.AuthenticatedSendAdmission {
-	if r == nil {
-		return nil
-	}
-	rc := RoleFromContext(r.Context())
-	if rc == nil || !rc.Role.HasPermission(PermWriteAgents) {
-		return nil
-	}
-	actor := strings.TrimSpace(rc.UserID)
-	if actor == "" || actor == "anonymous" {
-		return nil
-	}
-	admission, err := robot.NewAuthenticatedHTTPSendAdmission(actor, string(rc.Role), sessionID)
-	if err != nil {
-		return nil
-	}
-	return admission
-}
-
-// sendReceiptProvenance is retained for read-only diagnostics/tests. Mutation
-// handlers must use sendReceiptAdmission; this string view cannot authorize a
-// SendOptions dispatch.
-func sendReceiptProvenance(r *http.Request, sessionID string) (actor, origin, targetAuthorization string) {
-	admission := sendReceiptAdmission(r, sessionID)
-	if admission == nil {
-		return "", "", ""
-	}
-	rc := RoleFromContext(r.Context())
-	authorization, err := json.Marshal(struct {
-		Scheme     string     `json:"scheme"`
-		Role       Role       `json:"role"`
-		Permission Permission `json:"permission"`
-		Resource   string     `json:"resource"`
-	}{"rbac", rc.Role, PermWriteAgents, "session:" + sessionID})
-	if err != nil {
-		return "", "", ""
-	}
-	return rc.UserID, "http.api.v1", string(authorization)
-}
-
 func cloneReplayHeaders(src http.Header) http.Header {
 	if len(src) == 0 {
 		return nil
 	}
-	clone := make(http.Header, 2)
-	for _, key := range []string{"Content-Type", requestIDHeader} {
+	clone := make(http.Header, 3)
+	// Location is part of an accepted job's polling contract. Preserve that
+	// stable resource identity without replaying cookies, transport headers,
+	// security policy, or other request-specific response metadata.
+	for _, key := range []string{"Content-Type", "Location", requestIDHeader} {
 		values := src.Values(key)
 		if len(values) == 0 {
 			continue
@@ -2141,13 +2466,22 @@ func writeSuccessResponse(w http.ResponseWriter, status int, data map[string]int
 
 func robotErrorHTTPStatus(code string) int {
 	switch code {
-	case robot.ErrCodeInvalidFlag, robot.ErrCodeInvalidArgs, robot.ErrCodeReceiptProvenanceRequired:
+	case robot.ErrCodeInvalidFlag:
 		return http.StatusBadRequest
 	case robot.ErrCodeSessionNotFound, robot.ErrCodePaneNotFound, robot.ErrCodeNotFound:
 		return http.StatusNotFound
 	case robot.ErrCodePermissionDenied:
 		return http.StatusForbidden
-	case robot.ErrCodeResourceBusy:
+	case robot.ErrCodeDestructiveCommandBlocked, "SENSITIVE_DATA_BLOCKED":
+		// A safety refusal of the caller's own message: not a server fault,
+		// and retrying the same body cannot succeed.
+		return http.StatusForbidden
+	case robot.ErrCodeResourceBusy, robot.ErrCodeStaleWorkCoordination:
+		return http.StatusConflict
+	case robot.ErrCodeIdempotencyConflict, robot.ErrCodeOperationInProgress, robot.ErrCodeOperationOutcomeUnknown:
+		// The operation ID (Idempotency-Key) is bound to a different command,
+		// or another request holding it is still running: a client-side
+		// conflict to reconcile via the receipt, never a server fault.
 		return http.StatusConflict
 	case robot.ErrCodeTimeout:
 		return http.StatusGatewayTimeout
@@ -2265,25 +2599,24 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleSessionAgents handles /api/sessions/{id}/agents.
+// handleSessionAgents handles /api/sessions/{id}/agents. It reports the same
+// agents as GET /api/v1/sessions/{id}/agents in the legacy envelope.
 func (s *Server) handleSessionAgents(w http.ResponseWriter, r *http.Request, sessionID string) {
-	if s.stateStore == nil {
-		writeError(w, http.StatusServiceUnavailable, "state store not available")
+	if err := tmux.ValidateSessionName(sessionID); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid session ID: "+err.Error())
 		return
 	}
 
-	agents, err := s.stateStore.ListAgents(sessionID)
+	roster, err := s.listSessionAgents(r.Context(), sessionID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		status, _, message := sessionAgentsFailure(err)
+		writeError(w, status, message)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"success":    true,
-		"session_id": sessionID,
-		"agents":     agents,
-		"count":      len(agents),
-	})
+	body := roster.payload(sessionID)
+	body["success"] = true
+	writeJSON(w, http.StatusOK, body)
 }
 
 // handleSessionEvents handles /api/sessions/{id}/events.
@@ -2340,6 +2673,74 @@ func (s *Server) handleRobotHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+const sseMaxFrameBytes = 10 << 20
+
+// writeSSEEvent protects a complete frame before writing any of its bytes.
+// Streaming middleware cannot safely scan arbitrary Write/Flush fragments, and
+// mutating the shared feed would corrupt replay for other subscribers. Snapshot
+// configuration for each frame so a long-lived stream observes policy changes.
+func (s *Server) writeSSEEvent(w io.Writer, eventType string, payload any) (err error) {
+	defer func() {
+		if err != nil {
+			// All errors below are static: marshaler and transport errors can
+			// contain source data and must not be copied into server logs.
+			log.Printf("SSE: terminating stream: %v", err)
+		}
+	}()
+
+	if len(eventType) > sseMaxFrameBytes || strings.ContainsAny(eventType, "\r\n\x00") {
+		return errors.New("invalid SSE event type")
+	}
+	s.mu.RLock()
+	rcfg := s.redactionCfg
+	s.mu.RUnlock()
+	cfg := redaction.Config{Mode: redaction.ModeOff}
+	if rcfg != nil && rcfg.Enabled {
+		cfg = rcfg.Config
+	}
+
+	// The event type is routing metadata. Replacing it would silently route
+	// the event elsewhere; refuse a sensitive type in either enforcing mode.
+	metadataCfg := cfg
+	if metadataCfg.Mode == redaction.ModeRedact {
+		metadataCfg.Mode = redaction.ModeBlock
+	}
+	metadata := scanServerText(eventType, metadataCfg)
+	if metadata.LimitExceeded {
+		return errRedactionInspectionLimit
+	}
+	if metadata.Blocked {
+		return errors.New("sensitive SSE routing metadata")
+	}
+
+	data, marshalErr := json.Marshal(payload)
+	if marshalErr != nil {
+		return errors.New("failed to encode SSE event")
+	}
+	frameOverhead := len("event: \ndata: \n\n") + len(eventType)
+	if len(data) > sseMaxFrameBytes-frameOverhead {
+		return errors.New("SSE event exceeds the frame size limit")
+	}
+	data, result, redactErr := redactJSONBytes(data, cfg)
+	if redactErr != nil {
+		return redactErr
+	}
+	if len(data) > sseMaxFrameBytes-frameOverhead || bytes.ContainsAny(data, "\r\n") {
+		return errors.New("unsafe SSE event frame")
+	}
+	if len(metadata.Findings) > 0 || len(result.Findings) > 0 {
+		log.Printf("SSE redaction: metadata_findings=%d payload_findings=%d",
+			len(metadata.Findings), len(result.Findings))
+	}
+	// A frame is one write, with the JSON payload and routing label already
+	// protected. Preserve caller-controlled replay batching and flush timing.
+	n, writeErr := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, data)
+	if writeErr != nil || n != frameOverhead+len(data) {
+		return errors.New("failed to write SSE event")
+	}
+	return nil
+}
+
 // handleEventStream handles SSE event streaming at /events.
 func (s *Server) handleEventStream(w http.ResponseWriter, r *http.Request) {
 	// Set SSE headers
@@ -2361,8 +2762,10 @@ func (s *Server) handleEventStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Send initial connection event
-	if _, err := fmt.Fprintf(w, "event: connected\ndata: {\"status\":\"connected\",\"time\":\"%s\"}\n\n",
-		time.Now().UTC().Format(time.RFC3339)); err != nil {
+	if err := s.writeSSEEvent(w, "connected", map[string]string{
+		"status": "connected",
+		"time":   time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
 		return
 	}
 	flusher.Flush()
@@ -2374,16 +2777,12 @@ func (s *Server) handleEventStream(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case event := <-clientCh:
-			data, err := json.Marshal(map[string]interface{}{
+			if err := s.writeSSEEvent(w, event.EventType(), map[string]interface{}{
 				"type":      event.EventType(),
 				"timestamp": event.EventTimestamp().Format(time.RFC3339),
 				"session":   event.EventSession(),
-			})
-			if err != nil {
-				continue
-			}
-			if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.EventType(), data); err != nil {
-				return // Client disconnected
+			}); err != nil {
+				return
 			}
 			flusher.Flush()
 		}
@@ -2909,30 +3308,63 @@ func (s *Server) handleGetConfigV1(w http.ResponseWriter, r *http.Request) {
 	projDir := s.projectDir
 	s.mu.RUnlock()
 
-	// Return safe configuration fields only (no secrets)
+	// Return safe configuration fields only (no secrets). startup_project_dir
+	// is what a PATCH with an empty or null project_dir restores.
 	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-		"host":            s.host,
-		"port":            s.port,
-		"auth_mode":       string(s.auth.Mode),
-		"allowed_origins": origins,
-		"public_base_url": s.publicBaseURL,
-		"project_dir":     projDir,
+		"host":                s.host,
+		"port":                s.port,
+		"auth_mode":           string(s.auth.Mode),
+		"allowed_origins":     origins,
+		"public_base_url":     s.publicBaseURL,
+		"project_dir":         projDir,
+		"startup_project_dir": s.startupProjectDir,
 	}, reqID)
 }
 
 // handlePatchConfigV1 handles PATCH /api/v1/config.
 // Updates mutable configuration fields at runtime.
+//
+// project_dir selects the server-wide project. An omitted project_dir leaves
+// it unchanged. A path selects that directory. An empty string or null resets
+// it to the startup project (`--project-dir`), or to no project when the server
+// was started without one, so a PATCH can always be undone without a restart
+// (GH #360). A nonempty target, including the startup project on a reset, must
+// still be an existing directory.
 func (s *Server) handlePatchConfigV1(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
 	slog.Info("config patch", "request_id", reqID)
 
 	var req struct {
 		AllowedOrigins []string `json:"allowed_origins,omitempty"`
-		ProjectDir     string   `json:"project_dir,omitempty"`
+		// Raw so that an explicit "" or null (reset) is distinguishable from
+		// an omitted field (unchanged).
+		ProjectDir json.RawMessage `json:"project_dir,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "invalid request body: "+err.Error(), nil, reqID)
 		return
+	}
+	updateProject, resetProject := len(req.ProjectDir) > 0, false
+	var projectDir string
+	if updateProject {
+		var requested *string
+		if err := json.Unmarshal(req.ProjectDir, &requested); err != nil {
+			writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "project_dir must be a string or null", nil, reqID)
+			return
+		}
+		var err error
+		if requested == nil || *requested == "" {
+			resetProject = true
+			// The startup value was validated when the server started; check
+			// it again, since the directory may have been removed since.
+			if projectDir, err = ResolveProjectDir(s.startupProjectDir); err != nil {
+				writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "cannot reset project_dir to the startup project: "+err.Error(), nil, reqID)
+				return
+			}
+		} else if projectDir, err = ResolveProjectDir(*requested); err != nil {
+			writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, err.Error(), nil, reqID)
+			return
+		}
 	}
 
 	// Apply updates and snapshot the result under the lock so the log
@@ -2941,8 +3373,8 @@ func (s *Server) handlePatchConfigV1(w http.ResponseWriter, r *http.Request) {
 	if req.AllowedOrigins != nil {
 		s.corsAllowedOrigins = req.AllowedOrigins
 	}
-	if req.ProjectDir != "" {
-		s.projectDir = req.ProjectDir
+	if updateProject {
+		s.projectDir = projectDir
 		// Reset mail client so it picks up new project dir
 		s.mailClient = nil
 		// A new project directory invalidates the cached unavailability verdict too.
@@ -2952,7 +3384,7 @@ func (s *Server) handlePatchConfigV1(w http.ResponseWriter, r *http.Request) {
 	currentProjectDir := s.projectDir
 	s.mu.Unlock()
 
-	slog.Info("config updated", "request_id", reqID, "allowed_origins", len(currentOrigins), "project_dir", currentProjectDir)
+	slog.Info("config updated", "request_id", reqID, "allowed_origins", len(currentOrigins), "project_dir", currentProjectDir, "project_dir_reset", resetProject)
 
 	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
 		"updated": true,
@@ -3133,15 +3565,78 @@ func (s *Server) handleSessionsV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Ensure sessions is never null
-	if sessions == nil {
-		sessions = []state.Session{}
+	// The runtime store only knows sessions that were recorded through it, and
+	// ordinary `ntm spawn` sessions never are. Merge in the sessions tmux is
+	// running right now so the dashboard does not report "no sessions" while
+	// agents are live. A tmux failure degrades to the stored rows.
+	live, err := s.liveTmuxSessions(r.Context())
+	if err != nil {
+		slog.Warn("listing live tmux sessions failed", "request_id", reqID, "error", err)
+		live = nil
+	}
+
+	visible := make([]interface{}, 0, len(sessions)+len(live))
+	known := make(map[string]struct{}, len(sessions))
+	for _, session := range sessions {
+		visible = append(visible, session)
+		known[session.Name] = struct{}{}
+	}
+	for _, session := range live {
+		if _, ok := known[session.Name]; ok {
+			continue
+		}
+		known[session.Name] = struct{}{}
+		visible = append(visible, liveSessionRecord(session))
 	}
 
 	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-		"sessions": sessions,
-		"count":    len(sessions),
+		"sessions": visible,
+		"count":    len(visible),
 	}, reqID)
+}
+
+// defaultLiveSessionsTimeout bounds the tmux queries behind the sessions and
+// agents endpoints. The web UI polls them every few seconds; without a bound, a
+// wedged tmux server would hang every poll (and pile up tmux processes) instead
+// of degrading to the stored rows.
+const defaultLiveSessionsTimeout = 5 * time.Second
+
+// liveTmuxTimeout is the bound applied to each live tmux query a read endpoint
+// makes.
+func (s *Server) liveTmuxTimeout() time.Duration {
+	if s.liveSessionsTimeout > 0 {
+		return s.liveSessionsTimeout
+	}
+	return defaultLiveSessionsTimeout
+}
+
+// liveTmuxSessions returns the running tmux sessions sorted by name.
+func (s *Server) liveTmuxSessions(ctx context.Context) ([]tmux.Session, error) {
+	list := tmux.ListSessionsContext
+	if s.listLiveSessions != nil {
+		list = s.listLiveSessions
+	}
+	ctx, cancel := context.WithTimeout(ctx, s.liveTmuxTimeout())
+	defer cancel()
+	live, err := list(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(live, func(i, j int) bool { return live[i].Name < live[j].Name })
+	return live, nil
+}
+
+// liveSessionRecord describes a running tmux session the runtime store has no
+// row for, using the same field names as state.Session.
+func liveSessionRecord(session tmux.Session) map[string]interface{} {
+	return map[string]interface{}{
+		"id":       session.Name,
+		"name":     session.Name,
+		"status":   state.SessionActive,
+		"windows":  session.Windows,
+		"attached": session.Attached,
+		"source":   "tmux",
+	}
 }
 
 // handleSessionV1 handles GET /api/v1/sessions/{id}.
@@ -3164,39 +3659,34 @@ func (s *Server) handleSessionV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if session == nil {
+		// Same fallback as the list endpoint: a live tmux session without a
+		// store row is still a session the dashboard can open.
+		live, err := s.liveTmuxSessions(r.Context())
+		if err != nil {
+			// tmux, not the server, failed: a bounded listing that ran out of
+			// time is a timeout, anything else (circuit open, tmux error) is
+			// an unavailable dependency. Neither is an internal error.
+			status, code := http.StatusServiceUnavailable, ErrCodeServiceUnavail
+			if errors.Is(err, context.DeadlineExceeded) {
+				status, code = http.StatusGatewayTimeout, ErrCodeTimeout
+			}
+			writeErrorResponse(w, status, code, "listing live tmux sessions failed: "+err.Error(), nil, reqID)
+			return
+		}
+		for _, candidate := range live {
+			if candidate.Name == sessionID {
+				writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
+					"session": liveSessionRecord(candidate),
+				}, reqID)
+				return
+			}
+		}
 		writeErrorResponse(w, http.StatusNotFound, ErrCodeNotFound, "session not found", nil, reqID)
 		return
 	}
 
 	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
 		"session": session,
-	}, reqID)
-}
-
-// handleSessionAgentsV1 handles GET /api/v1/sessions/{id}/agents.
-func (s *Server) handleSessionAgentsV1(w http.ResponseWriter, r *http.Request, sessionID string) {
-	reqID := requestIDFromContext(r.Context())
-
-	if s.stateStore == nil {
-		writeErrorResponse(w, http.StatusServiceUnavailable, ErrCodeServiceUnavail, "state store not available", nil, reqID)
-		return
-	}
-
-	agents, err := s.stateStore.ListAgents(sessionID)
-	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
-		return
-	}
-
-	// Ensure agents is never null
-	if agents == nil {
-		agents = []state.Agent{}
-	}
-
-	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-		"session_id": sessionID,
-		"agents":     agents,
-		"count":      len(agents),
 	}, reqID)
 }
 
@@ -3748,24 +4238,210 @@ type PaneInputRequest struct {
 	Enter bool   `json:"enter,omitempty"`
 }
 
+const defaultPaneInputTimeout = 30 * time.Second
+
 // handlePaneInputV1 handles POST /api/v1/sessions/{sessionId}/panes/{paneIdx}/input.
 func (s *Server) handlePaneInputV1(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
-	// Retired: this raw SendKeys endpoint bypassed the robot dispatch receipt,
-	// resolved-target authorization, and durable audit event. It is intentionally
-	// a non-mutating terminal response; use the guarded agents/send endpoint.
-	writeErrorResponse(w, http.StatusGone, ErrCodeForbidden,
-		"raw pane input is retired; use the authenticated guarded agent send endpoint", nil, reqID)
+	sessionID := chi.URLParam(r, "sessionId")
+	paneIdxStr := chi.URLParam(r, "paneIdx")
+
+	if !validateSessionParam(w, sessionID, reqID) {
+		return
+	}
+
+	paneIdx := validatePaneIdx(w, paneIdxStr, reqID)
+	if paneIdx < 0 {
+		return
+	}
+
+	var req PaneInputRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "invalid request body", nil, reqID)
+		return
+	}
+
+	if req.Text == "" {
+		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "text required", nil, reqID)
+		return
+	}
+
+	budget := s.paneInputTimeout
+	if budget <= 0 {
+		budget = defaultPaneInputTimeout
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), budget)
+	defer cancel()
+	fail := func(status int, code string, err error) {
+		if ctx.Err() != nil {
+			status, code, err = http.StatusGatewayTimeout, ErrCodeTimeout, ctx.Err()
+		}
+		writeErrorResponse(w, status, code, err.Error(), nil, reqID)
+	}
+	if err := ctx.Err(); err != nil {
+		fail(http.StatusGatewayTimeout, ErrCodeTimeout, err)
+		return
+	}
+	// The server cannot interpret a remote pane's path as a local policy root.
+	if tmux.DefaultClient.Remote != "" {
+		fail(http.StatusServiceUnavailable, ErrCodeServiceUnavail, errors.New("cannot verify project safety policy for a remote tmux pane"))
+		return
+	}
+	resolve := resolvePaneByIndex
+	if s.resolvePane != nil {
+		resolve = s.resolvePane
+	}
+	lookup := func() (tmux.Pane, bool) {
+		pane, err := resolve(ctx, sessionID, paneIdx)
+		if err != nil {
+			status, code := http.StatusNotFound, ErrCodeNotFound
+			var selectorErr *tmux.PaneSelectorError
+			if errors.As(err, &selectorErr) && selectorErr.Kind == tmux.PaneSelectorAmbiguous {
+				status, code = http.StatusConflict, ErrCodeConflict
+			}
+			fail(status, code, err)
+			return tmux.Pane{}, false
+		}
+		selector, err := tmux.ParsePaneSelector(pane.ID)
+		if err != nil || selector.Kind != tmux.PaneSelectorID || pane.PID <= 0 || pane.Dead || pane.IsServicePane() {
+			fail(http.StatusConflict, ErrCodeConflict, errors.New("pane is not a live input target with a stable physical identity"))
+			return tmux.Pane{}, false
+		}
+		return pane, true
+	}
+	pane, ok := lookup()
+	if !ok {
+		return
+	}
+	// Join assignment/rotation admission and pipeline ownership before checking
+	// the physical pane again. Numeric indices can be reused while we wait.
+	store, err := assignment.LoadStoreStrictReadOnly(sessionID)
+	if err != nil {
+		fail(http.StatusServiceUnavailable, ErrCodeServiceUnavail, fmt.Errorf("load pane admission state: %w", err))
+		return
+	}
+	releaseTarget, err := store.AcquireTargetLock(ctx, pane.ID)
+	if err != nil {
+		fail(http.StatusServiceUnavailable, ErrCodeServiceUnavail, fmt.Errorf("acquire pane admission: %w", err))
+		return
+	}
+	defer releaseTarget()
+	releasePane, err := pipeline.AcquireSharedPaneLock(ctx, pane.ID, "")
+	if err != nil {
+		fail(http.StatusServiceUnavailable, ErrCodeServiceUnavail, fmt.Errorf("acquire pane delivery ownership: %w", err))
+		return
+	}
+	defer releasePane()
+	refresh := func() bool {
+		current, ok := lookup()
+		if !ok {
+			return false
+		}
+		if current.ID != pane.ID || current.PID != pane.PID || current.Type.Canonical() != pane.Type.Canonical() {
+			fail(http.StatusConflict, ErrCodeConflict, errors.New("pane identity changed while acquiring delivery ownership; refresh the session before sending"))
+			return false
+		}
+		pane = current
+		return true
+	}
+	if !refresh() {
+		return
+	}
+	if err := pane.Type.ValidateAutomatedPromptDelivery(); err != nil {
+		writeErrorResponse(w, http.StatusNotImplemented, ErrCodeNotImplemented, err.Error(), map[string]interface{}{
+			"agent_type": pane.Type.Canonical().String(),
+			"hint":       agent.GrokPromptDeliveryCapabilityHint,
+		}, reqID)
+		return
+	}
+	p, err := loadPaneProjectPolicy(ctx, pane)
+	if err != nil {
+		if errors.Is(err, errPaneProjectIdentityChanged) {
+			fail(http.StatusConflict, ErrCodeConflict, err)
+		} else {
+			fail(http.StatusServiceUnavailable, ErrCodeServiceUnavail, err)
+		}
+		return
+	}
+	if match := p.Check(req.Text); match != nil && match.Action == policy.ActionBlock {
+		slog.Warn("pane input blocked by policy",
+			"session", sessionID, "pane", paneIdx,
+			"pattern", match.Pattern, "request_id", reqID)
+		fail(http.StatusForbidden, ErrCodeForbidden, fmt.Errorf("blocked by safety policy: %s", match.Reason))
+		return
+	}
+	if !refresh() {
+		return
+	}
+	// The REST redaction middleware already admitted this text without rewriting
+	// it. Keep its bytes intact, including whitespace and stage-only input, while
+	// sharing the live quarantine, trust/composer, transport, and submission checks.
+	service, err := dispatch.NewService(dispatch.Ports{
+		Redactor: dispatch.AllowAllRedactor{}, Deliverer: dispatch.TMUXDeliverer{},
+	})
+	if err != nil {
+		fail(http.StatusInternalServerError, ErrCodeInternalError, err)
+		return
+	}
+	_, err = service.Execute(ctx, dispatch.Request{
+		Session: sessionID, Panes: []tmux.Pane{pane}, Selectors: []string{pane.ID},
+		RequireSingleSelector: true, IncludeUser: true, AllowEmptyMessage: true,
+		Message: req.Text, Submit: req.Enter, StopOnFailure: true,
+	})
+	if err != nil {
+		status, code := http.StatusInternalServerError, ErrCodeInternalError
+		var dispatchErr *dispatch.Error
+		if dispatch.IsGuaranteedNoDeliveryActuation(err) ||
+			(errors.As(err, &dispatchErr) && dispatchErr.Code == dispatch.ErrRotationPending) {
+			status, code = http.StatusConflict, ErrCodeConflict
+		}
+		fail(status, code, err)
+		return
+	}
+
+	slog.Info("pane input sent via API",
+		"session", sessionID, "pane", paneIdx,
+		"text_len", len(req.Text), "request_id", reqID)
+
+	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
+		"sent": true,
+		"pane": pane.ID,
+	}, reqID)
 }
 
 // handlePaneInterruptV1 handles POST /api/v1/sessions/{sessionId}/panes/{paneIdx}/interrupt.
 func (s *Server) handlePaneInterruptV1(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
-	// Bare Ctrl-C has no durable text receipt or per-target authenticated
-	// admission. Retire it until it can use the same guarded receipt path as
-	// agent send; do not leave an ambiguous mutation escape hatch.
-	writeErrorResponse(w, http.StatusGone, ErrCodeForbidden,
-		"bare pane interrupt is retired pending authenticated receipt admission", nil, reqID)
+	sessionID := chi.URLParam(r, "sessionId")
+	paneIdxStr := chi.URLParam(r, "paneIdx")
+
+	if !validateSessionParam(w, sessionID, reqID) {
+		return
+	}
+
+	paneIdx := validatePaneIdx(w, paneIdxStr, reqID)
+	if paneIdx < 0 {
+		return
+	}
+
+	pane, ok := s.resolvePaneForRequest(w, r, sessionID, paneIdx, reqID)
+	if !ok {
+		return
+	}
+	paneTarget := pane.ID
+
+	// Press the agent's interrupt KEY (Ctrl+C; Escape for omp). SendKeys is
+	// literal (-l) and would have typed the characters "C-c" instead.
+	if err := tmux.SendInterruptForAgent(paneTarget, pane.Type); err != nil {
+		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		return
+	}
+
+	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
+		"interrupted": true,
+		"pane":        paneTarget,
+		"key":         tmux.InterruptKeyLabel(pane.Type),
+	}, reqID)
 }
 
 // handlePaneOutputV1 handles GET /api/v1/sessions/{sessionId}/panes/{paneIdx}/output.
@@ -3991,20 +4667,171 @@ func (s *Server) handleListAgentsV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	panes, err := tmux.GetPanesContext(r.Context(), sessionID)
+	roster, err := s.listSessionAgents(r.Context(), sessionID)
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		status, code, message := sessionAgentsFailure(err)
+		writeErrorResponse(w, status, code, message, nil, reqID)
 		return
 	}
+	writeSuccessResponse(w, http.StatusOK, roster.payload(sessionID), reqID)
+}
 
-	// Filter to only include recognized agent panes (not user/unknown)
+// sessionAgentRoster is what the agents endpoints report for one session.
+type sessionAgentRoster struct {
+	agents   []map[string]interface{}
+	warnings []string
+}
+
+// payload is the roster's response body, without the envelope fields.
+func (roster sessionAgentRoster) payload(sessionID string) map[string]interface{} {
+	agents := roster.agents
+	if agents == nil {
+		agents = []map[string]interface{}{}
+	}
+	body := map[string]interface{}{
+		"session_id": sessionID,
+		"agents":     agents,
+		"count":      len(agents),
+	}
+	if len(roster.warnings) > 0 {
+		body["warnings"] = roster.warnings
+	}
+	return body
+}
+
+var (
+	// errSessionAgentsNotFound reports a session that tmux is not running and
+	// the state store does not record.
+	errSessionAgentsNotFound = errors.New("session not found")
+	// errSessionAgentsLiveListing wraps a failed live pane listing that no
+	// projection row could stand in for.
+	errSessionAgentsLiveListing = errors.New("listing live tmux panes failed")
+)
+
+// sessionAgentsFailure maps a listSessionAgents error to an HTTP status, an
+// error code and a message.
+func sessionAgentsFailure(err error) (int, string, string) {
+	switch {
+	case errors.Is(err, errSessionAgentsNotFound):
+		return http.StatusNotFound, ErrCodeNotFound, "session not found"
+	case errors.Is(err, errSessionAgentsLiveListing) && errors.Is(err, context.DeadlineExceeded):
+		// The bounded tmux listing ran out of time: tmux, not the server,
+		// failed.
+		return http.StatusGatewayTimeout, ErrCodeTimeout, err.Error()
+	case errors.Is(err, errSessionAgentsLiveListing):
+		return http.StatusServiceUnavailable, ErrCodeServiceUnavail, err.Error()
+	default:
+		return http.StatusInternalServerError, ErrCodeInternalError, err.Error()
+	}
+}
+
+// listSessionAgents reports the agents of one session for
+// GET /api/v1/sessions/{id}/agents and the legacy /api/sessions/{id}/agents.
+// The legacy `agents` table those endpoints used to read (Store.ListAgents)
+// has no production writer, so it only ever answered "no agents".
+//
+// Live tmux panes are the roster: they say which agents exist right now. The
+// runtime projection that `ntm serve` refreshes every few seconds
+// (robot.RefreshNormalizedProjection) adds what a pane listing cannot observe:
+// the agent's state, when it last produced output, its health and its current
+// bead. A live pane with no fresh projection row (right after start, or with
+// no state store) is still reported, just without that state.
+//
+// When tmux answers that the session does not exist, the session has no
+// agents, whatever an unexpired projection row still says: a session the
+// state store records is reported empty, any other is
+// errSessionAgentsNotFound. When tmux fails in any other way (a wedged server
+// past the bound, an open circuit breaker), the fresh projection rows are
+// reported on their own with a warning; with none, the failure is returned.
+func (s *Server) listSessionAgents(ctx context.Context, sessionID string) (sessionAgentRoster, error) {
+	var roster sessionAgentRoster
+	var projected []state.RuntimeAgent
+	if s.stateStore != nil {
+		rows, err := s.stateStore.GetRuntimeAgentsBySession(sessionID)
+		if err != nil {
+			slog.Warn("reading runtime agent projection failed", "session", sessionID, "error", err)
+			roster.warnings = append(roster.warnings, "runtime agent projection unavailable: "+err.Error())
+		} else {
+			projected = rows
+		}
+	}
+
+	paneCtx, cancel := context.WithTimeout(ctx, s.liveTmuxTimeout())
+	panes, err := tmux.GetPanesContext(paneCtx, sessionID)
+	cancel()
+	if err == nil {
+		roster.agents = s.liveAgentRecords(sessionID, panes, projected)
+		return roster, nil
+	}
+
+	switch tmux.ClassifyCommandError(err).Kind {
+	case tmux.CommandErrorSessionNotFound, tmux.CommandErrorNoServer:
+		if s.stateStore != nil {
+			stored, storeErr := s.stateStore.GetSession(sessionID)
+			if storeErr != nil {
+				return sessionAgentRoster{}, storeErr
+			}
+			if stored != nil {
+				roster.agents = []map[string]interface{}{}
+				return roster, nil
+			}
+		}
+		return sessionAgentRoster{}, errSessionAgentsNotFound
+	}
+
+	agents := projectedAgentRecords(sessionID, projected)
+	if len(agents) == 0 {
+		return sessionAgentRoster{}, fmt.Errorf("%w: %w", errSessionAgentsLiveListing, err)
+	}
+	slog.Warn("listing live tmux panes failed; reporting projected agents", "session", sessionID, "error", err)
+	roster.agents = agents
+	roster.warnings = append(roster.warnings, fmt.Sprintf("%v (%v); agents are reported from the runtime projection", errSessionAgentsLiveListing, err))
+	return roster, nil
+}
+
+// liveAgentRecords turns the agent panes of a running session into agent
+// records, adding each pane's fresh projection row when there is one.
+func (s *Server) liveAgentRecords(sessionID string, panes []tmux.Pane, projected []state.RuntimeAgent) []map[string]interface{} {
+	byPane := make(map[string]state.RuntimeAgent, len(projected))
+	for _, row := range projected {
+		byPane[row.Pane] = row
+	}
+
+	// Agent Mail names ("GreenLake") are recorded per pane. Only trust a
+	// mapping whose recorded pane PID still matches: tmux reuses pane IDs
+	// after a server restart, and a stale registry must not rename a new pane.
+	registry, err := agentmail.LoadBestSessionAgentRegistry(sessionID, s.projectDirSnapshot())
+	if err != nil {
+		slog.Debug("loading agent registry failed", "session", sessionID, "error", err)
+		registry = nil
+	}
+
 	agents := make([]map[string]interface{}, 0, len(panes))
 	for _, p := range panes {
-		agentType := string(p.Type)
-		if agentType == "" || agentType == "unknown" || agentType == "user" {
+		// User shells, unrecognized panes and tagged service panes (cm,
+		// cass, ...) are not agents; the projection leaves them out too.
+		agentType := servedAgentType(string(p.Type))
+		if agentType == "" || p.IsServicePane() {
 			continue
 		}
-		agents = append(agents, map[string]interface{}{
+		name := p.Title
+		agentMailName := ""
+		if registry != nil && p.PID != 0 && registry.PanePID(p.ID) == p.PID {
+			if registered, ok := registry.GetAgentByID(p.ID); ok && registered != "" {
+				agentMailName = registered
+				name = registered
+			}
+		}
+		agent := map[string]interface{}{
+			// Agent-record fields (id, session_id, name, type, tmux_pane_id,
+			// status, last_seen, current_task_id) that clients such as the
+			// web dashboard's Agents page render.
+			"id":           p.ID,
+			"session_id":   sessionID,
+			"name":         name,
+			"type":         agentType,
+			"tmux_pane_id": p.ID,
+			// Pane-specific fields.
 			"pane_index": p.Index,
 			"pane_id":    p.ID,
 			"agent_type": agentType,
@@ -4012,14 +4839,102 @@ func (s *Server) handleListAgentsV1(w http.ResponseWriter, r *http.Request) {
 			"variant":    p.Variant,
 			"tags":       p.Tags,
 			"active":     p.Active,
-		})
+			"dead":       p.Dead,
+		}
+		if agentMailName != "" {
+			agent["agent_mail_name"] = agentMailName
+		}
+		if row, ok := byPane[p.ID]; ok {
+			addProjectedAgentState(agent, row)
+		}
+		if p.Dead {
+			// tmux reports the pane's process has exited, which outranks
+			// whatever state the projection last classified.
+			agent["status"] = "dead"
+		}
+		agents = append(agents, agent)
 	}
+	return agents
+}
 
-	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-		"session_id": sessionID,
-		"agents":     agents,
-		"count":      len(agents),
-	}, reqID)
+// projectedAgentRecords turns fresh projection rows into agent records, for
+// when tmux cannot be listed. The projection records no pane index or title.
+// Its Agent Mail name is reported as is: without a live pane PID there is
+// nothing to verify it against, and it is the name --robot-status reports.
+func projectedAgentRecords(sessionID string, rows []state.RuntimeAgent) []map[string]interface{} {
+	agents := make([]map[string]interface{}, 0, len(rows))
+	for _, row := range rows {
+		agentType := servedAgentType(row.AgentType)
+		if agentType == "" || row.Pane == "" {
+			continue
+		}
+		name := row.Pane
+		if row.AgentMailName != "" {
+			name = row.AgentMailName
+		}
+		agent := map[string]interface{}{
+			"id":           row.Pane,
+			"session_id":   sessionID,
+			"name":         name,
+			"type":         agentType,
+			"tmux_pane_id": row.Pane,
+			"pane_id":      row.Pane,
+			"agent_type":   agentType,
+		}
+		if row.Variant != "" {
+			agent["variant"] = row.Variant
+		}
+		if row.AgentMailName != "" {
+			agent["agent_mail_name"] = row.AgentMailName
+		}
+		addProjectedAgentState(agent, row)
+		agents = append(agents, agent)
+	}
+	return agents
+}
+
+// addProjectedAgentState copies what the runtime projection observed about an
+// agent into its record: its state (idle, active, busy, error, compacting or
+// unknown, the --robot-status vocabulary), when it last produced output,
+// health, current bead, unread mail, and when the projection collected it.
+func addProjectedAgentState(agent map[string]interface{}, row state.RuntimeAgent) {
+	if row.State != "" {
+		agent["status"] = string(row.State)
+	}
+	if row.StateReason != "" {
+		agent["state_reason"] = row.StateReason
+	}
+	if row.LastOutputAt != nil && !row.LastOutputAt.IsZero() {
+		agent["last_seen"] = row.LastOutputAt.UTC()
+	}
+	if row.HealthStatus != "" {
+		agent["health_status"] = string(row.HealthStatus)
+	}
+	if row.HealthReason != "" {
+		agent["health_reason"] = row.HealthReason
+	}
+	if row.CurrentBead != "" {
+		agent["current_task_id"] = row.CurrentBead
+	}
+	if row.PendingMail > 0 {
+		agent["pending_mail"] = row.PendingMail
+	}
+	if !row.CollectedAt.IsZero() {
+		agent["projected_at"] = row.CollectedAt.UTC()
+	}
+}
+
+// servedAgentType returns the short agent type ("cc", "cod", ...) the agents
+// endpoints report, or "" for a pane that is not an agent. Live panes carry
+// the short form already; projection rows carry the robot form ("claude",
+// "codex").
+func servedAgentType(raw string) string {
+	switch canonical := tmux.AgentType(raw).Canonical(); canonical {
+	case "", tmux.AgentUser, tmux.AgentUnknown:
+		return ""
+	default:
+		return string(canonical)
+	}
 }
 
 // AgentSpawnRequest is the request body for POST /sessions/{id}/agents/spawn.
@@ -4029,10 +4944,23 @@ type AgentSpawnRequest struct {
 	GmiCount  int    `json:"gmi_count,omitempty"`
 	AgyCount  int    `json:"agy_count,omitempty"`
 	GrokCount int    `json:"grok_count,omitempty"`
+	OmpCount  int    `json:"omp_count,omitempty"`
+	OcCount   int    `json:"oc_count,omitempty"`
 	Preset    string `json:"preset,omitempty"`
 	WaitReady bool   `json:"wait_ready,omitempty"`
 	Label     string `json:"label,omitempty"` // Goal label for multi-session support
 }
+
+// hasAgentCountOrPreset reports whether the request names at least one agent
+// to spawn (by count for any supported type, or through a preset).
+func (req AgentSpawnRequest) hasAgentCountOrPreset() bool {
+	return req.CCCount != 0 || req.CodCount != 0 || req.GmiCount != 0 || req.AgyCount != 0 ||
+		req.GrokCount != 0 || req.OmpCount != 0 || req.OcCount != 0 || req.Preset != ""
+}
+
+// agentSpawnCountRequiredMessage is the shared validation error for a spawn
+// request that names no agents.
+const agentSpawnCountRequiredMessage = "at least one agent count (cc_count, cod_count, gmi_count, agy_count, grok_count, omp_count, oc_count) or preset required"
 
 // handleAgentSpawnV1 handles POST /api/v1/sessions/{sessionId}/agents/spawn.
 func (s *Server) handleAgentSpawnV1(w http.ResponseWriter, r *http.Request) {
@@ -4050,8 +4978,8 @@ func (s *Server) handleAgentSpawnV1(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// At least one agent count or preset must be specified
-	if req.CCCount == 0 && req.CodCount == 0 && req.GmiCount == 0 && req.AgyCount == 0 && req.GrokCount == 0 && req.Preset == "" {
-		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "at least one agent count (cc_count, cod_count, gmi_count, agy_count, grok_count) or preset required", nil, reqID)
+	if !req.hasAgentCountOrPreset() {
+		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, agentSpawnCountRequiredMessage, nil, reqID)
 		return
 	}
 
@@ -4063,6 +4991,8 @@ func (s *Server) handleAgentSpawnV1(w http.ResponseWriter, r *http.Request) {
 		GmiCount:  req.GmiCount,
 		AgyCount:  req.AgyCount,
 		GrokCount: req.GrokCount,
+		OmpCount:  req.OmpCount,
+		OcCount:   req.OcCount,
 		Preset:    req.Preset,
 		WaitReady: req.WaitReady,
 	}
@@ -4107,6 +5037,130 @@ type AgentSendRequest struct {
 	All        bool     `json:"all,omitempty"`
 }
 
+var errPaneProjectIdentityChanged = errors.New("pane identity changed while checking project safety policy")
+
+// loadPaneProjectPolicy resolves the actual target pane, including a project
+// root above its current subdirectory. Server selection and daemon cwd cannot
+// authorize input into another project's agent.
+func loadPaneProjectPolicy(ctx context.Context, pane tmux.Pane) (*policy.Policy, error) {
+	if tmux.DefaultClient.Remote != "" {
+		return nil, errors.New("cannot verify project safety policy for a remote tmux pane")
+	}
+	selector, err := tmux.ParsePaneSelector(pane.ID)
+	if err != nil || selector.Kind != tmux.PaneSelectorID || pane.PID <= 0 || pane.Dead || pane.IsServicePane() {
+		return nil, errors.New("cannot verify project safety policy for a pane without a live physical identity")
+	}
+	// Read lifetime and project in one tmux observation. A path by itself
+	// could belong to a replacement process under the same physical pane ID.
+	format := strings.Join([]string{"#{pane_id}", "#{pane_pid}", "#{pane_dead}", "#{pane_current_command}", "#{@ntm_agent_type}", "#{@acfs_service}", "#{@ntm_service}", "#{pane_current_path}"}, tmux.FieldSeparator)
+	observation, err := tmux.DefaultClient.RunContext(ctx, "display-message", "-p", "-t", tmux.ExactTarget(pane.ID), format)
+	if err != nil {
+		return nil, fmt.Errorf("resolve pane project: %w", err)
+	}
+	parts := strings.SplitN(strings.TrimSpace(observation), tmux.FieldSeparator, 8)
+	if len(parts) != 8 {
+		return nil, errors.New("pane did not report a complete project and lifetime observation")
+	}
+	pid, err := strconv.Atoi(parts[1])
+	recordedType := tmux.ParsePaneAgentTypeOption(parts[4])
+	if err != nil || parts[0] != pane.ID || pid != pane.PID || parts[2] != "0" || parts[3] != pane.Command ||
+		recordedType != tmux.AgentUnknown && recordedType.Canonical() != pane.Type.Canonical() ||
+		recordedType == tmux.AgentUnknown && (tmux.ParsePaneServiceOption(parts[5]) != "" || tmux.ParsePaneServiceOption(parts[6]) != "") {
+		return nil, errPaneProjectIdentityChanged
+	}
+	path := parts[7]
+	if !filepath.IsAbs(path) {
+		return nil, errors.New("pane did not report an absolute local project path")
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
+		return nil, errors.New("pane project path is not an accessible local directory")
+	}
+	projectDir, err := util.ResolveProjectDirContext(ctx, path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve pane project root: %w", err)
+	}
+	p, err := policy.LoadForProject(projectDir)
+	if err != nil {
+		return nil, fmt.Errorf("load pane project safety policy: %w", err)
+	}
+	return p, nil
+}
+
+type agentMessagePolicyError struct {
+	status int
+	code   string
+	err    error
+}
+
+func (e *agentMessagePolicyError) Error() string { return e.err.Error() }
+func (e *agentMessagePolicyError) Unwrap() error { return e.err }
+
+// agentMessageGuard runs inside the robot's canonical target selection, so
+// every affected pane is checked before the first send or interrupt. Keeping
+// this per request avoids global policy races between concurrently served
+// projects, while leaving durable selector bindings unchanged.
+func (s *Server) agentMessageGuard(requestCtx context.Context, refusal *error) func(context.Context, string, []tmux.Pane) error {
+	return func(_ context.Context, message string, panes []tmux.Pane) error {
+		fail := func(status int, code string, err error) error {
+			failure := &agentMessagePolicyError{status, code, err}
+			if *refusal == nil {
+				*refusal = failure
+			}
+			return failure
+		}
+		budget := s.paneInputTimeout
+		if budget <= 0 {
+			budget = defaultPaneInputTimeout
+		}
+		ctx, cancel := context.WithTimeout(requestCtx, budget)
+		defer cancel()
+		for _, pane := range panes {
+			p, err := loadPaneProjectPolicy(ctx, pane)
+			if err != nil {
+				if ctx.Err() != nil {
+					return fail(http.StatusGatewayTimeout, ErrCodeTimeout, ctx.Err())
+				}
+				if errors.Is(err, errPaneProjectIdentityChanged) {
+					return fail(http.StatusConflict, ErrCodeConflict, err)
+				}
+				return fail(http.StatusServiceUnavailable, ErrCodeServiceUnavail, err)
+			}
+			if match := p.Check(message); match != nil && match.Action == policy.ActionBlock {
+				return fail(http.StatusForbidden, ErrCodeForbidden,
+					fmt.Errorf("blocked by safety policy for pane %s: %s", pane.ID, match.Reason))
+			}
+		}
+		return nil
+	}
+}
+
+func writeAgentMessagePolicyError(w http.ResponseWriter, reqID string, err error, result interface{}) bool {
+	var refusal *agentMessagePolicyError
+	if !errors.As(err, &refusal) {
+		return false
+	}
+	var details map[string]interface{}
+	switch output := result.(type) {
+	case *robot.SendOutput:
+		if output != nil {
+			details = map[string]interface{}{"actuation": output}
+			if output.Operation != nil {
+				details["operation"] = output.Operation
+			}
+		}
+	case *robot.InterruptOutput:
+		if output != nil {
+			details = map[string]interface{}{"actuation": output}
+			if output.Operation != nil {
+				details["operation"] = output.Operation
+			}
+		}
+	}
+	writeErrorResponse(w, refusal.status, refusal.code, refusal.Error(), details, reqID)
+	return true
+}
+
 // handleAgentSendV1 handles POST /api/v1/sessions/{sessionId}/agents/send.
 func (s *Server) handleAgentSendV1(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
@@ -4127,20 +5181,9 @@ func (s *Server) handleAgentSendV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Policy check: reject messages that match a blocked safety pattern.
-	if p, policyErr := policy.LoadOrDefault(); policyErr != nil {
-		slog.Warn("agent send policy check skipped: failed to load policy",
-			"error", policyErr, "request_id", reqID)
-	} else if match := p.Check(req.Message); match != nil && match.Action == policy.ActionBlock {
-		slog.Warn("agent send blocked by policy",
-			"session", sessionID, "pattern", match.Pattern, "request_id", reqID)
-		writeErrorResponse(w, http.StatusForbidden, ErrCodeForbidden,
-			fmt.Sprintf("blocked by safety policy: %s", match.Reason), nil, reqID)
-		return
-	}
-
-	admission := sendReceiptAdmission(r, sessionID)
+	var policyRefusal error
 	opts := robot.SendOptions{
+		Context:        r.Context(),
 		Session:        sessionID,
 		Message:        req.Message,
 		Panes:          req.Panes,
@@ -4149,7 +5192,7 @@ func (s *Server) handleAgentSendV1(w http.ResponseWriter, r *http.Request) {
 		RequestID:      reqID,
 		CorrelationID:  reqID,
 		IdempotencyKey: r.Header.Get("Idempotency-Key"),
-		Admission:      admission,
+		MessageGuard:   s.agentMessageGuard(r.Context(), &policyRefusal),
 	}
 
 	sendAgents := robot.GetSend
@@ -4157,7 +5200,13 @@ func (s *Server) handleAgentSendV1(w http.ResponseWriter, r *http.Request) {
 		sendAgents = s.sendAgents
 	}
 	result, err := sendAgents(opts)
+	if writeAgentMessagePolicyError(w, reqID, policyRefusal, result) {
+		return
+	}
 	if err != nil {
+		if writeAgentMessagePolicyError(w, reqID, err, result) {
+			return
+		}
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
 		return
 	}
@@ -4169,6 +5218,12 @@ func (s *Server) handleAgentSendV1(w http.ResponseWriter, r *http.Request) {
 		details := map[string]interface{}{}
 		if result.Hint != "" {
 			details["hint"] = result.Hint
+		}
+		if result.Operation != nil {
+			details["operation"] = result.Operation
+		}
+		if len(result.Warnings) > 0 {
+			details["warnings"] = result.Warnings
 		}
 		writeErrorResponse(w, robotErrorHTTPStatus(result.ErrorCode), result.ErrorCode, result.Error, details, reqID)
 		return
@@ -4185,20 +5240,83 @@ func (s *Server) handleAgentSendV1(w http.ResponseWriter, r *http.Request) {
 
 // AgentInterruptRequest is the request body for POST /sessions/{id}/agents/interrupt.
 type AgentInterruptRequest struct {
-	Panes   []string `json:"panes,omitempty"`
-	Message string   `json:"message,omitempty"`
-	Force   bool     `json:"force,omitempty"`
-	NoWait  bool     `json:"no_wait,omitempty"`
+	Panes      []string `json:"panes,omitempty"`
+	AgentTypes []string `json:"agent_types,omitempty"`
+	Message    string   `json:"message,omitempty"`
+	Force      bool     `json:"force,omitempty"`
+	NoWait     bool     `json:"no_wait,omitempty"`
 }
 
 // handleAgentInterruptV1 handles POST /api/v1/sessions/{sessionId}/agents/interrupt.
 func (s *Server) handleAgentInterruptV1(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
-	// This endpoint combines a bare Ctrl-C with an optional direct Dispatch
-	// follow-up. Neither can prove the required atomic receipt/event admission,
-	// so the entire mutation route is retired rather than partially guarded.
-	writeErrorResponse(w, http.StatusGone, ErrCodeForbidden,
-		"agent interrupt is retired pending authenticated receipt admission", nil, reqID)
+	sessionID := chi.URLParam(r, "sessionId")
+
+	if !validateSessionParam(w, sessionID, reqID) {
+		return
+	}
+
+	var req AgentInterruptRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "invalid request body", nil, reqID)
+		return
+	}
+
+	var policyRefusal error
+	opts := robot.InterruptOptions{
+		Session:        sessionID,
+		Panes:          req.Panes,
+		AgentTypes:     req.AgentTypes,
+		Message:        req.Message,
+		Force:          req.Force,
+		NoWait:         req.NoWait,
+		RequestID:      reqID,
+		CorrelationID:  reqID,
+		IdempotencyKey: r.Header.Get("Idempotency-Key"),
+		MessageGuard:   s.agentMessageGuard(r.Context(), &policyRefusal),
+	}
+
+	interruptAgents := robot.GetInterrupt
+	if s.interruptAgents != nil {
+		interruptAgents = s.interruptAgents
+	}
+	result, err := interruptAgents(opts)
+	if writeAgentMessagePolicyError(w, reqID, policyRefusal, result) {
+		return
+	}
+	if err != nil {
+		if writeAgentMessagePolicyError(w, reqID, err, result) {
+			return
+		}
+		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		return
+	}
+	if result == nil {
+		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, "agent interrupt returned no result", nil, reqID)
+		return
+	}
+	if !result.Success {
+		details := map[string]interface{}{}
+		if result.Hint != "" {
+			details["hint"] = result.Hint
+		}
+		if result.Operation != nil {
+			details["operation"] = result.Operation
+		}
+		if len(result.Warnings) > 0 {
+			details["warnings"] = result.Warnings
+		}
+		writeErrorResponse(w, robotErrorHTTPStatus(result.ErrorCode), result.ErrorCode, result.Error, details, reqID)
+		return
+	}
+
+	data, err := toJSONMap(result)
+	if err != nil {
+		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to serialize response", nil, reqID)
+		return
+	}
+
+	writeSuccessResponse(w, http.StatusOK, data, reqID)
 }
 
 // AgentWaitRequest is the request body for POST /sessions/{id}/agents/wait.
@@ -4317,8 +5435,9 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-		"jobs":  jobs,
-		"count": len(jobs),
+		"jobs":      jobs,
+		"count":     len(jobs),
+		"execution": s.jobExecutor.snapshot(),
 	}, reqID)
 }
 
@@ -4327,6 +5446,10 @@ type CreateJobRequest struct {
 	Type    string                 `json:"type"`
 	Params  map[string]interface{} `json:"params,omitempty"`
 	Session string                 `json:"session,omitempty"`
+
+	// Internal service ownership; never accepted from JSON or fingerprinted.
+	executionContext    context.Context
+	executionProjectDir string
 }
 
 // handleCreateJob handles POST /api/v1/jobs.
@@ -4334,8 +5457,14 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
 
 	var req CreateJobRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "invalid request body", nil, reqID)
+	var err error
+	if scope, captured := r.Context().Value(jobHTTPReplayScopeKey{}).(jobHTTPReplayScope); captured {
+		req, err = scope.request, scope.requestErr
+	} else {
+		req, err = decodeCreateJobRequest(r.Body)
+	}
+	if err != nil {
+		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "invalid request body: "+err.Error(), nil, reqID)
 		return
 	}
 
@@ -4355,10 +5484,23 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	job := s.jobStore.Create(req.Type)
-
-	// Start real job execution in background
-	go s.dispatchJob(job.ID, req)
+	job, err := s.submitJob(r.Context(), req)
+	if err != nil {
+		code, status := ErrCodeServiceUnavail, http.StatusServiceUnavailable
+		if errors.Is(err, errInvalidJobRequest) {
+			code, status = ErrCodeBadRequest, http.StatusBadRequest
+		}
+		if errors.Is(err, errJobQueueFull) {
+			w.Header().Set("Retry-After", "1")
+		}
+		details := map[string]interface{}{"execution": s.jobExecutor.snapshot()}
+		if job != nil {
+			details["job"] = job
+		}
+		writeErrorResponse(w, status, code, err.Error(), details, reqID)
+		return
+	}
+	w.Header().Set("Location", "/api/v1/jobs/"+job.ID)
 
 	writeSuccessResponse(w, http.StatusAccepted, map[string]interface{}{
 		"job": job,
@@ -4386,27 +5528,29 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
 	jobID := chi.URLParam(r, "id")
 
-	job := s.jobStore.Get(jobID)
-	if job == nil {
+	job, err := s.cancelJob(jobID)
+	if errors.Is(err, errJobNotFound) {
 		writeErrorResponse(w, http.StatusNotFound, ErrCodeNotFound, "job not found", nil, reqID)
 		return
 	}
 
-	// Only allow cancelling pending or running jobs
-	if job.Status != JobStatusPending && job.Status != JobStatusRunning {
+	if errors.Is(err, errJobNotCancellable) {
 		writeErrorResponse(w, http.StatusConflict, ErrCodeConflict, "job cannot be cancelled", map[string]interface{}{
 			"status": job.Status,
 		}, reqID)
 		return
 	}
 
-	s.jobStore.Update(jobID, JobStatusCancelled, job.Progress, nil, "cancelled by user")
-	// Stop the real work, not just the bookkeeping: cancel the dispatch
-	// goroutine's context (no-op for jobs that already finished).
-	s.jobStore.Cancel(jobID)
+	if err != nil {
+		writeErrorResponse(w, http.StatusServiceUnavailable, ErrCodeServiceUnavail,
+			"cancellation signalled but checkpoint failed: "+err.Error(), map[string]interface{}{
+				"job": job, "cancellation_requested": true,
+			}, reqID)
+		return
+	}
 
 	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
-		"job": s.jobStore.Get(jobID),
+		"job": job,
 	}, reqID)
 }
 
@@ -4734,6 +5878,7 @@ func (c *WSClient) handleSubscribe(msg WSMessage) {
 	// complete request (or partially subscribe its regular topics) as though it
 	// had succeeded.
 	var attentionResult map[string]interface{}
+	var attentionSub *WSAttentionSub
 	if len(attentionTopics) > 0 {
 		attentionResult = c.handleAttentionSubscribe(msg, attentionTopics)
 		if errorCode, failed := attentionResult["error_code"].(string); failed {
@@ -4744,40 +5889,54 @@ func (c *WSClient) handleSubscribe(msg WSMessage) {
 			c.sendError(msg.RequestID, errorCode, message)
 			return
 		}
+		c.attentionSubMu.Lock()
+		attentionSub = c.attentionSub
+		c.attentionSubMu.Unlock()
+	}
+
+	response := map[string]interface{}{"subscribed": topics}
+	if attentionResult != nil {
+		response["attention"] = attentionResult
+	}
+	sendSubscriptionAck := func() bool {
+		if len(attentionTopics) == 0 {
+			return c.sendAck(msg.RequestID, response)
+		}
+		// A live callback can fail while replay or the regular-topic
+		// subscription is being prepared. Commit the acknowledgment under the
+		// same lock as delivery so no failed subscription is acknowledged.
+		c.attentionSubMu.Lock()
+		defer c.attentionSubMu.Unlock()
+		if attentionSub == nil || c.attentionSub != attentionSub || !attentionSub.Active {
+			return c.sendError(msg.RequestID, "REDACTION_FAILED", "attention subscription is no longer active; resynchronize the subscription")
+		}
+		return c.sendAck(msg.RequestID, response)
 	}
 
 	// Regular topics are only committed after any durable attention request has
 	// been accepted, keeping a single subscribe message all-or-nothing.
-	var replayInfo map[string]interface{}
 	if len(regularTopics) > 0 {
 		if since >= 0 {
-			// Replay-then-live is serialized through the hub loop; the replay
-			// frames are queued to this client's send channel before the ack
-			// below, so the ack marks the end of replay.
-			res := c.hub.SubscribeWithReplay(c, regularTopics, since)
-			replayInfo = map[string]interface{}{
-				"since":    since,
-				"replayed": res.replayed,
-				"reset":    res.reset,
-				"cursor":   res.cursor,
-			}
+			// Queue the completion ack on the hub loop too: live delivery
+			// must not overtake it or consume the slot reserved for it.
+			c.hub.SubscribeWithReplay(c, regularTopics, since, func(res wsReplayResult) bool {
+				response["total"] = len(c.Topics())
+				response["replay"] = map[string]interface{}{
+					"since":    since,
+					"replayed": res.replayed,
+					"reset":    res.reset,
+					"cursor":   res.cursor,
+				}
+				return sendSubscriptionAck()
+			})
+			return
 		} else {
 			c.Subscribe(regularTopics)
 		}
 	}
 
-	// Build response
-	response := map[string]interface{}{
-		"subscribed": topics,
-		"total":      len(c.Topics()),
-	}
-	if attentionResult != nil {
-		response["attention"] = attentionResult
-	}
-	if replayInfo != nil {
-		response["replay"] = replayInfo
-	}
-	c.sendAck(msg.RequestID, response)
+	response["total"] = len(c.Topics())
+	sendSubscriptionAck()
 }
 
 // handleUnsubscribe processes an unsubscribe request.
@@ -5019,7 +6178,28 @@ func (c *WSClient) handleAttentionSubscribeWithFeed(feed attentionStreamFeed, ms
 			}
 		} else {
 			// Deliver replayed events
-			replayCount = c.deliverAttentionReplay(events, topics, sub)
+			var replayErr error
+			replayCount, replayErr = c.deliverAttentionReplay(events, topics, sub)
+			if replayErr != nil {
+				c.cancelAttentionSubscription()
+				return map[string]interface{}{
+					"error":      "attention replay could not be disclosed safely; resynchronize the subscription",
+					"error_code": "REDACTION_FAILED",
+				}
+			}
+		}
+	}
+
+	// Live delivery may have failed while replay was in progress, including
+	// an empty replay. Never report that inactive subscription as accepted.
+	c.attentionSubMu.Lock()
+	active := c.attentionSub == sub && sub.Active
+	c.attentionSubMu.Unlock()
+	if !active {
+		c.cancelAttentionSubscription()
+		return map[string]interface{}{
+			"error":      "attention subscription is no longer active; resynchronize the subscription",
+			"error_code": "REDACTION_FAILED",
 		}
 	}
 
@@ -5148,41 +6328,54 @@ func (c *WSClient) deliverAttentionEvent(event robot.AttentionEvent, expected *W
 		Data:      event,
 	}
 
+	if c.hub != nil {
+		if err := c.hub.redactEvent(wsEvent); err != nil {
+			// Do not let a later cursor conceal the withheld event. The next
+			// subscribe replaces this inactive subscription and releases its
+			// feed callback; an in-flight callback for a replaced subscription
+			// must not stop the new one.
+			c.attentionSubMu.Lock()
+			current := c.attentionSub == expected && expected.Active
+			if current {
+				expected.Active = false
+				c.sendError("", "REDACTION_FAILED", "attention event could not be disclosed safely; resynchronize the subscription")
+			}
+			c.attentionSubMu.Unlock()
+			return
+		}
+	}
 	data, err := json.Marshal(wsEvent)
 	if err != nil {
 		return
 	}
 
-	// Send with backpressure tracking
-	sent := c.trySend(data, func() {
-		c.attentionSubMu.Lock()
-		if c.attentionSub != nil {
-			c.attentionSub.DroppedCount++
-		}
+	// Redaction can take time, so a replay failure or replacement may have
+	// invalidated the snapshot. Sending and committing the cursor must be one
+	// operation with respect to those changes.
+	c.attentionSubMu.Lock()
+	if c.attentionSub != expected || !expected.Active || event.Cursor <= expected.Cursor {
 		c.attentionSubMu.Unlock()
-		log.Printf("ws attention: dropped event cursor=%d client=%s", event.Cursor, c.id)
-	})
-
+		return
+	}
+	sent := c.trySend(data, nil)
 	if sent {
-		c.attentionSubMu.Lock()
-		if c.attentionSub != nil {
-			// Monotonic, like the replay path: a live event and a replayed one
-			// can commit in either order, and the cursor is what "resume from
-			// here" means to the client. Never move it backwards.
-			if event.Cursor > c.attentionSub.Cursor {
-				c.attentionSub.Cursor = event.Cursor
-			}
-			c.attentionSub.EventCount++
-		}
-		c.attentionSubMu.Unlock()
+		expected.Cursor = event.Cursor
+		expected.EventCount++
+	} else {
+		expected.DroppedCount++
+	}
+	c.attentionSubMu.Unlock()
+	if !sent {
+		log.Printf("ws attention: dropped event cursor=%d client=%s", event.Cursor, c.id)
 	}
 }
 
 // deliverAttentionReplay delivers replayed attention events to the client.
-// Returns the count of events delivered.
-func (c *WSClient) deliverAttentionReplay(events []robot.AttentionEvent, topics []string, sub *WSAttentionSub) int {
+// Returns the count of events delivered and refuses an unsafe replay so the
+// caller cannot acknowledge a partial subscription as successful.
+func (c *WSClient) deliverAttentionReplay(events []robot.AttentionEvent, topics []string, sub *WSAttentionSub) (int, error) {
 	if sub == nil {
-		return 0
+		return 0, nil
 	}
 
 	delivered := 0
@@ -5228,22 +6421,36 @@ func (c *WSClient) deliverAttentionReplay(events []robot.AttentionEvent, topics 
 			Data:      event,
 		}
 
+		if c.hub != nil {
+			if err := c.hub.redactEvent(wsEvent); err != nil {
+				c.attentionSubMu.Lock()
+				if c.attentionSub == sub {
+					sub.Active = false
+				}
+				c.attentionSubMu.Unlock()
+				return delivered, err
+			}
+		}
 		data, err := json.Marshal(wsEvent)
 		if err != nil {
 			continue
 		}
 
+		c.attentionSubMu.Lock()
+		if c.attentionSub != sub || !sub.Active {
+			c.attentionSubMu.Unlock()
+			return delivered, errors.New("attention subscription changed during replay")
+		}
 		if c.trySend(data, nil) {
 			delivered++
-			c.attentionSubMu.Lock()
-			if c.attentionSub != nil && event.Cursor > c.attentionSub.Cursor {
-				c.attentionSub.Cursor = event.Cursor
+			if event.Cursor > sub.Cursor {
+				sub.Cursor = event.Cursor
 			}
-			c.attentionSubMu.Unlock()
 		}
+		c.attentionSubMu.Unlock()
 	}
 
-	return delivered
+	return delivered, nil
 }
 
 // extractStringSlice extracts a string slice from an interface{}.
@@ -5284,7 +6491,7 @@ func (c *WSClient) trySend(data []byte, onDrop func()) (ok bool) {
 }
 
 // sendError sends a WebSocket error frame.
-func (c *WSClient) sendError(requestID, code, message string) {
+func (c *WSClient) sendError(requestID, code, message string) bool {
 	errMsg := WSError{
 		Type:      WSMsgError,
 		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
@@ -5294,15 +6501,15 @@ func (c *WSClient) sendError(requestID, code, message string) {
 	}
 	data, err := json.Marshal(errMsg)
 	if err != nil {
-		return
+		return false
 	}
-	c.trySend(data, func() {
+	return c.trySend(data, func() {
 		log.Printf("ws client buffer full, dropping error id=%s", c.id)
 	})
 }
 
 // sendAck sends a WebSocket acknowledgment frame.
-func (c *WSClient) sendAck(requestID string, data map[string]interface{}) {
+func (c *WSClient) sendAck(requestID string, data map[string]interface{}) bool {
 	ack := WSMessage{
 		Type:      WSMsgAck,
 		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
@@ -5311,9 +6518,9 @@ func (c *WSClient) sendAck(requestID string, data map[string]interface{}) {
 	}
 	msg, err := json.Marshal(ack)
 	if err != nil {
-		return
+		return false
 	}
-	c.trySend(msg, func() {
+	return c.trySend(msg, func() {
 		log.Printf("ws client buffer full, dropping ack id=%s", c.id)
 	})
 }
@@ -5435,7 +6642,7 @@ func filterAttentionReplayBoundary(events []robot.AttentionEvent, maxCursor int6
 	return filtered
 }
 
-func writeAttentionReplay(
+func (s *Server) writeAttentionReplay(
 	w io.Writer,
 	flusher http.Flusher,
 	events []robot.AttentionEvent,
@@ -5446,23 +6653,16 @@ func writeAttentionReplay(
 ) (int64, int, error) {
 	delivered := 0
 	for _, event := range events {
-		if event.Cursor > replayCursor {
-			replayCursor = event.Cursor
-		}
-		if event.Type == robot.EventType(robot.DefaultTransportLiveness.HeartbeatType) {
+		if event.Type == robot.EventType(robot.DefaultTransportLiveness.HeartbeatType) ||
+			!matchesAttentionFilters(event, categoryFilter, sessionFilter, actionabilityFilter) {
 			// Match the live stream path: transport heartbeat events are not emitted as attention items.
+			replayCursor = max(replayCursor, event.Cursor)
 			continue
 		}
-		if !matchesAttentionFilters(event, categoryFilter, sessionFilter, actionabilityFilter) {
-			continue
-		}
-		data, err := json.Marshal(event)
-		if err != nil {
-			continue
-		}
-		if _, err := fmt.Fprintf(w, "event: attention\ndata: %s\n\n", data); err != nil {
+		if err := s.writeSSEEvent(w, "attention", event); err != nil {
 			return replayCursor, delivered, err
 		}
+		replayCursor = max(replayCursor, event.Cursor)
 		delivered++
 	}
 	if flusher != nil {
@@ -5527,12 +6727,7 @@ func (s *Server) handleAttentionStreamV1(w http.ResponseWriter, r *http.Request)
 		}
 
 		cursorExpiredEvent := attentionCursorExpiredPayload(cursorErr, feed.Stats().NewestCursor)
-		data, marshalErr := json.Marshal(cursorExpiredEvent)
-		if marshalErr != nil {
-			log.Printf("SSE: failed to marshal cursor expired event: %v", marshalErr)
-			return
-		}
-		if _, err := fmt.Fprintf(w, "event: error\ndata: %s\n\n", data); err != nil {
+		if err := s.writeSSEEvent(w, "error", cursorExpiredEvent); err != nil {
 			return
 		}
 		flusher.Flush()
@@ -5560,12 +6755,7 @@ func (s *Server) handleAttentionStreamV1(w http.ResponseWriter, r *http.Request)
 		"oldest_cursor": attentionReplayEarliestCursor(prepared.stats),
 		"newest_cursor": prepared.stats.NewestCursor,
 	}
-	connData, marshalErr := json.Marshal(connEvent)
-	if marshalErr != nil {
-		log.Printf("SSE: failed to marshal connection event: %v", marshalErr)
-		return
-	}
-	if _, err := fmt.Fprintf(w, "event: connected\ndata: %s\n\n", connData); err != nil {
+	if err := s.writeSSEEvent(w, "connected", connEvent); err != nil {
 		return
 	}
 	flusher.Flush()
@@ -5576,7 +6766,7 @@ func (s *Server) handleAttentionStreamV1(w http.ResponseWriter, r *http.Request)
 
 	// Replay events from cursor if requested
 	replayCursor := prepared.replayBoundary
-	replayCursor, eventsSinceStart, err := writeAttentionReplay(
+	replayCursor, eventsSinceStart, err := s.writeAttentionReplay(
 		w,
 		flusher,
 		prepared.replayEvents,
@@ -5638,11 +6828,7 @@ func (s *Server) handleAttentionStreamV1(w http.ResponseWriter, r *http.Request)
 				filteredSinceHeartbeat++
 				continue
 			}
-			data, err := json.Marshal(event)
-			if err != nil {
-				continue
-			}
-			if _, err := fmt.Fprintf(w, "event: attention\ndata: %s\n\n", data); err != nil {
+			if err := s.writeSSEEvent(w, "attention", event); err != nil {
 				return
 			}
 			flusher.Flush()
@@ -5698,12 +6884,7 @@ func (s *Server) handleAttentionStreamV1(w http.ResponseWriter, r *http.Request)
 				heartbeat["last_event_time"] = lastEventTime.Format(time.RFC3339Nano)
 				heartbeat["idle_ms"] = time.Since(lastEventTime).Milliseconds()
 			}
-			data, marshalErr := json.Marshal(heartbeat)
-			if marshalErr != nil {
-				log.Printf("SSE: failed to marshal heartbeat: %v", marshalErr)
-				return
-			}
-			if _, err := fmt.Fprintf(w, "event: heartbeat\ndata: %s\n\n", data); err != nil {
+			if err := s.writeSSEEvent(w, "heartbeat", heartbeat); err != nil {
 				return
 			}
 			flusher.Flush()
@@ -6466,9 +7647,22 @@ func resolvePaneByIndex(ctx context.Context, session string, paneIdx int) (tmux.
 	if err != nil {
 		return tmux.Pane{}, fmt.Errorf("list panes: %w", err)
 	}
+	var matches []tmux.Pane
 	for _, p := range panes {
 		if p.Index == paneIdx {
-			return p, nil
+			matches = append(matches, p)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	if len(matches) > 1 {
+		ids := make([]string, len(matches))
+		for i, pane := range matches {
+			ids[i] = pane.ID
+		}
+		return tmux.Pane{}, &tmux.PaneSelectorError{
+			Kind: tmux.PaneSelectorAmbiguous, Selector: strconv.Itoa(paneIdx), Matches: len(matches), Available: ids,
 		}
 	}
 	return tmux.Pane{}, fmt.Errorf("no pane with index %d in session %q", paneIdx, session)
@@ -6514,6 +7708,13 @@ func parseCSVParam(value string) []string {
 
 // Stop cleans up resources used by the Server.
 func (s *Server) Stop() {
+	if s.jobStore != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := s.drainJobWorkers(ctx); err != nil {
+			slog.Warn("job workers still shutting down", "error", err)
+		}
+		cancel()
+	}
 	if s.idempotencyStore != nil {
 		s.idempotencyStore.Stop()
 	}

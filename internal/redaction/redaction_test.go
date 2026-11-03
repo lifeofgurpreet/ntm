@@ -1,7 +1,12 @@
 package redaction
 
 import (
+	"encoding/json"
+	"fmt"
+	"math/rand"
+	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -829,5 +834,2233 @@ func TestConfigDeepCopy_NilFieldsStayNil(t *testing.T) {
 	}
 	if cp.DisabledCategories != nil {
 		t.Errorf("DisabledCategories became non-nil after deep-copy of zero value: %v", cp.DisabledCategories)
+	}
+}
+
+// Issue #372: JSON/JSONL keys have a closing quote before the separator. Each
+// match must include the complete string value, even across escaped quotes.
+func TestJSONCredentialDetection(t *testing.T) {
+	cases := []struct {
+		name     string
+		field    string
+		category Category
+	}{
+		{"password", `"password":"synthetic-never-valid-json-value"`, CategoryPassword},
+		{"passwd", `"passwd":"synthetic-passwd-value"`, CategoryPassword},
+		{"pwd credential", `"pwd":"synthetic-pwd-value"`, CategoryPassword},
+		{"prefixed password", `"DB_PASSWORD":"synthetic-db-password"`, CategoryPassword},
+		{"prefixed pwd path credential", `"MYSQL_PWD":"/hunter2isnotapath"`, CategoryPassword},
+		{"mixed case and whitespace", "\"PaSsWoRd\" \n : \n \"synthetic-mixed-value\"", CategoryPassword},
+		{"escaped quote", `"password":"secret-prefix\"secret-suffix"`, CategoryPassword},
+		{"escaped backslash and slash", `"password":"secret-prefix\\middle\/secret-suffix"`, CategoryPassword},
+		{"escaped controls", `"password":"secret-prefix\n\t\rsecret-suffix"`, CategoryPassword},
+		{"spaces and apostrophe", `"password":"secret prefix isn't public"`, CategoryPassword},
+		{"eight characters", `"password":"1234567\u0061"`, CategoryPassword},
+		{"unicode characters", `"password":"密码密码密码密码"`, CategoryPassword},
+		{"API key", `"api_key":"synthetic_api_value_123"`, CategoryGenericAPIKey},
+		{"prefixed API key", `"SERVICE_APIKEY":"synthetic-api-value-123"`, CategoryGenericAPIKey},
+		{"escaped API key", `"api_key":"synthetic\u005fapi\u005fvalue_123"`, CategoryGenericAPIKey},
+		{"secret", `"secret":"synthetic/secret+value="`, CategoryGenericSecret},
+		{"private key", `"private_key":"synthetic-private-value"`, CategoryGenericSecret},
+		{"token", `"token":"synthetic-token-value"`, CategoryGenericSecret},
+		{"prefixed token", `"access_token":"synthetic-access-value"`, CategoryGenericSecret},
+		{"escaped secret", `"client_secret":"synthetic\/secret\u002bvalue="`, CategoryGenericSecret},
+		{"AWS secret", `"aws_secret":"` + strings.Repeat("X", 40) + `"`, CategoryAWSSecretKey},
+		{"AWS prefixed secret", `"aws_secret_access_key":"` + strings.Repeat("Y", 40) + `"`, CategoryAWSSecretKey},
+		{"AWS escaped secret", `"secret_access_key":"` + strings.Repeat("Z", 36) + `a\/b="`, CategoryAWSSecretKey},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			const before = `{"before":"public-before","auth":{`
+			const after = `},"after":"public-after"}`
+			input := before + tc.field + after
+			if !json.Valid([]byte(input)) {
+				t.Fatal("invalid JSON fixture")
+			}
+			result := ScanAndRedact(input, Config{Mode: ModeRedact})
+			if len(result.Findings) != 1 {
+				t.Fatalf("findings=%d, want 1", len(result.Findings))
+			}
+			f := result.Findings[0]
+			if f.Category != tc.category || f.Match != tc.field {
+				t.Errorf("got %s match %q, want %s match %q", f.Category, f.Match, tc.category, tc.field)
+			}
+			if f.Start != len(before) || f.End != len(before)+len(tc.field) {
+				t.Errorf("unexpected source range [%d:%d]", f.Start, f.End)
+			}
+			if result.Output != before+f.Redacted+after {
+				t.Error("redaction left part of the credential or changed a neighboring field")
+			}
+		})
+	}
+}
+
+func TestJSONCredentialNegativeFields(t *testing.T) {
+	fields := []string{
+		`"password":""`, `"password":"1234567"`, `"password":"12345\u0061"`,
+		`"password":"密码密码"`, `"password":1234567`, `"password":null`,
+		`"password":false`, `"password":{}`, `"password":["public-array-value"]`,
+		`"password_hint":"public-password-description"`, `"notpassword":"public-description"`,
+		`"token_count":"public-token-description"`, `"api_key_name":"public-key-description"`,
+		`"secret_name":"public-secret-description"`, `"private_key_path":"/public/path/to/key"`,
+		`"api_key":"123456789012345"`, `"api_key":"12345678901234\u0061"`,
+		`"api_key":"invalid-key-value!"`, `"token":"invalid.token.value"`,
+		`"secret_access_key":"` + strings.Repeat("a", 39) + `"`,
+		`"secret_access_key":"` + strings.Repeat("a", 41) + `"`,
+		`"password":"<redacted>"`, `"passwd":"\u003cset\u003e"`,
+		`"password":"************"`, `"pwd":"<hidden>"`,
+		`"PWD":"/home/user/project"`, `"OLDPWD":"/home/user/previous"`,
+		`"pwd":"\/home\/user\/project"`, `"pwd":"\u002fhome/user/project"`,
+		`"PWD":"C:\\Users\\user\\project"`, `"OLDPWD":"$HOME/projects/example"`,
+	}
+	for _, field := range fields {
+		t.Run(field, func(t *testing.T) {
+			input := `{` + field + `,"message":"a long harmless neighboring value"}`
+			if !json.Valid([]byte(input)) {
+				t.Fatal("invalid JSON fixture")
+			}
+			result := ScanAndRedact(input, Config{Mode: ModeRedact})
+			if len(result.Findings) != 0 || result.Output != input {
+				t.Errorf("non-credential field produced findings: %+v", result.Findings)
+			}
+		})
+	}
+}
+
+func TestJSONLCredentialsAndAssignments(t *testing.T) {
+	lines := []string{
+		`{"password":"synthetic-first-value","password":"synthetic-second-value"}`,
+		`{"password":"escaped-prefix\"escaped-suffix","status":"ready"}`,
+		`PASSWORD=synthetic-never-valid-control-value`,
+		`passwd: 'synthetic-assignment-value'`,
+		`DB_PWD=synthetic-database-value`,
+	}
+	input := strings.Join(lines, "\n")
+	findings := Scan(input, Config{})
+	AddLineInfo(input, findings)
+	wantLines := []int{1, 1, 2, 3, 4, 5}
+	if len(findings) != len(wantLines) {
+		t.Fatalf("findings=%d, want %d", len(findings), len(wantLines))
+	}
+	for i, f := range findings {
+		if f.Category != CategoryPassword || f.Line != wantLines[i] || input[f.Start:f.End] != f.Match {
+			t.Errorf("finding %d has wrong category, line, or source range: %+v", i, f)
+		}
+	}
+	output, _ := Redact(input, Config{})
+	for _, fragment := range []string{"synthetic-", "escaped-prefix", "escaped-suffix"} {
+		if strings.Contains(output, fragment) {
+			t.Error("redaction exposed a secret fragment")
+		}
+	}
+	if !strings.Contains(output, `"status":"ready"`) {
+		t.Error("redaction consumed the neighboring public field")
+	}
+}
+
+func TestJSONCredentialsPreserveAllowlistAndPriorities(t *testing.T) {
+	provider := "gh" + "p_" + strings.Repeat("q", 40)
+	for _, key := range []string{"password", "api_key", "token"} {
+		input := `{"` + key + `":"` + provider + `"}`
+		findings := Scan(input, Config{})
+		if len(findings) != 1 || findings[0].Category != CategoryGitHubToken || findings[0].Match != provider {
+			t.Fatalf("provider priority changed for %s: %+v", key, findings)
+		}
+		cfg := Config{Allowlist: []string{"^" + regexp.QuoteMeta(provider) + "$"}}
+		if got := Scan(input, cfg); len(got) != 0 {
+			t.Errorf("allowlisted provider exposed lower-priority matches for %s: %+v", key, got)
+		}
+	}
+	const assignment = "TOKEN=fixture-never-log-this"
+	if got := Scan(assignment, Config{Allowlist: []string{"^" + assignment + "$"}}); len(got) != 0 {
+		t.Error("anchored assignment allowlist changed")
+	}
+	const allowedField = `"password":"synthetic-allowed-value"`
+	input := `{` + allowedField + `,"passwd":"synthetic-unlisted-value"}`
+	findings := Scan(input, Config{Allowlist: []string{"^" + regexp.QuoteMeta(allowedField) + "$"}})
+	if len(findings) != 1 || findings[0].Match != `"passwd":"synthetic-unlisted-value"` {
+		t.Errorf("JSON allowlist did not suppress only the intended match: %+v", findings)
+	}
+	if got := Scan(input, Config{DisabledCategories: []Category{CategoryPassword}}); len(got) != 0 {
+		t.Error("disabled password category still reported JSON fields")
+	}
+}
+
+func TestJSONCredentialProviderOverlapRedactsCompleteValue(t *testing.T) {
+	github := "gh" + "p_" + strings.Repeat("q", 40)
+	partialGitHub := "gh" + "p_" + strings.Repeat("q", 31)
+	google := "AI" + "za" + strings.Repeat("q", 35)
+	aws := "AK" + "IA" + strings.Repeat("Q", 16)
+	tests := []struct {
+		name      string
+		key       string
+		rawValue  string
+		category  Category
+		providers map[string]Category
+		fragments []string
+	}{
+		{
+			name: "escaped token suffix", key: "token",
+			rawValue: partialGitHub + `\u0071SECRETL8`, category: CategoryGenericSecret,
+			providers: map[string]Category{partialGitHub: CategoryGitHubToken},
+			fragments: []string{`\u0071`, "SECRETL8"},
+		},
+		{
+			name: "escaped api key suffix", key: "api_key",
+			rawValue: partialGitHub + `\u0071SECRETL8`, category: CategoryGenericAPIKey,
+			providers: map[string]Category{partialGitHub: CategoryGitHubToken},
+			fragments: []string{`\u0071`, "SECRETL8"},
+		},
+		{
+			name: "escaped password suffix", key: "password",
+			rawValue: partialGitHub + `\u0071SECRETL8`, category: CategoryPassword,
+			providers: map[string]Category{partialGitHub: CategoryGitHubToken},
+			fragments: []string{`\u0071`, "SECRETL8"},
+		},
+		{
+			name: "password prefix and suffix", key: "password",
+			rawValue: "sensitive-prefix:" + github + ":sensitive-suffix", category: CategoryPassword,
+			providers: map[string]Category{github: CategoryGitHubToken},
+			fragments: []string{"sensitive-prefix", "sensitive-suffix"},
+		},
+		{
+			name: "escaped password prefix and suffix", key: "password",
+			rawValue: `sensitive-prefix\"` + github + `\\sensitive-suffix`, category: CategoryPassword,
+			providers: map[string]Category{github: CategoryGitHubToken},
+			fragments: []string{"sensitive-prefix", "sensitive-suffix"},
+		},
+		{
+			name: "multiple providers in password", key: "password",
+			rawValue: "sensitive-prefix:" + github + ":sensitive-middle:" + aws + ":sensitive-suffix", category: CategoryPassword,
+			providers: map[string]Category{github: CategoryGitHubToken, aws: CategoryAWSAccessKey},
+			fragments: []string{"sensitive-prefix", "sensitive-middle", "sensitive-suffix"},
+		},
+		{
+			name: "fixed length provider in api key", key: "api_key",
+			rawValue: google + "sensitiveSuffix", category: CategoryGenericAPIKey,
+			providers: map[string]Category{google: CategoryGoogleAPIKey},
+			fragments: []string{"sensitiveSuffix"},
+		},
+		{
+			name: "fixed length provider in aws secret", key: "secret_key",
+			rawValue: google + "Z", category: CategoryAWSSecretKey,
+			providers: map[string]Category{google: CategoryGoogleAPIKey},
+			fragments: []string{"Z"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			field := `"` + tc.key + `":"` + tc.rawValue + `"`
+			input := `{"status":"public",` + field + `,"count":2}`
+			if !json.Valid([]byte(input)) {
+				t.Fatal("invalid JSON test fixture")
+			}
+			result := ScanAndRedact(input, Config{Mode: ModeRedact})
+			for _, fragment := range tc.fragments {
+				if strings.Contains(result.Output, fragment) {
+					t.Errorf("redacted output exposed a credential fragment %q", fragment)
+				}
+			}
+			if !strings.Contains(result.Output, `"status":"public"`) || !strings.Contains(result.Output, `"count":2`) {
+				t.Error("redaction consumed a neighboring public field")
+			}
+			residuals := 0
+			for _, f := range result.Findings {
+				if f.Match != input[f.Start:f.End] {
+					t.Errorf("finding no longer identifies its raw source range: %+v", f)
+				}
+				if f.Category == tc.category {
+					residuals++
+				}
+			}
+			if residuals == 0 {
+				t.Error("missing lower-priority credential portions outside the provider match")
+			}
+			for provider, category := range tc.providers {
+				found := false
+				for _, f := range result.Findings {
+					if f.Category == category && f.Match == provider {
+						found = true
+						start := strings.Index(input, provider)
+						if f.Start != start || f.End != start+len(provider) {
+							t.Error("provider finding offsets changed")
+						}
+					}
+				}
+				if !found {
+					t.Errorf("missing original %s provider finding", category)
+				}
+			}
+		})
+	}
+}
+
+func TestJSONCredentialProviderOverlapAllowlistsAndDisabledCategories(t *testing.T) {
+	provider := "gh" + "p_" + strings.Repeat("q", 31)
+	suffix := `\u0071SECRETL8`
+	field := `"token":"` + provider + suffix + `"`
+	input := `{` + field + `}`
+	providerAllowlist := "^" + regexp.QuoteMeta(provider) + "$"
+	fieldAllowlist := "^" + regexp.QuoteMeta(field) + "$"
+	tests := []struct {
+		name          string
+		cfg           Config
+		wantProvider  bool
+		wantResiduals bool
+	}{
+		{name: "default", wantProvider: true, wantResiduals: true},
+		{name: "partial provider allowed", cfg: Config{Allowlist: []string{providerAllowlist}}, wantResiduals: true},
+		{name: "original field allowed", cfg: Config{Allowlist: []string{fieldAllowlist}}, wantProvider: true},
+		{name: "provider and field allowed", cfg: Config{Allowlist: []string{providerAllowlist, fieldAllowlist}}},
+		{name: "residual alone is not the allowlist context", cfg: Config{Allowlist: []string{"^" + regexp.QuoteMeta(suffix) + "$"}}, wantProvider: true, wantResiduals: true},
+		{name: "generic category disabled", cfg: Config{DisabledCategories: []Category{CategoryGenericSecret}}, wantProvider: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			output, findings := Redact(input, tc.cfg)
+			var hasProvider, hasResiduals bool
+			for _, f := range findings {
+				switch f.Category {
+				case CategoryGitHubToken:
+					hasProvider = true
+					if f.Match != provider {
+						t.Error("provider match changed")
+					}
+				case CategoryGenericSecret:
+					hasResiduals = true
+					if f.Match != suffix || input[f.Start:f.End] != suffix {
+						t.Error("residual no longer identifies the raw escaped suffix")
+					}
+				}
+			}
+			if hasProvider != tc.wantProvider || hasResiduals != tc.wantResiduals {
+				t.Errorf("provider=%v, residuals=%v; want provider=%v, residuals=%v", hasProvider, hasResiduals, tc.wantProvider, tc.wantResiduals)
+			}
+			if tc.wantResiduals && strings.Contains(output, "SECRETL8") {
+				t.Error("redaction exposed a residual despite the selected allowlist")
+			}
+			if !tc.wantProvider && !tc.wantResiduals && output != input {
+				t.Error("allowlisted input changed")
+			}
+		})
+	}
+
+	for _, input := range []string{`{"token":"` + provider + `"}`, "token=" + provider} {
+		findings := Scan(input, Config{})
+		if len(findings) != 1 || findings[0].Category != CategoryGitHubToken || findings[0].Match != provider {
+			t.Error("a complete provider value no longer has exactly its original provider finding")
+		}
+		output, findings := Redact(input, Config{Allowlist: []string{providerAllowlist}})
+		if len(findings) != 0 || output != input {
+			t.Error("anchored allowlist changed for a complete provider value")
+		}
+	}
+}
+
+func TestJSONCredentialProviderOverlapWithZeroWidthExtraPatterns(t *testing.T) {
+	provider := "gh" + "p_" + strings.Repeat("q", 40)
+	for _, input := range []string{
+		"password=sensitive-never-valid-value",
+		`{"password":"sensitive-prefix:` + provider + `:sensitive-suffix"}`,
+	} {
+		cfg := Config{
+			Mode:          ModeRedact,
+			ExtraPatterns: map[Category][]string{"CUSTOM_ANCHOR": {`^`, `\b`, `$`}},
+		}
+		result := ScanAndRedact(input, cfg)
+		anchors := 0
+		for _, f := range result.Findings {
+			if f.Start == f.End {
+				anchors++
+			}
+			if f.Match != input[f.Start:f.End] {
+				t.Error("finding source range changed with zero-width patterns")
+			}
+		}
+		if anchors == 0 {
+			t.Fatal("test did not retain zero-width matches")
+		}
+		for _, fragment := range []string{"sensitive", strings.Repeat("q", 8)} {
+			if strings.Contains(result.Output, fragment) {
+				t.Error("zero-width pattern caused a credential fragment to remain in ScanAndRedact output")
+			}
+		}
+		output, findings := Redact(input, cfg)
+		if output != result.Output || len(findings) != len(result.Findings) {
+			t.Error("Redact and ScanAndRedact differ with zero-width patterns")
+		}
+	}
+}
+
+func assertJSONRawFinding(t *testing.T, input, rawMatch string, category Category) Finding {
+	t.Helper()
+	start := strings.Index(input, rawMatch)
+	if start < 0 {
+		t.Fatal("expected raw match is absent from the test fixture")
+	}
+	result := ScanAndRedact(input, Config{Mode: ModeRedact})
+	if len(result.Findings) != 1 {
+		t.Fatalf("findings=%d, want exactly one %s finding", len(result.Findings), category)
+	}
+	f := result.Findings[0]
+	if f.Category != category || f.Match != rawMatch || f.Start != start || f.End != start+len(rawMatch) {
+		t.Errorf("finding has wrong category, raw match, or byte range: %+v", f)
+	}
+	wantOutput := input[:start] + f.Redacted + input[start+len(rawMatch):]
+	if result.Output != wantOutput {
+		t.Error("redacted output did not replace exactly the original source span")
+	}
+	return f
+}
+
+func TestJSONEscapedContentDetection(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		rawMatch string
+	}{
+		{
+			name:     "quoted logged assignment",
+			input:    `{"message":"PASSWORD=\"synthetic-never-valid-quoted\"","status":"ready"}`,
+			rawMatch: `PASSWORD=\"synthetic-never-valid-quoted\"`,
+		},
+		{
+			name:     "fully encoded keyword and separator",
+			input:    `{"message":"\u0050\u0041\u0053\u0053\u0057\u004f\u0052\u0044\u003dsynthetic-never-valid-encoded","status":"ready"}`,
+			rawMatch: `\u0050\u0041\u0053\u0053\u0057\u004f\u0052\u0044\u003dsynthetic-never-valid-encoded`,
+		},
+		{
+			name:     "encoded separator",
+			input:    `{"message":"PASSWORD\u003dsynthetic-never-valid-separator","status":"ready"}`,
+			rawMatch: `PASSWORD\u003dsynthetic-never-valid-separator`,
+		},
+		{
+			name:     "encoded value",
+			input:    `{"message":"PASSWORD=synthetic\u002dnever\u002dvalid\u002dvalue","status":"ready"}`,
+			rawMatch: `PASSWORD=synthetic\u002dnever\u002dvalid\u002dvalue`,
+		},
+		{
+			name:     "logged nested field",
+			input:    `{"message":"{\"password\":\"synthetic-never-valid-nested\"}","status":"ready"}`,
+			rawMatch: `\"password\":\"synthetic-never-valid-nested\"`,
+		},
+		{
+			name:     "escaped whitespace around assignment",
+			input:    `{"message":"first line\nPASSWORD=synthetic-never-valid-spaces\tpublic","status":"ready"}`,
+			rawMatch: `PASSWORD=synthetic-never-valid-spaces`,
+		},
+		{
+			name:     "database PWD path remains a credential",
+			input:    `{"message":"MYSQL_PWD=\u002fhome\u002fagent\u002fproject","status":"ready"}`,
+			rawMatch: `PWD=\u002fhome\u002fagent\u002fproject`,
+		},
+		{
+			name:     "escaped quote key does not hide message content",
+			input:    `{"not\"password":"\u0050ASSWORD\u003dsynthetic-never-valid-message","status":"ready"}`,
+			rawMatch: `\u0050ASSWORD\u003dsynthetic-never-valid-message`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if !json.Valid([]byte(tc.input)) {
+				t.Fatal("invalid JSON test fixture")
+			}
+			assertJSONRawFinding(t, tc.input, tc.rawMatch, CategoryPassword)
+		})
+	}
+}
+
+func TestJSONEscapedContentRejectsDecodedFalsePositives(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"seven decoded characters", `{"message":"PASSWORD=\u0061\u0062\u0063\u0064\u0065\u0066\u0067"}`},
+		{"decoded whitespace ends a short value", `{"message":"PASSWORD=abc\u0020defg"}`},
+		{"shell PWD path", `{"message":"PWD=\u002fhome\u002fagent\u002fproject"}`},
+		{"shell OLDPWD path", `{"message":"OLDPWD=\u002fhome\u002fagent\u002fproject"}`},
+		{"Windows PWD path", `{"message":"PWD=\u0043\u003a\u005cUsers\u005cagent\u005cproject"}`},
+		{"shell expansion", `{"message":"PWD=\u0024HOME/project"}`},
+		{"star placeholder", `{"message":"PASSWORD=\u002a\u002a\u002a\u002a\u002a\u002a\u002a\u002a"}`},
+		{"redacted placeholder", `{"message":"PASSWORD=\u003credacted\u003e"}`},
+		{"seven surrogate pair runes", `{"message":"PASSWORD=` + strings.Repeat(`\ud83d\ude00`, 7) + `"}`},
+		{"literal backslash u separator", `{"message":"PASSWORD\\u003dsynthetic-never-valid-double"}`},
+		{"nested key is not decoded twice", `{"message":"{\"pass\\u0077ord\":\"synthetic-never-valid-double\"}"}`},
+		{"false key cannot suppress decoded short-value filtering", `{"not\"password":"PASSWORD=\u0061\u0062\u0063\u0064\u0065\u0066\u0067"}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if !json.Valid([]byte(tc.input)) {
+				t.Fatal("invalid JSON test fixture")
+			}
+			output, findings := Redact(tc.input, Config{})
+			if len(findings) != 0 || output != tc.input {
+				t.Errorf("decoded non-credential produced findings: %+v", findings)
+			}
+		})
+	}
+}
+
+func TestJSONEscapedContentUnicodeSourceOffsets(t *testing.T) {
+	tests := []struct {
+		name     string
+		rawValue string
+	}{
+		{"paired surrogates", `\u96ea` + strings.Repeat(`\ud83d\ude00`, 7)},
+		{"unpaired high surrogate", `abcdefg\ud800`},
+		{"unpaired low surrogate", `abcdefg\udc00`},
+		{"unpaired then paired surrogate", `abcdef\ud800\ud83d\ude00`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rawMatch := "PASSWORD=" + tc.rawValue
+			input := `{"message":"raw:雪 escaped:\u96ea paired:\ud83d\ude00 ` + rawMatch + `\tpublic","status":"ready"}`
+			if !json.Valid([]byte(input)) {
+				t.Fatal("invalid JSON test fixture")
+			}
+			assertJSONRawFinding(t, input, rawMatch, CategoryPassword)
+		})
+	}
+}
+
+func TestJSONEncodedCredentialKeysDetection(t *testing.T) {
+	tests := []struct {
+		name     string
+		field    string
+		category Category
+	}{
+		{"password", `"pass\u0077ord":"synthetic-never-valid-password"`, CategoryPassword},
+		{"uppercase password", `"\u0050ASSWORD":"synthetic-never-valid-password"`, CategoryPassword},
+		{"API key", `"api\u005fkey":"syntheticNeverValidApiKey123"`, CategoryGenericAPIKey},
+		{"prefixed token", `"access_\u0074oken":"syntheticNeverValidToken123"`, CategoryGenericSecret},
+		{"AWS key", `"aws_\u0073ecret_access_key":"` + strings.Repeat("Q", 40) + `"`, CategoryAWSSecretKey},
+		{"database PWD path", `"mysql_\u0070wd":"\u002fhome/agent/project"`, CategoryPassword},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := `{"status":"ready",` + tc.field + `,"count":2}`
+			if !json.Valid([]byte(input)) {
+				t.Fatal("invalid JSON test fixture")
+			}
+			assertJSONRawFinding(t, input, tc.field, tc.category)
+		})
+	}
+}
+
+func TestJSONEncodedCredentialKeysRejectNonCredentials(t *testing.T) {
+	fields := []string{
+		`"notpass\u0077ord":"synthetic-never-valid-neighbor"`,
+		`"pass\u0077ord_hint":"synthetic-never-valid-neighbor"`,
+		`"not\"password":"synthetic-never-valid-neighbor"`,
+		`"not\u0022password":"synthetic-never-valid-neighbor"`,
+		`"pass\\u0077ord":"synthetic-never-valid-double"`,
+		`"pass\u0077ord":12345678`,
+		`"pass\u0077ord":"\u0061\u0062\u0063\u0064\u0065\u0066\u0067"`,
+		`"pass\u0077ord":"\u003credacted\u003e"`,
+		`"\u0050WD":"\u002fhome/agent/project"`,
+		`"OLD\u0050WD":"\u002fhome/agent/project"`,
+	}
+	for _, field := range fields {
+		input := "{" + field + "}"
+		if !json.Valid([]byte(input)) {
+			t.Fatal("invalid JSON test fixture")
+		}
+		output, findings := Redact(input, Config{})
+		if len(findings) != 0 || output != input {
+			t.Errorf("non-credential key produced findings: %+v", findings)
+		}
+	}
+}
+
+func TestJSONEncodedCredentialKeysJSONLDuplicates(t *testing.T) {
+	first := `"password":"synthetic-never-valid-first"`
+	second := `"pass\u0077ord":"synthetic-never-valid-second"`
+	third := `PASSWORD=\"synthetic-never-valid-third\"`
+	input := "\n{" + first + "," + second + ",\"status\":\"ready\"}\r\n \t\n" + `{"message":"` + third + `"}` + "\n"
+	findings := Scan(input, Config{})
+	if len(findings) != 3 {
+		t.Fatalf("findings=%d, want both duplicate properties and the next record", len(findings))
+	}
+	AddLineInfo(input, findings)
+	for i, want := range []string{first, second, third} {
+		f := findings[i]
+		start := strings.Index(input, want)
+		wantLine := []int{2, 2, 4}[i]
+		if f.Category != CategoryPassword || f.Match != want || f.Start != start || f.End != start+len(want) || f.Line != wantLine {
+			t.Errorf("finding %d has wrong raw source or physical line: %+v", i, f)
+		}
+	}
+	output, _ := Redact(input, Config{})
+	if strings.Contains(output, "synthetic-never-valid") || !strings.Contains(output, `"status":"ready"`) {
+		t.Error("JSONL redaction exposed credential content or consumed a public field")
+	}
+}
+
+func TestJSONEscapedContentPreservesRawInvalidInput(t *testing.T) {
+	assignment := `PASSWORD=\u0061\u0062\u0063\u0064\u0065\u0066\u0067`
+	tests := []struct {
+		name     string
+		input    string
+		rawMatch string
+	}{
+		{"plaintext quoted text", `log message="` + assignment + `"`, assignment + `"`},
+		{"malformed single record", `{"message":"` + assignment + `",BROKEN`, assignment + `"`},
+		{"malformed pretty document", "{\n\"" + assignment + "\"\nBROKEN\n}", assignment + `"`},
+		{"invalid JSON escape", `{"message":"PASSWORD=abcdefg\q"}`, `PASSWORD=abcdefg\q"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if json.Valid([]byte(tc.input)) {
+				t.Fatal("test fixture unexpectedly contains valid whole JSON")
+			}
+			assertJSONRawFinding(t, tc.input, tc.rawMatch, CategoryPassword)
+		})
+	}
+}
+
+func TestJSONLCompleteRecordsSurviveMalformedNeighbors(t *testing.T) {
+	logged := `PASSWORD=\"synthetic-never-valid-complete-record\"`
+	field := `"pass\u0077ord":"synthetic-never-valid-encoded-key"`
+	assignment := "PASSWORD=synthetic-never-valid-raw-assignment"
+	first := `{"message":"` + logged + `","note":"public-neighbor"}`
+	second := `{"status":"ready",` + field + `}`
+	tests := []struct {
+		name    string
+		input   string
+		matches []string
+		lines   []int
+	}{
+		{
+			name:    "incomplete trailing record",
+			input:   first + "\n" + `{"message":`,
+			matches: []string{logged},
+			lines:   []int{1},
+		},
+		{
+			name:    "incomplete leading record",
+			input:   `{"message":` + "\n" + second + "\n",
+			matches: []string{field},
+			lines:   []int{2},
+		},
+		{
+			name:    "interleaved plain text and malformed records",
+			input:   "INFO starting\r\n \t\n" + first + "\r\n" + `{"broken":"\q"}` + "\n" + second + "\nINFO finished",
+			matches: []string{logged, field},
+			lines:   []int{3, 5},
+		},
+		{
+			name:    "ordinary assignments outside JSON still detected",
+			input:   assignment + "\n" + first + "\n" + `{"message":`,
+			matches: []string{assignment, logged},
+			lines:   []int{1, 2},
+		},
+		{
+			name:    "complete array record",
+			input:   "INFO prefix\n[" + second + "]\n" + `{"message":`,
+			matches: []string{field},
+			lines:   []int{2},
+		},
+		{
+			name:    "valid scalar JSONL retains support",
+			input:   `"` + logged + `"` + "\nfalse\n" + second + "\n",
+			matches: []string{logged, field},
+			lines:   []int{1, 3},
+		},
+		{
+			name:    "pretty document takes precedence",
+			input:   "{\n\"records\": [\n" + first + ",\n" + second + "\n]\n}\n",
+			matches: []string{logged, field},
+			lines:   []int{3, 4},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			output, findings := Redact(tc.input, Config{})
+			if len(findings) != len(tc.matches) {
+				t.Fatalf("findings=%d, want %d from complete records and raw assignments", len(findings), len(tc.matches))
+			}
+			AddLineInfo(tc.input, findings)
+			for i, raw := range tc.matches {
+				f := findings[i]
+				start := strings.Index(tc.input, raw)
+				if f.Category != CategoryPassword || f.Match != raw || f.Start != start || f.End != start+len(raw) || f.Line != tc.lines[i] {
+					t.Errorf("finding %d lost its category, raw source span, or physical line: %+v", i, f)
+				}
+			}
+			if strings.Contains(output, "synthetic-never-valid") {
+				t.Error("complete record or ordinary assignment leaked credential bytes")
+			}
+			for _, public := range []string{"public-neighbor", `"status":"ready"`, "INFO starting", "INFO finished", `{"message":`, `{"broken":"\q"}`} {
+				if strings.Contains(tc.input, public) && !strings.Contains(output, public) {
+					t.Errorf("redaction consumed neighboring content %q", public)
+				}
+			}
+		})
+	}
+}
+
+func TestJSONLCompleteRecordsKeepFalsePositiveProtections(t *testing.T) {
+	input := "INFO starting\n" +
+		`{"message":"PASSWORD=\u0061\u0062\u0063\u0064\u0065\u0066\u0067"}` + "\n" +
+		`{"message":"PWD=\u002fhome/agent/project"}` + "\n" +
+		`{"message":"PASSWORD=\u003credacted\u003e"}` + "\n" +
+		`{"not\"password":"public-neighbor-long"}` + "\n" +
+		`{"pass\u0077ord_hint":"public-neighbor-long"}` + "\n" +
+		`{"message":`
+	output, findings := Redact(input, Config{})
+	if len(findings) != 0 || output != input {
+		t.Errorf("malformed neighbors disabled decoded false-positive protections: %+v", findings)
+	}
+}
+
+func TestJSONLCompleteRecordsKeepAllowlistsAndDisabledCategories(t *testing.T) {
+	logged := `PASSWORD=\"synthetic-never-valid-allowlisted\"`
+	input := "INFO starting\n" + `{"message":"` + logged + `"}` + "\n" + `{"message":`
+	for _, allowed := range []string{logged, `PASSWORD="synthetic-never-valid-allowlisted"`} {
+		output, findings := Redact(input, Config{Allowlist: []string{"^" + regexp.QuoteMeta(allowed) + "$"}})
+		if len(findings) != 0 || output != input {
+			t.Error("raw or logical allowlist failed for a complete record in a mixed log")
+		}
+	}
+	output, findings := Redact(input, Config{DisabledCategories: []Category{CategoryPassword}})
+	if len(findings) != 0 || output != input {
+		t.Error("disabled password category was detected in a complete record")
+	}
+}
+
+func TestJSONEscapedContentAllowlistsAndDisabledCategories(t *testing.T) {
+	provider := "gh" + "p_" + strings.Repeat("q", 40)
+	encodedProvider := `\u0067` + provider[1:]
+	encodedField := `"pass\u0077ord":"synthetic\u002dnever\u002dvalid"`
+	tests := []struct {
+		name         string
+		input        string
+		rawMatch     string
+		logicalMatch string
+		category     Category
+	}{
+		{
+			name:         "quoted assignment",
+			input:        `{"message":"PASSWORD=\"synthetic\u002dnever\u002dvalid\""}`,
+			rawMatch:     `PASSWORD=\"synthetic\u002dnever\u002dvalid\"`,
+			logicalMatch: `PASSWORD="synthetic-never-valid"`,
+			category:     CategoryPassword,
+		},
+		{
+			name:         "provider keeps priority in a logged assignment",
+			input:        `{"message":"token=` + encodedProvider + `"}`,
+			rawMatch:     encodedProvider,
+			logicalMatch: provider,
+			category:     CategoryGitHubToken,
+		},
+		{
+			name:         "encoded property key retains raw value",
+			input:        "{" + encodedField + "}",
+			rawMatch:     encodedField,
+			logicalMatch: `"password":"synthetic\u002dnever\u002dvalid"`,
+			category:     CategoryPassword,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assertJSONRawFinding(t, tc.input, tc.rawMatch, tc.category)
+			for _, allowed := range []string{tc.rawMatch, tc.logicalMatch} {
+				output, findings := Redact(tc.input, Config{Allowlist: []string{"^" + regexp.QuoteMeta(allowed) + "$"}})
+				if len(findings) != 0 || output != tc.input {
+					t.Error("anchored raw or logical allowlist did not suppress the complete match")
+				}
+			}
+			cfg := Config{DisabledCategories: []Category{tc.category}}
+			if tc.category == CategoryGitHubToken {
+				// The lower-priority generic assignment is still eligible when
+				// only the provider category is disabled.
+				cfg.DisabledCategories = append(cfg.DisabledCategories, CategoryGenericSecret)
+			}
+			output, findings := Redact(tc.input, cfg)
+			if len(findings) != 0 || output != tc.input {
+				t.Error("disabled categories were detected in decoded content")
+			}
+		})
+	}
+}
+
+func TestJSONEscapedContentExtraPatternsStayRaw(t *testing.T) {
+	rawMarker := `\u0050ASSWORD`
+	input := `{"message":"` + rawMarker + `\u003dsynthetic-never-valid-custom"}`
+	cfg := Config{
+		DisabledCategories: []Category{CategoryPassword},
+		ExtraPatterns:      map[Category][]string{"CUSTOM_RAW": {regexp.QuoteMeta(rawMarker)}},
+	}
+	findings := Scan(input, cfg)
+	start := strings.Index(input, rawMarker)
+	if len(findings) != 1 || findings[0].Category != "CUSTOM_RAW" || findings[0].Match != rawMarker || findings[0].Start != start || findings[0].End != start+len(rawMarker) {
+		t.Errorf("raw custom pattern was changed or suppressed: %+v", findings)
+	}
+	cfg.ExtraPatterns = map[Category][]string{"CUSTOM_LOGICAL": {regexp.QuoteMeta("PASSWORD=synthetic-never-valid-custom")}}
+	if findings := Scan(input, cfg); len(findings) != 0 {
+		t.Errorf("custom pattern was incorrectly applied to decoded content: %+v", findings)
+	}
+}
+
+func TestJSONEscapedContentNestedFieldPreservesResiduals(t *testing.T) {
+	provider := "gh" + "p_" + strings.Repeat("q", 40)
+	logicalField := `"password":"sensitive-prefix:` + provider + `:sensitive-suffix"`
+	rawField := `\"password\":\"sensitive-prefix:` + provider + `:sensitive-suffix\"`
+	input := `{"message":"{` + rawField + `}","status":"ready"}`
+	output, findings := Redact(input, Config{})
+	if len(findings) != 3 {
+		t.Fatalf("findings=%d, want provider and two residual spans", len(findings))
+	}
+	for _, f := range findings {
+		if f.Match != input[f.Start:f.End] {
+			t.Error("nested field finding lost its original raw range")
+		}
+	}
+	if findings[0].Category != CategoryPassword || findings[1].Category != CategoryGitHubToken || findings[1].Match != provider || findings[2].Category != CategoryPassword {
+		t.Error("nested field changed provider priority or residual categories")
+	}
+	if strings.Contains(output, "sensitive-") || strings.Contains(output, provider) || !strings.Contains(output, `"status":"ready"`) {
+		t.Error("nested field redaction exposed credential content or consumed a public field")
+	}
+	for _, allowed := range []string{rawField, logicalField} {
+		findings := Scan(input, Config{Allowlist: []string{"^" + regexp.QuoteMeta(allowed) + "$"}})
+		if len(findings) != 1 || findings[0].Category != CategoryGitHubToken || findings[0].Match != provider {
+			t.Error("nested residuals did not inherit the original raw and logical field allowlist contexts")
+		}
+	}
+}
+
+func TestJSONEscapedContentQuotedAssignmentPreservesResiduals(t *testing.T) {
+	provider := "gh" + "p_" + strings.Repeat("q", 40)
+	logicalAssignment := `PASSWORD="sensitive-prefix:` + provider + `:sensitive-suffix"`
+	rawAssignment := `PASSWORD=\"sensitive-prefix:` + provider + `:sensitive-suffix\"`
+	input := `{"message":"` + rawAssignment + `","status":"ready"}`
+	if !json.Valid([]byte(input)) {
+		t.Fatal("invalid JSON test fixture")
+	}
+	output, findings := Redact(input, Config{})
+	if len(findings) != 3 {
+		t.Fatalf("findings=%d, want provider and two quoted-value residuals", len(findings))
+	}
+	for i, want := range []string{"sensitive-prefix:", provider, ":sensitive-suffix"} {
+		f := findings[i]
+		category := CategoryPassword
+		if i == 1 {
+			category = CategoryGitHubToken
+		}
+		start := strings.Index(input, want)
+		if f.Category != category || f.Match != want || f.Start != start || f.End != start+len(want) {
+			t.Errorf("finding %d changed provider priority or raw quoted-value bounds: %+v", i, f)
+		}
+	}
+	if strings.Contains(output, "sensitive-") || strings.Contains(output, provider) || !strings.Contains(output, `"status":"ready"`) {
+		t.Error("quoted assignment exposed credential content or consumed a public field")
+	}
+
+	for _, allowed := range []string{rawAssignment, logicalAssignment} {
+		findings := Scan(input, Config{Allowlist: []string{"^" + regexp.QuoteMeta(allowed) + "$"}})
+		if len(findings) != 1 || findings[0].Category != CategoryGitHubToken || findings[0].Match != provider {
+			t.Error("quoted-value residuals lost their full raw or logical assignment allowlist context")
+		}
+	}
+	providerAllowlist := "^" + regexp.QuoteMeta(provider) + "$"
+	output, findings = Redact(input, Config{Allowlist: []string{providerAllowlist}})
+	if len(findings) != 2 || findings[0].Category != CategoryPassword || findings[1].Category != CategoryPassword {
+		t.Error("allowlisting the provider suppressed uncovered password portions")
+	}
+	if strings.Contains(output, "sensitive-") || !strings.Contains(output, provider) {
+		t.Error("provider-only allowlist did not preserve protection of the remaining password")
+	}
+	output, findings = Redact(input, Config{Allowlist: []string{providerAllowlist, "^" + regexp.QuoteMeta(logicalAssignment) + "$"}})
+	if len(findings) != 0 || output != input {
+		t.Error("allowlisting the provider and complete assignment changed the input")
+	}
+}
+
+func TestPrivateKeyCompleteBlocks(t *testing.T) {
+	body := strings.Repeat("c3ludGhldGlj", 8)
+	for _, kind := range []string{"PRIVATE KEY", "RSA PRIVATE KEY", "DSA PRIVATE KEY", "EC PRIVATE KEY", "OPENSSH PRIVATE KEY", "ENCRYPTED PRIVATE KEY"} {
+		t.Run(kind, func(t *testing.T) {
+			block := "-----BEGIN " + kind + "-----\n" + body + "\n-----END " + kind + "-----"
+			assertJSONRawFinding(t, "public-before\n"+block+"\npublic-after", block, CategoryPrivateKey)
+			assertJSONRawFinding(t, "-----BEGIN "+kind+"-----", "-----BEGIN "+kind+"-----", CategoryPrivateKey)
+		})
+	}
+	block := "-----BEGIN RSA PRIVATE KEY-----\r\nProc-Type: 4,ENCRYPTED\r\nDEK-Info: AES-256-CBC,00112233445566778899AABBCCDDEEFF\r\n\r\n" + body + "\r\n-----END RSA PRIVATE KEY-----"
+	assertJSONRawFinding(t, "public-before\r\n"+block+"\r\npublic-after", block, CategoryPrivateKey)
+	spacedMetadata := strings.Replace(block, "Proc-Type:", " \tProc-Type \t:", 1)
+	spacedMetadata = strings.Replace(spacedMetadata, "DEK-Info:", "\tDEK-Info :", 1)
+	assertJSONRawFinding(t, "public-before\r\n"+spacedMetadata+"\r\npublic-after", spacedMetadata, CategoryPrivateKey)
+	block = "-----BEGIN PRIVATE KEY----- \t\n" + body + "\n-----END PRIVATE KEY-----"
+	assertJSONRawFinding(t, "public-before\n"+block+"\npublic-after", block, CategoryPrivateKey)
+}
+
+func TestPrivateKeyJSONAndJSONL(t *testing.T) {
+	block := "-----BEGIN PRIVATE KEY-----\n" + strings.Repeat("c3ludGhldGlj", 8) + "\n-----END PRIVATE KEY-----"
+	encoded, err := json.Marshal(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := string(encoded[1 : len(encoded)-1])
+	tests := []struct {
+		name  string
+		key   string
+		value string
+		cfg   Config
+	}{
+		{name: "private key field", key: "private_key", value: raw},
+		{name: "password field", key: "password", value: raw},
+		{name: "disabled password field", key: "password", value: raw, cfg: Config{DisabledCategories: []Category{CategoryPassword}}},
+		{name: "Unicode escapes in protected field", key: "password", value: strings.Replace(strings.ReplaceAll(raw, `\n`, `\u000a`), "c3ludGhldGlj", `\u00633ludGhldGlj`, 1), cfg: Config{DisabledCategories: []Category{CategoryPassword}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := `{"` + tc.key + `":"` + tc.value + `","public":"ready"}`
+			if !json.Valid([]byte(input)) {
+				t.Fatal("invalid JSON test fixture")
+			}
+			output, findings := Redact(input, tc.cfg)
+			start := strings.Index(input, tc.value)
+			if len(findings) != 1 || findings[0].Category != CategoryPrivateKey || findings[0].Match != tc.value || findings[0].Start != start || findings[0].End != start+len(tc.value) {
+				t.Fatalf("complete PEM did not retain its raw source range: %+v", findings)
+			}
+			if strings.Contains(output, "c3ludGhldGlj") || !strings.Contains(output, `"public":"ready"`) {
+				t.Error("PEM body leaked or neighboring public field was consumed")
+			}
+		})
+	}
+	input := `{"private_key":"` + raw + `","public":"first"}` + "\n" + `{"password":"` + raw + `","public":"second"}` + "\n"
+	findings := Scan(input, Config{})
+	if len(findings) != 2 {
+		t.Fatalf("JSONL findings=%d, want two complete private keys", len(findings))
+	}
+	AddLineInfo(input, findings)
+	for i, f := range findings {
+		if f.Category != CategoryPrivateKey || f.Match != raw || f.Line != i+1 || f.Match != input[f.Start:f.End] {
+			t.Errorf("PEM JSONL finding has wrong source range or physical line: %+v", f)
+		}
+	}
+}
+
+func TestPrivateKeyAllowlistsAndProviderOverlap(t *testing.T) {
+	body := strings.Repeat("c3ludGhldGlj", 8)
+	header := "-----BEGIN PRIVATE KEY-----"
+	block := header + "\n" + body + "\n-----END PRIVATE KEY-----"
+	encoded, _ := json.Marshal(block)
+	raw := string(encoded[1 : len(encoded)-1])
+	for _, input := range []string{block, `{"password":"` + raw + `","public":"ready"}`} {
+		for _, allowed := range []string{block, raw} {
+			if input == block && allowed == raw {
+				continue
+			}
+			output, findings := Redact(input, Config{Allowlist: []string{"^" + regexp.QuoteMeta(allowed) + "$"}})
+			if len(findings) != 0 || output != input {
+				t.Error("anchored full raw or logical PEM allowlist did not suppress the complete key")
+			}
+		}
+		output, findings := Redact(input, Config{Allowlist: []string{"^" + regexp.QuoteMeta(header) + "$"}})
+		if len(findings) != 1 || findings[0].Category != CategoryPrivateKey || strings.Contains(output, body) {
+			t.Error("allowlisting only a header exempted the private body")
+		}
+	}
+
+	provider := "AI" + "za" + strings.Repeat("Q", 35)
+	block = header + "\n" + body + "\n" + provider + "A\n" + body + "\n-----END PRIVATE KEY-----"
+	encoded, _ = json.Marshal(block)
+	raw = string(encoded[1 : len(encoded)-1])
+	for _, input := range []string{block, `{"password":"` + raw + `","public":"ready"}`} {
+		output, findings := Redact(input, Config{})
+		if len(findings) != 3 || findings[0].Category != CategoryPrivateKey || findings[1].Category != CategoryGoogleAPIKey || findings[1].Match != provider || findings[2].Category != CategoryPrivateKey {
+			t.Fatalf("provider priority discarded part of a private key: %+v", findings)
+		}
+		for _, f := range findings {
+			if f.Match != input[f.Start:f.End] {
+				t.Error("private key residual lost its raw source range")
+			}
+		}
+		if strings.Contains(output, body) || strings.Contains(output, provider) {
+			t.Error("provider overlap exposed private key material")
+		}
+		output, findings = Redact(input, Config{Allowlist: []string{"^" + regexp.QuoteMeta(provider) + "$"}})
+		if len(findings) != 2 || findings[0].Category != CategoryPrivateKey || findings[1].Category != CategoryPrivateKey || strings.Contains(output, body) {
+			t.Error("provider-only allowlist exempted the rest of the private key")
+		}
+		findings = Scan(input, Config{Allowlist: []string{"^" + regexp.QuoteMeta(block) + "$"}})
+		if len(findings) != 1 || findings[0].Category != CategoryGoogleAPIKey || findings[0].Match != provider {
+			t.Error("whole-block allowlist did not preserve the provider's independent category")
+		}
+	}
+}
+
+func TestPrivateKeyBlockBoundaries(t *testing.T) {
+	body := strings.Repeat("c3ludGhldGlj", 8)
+	rsaHeader := "-----BEGIN RSA PRIVATE KEY-----"
+	ec := "-----BEGIN EC PRIVATE KEY-----\n" + body + "\n-----END EC PRIVATE KEY-----"
+	for _, prefix := range []string{
+		rsaHeader + "\n" + body + "\n-----END EC PRIVATE KEY-----",
+		rsaHeader + "\n" + body,
+	} {
+		input := prefix + "\npublic-neighbor\n" + ec + "\npublic-after"
+		output, findings := Redact(input, Config{})
+		if len(findings) != 2 || findings[0].Match != rsaHeader || findings[1].Match != ec {
+			t.Errorf("mismatched or truncated PEM swallowed neighboring content: %+v", findings)
+		}
+		if !strings.Contains(output, "public-neighbor") || !strings.Contains(output, "public-after") {
+			t.Error("PEM matching consumed a public neighbor")
+		}
+	}
+}
+
+func TestCredentialBodyOverlapCoverage(t *testing.T) {
+	provider := "gh" + "p_" + strings.Repeat("q", 40)
+	tests := []struct {
+		name     string
+		input    string
+		category Category
+	}{
+		{"bare password", "PASSWORD=sensitive-prefix:" + provider + ":sensitive-suffix", CategoryPassword},
+		{"logged bare password", `{"message":"PASSWORD=sensitive-prefix:` + provider + `:sensitive-suffix","public":"ready"}`, CategoryPassword},
+		{"encoded bare password", `{"message":"PASSWORD\u003dsensitive-prefix:` + provider + `:sensitive-suffix","public":"ready"}`, CategoryPassword},
+		{"bare API key", "api_key=sensitive-prefix_" + provider + "_sensitive-suffix", CategoryGenericAPIKey},
+		{"bare generic secret", "token=sensitive-prefix_" + provider + "_sensitive-suffix", CategoryGenericSecret},
+		{"bearer token", `{"authorization":"Bearer sensitive-prefix.` + provider + `.sensitive-suffix","public":"ready"}`, CategoryBearerToken},
+		{"JWT", "eyJhbGciOiJub25lIn0.eyJzdWIiOiJzeW50aGV0aWMifQ.sensitive-prefix_" + provider + "_sensitive-suffix", CategoryJWT},
+		{"database URL", `{"url":"postgres://synthetic-user:sensitive-prefix:` + provider + `:sensitive-suffix@db.invalid/project","public":"ready"}`, CategoryDatabaseURL},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			output, findings := Redact(tc.input, Config{})
+			if len(findings) != 3 || findings[0].Category != tc.category || findings[1].Category != CategoryGitHubToken || findings[1].Match != provider || findings[2].Category != tc.category {
+				t.Fatalf("provider overlap dropped credential bytes: %+v", findings)
+			}
+			for _, f := range findings {
+				if f.Match != tc.input[f.Start:f.End] {
+					t.Error("credential residual lost its raw source range")
+				}
+			}
+			if strings.Contains(output, "sensitive-prefix") || strings.Contains(output, "sensitive-suffix") {
+				t.Error("redaction exposed a credential fragment")
+			}
+			if strings.Contains(tc.input, `"public":"ready"`) && !strings.Contains(output, `"public":"ready"`) {
+				t.Error("credential redaction consumed a neighboring public field")
+			}
+			output, findings = Redact(tc.input, Config{Allowlist: []string{"^" + regexp.QuoteMeta(provider) + "$"}})
+			if len(findings) != 2 || strings.Contains(output, "sensitive-prefix") || strings.Contains(output, "sensitive-suffix") {
+				t.Error("provider-only allowlist exempted uncovered credential bytes")
+			}
+		})
+	}
+	google := "AI" + "za" + strings.Repeat("Q", 35)
+	output, findings := Redact("aws_secret="+google+"Z", Config{})
+	if len(findings) != 2 || findings[0].Category != CategoryGoogleAPIKey || findings[0].Match != google || findings[1].Category != CategoryAWSSecretKey || findings[1].Match != "Z" || strings.Contains(output, "Z") {
+		t.Error("provider overlap exposed the remainder of an AWS secret assignment")
+	}
+}
+
+func TestCredentialBodyExactProviderAllowlistsAndRawExtras(t *testing.T) {
+	provider := "gh" + "p_" + strings.Repeat("q", 40)
+	for _, input := range []string{
+		"PASSWORD=" + provider,
+		"PASSWORD=\"" + provider + "\"",
+		"api_key='" + provider + "'",
+		"token=" + provider,
+		"Bearer " + provider,
+		`{"message":"PASSWORD=` + provider + `","public":"ready"}`,
+	} {
+		findings := Scan(input, Config{})
+		if len(findings) != 1 || findings[0].Category != CategoryGitHubToken || findings[0].Match != provider {
+			t.Error("public assignment or Bearer context produced a spurious residual")
+		}
+		output, findings := Redact(input, Config{Allowlist: []string{"^" + regexp.QuoteMeta(provider) + "$"}})
+		if len(findings) != 0 || output != input {
+			t.Error("anchored exact-provider allowlist no longer suppresses the complete value")
+		}
+	}
+	input := "custom-prefix:" + provider + ":custom-suffix"
+	for _, category := range []Category{CategoryPassword, CategoryPrivateKey, CategoryBearerToken} {
+		cfg := Config{ExtraPatterns: map[Category][]string{category: {regexp.QuoteMeta(input)}}}
+		findings := Scan(input, cfg)
+		if len(findings) != 1 || findings[0].Category != CategoryGitHubToken || findings[0].Match != provider {
+			t.Error("custom pattern incorrectly inherited builtin credential-body protection")
+		}
+	}
+	input = `{"not\"` + provider + `":"public"}`
+	assertJSONRawFinding(t, input, provider, CategoryGitHubToken)
+}
+
+func TestJSONTruncatedContentDetection(t *testing.T) {
+	logged := `PASSWORD=\"synthetic-never-valid-open-record\"`
+	encodedField := `"pass\u0077ord":"synthetic-never-valid-open-field"`
+	tests := []struct {
+		name, input, rawMatch string
+	}{
+		{"missing object brace", `{"note":"public-neighbor","message":"` + logged + `"`, logged},
+		{"missing brace after encoded key", `{"note":"public-neighbor",` + encodedField, encodedField},
+		{"trailing object comma", `{"message":"` + logged + `",`, logged},
+		{"unfinished later field", `{"message":"` + logged + `","next":"unfinished`, logged},
+		{"unfinished later number", `{"message":"` + logged + `","attempt":1e`, logged},
+		{"large numeric exponent before message", `{"attempt":1e999999,"message":"` + logged + `"`, logged},
+		{"open array", `[{"message":"` + logged + `"},`, logged},
+		{"open nested containers", `{"records":[{"message":"` + logged + `"}`, logged},
+		{"pretty unfinished root", "{\n  \"records\": [\n    {" + encodedField + "}\n", encodedField},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if json.Valid([]byte(tc.input)) {
+				t.Fatal("fixture must be an unfinished JSON container")
+			}
+			assertJSONRawFinding(t, tc.input, tc.rawMatch, CategoryPassword)
+		})
+	}
+}
+
+func TestJSONTruncatedCredentialValues(t *testing.T) {
+	tests := []struct {
+		name, field, rawMatch string
+		category              Category
+	}{
+		{"password", `"password":"synthetic-never-valid-open-password`, "", CategoryPassword},
+		{"encoded password key", `"pass\u0077ord":"synthetic-never-valid-open-password`, "", CategoryPassword},
+		{"database PWD path", `"MYSQL_PWD":"\u002fhome/agent/synthetic-project`, "", CategoryPassword},
+		{"API key", `"api_key":"syntheticNeverValidApiKey123`, "", CategoryGenericAPIKey},
+		{"encoded API key", `"api\u005fkey":"syntheticNeverValidApiKey123`, "", CategoryGenericAPIKey},
+		{"generic secret", `"access_token":"syntheticNeverValidToken123`, "", CategoryGenericSecret},
+		{"AWS secret", `"aws_secret_access_key":"` + strings.Repeat("Q", 40), "", CategoryAWSSecretKey},
+		{"escaped quote and backslash", `"password":"synthetic\"never\\valid`, "", CategoryPassword},
+		{"Unicode and surrogate pairs", `"password":"\u96ea` + strings.Repeat(`\ud83d\ude00`, 7), "", CategoryPassword},
+		{"encoded message assignment", `"message":"\u0050ASSWORD\u003dsynthetic-never-valid-open-message`, `\u0050ASSWORD\u003dsynthetic-never-valid-open-message`, CategoryPassword},
+		{"quoted message assignment", `"message":"PASSWORD=\"synthetic-never-valid-open-message`, `PASSWORD=\"synthetic-never-valid-open-message`, CategoryPassword},
+	}
+	for _, tail := range []string{`\`, `\u`, `\u1`, `\u12`, `\u123`} {
+		tests = append(tests, struct {
+			name, field, rawMatch string
+			category              Category
+		}{"pending field escape " + tail, `"password":"synthetic-never-valid-pending` + tail, "", CategoryPassword})
+		raw := `PASSWORD\u003dsynthetic-never-valid-pending` + tail
+		tests = append(tests, struct {
+			name, field, rawMatch string
+			category              Category
+		}{"pending message escape " + tail, `"message":"` + raw, raw, CategoryPassword})
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := `{"note":"public-neighbor",` + tc.field
+			rawMatch := tc.rawMatch
+			if rawMatch == "" {
+				rawMatch = tc.field
+			}
+			assertJSONRawFinding(t, input, rawMatch, tc.category)
+		})
+	}
+}
+
+func TestJSONTruncatedFalsePositiveProtections(t *testing.T) {
+	short := `\u0061\u0062\u0063\u0064\u0065\u0066\u0067`
+	tests := []struct {
+		name, input string
+	}{
+		{"short complete message in prefix", `{"message":"PASSWORD=` + short + `",`},
+		{"short unfinished field", `{"password":"` + short},
+		{"short encoded field", `{"pass\u0077ord":"` + short},
+		{"short unfinished message", `{"message":"PASSWORD=` + short},
+		{"seven surrogate pair runes", `{"password":"` + strings.Repeat(`\ud83d\ude00`, 7)},
+		{"short decoded message before whitespace", `{"message":"PASSWORD=abc\u0020defg`},
+		{"short API key", `{"api_key":"123456789abcdef`},
+		{"short generic secret", `{"token":"123456789abcdef`},
+		{"short AWS secret", `{"aws_secret_access_key":"` + strings.Repeat("Q", 39)},
+		{"long AWS secret", `{"aws_secret_access_key":"` + strings.Repeat("Q", 41)},
+		{"PWD path", `{"PWD":"\u002fhome/agent/project`},
+		{"encoded OLDPWD path", `{"OLD\u0050WD":"\u002fhome/agent/project`},
+		{"logged PWD path", `{"message":"PWD=\u002fhome/agent/project`},
+		{"placeholder", `{"password":"\u003credacted\u003e`},
+		{"placeholder before pending escape", `{"password":"\u003credacted\u003e\u12`},
+		{"PWD before pending escape", `{"PWD":"\u002fhome/agent/project\u12`},
+		{"logged placeholder", `{"message":"PASSWORD=\u003credacted\u003e`},
+		{"star placeholder", `{"password":"********`},
+		{"neighboring key", `{"password_hint":"public-neighbor-long`},
+		{"escaped quote in key", `{"not\"password":"public-neighbor-long`},
+		{"encoded quote in key", `{"not\u0022password":"public-neighbor-long`},
+		{"literal backslash-u key", `{"pass\\u0077ord":"public-neighbor-long`},
+		{"literal backslash-u separator", `{"message":"PASSWORD\\u003dsynthetic-never-valid-literal`},
+		{"unfinished property key", `{"\u0050ASSWORD=synthetic-never-valid-key`},
+		{"complete property key awaiting colon", `{"PASSWORD=\"synthetic-never-valid-key\""`},
+		{"complete encoded property key awaiting colon", `{"\u0050ASSWORD=synthetic-never-valid-key"`},
+		{"unfinished root string", `"\u0050ASSWORD=synthetic-never-valid-scalar`},
+		{"unfinished array string", `["\u0050ASSWORD=synthetic-never-valid-array`},
+		{"non-string password field", `{"password":12345678`},
+	}
+	for _, tail := range []string{`\`, `\u`, `\u1`, `\u12`, `\u123`} {
+		tests = append(tests,
+			struct{ name, input string }{"short field with pending escape " + tail, `{"password":"` + short + tail},
+			struct{ name, input string }{"short message with pending escape " + tail, `{"message":"PASSWORD=` + short + tail},
+		)
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			output, findings := Redact(tc.input, Config{})
+			if len(findings) != 0 || output != tc.input {
+				t.Errorf("unfinished non-credential produced findings: %+v", findings)
+			}
+		})
+	}
+}
+
+func TestJSONTruncatedDoesNotDecodeMalformedInput(t *testing.T) {
+	encoded := `\u0050ASSWORD\u003dsynthetic-never-valid-malformed`
+	for _, input := range []string{
+		`log message="` + encoded,
+		`{"message":"` + encoded + `",BROKEN`,
+		`{"message":"` + encoded + `\q`,
+		`{"message":"` + encoded + `\u12x`,
+		`{"message":"` + encoded + "\tinvalid-control",
+		`{"message":"` + encoded + `" "missing-comma`,
+		`{} {"message":"` + encoded,
+		`{"message":"` + encoded + `"} {`,
+	} {
+		output, findings := Redact(input, Config{})
+		if len(findings) != 0 || output != input {
+			t.Errorf("definite malformed syntax was decoded as an unfinished record: %+v", findings)
+		}
+	}
+	for _, tail := range []string{`\q`, `\u12x`} {
+		raw := `PASSWORD=synthetic-never-valid-raw` + tail
+		assertJSONRawFinding(t, `{"message":"`+raw, raw, CategoryPassword)
+	}
+}
+
+func TestJSONTruncatedJSONLSourceOffsets(t *testing.T) {
+	complete := `"pass\u0077ord":"synthetic-never-valid-complete"`
+	message := `\u0050ASSWORD\u003dsynthetic-never-valid-message\u12`
+	partial := `"pass\u0077ord":"synthetic-never-valid-partial`
+	ordinary := "PASSWORD=synthetic-never-valid-ordinary"
+	input := "INFO start\r\n" + "{" + complete + ",\"note\":\"public-neighbor\"}\r\n" +
+		`{"message":"` + message + "\r\n" + `{"broken":"\q"}` + "\r\n" +
+		"{" + partial + "\r\n" + ordinary + "\nINFO end"
+	output, findings := Redact(input, Config{})
+	wantMatches := []string{complete, message, partial, ordinary}
+	if len(findings) != len(wantMatches) {
+		t.Fatalf("findings=%d, want %d complete and unfinished record credentials", len(findings), len(wantMatches))
+	}
+	AddLineInfo(input, findings)
+	for i, raw := range wantMatches {
+		f := findings[i]
+		start := strings.Index(input, raw)
+		wantLine := []int{2, 3, 5, 6}[i]
+		if f.Category != CategoryPassword || f.Match != raw || f.Start != start || f.End != start+len(raw) || f.Line != wantLine {
+			t.Errorf("finding %d lost its exact raw bytes or physical line: %+v", i, f)
+		}
+	}
+	if strings.Contains(output, "synthetic-never-valid") {
+		t.Error("unfinished JSONL record leaked available credential bytes")
+	}
+	for _, public := range []string{"INFO start", "INFO end", "public-neighbor", `{"broken":"\q"}`} {
+		if !strings.Contains(output, public) {
+			t.Errorf("redaction consumed neighboring content %q", public)
+		}
+	}
+}
+
+func TestJSONTruncatedAllowlistsAndDisabledCategories(t *testing.T) {
+	tests := []struct {
+		name, input, rawMatch, logicalMatch string
+	}{
+		{"partial field", `{"password":"synthetic-never-valid-allowed`, `"password":"synthetic-never-valid-allowed`, `"password":"synthetic-never-valid-allowed`},
+		{"partial encoded field", `{"pass\u0077ord":"synthetic-never-valid-allowed`, `"pass\u0077ord":"synthetic-never-valid-allowed`, `"password":"synthetic-never-valid-allowed`},
+		{"partial encoded message", `{"message":"\u0050ASSWORD=synthetic\u002dnever\u002dvalid`, `\u0050ASSWORD=synthetic\u002dnever\u002dvalid`, `PASSWORD=synthetic-never-valid`},
+		{"complete quoted message", `{"message":"PASSWORD=\"synthetic-never-valid-allowed\""`, `PASSWORD=\"synthetic-never-valid-allowed\"`, `PASSWORD="synthetic-never-valid-allowed"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assertJSONRawFinding(t, tc.input, tc.rawMatch, CategoryPassword)
+			for _, allowed := range []string{tc.rawMatch, tc.logicalMatch} {
+				output, findings := Redact(tc.input, Config{Allowlist: []string{"^" + regexp.QuoteMeta(allowed) + "$"}})
+				if len(findings) != 0 || output != tc.input {
+					t.Error("raw or logical allowlist did not match the actual unfinished credential span")
+				}
+			}
+			output, findings := Redact(tc.input, Config{DisabledCategories: []Category{CategoryPassword}})
+			if len(findings) != 0 || output != tc.input {
+				t.Error("disabled password category was detected in an unfinished record")
+			}
+		})
+	}
+	field := `"password":"synthetic-never-valid-allowed\u12`
+	input := "{" + field
+	output, findings := Redact(input, Config{Allowlist: []string{"^" + regexp.QuoteMeta(field) + "$"}})
+	if len(findings) != 0 || output != input {
+		t.Error("raw allowlist did not retain pending escape bytes in its source context")
+	}
+	for _, completed := range []string{
+		`"password":"synthetic-never-valid-allowed"`,
+		field + `"`,
+	} {
+		output, findings = Redact(input, Config{Allowlist: []string{"^" + regexp.QuoteMeta(completed) + "$"}})
+		if len(findings) != 1 || findings[0].Match != field || strings.Contains(output, "synthetic") || strings.Contains(output, `\u12`) {
+			t.Error("synthetically completed field leaked into allowlist context")
+		}
+	}
+	raw := `\u0050ASSWORD=synthetic\u002dnever\u002dvalid\u12`
+	input = `{"message":"` + raw
+	output, findings = Redact(input, Config{Allowlist: []string{"^" + regexp.QuoteMeta(raw) + "$"}})
+	if len(findings) != 0 || output != input {
+		t.Error("raw message allowlist did not match all available pending bytes")
+	}
+	output, findings = Redact(input, Config{Allowlist: []string{`^PASSWORD=synthetic-never-valid$`}})
+	if len(findings) != 1 || findings[0].Match != raw || strings.Contains(output, "synthetic") || strings.Contains(output, `\u12`) {
+		t.Error("logical allowlist exempted an unknown unfinished escape suffix")
+	}
+	input = `{"note":"public\u12`
+	cfg := Config{ExtraPatterns: map[Category][]string{"CUSTOM_RAW": {regexp.QuoteMeta(`\u12`)}}}
+	output, findings = Redact(input, cfg)
+	if len(findings) != 1 || findings[0].Category != "CUSTOM_RAW" || findings[0].Match != `\u12` || strings.Contains(output, `\u12`) {
+		t.Error("custom pattern lost raw-input semantics in an unfinished JSON string")
+	}
+}
+
+func TestJSONTruncatedProviderOverlap(t *testing.T) {
+	provider := "gh" + "p_" + strings.Repeat("q", 40)
+	for _, field := range []string{
+		`"password":"sensitive-prefix:` + provider + `:sensitive-suffix\u12`,
+		`"message":"PASSWORD\u003dsensitive-prefix:` + provider + `:sensitive-suffix\u12`,
+	} {
+		input := `{"note":"public-neighbor",` + field
+		output, findings := Redact(input, Config{})
+		if len(findings) != 3 || findings[0].Category != CategoryPassword || findings[1].Category != CategoryGitHubToken || findings[1].Match != provider || findings[2].Category != CategoryPassword {
+			t.Fatalf("provider overlap dropped an unfinished credential span: %+v", findings)
+		}
+		for _, f := range findings {
+			if f.Match != input[f.Start:f.End] {
+				t.Error("unfinished credential residual lost its raw source range")
+			}
+		}
+		if findings[0].Match != "sensitive-prefix:" || findings[2].Match != `:sensitive-suffix\u12` {
+			t.Error("unfinished credential residual included public context or omitted pending bytes")
+		}
+		if strings.Contains(output, "sensitive-") || strings.Contains(output, `\u12`) || !strings.Contains(output, "public-neighbor") {
+			t.Error("unfinished credential redaction exposed a fragment or consumed public text")
+		}
+		output, findings = Redact(input, Config{Allowlist: []string{"^" + regexp.QuoteMeta(provider) + "$"}})
+		if len(findings) != 2 || strings.Contains(output, "sensitive-") || strings.Contains(output, `\u12`) {
+			t.Error("provider-only allowlist exempted an unfinished credential residual")
+		}
+	}
+	for _, tail := range []string{"", `\u12`} {
+		input := `{"password":"` + provider + tail
+		output, findings := Redact(input, Config{Allowlist: []string{"^" + regexp.QuoteMeta(provider) + "$"}})
+		if tail == "" {
+			if len(findings) != 0 || output != input {
+				t.Error("exact-provider allowlist created a public-context residual in an unfinished field")
+			}
+		} else if len(findings) != 1 || findings[0].Category != CategoryPassword || findings[0].Match != tail || strings.Contains(output, tail) {
+			t.Error("allowlisted provider exposed a pending credential escape tail")
+		}
+	}
+}
+
+func TestJSONTruncatedKeepsCrossRecordRawMatches(t *testing.T) {
+	body := strings.Repeat("c3ludGhldGlj", 8)
+	tests := []struct {
+		name, raw, sensitive string
+		category             Category
+	}{
+		{
+			name:      "complete PEM crosses unfinished message record",
+			raw:       "-----BEGIN PRIVATE KEY-----\n" + body + "\n-----END PRIVATE KEY-----",
+			sensitive: body,
+			category:  CategoryPrivateKey,
+		},
+		{
+			name:      "assignment separator crosses unfinished message record",
+			raw:       "PASSWORD\n=synthetic-never-valid-cross-line",
+			sensitive: "synthetic-never-valid-cross-line",
+			category:  CategoryPassword,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := `{"note":"public-before","message":"` + tc.raw + "\npublic-after"
+			assertJSONRawFinding(t, input, tc.raw, tc.category)
+			output, _ := Redact(input, Config{})
+			if strings.Contains(output, tc.sensitive) || !strings.Contains(output, "public-before") || !strings.Contains(output, "public-after") {
+				t.Error("decoding an unfinished record discarded a longer raw credential match")
+			}
+		})
+	}
+}
+
+// A JSON transport can add several encoding layers around a handler's string.
+// Keep each representation of the matched span for original-offset and
+// allowlist checks without decoding through a map (which loses duplicate keys).
+func nestedJSONScanFixture(t *testing.T, document, matched string, depth int) (string, string, []string) {
+	t.Helper()
+	contexts := []string{matched}
+	for range depth {
+		encoded, err := json.Marshal(document)
+		if err != nil {
+			t.Fatal(err)
+		}
+		document = `{"message":` + string(encoded) + `,"status":"ready"}`
+		encoded, err = json.Marshal(matched)
+		if err != nil {
+			t.Fatal(err)
+		}
+		matched = string(encoded[1 : len(encoded)-1])
+		contexts = append(contexts, matched)
+	}
+	if !json.Valid([]byte(document)) {
+		t.Fatal("invalid JSON scan fixture")
+	}
+	return document, matched, contexts
+}
+
+func assertJSONScanFinding(t *testing.T, input, rawMatch string, category Category, cfg Config) Finding {
+	t.Helper()
+	cfg.Mode = ModeBlock
+	result := ScanJSONAndRedact(input, cfg)
+	if !result.Blocked || result.Output != input || result.OriginalLength != len(input) || len(result.Findings) != 1 {
+		t.Fatalf("semantic scan must block one finding without changing input: blocked=%v findings=%d unchanged=%v", result.Blocked, len(result.Findings), result.Output == input)
+	}
+	finding := result.Findings[0]
+	start := strings.Index(input, rawMatch)
+	if start < 0 || finding.Category != category || finding.Start != start || finding.End != start+len(rawMatch) || finding.Match != rawMatch {
+		t.Fatalf("finding lost its original byte range or category: got=%+v want category=%s range=[%d,%d)", finding, category, start, start+len(rawMatch))
+	}
+	return finding
+}
+
+func TestScanJSONAndRedactFindsEscapedKeysAndNestedDocuments(t *testing.T) {
+	provider := "gh" + "p_" + strings.Repeat("q", 40)
+	encodedProvider := `\u0067` + provider[1:]
+	field := `"api_\u0074oken":"syntheticCredential123456"`
+	for _, tc := range []struct {
+		name, document, matched string
+		category                Category
+		minimumDepth            int
+	}{
+		{"provider key", `{"` + encodedProvider + `":"public"}`, encodedProvider, CategoryGitHubToken, 0},
+		{"embedded credential field", `{` + field + `}`, field, CategoryGenericSecret, 1},
+	} {
+		for depth := tc.minimumDepth; depth <= 3; depth++ {
+			t.Run(fmt.Sprintf("%s/depth=%d", tc.name, depth), func(t *testing.T) {
+				input, matched, _ := nestedJSONScanFixture(t, tc.document, tc.matched, depth)
+				assertJSONScanFinding(t, input, matched, tc.category, Config{})
+				// Free-text callers retain the documented one-level semantics.
+				generic := ScanAndRedact(input, Config{Mode: ModeBlock})
+				if generic.Blocked || len(generic.Findings) != 0 || generic.Output != input {
+					t.Fatal("JSON-specific scanning changed the generic scanner contract")
+				}
+			})
+		}
+	}
+}
+
+func TestScanJSONAndRedactCustomPatternsKeepRawAndDecodedMatches(t *testing.T) {
+	const logical = "SYNTHETIC-CONFIDENTIAL"
+	const encoded = `\u0053YNTHETIC-CONFIDENTIAL`
+	const rawOnly = `\u0058`
+	input := `{"action":"` + encoded + `","encoding":"` + rawOnly + `","public":"ready"}`
+	cfg := Config{Mode: ModeBlock, ExtraPatterns: map[Category][]string{
+		"CUSTOM_LOGICAL": {regexp.QuoteMeta(logical)},
+		"CUSTOM_RAW":     {regexp.QuoteMeta(rawOnly)},
+	}}
+	result := ScanJSONAndRedact(input, cfg)
+	if !result.Blocked || result.Output != input || len(result.Findings) != 2 {
+		t.Fatalf("raw and decoded custom patterns were not both retained: %+v", result.Findings)
+	}
+	for i, expected := range []struct {
+		category Category
+		matched  string
+	}{{"CUSTOM_LOGICAL", encoded}, {"CUSTOM_RAW", rawOnly}} {
+		finding := result.Findings[i]
+		start := strings.Index(input, expected.matched)
+		if finding.Category != expected.category || finding.Match != expected.matched || finding.Start != start || finding.End != start+len(expected.matched) {
+			t.Errorf("custom finding %d lost source bytes: %+v", i, finding)
+		}
+	}
+	generic := ScanAndRedact(input, cfg)
+	if len(generic.Findings) != 1 || generic.Findings[0].Category != "CUSTOM_RAW" || generic.Findings[0].Match != rawOnly {
+		t.Fatal("generic custom patterns no longer use only their raw input")
+	}
+}
+
+func TestScanJSONAndRedactAppliesAnchoredPatternsToUnescapedStrings(t *testing.T) {
+	const marker = "SYNTHETIC-CONFIDENTIAL"
+	cfg := Config{Mode: ModeBlock, ExtraPatterns: map[Category][]string{"CUSTOM_ANCHORED": {"^" + regexp.QuoteMeta(marker) + "$"}}}
+	for _, tc := range []struct {
+		name, input string
+	}{
+		{"value", `{"action":"` + marker + `","public":"ready"}`},
+		{"key", `{"` + marker + `":"public","status":"ready"}`},
+		{"array value", `{"items":["public","` + marker + `"]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertJSONScanFinding(t, tc.input, marker, "CUSTOM_ANCHORED", cfg)
+			generic := ScanAndRedact(tc.input, cfg)
+			if generic.Blocked || len(generic.Findings) != 0 || generic.Output != tc.input {
+				t.Fatal("generic anchored patterns stopped applying to the complete raw input")
+			}
+			allowedCfg := cfg
+			allowedCfg.Allowlist = []string{"^" + regexp.QuoteMeta(marker) + "$"}
+			permitted := ScanJSONAndRedact(tc.input, allowedCfg)
+			if permitted.Blocked || len(permitted.Findings) != 0 || permitted.Output != tc.input {
+				t.Fatal("explicit logical allowlist did not preserve the unescaped string")
+			}
+		})
+	}
+}
+
+func TestScanJSONAndRedactMapsSurrogatePairsAcrossEncodingLayers(t *testing.T) {
+	const logical = "SYNTHETIC-😀-SECRET"
+	const encoded = `\u0053YNTHETIC-\ud83d\ude00-SECRET`
+	cfg := Config{ExtraPatterns: map[Category][]string{"CUSTOM_UNICODE": {regexp.QuoteMeta(logical)}}}
+	for _, position := range []string{"key", "value"} {
+		for depth := 0; depth <= 2; depth++ {
+			t.Run(fmt.Sprintf("%s/depth=%d", position, depth), func(t *testing.T) {
+				field := `"action":"` + encoded + `"`
+				if position == "key" {
+					field = `"` + encoded + `":"public"`
+				}
+				input := `{"prefix":"雪\u96ea\ud83d\ude00",` + field + `,"after":"ready"}`
+				input, matched, _ := nestedJSONScanFixture(t, input, encoded, depth)
+				assertJSONScanFinding(t, input, matched, "CUSTOM_UNICODE", cfg)
+			})
+		}
+	}
+}
+
+func TestScanJSONAndRedactPreservesNestedAllowlistContexts(t *testing.T) {
+	provider := "gh" + "p_" + strings.Repeat("q", 40)
+	encodedProvider := `\u0067` + provider[1:]
+	encodedField := `"pass\u0077ord":"synthetic-never-valid-password"`
+	logicalField := `"password":"synthetic-never-valid-password"`
+	for _, tc := range []struct {
+		name, document, matched, logical string
+		category                         Category
+	}{
+		{"provider key", `{"` + encodedProvider + `":"public"}`, encodedProvider, provider, CategoryGitHubToken},
+		{"credential field", `{` + encodedField + `}`, encodedField, logicalField, CategoryPassword},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input, matched, contexts := nestedJSONScanFixture(t, tc.document, tc.matched, 3)
+			assertJSONScanFinding(t, input, matched, tc.category, Config{})
+			contexts = append(contexts, tc.logical)
+			for i, allowed := range contexts {
+				t.Run(fmt.Sprintf("context=%d", i), func(t *testing.T) {
+					cfg := Config{Mode: ModeBlock, Allowlist: []string{"^" + regexp.QuoteMeta(allowed) + "$"}}
+					result := ScanJSONAndRedact(input, cfg)
+					if result.Blocked || len(result.Findings) != 0 || result.Output != input {
+						t.Fatalf("raw/intermediate/logical allowlist lost at encoding level %d", i)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestScanJSONAndRedactNestedResidualsRetainWholeFieldAllowlists(t *testing.T) {
+	provider := "gh" + "p_" + strings.Repeat("q", 40)
+	field := `"password":"sensitive-prefix:` + provider + `:sensitive-suffix"`
+	input, _, contexts := nestedJSONScanFixture(t, `{`+field+`}`, field, 3)
+	result := ScanJSONAndRedact(input, Config{Mode: ModeBlock})
+	if !result.Blocked || len(result.Findings) != 3 || result.Output != input {
+		t.Fatalf("nested credential lost provider or residual findings: %+v", result.Findings)
+	}
+	for i, expected := range []string{"sensitive-prefix:", provider, ":sensitive-suffix"} {
+		finding := result.Findings[i]
+		category := CategoryPassword
+		if i == 1 {
+			category = CategoryGitHubToken
+		}
+		if finding.Category != category || finding.Match != expected || finding.Start < 0 || finding.End > len(input) || input[finding.Start:finding.End] != expected {
+			t.Fatalf("nested residual %d changed its original source range: %+v", i, finding)
+		}
+	}
+	for i, allowed := range contexts {
+		t.Run(fmt.Sprintf("whole field context=%d", i), func(t *testing.T) {
+			cfg := Config{Mode: ModeBlock, Allowlist: []string{"^" + regexp.QuoteMeta(allowed) + "$"}}
+			result := ScanJSONAndRedact(input, cfg)
+			if len(result.Findings) != 1 || result.Findings[0].Category != CategoryGitHubToken || result.Findings[0].Match != provider {
+				t.Fatal("whole-field allowlist lost residual context or exempted an independent provider")
+			}
+			cfg.Allowlist = append(cfg.Allowlist, "^"+regexp.QuoteMeta(provider)+"$")
+			result = ScanJSONAndRedact(input, cfg)
+			if result.Blocked || len(result.Findings) != 0 || result.Output != input {
+				t.Fatal("explicit field and provider allowlists failed to preserve original input")
+			}
+		})
+	}
+}
+
+func TestScanJSONAndRedactHonorsDisabledCategories(t *testing.T) {
+	provider := "gh" + "p_" + strings.Repeat("q", 40)
+	encodedProvider := `\u0067` + provider[1:]
+	passwordField := `"pass\u0077ord":"synthetic-never-valid-password"`
+	nestedPassword, _, _ := nestedJSONScanFixture(t, `{`+passwordField+`}`, passwordField, 2)
+	for _, tc := range []struct {
+		name, input string
+		cfg         Config
+	}{
+		{"provider key", `{"` + encodedProvider + `":"public"}`, Config{DisabledCategories: []Category{CategoryGitHubToken}}},
+		{"nested password", nestedPassword, Config{DisabledCategories: []Category{CategoryPassword}}},
+		{"protected field retains category suppression", `{"api_token":"` + encodedProvider + `"}`, Config{DisabledCategories: []Category{CategoryGenericSecret}}},
+		{"custom decoded match", `{"action":"\u0053YNTHETIC-CONFIDENTIAL"}`, Config{
+			ExtraPatterns: map[Category][]string{"CUSTOM_LOGICAL": {`SYNTHETIC-CONFIDENTIAL`}}, DisabledCategories: []Category{"CUSTOM_LOGICAL"},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.cfg.Mode = ModeBlock
+			result := ScanJSONAndRedact(tc.input, tc.cfg)
+			if result.Blocked || len(result.Findings) != 0 || result.Output != tc.input {
+				t.Fatalf("disabled category changed accepted input: %+v", result.Findings)
+			}
+		})
+	}
+}
+
+func TestScanJSONAndRedactPreservesDuplicateKeysNumbersAndModeSemantics(t *testing.T) {
+	first := `\u0067` + "hp_" + strings.Repeat("q", 40)
+	second := `\u0067` + "hp_" + strings.Repeat("r", 40)
+	input := " \n" + `{"item":"` + first + `","item":"` + second + `","number":9007199254740993,"zero":-0.0,"empty":[]}` + "\t\n"
+	for _, mode := range []Mode{ModeOff, ModeWarn, ModeRedact, ModeBlock} {
+		t.Run(string(mode), func(t *testing.T) {
+			result := ScanJSONAndRedact(input, Config{Mode: mode})
+			wantFindings := 2
+			if mode == ModeOff {
+				wantFindings = 0
+			}
+			if result.Mode != mode || result.OriginalLength != len(input) || len(result.Findings) != wantFindings || result.Blocked != (mode == ModeBlock) {
+				t.Fatalf("JSON scanning changed mode semantics: mode=%s findings=%d blocked=%v", result.Mode, len(result.Findings), result.Blocked)
+			}
+			if mode != ModeRedact {
+				if result.Output != input {
+					t.Fatal("non-rewriting mode changed duplicate keys, number spelling or whitespace")
+				}
+				return
+			}
+			if strings.Contains(result.Output, first) || strings.Contains(result.Output, second) || strings.Count(result.Output, `"item":`) != 2 ||
+				!strings.Contains(result.Output, `"number":9007199254740993,"zero":-0.0,"empty":[]`) || !json.Valid([]byte(result.Output)) {
+				t.Fatal("redaction lost a duplicate credential or altered neighboring JSON values")
+			}
+		})
+	}
+	clean := " \n" + `{"item":"ready","item":"still ready","number":9007199254740993,"escaped":"\ud83d\ude00","zero":-0.0}` + "\t\n"
+	for _, mode := range []Mode{ModeOff, ModeWarn, ModeRedact, ModeBlock} {
+		result := ScanJSONAndRedact(clean, Config{Mode: mode})
+		if result.Blocked || len(result.Findings) != 0 || result.Output != clean {
+			t.Fatalf("clean JSON was changed in mode %s", mode)
+		}
+	}
+}
+
+// This is the incumbent overlap algorithm, kept unchanged apart from function
+// names so equivalence tests and paired benchmarks run both implementations.
+func deduplicateMatchesIncumbent(matches []match) []match {
+	if len(matches) == 0 {
+		return matches
+	}
+
+	// Sort by priority (descending) so higher priority matches get first pick.
+	// For same priority, prefer earlier matches, then complete matches over
+	// shorter fallbacks at the same position (for example a PEM header).
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].priority != matches[j].priority {
+			return matches[i].priority > matches[j].priority
+		}
+		if matches[i].start != matches[j].start {
+			return matches[i].start < matches[j].start
+		}
+		return matches[i].end > matches[j].end
+	})
+
+	var result []match
+	for _, m := range matches {
+		overlaps := false
+		for _, kept := range result {
+			// Check for overlap with already kept higher-priority matches.
+			// Overlap exists if max(m.start, kept.start) < min(m.end, kept.end)
+			start := m.start
+			if kept.start > start {
+				start = kept.start
+			}
+			end := m.end
+			if kept.end < end {
+				end = kept.end
+			}
+			if start < end {
+				overlaps = true
+				break
+			}
+		}
+
+		if !overlaps {
+			result = append(result, m)
+		} else if m.valueStart < m.valueEnd {
+			// A provider pattern can cover only part of another credential.
+			// Keep its category and exact match while protecting every other
+			// byte already recognized as part of the surrounding secret.
+			result = append(result, uncoveredValueMatchesIncumbent(m, result)...)
+		}
+	}
+
+	// Sort result by start position for consistent output order.
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].start < result[j].start
+	})
+
+	return result
+}
+
+func uncoveredValueMatchesIncumbent(m match, kept []match) []match {
+	fragments := []match{{
+		category:          m.category,
+		start:             m.valueStart,
+		end:               m.valueEnd,
+		priority:          m.priority,
+		allowlistSource:   m.match,
+		logicalMatch:      m.logicalMatch,
+		allowlistContexts: m.allowlistContexts,
+	}}
+	for _, other := range kept {
+		if other.start == other.end {
+			continue // Zero-width patterns do not protect any credential bytes.
+		}
+		if other.end <= m.valueStart || other.start >= m.valueEnd {
+			continue
+		}
+		var remaining []match
+		for _, fragment := range fragments {
+			if fragment.end <= other.start || fragment.start >= other.end {
+				remaining = append(remaining, fragment)
+				continue
+			}
+			if fragment.start < other.start {
+				left := fragment
+				left.end = other.start
+				remaining = append(remaining, left)
+			}
+			if other.end < fragment.end {
+				right := fragment
+				right.start = other.end
+				remaining = append(remaining, right)
+			}
+		}
+		fragments = remaining
+		if len(fragments) == 0 {
+			break
+		}
+	}
+	for i := range fragments {
+		fragments[i].match = m.match[fragments[i].start-m.start : fragments[i].end-m.start]
+	}
+	return fragments
+}
+
+func cloneDedupMatches(matches []match) []match {
+	if matches == nil {
+		return nil
+	}
+	cloned := make([]match, len(matches))
+	copy(cloned, matches)
+	return cloned
+}
+
+func TestDeduplicateMatchesMatchesIncumbent(t *testing.T) {
+	source := strings.Repeat("0123456789abcdefghijklmnopqrstuvwxyz", 2)
+	span := func(name string, start, end, priority, valueStart, valueEnd int) match {
+		return match{
+			category:          Category(name),
+			match:             source[start:end],
+			start:             start,
+			end:               end,
+			priority:          priority,
+			valueStart:        valueStart,
+			valueEnd:          valueEnd,
+			jsonField:         true,
+			allowlistSource:   "original-" + name,
+			logicalMatch:      "logical-" + name,
+			allowlistContexts: []string{"encoded-" + name, "nested-" + name},
+		}
+	}
+	cases := []struct {
+		name    string
+		matches []match
+	}{
+		{name: "nil"},
+		{name: "empty", matches: []match{}},
+		{name: "zero widths only", matches: []match{
+			span("zero-lower", 8, 8, 25, 0, 0),
+			span("zero-first", 8, 8, 100, 0, 0),
+			span("zero-second", 8, 8, 100, 0, 0),
+			span("zero-earlier", 3, 3, 100, 0, 0),
+		}},
+		{name: "adjacent spans and zero width boundaries", matches: []match{
+			span("right", 5, 10, 100, 0, 0),
+			span("left", 0, 5, 100, 0, 0),
+			span("zero-between", 5, 5, 200, 0, 0),
+			span("zero-end", 10, 10, 1, 0, 0),
+			span("surrounding", 0, 15, 25, 2, 14),
+		}},
+		{name: "identical ties and longer same start", matches: []match{
+			span("short", 4, 8, 50, 0, 0),
+			span("long-first", 4, 12, 50, 0, 0),
+			span("long-second", 4, 12, 50, 0, 0),
+			span("earlier", 1, 5, 50, 0, 0),
+			span("higher", 18, 23, 100, 0, 0),
+		}},
+		{name: "surrounding credential residuals and metadata", matches: []match{
+			span("provider-first", 10, 15, 100, 0, 0),
+			span("provider-second", 22, 25, 90, 0, 0),
+			span("field", 0, 32, 50, 8, 30),
+			span("outer-field", 0, 40, 25, 4, 38),
+			span("zero-in-gap", 18, 18, 120, 0, 0),
+			span("already-covered", 0, 40, 1, 8, 30),
+		}},
+		{name: "overlap only in public field prefix", matches: []match{
+			span("prefix", 0, 4, 100, 0, 0),
+			span("field", 0, 20, 50, 8, 18),
+			span("outer-field", 0, 22, 25, 6, 20),
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			want := deduplicateMatchesIncumbent(cloneDedupMatches(tc.matches))
+			got := deduplicateMatches(cloneDedupMatches(tc.matches))
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("overlap semantics changed:\n got: %#v\nwant: %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestDeduplicateMatchesGeneratedEquivalence(t *testing.T) {
+	const seed int64 = 20261101
+	rng := rand.New(rand.NewSource(seed))
+	source := strings.Repeat("0123456789abcdef", 16)
+	priorities := []int{100, 90, 50, 25}
+	for trial := 0; trial < 1200; trial++ {
+		input := make([]match, rng.Intn(129))
+		for i := range input {
+			start := rng.Intn(len(source) + 1)
+			end := start + rng.Intn(len(source)-start+1)
+			if rng.Intn(8) == 0 {
+				end = start
+			}
+			if i > 0 && rng.Intn(5) == 0 {
+				// Exercise exact ties without making the metadata interchangeable.
+				previous := input[rng.Intn(i)]
+				start, end = previous.start, previous.end
+			}
+			m := match{
+				category:        Category(fmt.Sprintf("category-%d", i)),
+				match:           source[start:end],
+				start:           start,
+				end:             end,
+				priority:        priorities[rng.Intn(len(priorities))],
+				jsonField:       rng.Intn(2) == 0,
+				allowlistSource: fmt.Sprintf("source-%d", i),
+				logicalMatch:    fmt.Sprintf("logical-%d", i),
+			}
+			if start < end && rng.Intn(2) == 0 {
+				m.valueStart = start + rng.Intn(end-start)
+				m.valueEnd = m.valueStart + 1 + rng.Intn(end-m.valueStart)
+			}
+			switch rng.Intn(3) {
+			case 1:
+				m.allowlistContexts = []string{}
+			case 2:
+				m.allowlistContexts = []string{fmt.Sprintf("encoded-%d", i), fmt.Sprintf("nested-%d", i)}
+			}
+			input[i] = m
+		}
+		want := deduplicateMatchesIncumbent(cloneDedupMatches(input))
+		got := deduplicateMatches(cloneDedupMatches(input))
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("seed=%d trial=%d changed overlap output:\ninput: %#v\n got: %#v\nwant: %#v", seed, trial, input, got, want)
+		}
+	}
+}
+
+const boundedScannerTestCategory Category = "BOUNDED_TEST"
+
+// Isolate work and candidate boundaries from the number of builtin patterns.
+func boundedScannerTestConfig(patterns ...string) Config {
+	cfg := Config{Mode: ModeRedact}
+	seen := make(map[Category]bool)
+	for _, p := range getPatterns() {
+		if !seen[p.category] {
+			cfg.DisabledCategories = append(cfg.DisabledCategories, p.category)
+			seen[p.category] = true
+		}
+	}
+	if len(patterns) > 0 {
+		cfg.ExtraPatterns = map[Category][]string{boundedScannerTestCategory: patterns}
+	}
+	return cfg
+}
+
+func assertScanLimitExceeded(t *testing.T, got Result, input string, mode Mode) {
+	t.Helper()
+	if !got.LimitExceeded || !got.Blocked || got.Output != "" || got.Findings != nil ||
+		got.Mode != mode || got.OriginalLength != len(input) {
+		t.Fatalf("incomplete scan did not withhold its entire result: %#v", got)
+	}
+}
+
+func TestBoundedScannerInputAndResultLimits(t *testing.T) {
+	for _, field := range []string{"input", "result"} {
+		t.Run(field, func(t *testing.T) {
+			limits := DefaultScanLimits()
+			if field == "input" {
+				limits.MaxInputBytes = len("clear")
+			} else {
+				limits.MaxResultBytes = len("clear")
+			}
+			cfg := boundedScannerTestConfig()
+			exact := ScanAndRedactWithLimits("clear", cfg, limits)
+			if want := ScanAndRedact("clear", cfg); !reflect.DeepEqual(exact, want) {
+				t.Fatalf("exact byte limit changed the result: got %#v want %#v", exact, want)
+			}
+			assertScanLimitExceeded(t, ScanAndRedactWithLimits("clear!", cfg, limits), "clear!", cfg.Mode)
+		})
+	}
+}
+
+func TestBoundedScannerInvalidLimitsAndOffMode(t *testing.T) {
+	fields := []struct {
+		name string
+		zero func(*ScanLimits)
+	}{
+		{"input", func(l *ScanLimits) { l.MaxInputBytes = 0 }},
+		{"result", func(l *ScanLimits) { l.MaxResultBytes = 0 }},
+		{"candidates", func(l *ScanLimits) { l.MaxCandidates = 0 }},
+		{"tokens", func(l *ScanLimits) { l.MaxJSONTokens = 0 }},
+		{"work", func(l *ScanLimits) { l.MaxWorkBytes = 0 }},
+		{"depth", func(l *ScanLimits) { l.MaxDepth = 0 }},
+		{"config entries", func(l *ScanLimits) { l.MaxConfigEntries = 0 }},
+		{"config bytes", func(l *ScanLimits) { l.MaxConfigBytes = 0 }},
+	}
+	for _, field := range fields {
+		t.Run(field.name, func(t *testing.T) {
+			limits := DefaultScanLimits()
+			field.zero(&limits)
+			for _, mode := range []Mode{ModeWarn, ModeRedact, ModeBlock} {
+				cfg := boundedScannerTestConfig("x")
+				cfg.Mode = mode
+				assertScanLimitExceeded(t, ScanAndRedactWithLimits("x", cfg, limits), "x", mode)
+			}
+		})
+	}
+	cfg := Config{Mode: ModeOff, ExtraPatterns: map[Category][]string{"IGNORED": {"("}}}
+	input := "ghp_" + strings.Repeat("z", 40)
+	if got, want := ScanJSONAndRedactWithLimits(input, cfg, ScanLimits{}), ScanJSONAndRedact(input, cfg); !reflect.DeepEqual(got, want) {
+		t.Fatalf("off mode no longer intentionally bypasses inspection: got %#v want %#v", got, want)
+	}
+}
+
+func TestBoundedScannerCandidatesBeforeFiltering(t *testing.T) {
+	for _, allowed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("allowlisted=%v", allowed), func(t *testing.T) {
+			cfg := boundedScannerTestConfig("x")
+			if allowed {
+				cfg.Allowlist = []string{"^x$"}
+			}
+			limits := DefaultScanLimits()
+			limits.MaxCandidates = 2
+			input := "x x"
+			if got, want := ScanAndRedactWithLimits(input, cfg, limits), ScanAndRedact(input, cfg); !reflect.DeepEqual(got, want) {
+				t.Fatalf("exact candidate limit changed output: got %#v want %#v", got, want)
+			}
+			assertScanLimitExceeded(t, ScanAndRedactWithLimits("x x x", cfg, limits), "x x x", cfg.Mode)
+		})
+	}
+	t.Run("rejected builtin candidates still count", func(t *testing.T) {
+		cfg := boundedScannerTestConfig()
+		var disabled []Category
+		for _, category := range cfg.DisabledCategories {
+			if category != CategoryPassword {
+				disabled = append(disabled, category)
+			}
+		}
+		cfg.DisabledCategories = disabled
+		limits := DefaultScanLimits()
+		limits.MaxCandidates = 2
+		input := strings.Repeat("password=<redacted> ", 2)
+		got := ScanAndRedactWithLimits(input, cfg, limits)
+		if got.LimitExceeded || len(got.Findings) != 0 || got.Output != input {
+			t.Fatalf("rejected builtin control changed: %#v", got)
+		}
+		input += "password=<redacted>"
+		assertScanLimitExceeded(t, ScanAndRedactWithLimits(input, cfg, limits), input, cfg.Mode)
+	})
+	t.Run("zero width candidates still count", func(t *testing.T) {
+		cfg := boundedScannerTestConfig("(?:)")
+		limits := DefaultScanLimits()
+		limits.MaxCandidates = 3
+		input := "xy"
+		got, want := ScanAndRedactWithLimits(input, cfg, limits), ScanAndRedact(input, cfg)
+		if len(want.Findings) != 3 || !reflect.DeepEqual(got, want) {
+			t.Fatalf("zero-width exact boundary changed: got %#v want %#v", got, want)
+		}
+		limits.MaxCandidates--
+		assertScanLimitExceeded(t, ScanAndRedactWithLimits(input, cfg, limits), input, cfg.Mode)
+	})
+	t.Run("disabled category skips raw candidates", func(t *testing.T) {
+		cfg := boundedScannerTestConfig("x")
+		cfg.DisabledCategories = append(cfg.DisabledCategories, boundedScannerTestCategory)
+		limits := DefaultScanLimits()
+		limits.MaxCandidates = 1
+		input := "x x x x " + strings.Repeat("ghp_"+strings.Repeat("d", 40)+" ", 4)
+		got := ScanAndRedactWithLimits(input, cfg, limits)
+		if got.LimitExceeded || len(got.Findings) != 0 || got.Output != input {
+			t.Fatalf("disabled categories consumed candidate budget: %#v", got)
+		}
+	})
+}
+
+func TestBoundedScannerJSONTokenLimits(t *testing.T) {
+	embedded, err := json.Marshal(map[string]string{"payload": "{\"label\":\"clear"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name  string
+		input string
+		exact int
+	}{
+		{"clean document", "[\"a\",\"b\"]", 3}, // One record and two string tokens.
+		{"JSONL", "\"a\"\n\"b\"", 4},           // Two records and two string tokens.
+		{"unfinished field", "{\"label\":\"clear", 5},
+		{"embedded unfinished field", string(embedded), 8},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := boundedScannerTestConfig()
+			limits := DefaultScanLimits()
+			limits.MaxJSONTokens = tc.exact
+			got, want := ScanJSONAndRedactWithLimits(tc.input, cfg, limits), ScanJSONAndRedact(tc.input, cfg)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("exact token boundary changed the result: got %#v want %#v", got, want)
+			}
+			limits.MaxJSONTokens--
+			assertScanLimitExceeded(t, ScanJSONAndRedactWithLimits(tc.input, cfg, limits), tc.input, cfg.Mode)
+		})
+	}
+}
+
+func TestBoundedScannerDecodedDepth(t *testing.T) {
+	input := "clear"
+	for i := 0; i < 3; i++ {
+		encoded, err := json.Marshal(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input = string(encoded)
+	}
+	cfg := boundedScannerTestConfig()
+	limits := DefaultScanLimits()
+	limits.MaxDepth = 3
+	if got, want := ScanJSONAndRedactWithLimits(input, cfg, limits), ScanJSONAndRedact(input, cfg); !reflect.DeepEqual(got, want) {
+		t.Fatalf("exact decoded depth changed the result: got %#v want %#v", got, want)
+	}
+	limits.MaxDepth--
+	assertScanLimitExceeded(t, ScanJSONAndRedactWithLimits(input, cfg, limits), input, cfg.Mode)
+
+	// Plain object/array nesting is not another decoded string representation.
+	input = strings.Repeat("[", 96) + "\"clear\"" + strings.Repeat("]", 96)
+	limits.MaxDepth = 1
+	if got := ScanJSONAndRedactWithLimits(input, cfg, limits); got.LimitExceeded || got.Output != input {
+		t.Fatalf("ordinary container nesting consumed decoded-view depth: %#v", got)
+	}
+}
+
+func TestBoundedScannerSharedBudgetAndConfiguration(t *testing.T) {
+	t.Run("candidates and sticky refusal", func(t *testing.T) {
+		cfg := boundedScannerTestConfig("x")
+		limits := DefaultScanLimits()
+		limits.MaxCandidates = 2
+		scanner := NewScanner(cfg, limits)
+		for i := 0; i < 2; i++ {
+			if got, want := scanner.ScanAndRedact("x"), ScanAndRedact("x", cfg); !reflect.DeepEqual(got, want) {
+				t.Fatalf("call %d changed before exhausting shared candidates: %#v", i+1, got)
+			}
+		}
+		if got := scanner.ScanAndRedact("clear"); got.LimitExceeded || got.Output != "clear" {
+			t.Fatalf("exact candidate budget rejected a candidate-free call: %#v", got)
+		}
+		assertScanLimitExceeded(t, scanner.ScanAndRedact("x"), "x", cfg.Mode)
+		assertScanLimitExceeded(t, scanner.ScanJSONAndRedact("\"clear\""), "\"clear\"", cfg.Mode)
+	})
+	t.Run("JSON tokens span calls", func(t *testing.T) {
+		cfg := boundedScannerTestConfig()
+		limits := DefaultScanLimits()
+		limits.MaxJSONTokens = 4
+		scanner := NewScanner(cfg, limits)
+		for i := 0; i < 2; i++ {
+			if got := scanner.ScanJSONAndRedact("[\"clear\"]"); got.LimitExceeded || got.Output != "[\"clear\"]" {
+				t.Fatalf("call %d changed before exhausting shared tokens: %#v", i+1, got)
+			}
+		}
+		assertScanLimitExceeded(t, scanner.ScanJSONAndRedact("[\"clear\"]"), "[\"clear\"]", cfg.Mode)
+	})
+	t.Run("work spans calls including empty subjects", func(t *testing.T) {
+		cfg := boundedScannerTestConfig()
+		limits := DefaultScanLimits()
+		limits.MaxWorkBytes = 2
+		scanner := NewScanner(cfg, limits)
+		for i := 0; i < 2; i++ {
+			if got := scanner.ScanAndRedact(""); got.LimitExceeded || got.Output != "" || got.Blocked {
+				t.Fatalf("empty call %d changed before exhausting shared work: %#v", i+1, got)
+			}
+		}
+		assertScanLimitExceeded(t, scanner.ScanAndRedact(""), "", cfg.Mode)
+	})
+	t.Run("configuration is frozen before first scan", func(t *testing.T) {
+		cfg := boundedScannerTestConfig("x")
+		cfg.Allowlist = []string{"^safe$"}
+		want := ScanAndRedact("x", cfg)
+		scanner := NewScanner(cfg, DefaultScanLimits())
+		cfg.Allowlist[0] = ".*"
+		cfg.ExtraPatterns[boundedScannerTestCategory][0] = "y"
+		cfg.DisabledCategories[0] = boundedScannerTestCategory
+		if got := scanner.ScanAndRedact("x"); !reflect.DeepEqual(got, want) {
+			t.Fatalf("caller mutation changed the prepared scanner configuration: got %#v want %#v", got, want)
+		}
+	})
+}
+
+func TestBoundedScannerConfigurationLimits(t *testing.T) {
+	cases := []struct {
+		name     string
+		cfg      Config
+		exact    int
+		bytes    bool
+		overflow func(*Config)
+	}{
+		{"blank allowlist entries", Config{Mode: ModeRedact, Allowlist: []string{"", ""}}, 2, false,
+			func(c *Config) { c.Allowlist = append(c.Allowlist, "") }},
+		{"empty pattern category keys", Config{Mode: ModeRedact, ExtraPatterns: map[Category][]string{"A": nil}}, 1, false,
+			func(c *Config) { c.ExtraPatterns["B"] = nil }},
+		{"blank patterns", Config{Mode: ModeRedact, ExtraPatterns: map[Category][]string{"A": {""}}}, 2, false,
+			func(c *Config) { c.ExtraPatterns["A"] = append(c.ExtraPatterns["A"], "") }},
+		{"blank disabled categories", Config{Mode: ModeRedact, DisabledCategories: []Category{"", ""}}, 2, false,
+			func(c *Config) { c.DisabledCategories = append(c.DisabledCategories, "") }},
+		{"disabled pattern entries", Config{Mode: ModeRedact, ExtraPatterns: map[Category][]string{"A": {"x", "y"}}, DisabledCategories: []Category{"A"}}, 4, false,
+			func(c *Config) { c.ExtraPatterns["A"] = append(c.ExtraPatterns["A"], "z") }},
+		{"allowlist bytes", Config{Mode: ModeRedact, Allowlist: []string{"x"}}, 1, true,
+			func(c *Config) { c.Allowlist[0] += "y" }},
+		{"category key bytes", Config{Mode: ModeRedact, ExtraPatterns: map[Category][]string{"AB": nil}}, 2, true,
+			func(c *Config) { c.ExtraPatterns["C"] = nil }},
+		{"disabled pattern bytes", Config{Mode: ModeRedact, ExtraPatterns: map[Category][]string{"A": {"x", "y"}}, DisabledCategories: []Category{"A"}}, 4, true,
+			func(c *Config) { c.ExtraPatterns["A"] = append(c.ExtraPatterns["A"], "z") }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			limits := DefaultScanLimits()
+			if tc.bytes {
+				limits.MaxConfigBytes = tc.exact
+			} else {
+				limits.MaxConfigEntries = tc.exact
+			}
+			if got, want := ScanAndRedactWithLimits("clear", tc.cfg, limits), ScanAndRedact("clear", tc.cfg); !reflect.DeepEqual(got, want) {
+				t.Fatalf("exact configuration limit changed the result: got %#v want %#v", got, want)
+			}
+			cfg := tc.cfg.DeepCopy()
+			tc.overflow(&cfg)
+			assertScanLimitExceeded(t, ScanAndRedactWithLimits("clear", cfg, limits), "clear", cfg.Mode)
+		})
+	}
+}
+
+func TestBoundedScannerResultExpansion(t *testing.T) {
+	cfg := boundedScannerTestConfig("x")
+	input := strings.Repeat("q", 256) + "x"
+	want := ScanAndRedact(input, cfg)
+	if len(want.Findings) != 1 || len(want.Output) <= len(input) {
+		t.Fatal("fixture must grow when replacing the short custom match")
+	}
+	limits := DefaultScanLimits()
+	limits.MaxResultBytes = len(want.Output)
+	if got := ScanAndRedactWithLimits(input, cfg, limits); !reflect.DeepEqual(got, want) {
+		t.Fatalf("exact expanded-output boundary changed the result: got %#v want %#v", got, want)
+	}
+	limits.MaxResultBytes--
+	assertScanLimitExceeded(t, ScanAndRedactWithLimits(input, cfg, limits), input, cfg.Mode)
+
+	// Even non-rewriting modes must bound their diagnostic allocation.
+	cfg.Mode = ModeWarn
+	limits = DefaultScanLimits()
+	limits.MaxResultBytes = 64
+	assertScanLimitExceeded(t, ScanAndRedactWithLimits("x", cfg, limits), "x", cfg.Mode)
+}
+
+func TestBoundedScannerWorkAccounting(t *testing.T) {
+	cfg := boundedScannerTestConfig()
+	input := "clear"
+	limits := DefaultScanLimits()
+	// With every pattern disabled and no quote, the encoded-content check is
+	// the only subject read. It costs the input bytes plus one fixed unit.
+	limits.MaxWorkBytes = int64(len(input) + 1)
+	if got, want := ScanAndRedactWithLimits(input, cfg, limits), ScanAndRedact(input, cfg); !reflect.DeepEqual(got, want) {
+		t.Fatalf("exact work boundary changed the result: got %#v want %#v", got, want)
+	}
+	limits.MaxWorkBytes--
+	assertScanLimitExceeded(t, ScanAndRedactWithLimits(input, cfg, limits), input, cfg.Mode)
+
+	cfg = boundedScannerTestConfig("x")
+	input = "x"
+	limits = DefaultScanLimits()
+	// Encoded-content check, custom regexp subject, finding hash subject, and
+	// finding category are the reads for this isolated successful scan.
+	limits.MaxWorkBytes = int64(3*(len(input)+1) + len(boundedScannerTestCategory) + 1)
+	if got, want := ScanAndRedactWithLimits(input, cfg, limits), ScanAndRedact(input, cfg); !reflect.DeepEqual(got, want) {
+		t.Fatalf("isolated custom match exceeded its exact read budget: got %#v want %#v", got, want)
+	}
+	cfg.Allowlist = []string{"^safe$"}
+	assertScanLimitExceeded(t, ScanAndRedactWithLimits(input, cfg, limits), input, cfg.Mode)
+}
+
+func TestBoundedScannerPreservesLegacyResults(t *testing.T) {
+	token := "ghp_" + strings.Repeat("p", 40)
+	inner := "{\"message\":\"\\u0067" + token[1:] + "\",\"custom\":\"marker-123\"}"
+	nested, err := json.Marshal(inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs := []string{
+		"ordinary text",
+		"provider=" + token,
+		"{\"\\u0061pi_token\":\"synthetic-never-valid-value\",\"n\":9007199254740993,\"n\":-0.0}",
+		"{\"payload\":" + string(nested) + "}",
+	}
+	configs := []Config{
+		{},
+		{Allowlist: []string{"^" + regexp.QuoteMeta(token) + "$", "synthetic-never-valid-value"}},
+		{ExtraPatterns: map[Category][]string{"CUSTOM": {"^marker-[0-9]+$", "marker-[0-9]+"}}},
+		{DisabledCategories: []Category{CategoryGitHubToken}},
+	}
+	apis := []struct {
+		name      string
+		unbounded func(string, Config) Result
+		bounded   func(string, Config, ScanLimits) Result
+	}{
+		{"raw", ScanAndRedact, ScanAndRedactWithLimits},
+		{"JSON", ScanJSONAndRedact, ScanJSONAndRedactWithLimits},
+	}
+	for _, api := range apis {
+		for configIndex, base := range configs {
+			for _, mode := range []Mode{ModeOff, ModeWarn, ModeRedact, ModeBlock} {
+				for inputIndex, input := range inputs {
+					t.Run(fmt.Sprintf("%s/config%d/%s/input%d", api.name, configIndex, mode, inputIndex), func(t *testing.T) {
+						cfg := base.DeepCopy()
+						cfg.Mode = mode
+						want := api.unbounded(input, cfg)
+						got := api.bounded(input, cfg, DefaultScanLimits())
+						if !reflect.DeepEqual(got, want) {
+							t.Fatalf("bounded scan changed complete legacy result: got %#v want %#v", got, want)
+						}
+					})
+				}
+			}
+		}
 	}
 }

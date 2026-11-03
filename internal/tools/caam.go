@@ -183,20 +183,6 @@ func (a *CAAMAdapter) isResponsive(ctx context.Context) bool {
 	return stdout.Len() > 0 || stderr.Len() > 0
 }
 
-// HasCapability checks if caam has a specific capability
-func (a *CAAMAdapter) HasCapability(ctx context.Context, cap Capability) bool {
-	caps, err := a.Capabilities(ctx)
-	if err != nil {
-		return false
-	}
-	for _, c := range caps {
-		if c == cap {
-			return true
-		}
-	}
-	return false
-}
-
 // Info returns complete caam tool information
 func (a *CAAMAdapter) Info(ctx context.Context) (*ToolInfo, error) {
 	return a.BaseAdapter.Info(ctx, a)
@@ -214,6 +200,15 @@ type CAAMAccount struct {
 	RateLimited   bool      `json:"rate_limited,omitempty"`
 	CooldownUntil time.Time `json:"cooldown_until,omitempty"`
 	CostCents     int       `json:"cost_cents,omitempty"`
+}
+
+// CAAMProfileUnusable reports whether caam says a profile cannot start work
+// now. caam has no "cooldown" health status: an active rate-limit cooldown is
+// cooldown.active, and it (like a required re-login) sets
+// health.launch_usable false, the field caam documents for routing. A
+// critical composite verdict also counts.
+func CAAMProfileUnusable(status string, launchUsable *bool, cooldownActive bool) bool {
+	return cooldownActive || status == "critical" || (launchUsable != nil && !*launchUsable)
 }
 
 // CAAMCostSession is CAAM's per-profile cost record. Costs are estimates
@@ -390,8 +385,13 @@ func (a *CAAMAdapter) fetchStatus(ctx context.Context) (*CAAMStatus, error) {
 					Active bool   `json:"active"`
 					System bool   `json:"system"`
 					Health struct {
-						Status string `json:"status"`
+						Status       string `json:"status"`
+						LaunchUsable *bool  `json:"launch_usable"`
 					} `json:"health"`
+					Cooldown *struct {
+						Active bool   `json:"active"`
+						Until  string `json:"until"`
+					} `json:"cooldown"`
 				} `json:"profiles"`
 			} `json:"providers"`
 		} `json:"data"`
@@ -411,13 +411,20 @@ func (a *CAAMAdapter) fetchStatus(ctx context.Context) (*CAAMStatus, error) {
 			if profile.System {
 				continue
 			}
-			accounts = append(accounts, CAAMAccount{
-				ID:          profile.Name,
-				Provider:    caamProviderForNTM(provider.ID),
-				Name:        profile.Name,
-				Active:      profile.Active,
-				RateLimited: profile.Health.Status == "cooldown" || profile.Health.Status == "critical",
-			})
+			account := CAAMAccount{
+				ID:       profile.Name,
+				Provider: caamProviderForNTM(provider.ID),
+				Name:     profile.Name,
+				Active:   profile.Active,
+			}
+			cooldownActive := profile.Cooldown != nil && profile.Cooldown.Active
+			account.RateLimited = CAAMProfileUnusable(profile.Health.Status, profile.Health.LaunchUsable, cooldownActive)
+			if cooldownActive {
+				if until, err := time.Parse(time.RFC3339, profile.Cooldown.Until); err == nil {
+					account.CooldownUntil = until
+				}
+			}
+			accounts = append(accounts, account)
 		}
 	}
 
@@ -653,17 +660,20 @@ func (a *CAAMAdapter) SwitchAccount(ctx context.Context, provider, accountID str
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return ErrTimeout
-		}
-		return fmt.Errorf("failed to switch account: %w: %s", err, strings.TrimSpace(stderr.String()))
+	runErr := cmd.Run()
+	if runErr != nil && ctx.Err() == context.DeadlineExceeded {
+		return ErrTimeout
 	}
+	// caam reports a failed activate as {"success":false,"error":...} on
+	// stdout and exits 1, so read the JSON before falling back to stderr.
 	var response struct {
 		Success bool   `json:"success"`
 		Error   string `json:"error"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &response); err != nil {
+		if runErr != nil {
+			return fmt.Errorf("failed to switch account: %w: %s", runErr, strings.TrimSpace(stderr.String()))
+		}
 		return fmt.Errorf("%w: parse caam activate response: %v", ErrSchemaValidation, err)
 	}
 	if !response.Success {
@@ -671,6 +681,9 @@ func (a *CAAMAdapter) SwitchAccount(ctx context.Context, provider, accountID str
 			return fmt.Errorf("caam activate failed: %s", response.Error)
 		}
 		return fmt.Errorf("%w: caam activate returned success=false", ErrSchemaValidation)
+	}
+	if runErr != nil {
+		return fmt.Errorf("failed to switch account: %w: %s", runErr, strings.TrimSpace(stderr.String()))
 	}
 
 	// Invalidate cache after switch

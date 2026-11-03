@@ -3,6 +3,7 @@ package agentmail
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,10 +18,15 @@ import (
 
 // SessionAgentInfo tracks the registered agent identity for a session.
 type SessionAgentInfo struct {
-	AgentName    string    `json:"agent_name"`
-	ProjectKey   string    `json:"project_key"`
-	RegisteredAt time.Time `json:"registered_at"`
-	LastActiveAt time.Time `json:"last_active_at"`
+	AgentName  string `json:"agent_name"`
+	ProjectKey string `json:"project_key"`
+	// RegistrationToken is the server-issued token for this identity.
+	// Persisting it lets a later ntm process re-claim the same agent name
+	// instead of being rejected by a server that requires token auth for
+	// re-registration.
+	RegistrationToken string    `json:"registration_token,omitempty"`
+	RegisteredAt      time.Time `json:"registered_at"`
+	LastActiveAt      time.Time `json:"last_active_at"`
 }
 
 // sanitizeRegex is precompiled for performance (used by sanitizeSessionName)
@@ -269,12 +275,18 @@ func SaveSessionAgent(sessionName, projectKey string, info *SessionAgentInfo) er
 }
 
 // RegisterSessionAgent registers a session as an agent with Agent Mail.
-// If Agent Mail is unavailable, registration silently fails without blocking.
-// Returns the agent info on success, nil if unavailable, or an error on failure.
+// The required registration calls double as the availability probe: the full
+// health_check diagnostic is deliberately not used here because assembling
+// its snapshot can be slower than ordinary identity operations on a loaded
+// server, which would suppress registration while the server is healthy.
+// Returns the agent info on success or an error on failure.
 func (c *Client) RegisterSessionAgent(ctx context.Context, sessionName, workingDir string) (*SessionAgentInfo, error) {
-	// Check if Agent Mail is available
-	if !c.IsAvailable() {
-		return nil, nil // Silently skip if unavailable
+	// Ensure the project first, even when local session metadata already
+	// exists: Agent Mail may have rebuilt its database from the archive since
+	// the last NTM run, and this lightweight required call is also the
+	// reachability probe.
+	if _, err := c.EnsureProject(ctx, workingDir); err != nil {
+		return nil, fmt.Errorf("ensuring project: %w", err)
 	}
 
 	// Check if already registered
@@ -285,12 +297,17 @@ func (c *Client) RegisterSessionAgent(ctx context.Context, sessionName, workingD
 
 	// If already registered with same project, just update activity
 	if existing != nil && existing.ProjectKey == workingDir && existing.AgentName != "" {
+		// Prime the client's token cache with the persisted token so the
+		// re-register call below authenticates as the existing identity.
+		if existing.RegistrationToken != "" {
+			c.SetRegistrationToken(workingDir, existing.AgentName, existing.RegistrationToken)
+		}
 		existing.LastActiveAt = time.Now()
 		if err := SaveSessionAgent(sessionName, workingDir, existing); err != nil {
 			return nil, err
 		}
 		// Update activity on server (re-register updates last_active_ts)
-		_, serverErr := c.RegisterAgent(ctx, RegisterAgentOptions{
+		agent, serverErr := c.RegisterAgent(ctx, RegisterAgentOptions{
 			ProjectKey:      workingDir,
 			Program:         "ntm",
 			Model:           "coordinator",
@@ -301,12 +318,14 @@ func (c *Client) RegisterSessionAgent(ctx context.Context, sessionName, workingD
 			// Return local state but pass error up so caller can warn
 			return existing, fmt.Errorf("updating server activity: %w", serverErr)
 		}
+		// Persist a (re)issued token for the next process.
+		if agent != nil && agent.RegistrationToken != "" && agent.RegistrationToken != existing.RegistrationToken {
+			existing.RegistrationToken = agent.RegistrationToken
+			if err := SaveSessionAgent(sessionName, workingDir, existing); err != nil {
+				return nil, err
+			}
+		}
 		return existing, nil
-	}
-
-	// Ensure project exists
-	if _, err := c.EnsureProject(ctx, workingDir); err != nil {
-		return nil, fmt.Errorf("ensuring project: %w", err)
 	}
 
 	// Register the agent. Omit Name so the server auto-generates a valid
@@ -323,10 +342,11 @@ func (c *Client) RegisterSessionAgent(ctx context.Context, sessionName, workingD
 
 	// Save locally
 	info := &SessionAgentInfo{
-		AgentName:    agent.Name,
-		ProjectKey:   workingDir,
-		RegisteredAt: time.Now(),
-		LastActiveAt: time.Now(),
+		AgentName:         agent.Name,
+		ProjectKey:        workingDir,
+		RegistrationToken: agent.RegistrationToken,
+		RegisteredAt:      time.Now(),
+		LastActiveAt:      time.Now(),
 	}
 	if err := SaveSessionAgent(sessionName, workingDir, info); err != nil {
 		return nil, err
@@ -363,8 +383,16 @@ func (c *Client) UpdateSessionActivity(ctx context.Context, sessionName, project
 		return nil // Silently skip server update
 	}
 
+	// Prime the client's token cache with the persisted token so the
+	// re-register below authenticates as the existing identity on
+	// mcp-agent-mail >=2.13 instead of being refused (mirrors the
+	// already-registered branch of EnsureSessionAgent).
+	if info.RegistrationToken != "" {
+		c.SetRegistrationToken(info.ProjectKey, info.AgentName, info.RegistrationToken)
+	}
+
 	// Re-register to update last_active_ts on server
-	_, err = c.RegisterAgent(ctx, RegisterAgentOptions{
+	agent, err := c.RegisterAgent(ctx, RegisterAgentOptions{
 		ProjectKey:      info.ProjectKey,
 		Program:         "ntm",
 		Model:           "coordinator",
@@ -374,6 +402,16 @@ func (c *Client) UpdateSessionActivity(ctx context.Context, sessionName, project
 	if err != nil {
 		return fmt.Errorf("updating server activity: %w", err)
 	}
+	// Same rotation hazard as the spawn identity path (ntm#321): re-claiming
+	// an existing name can return a replacement credential, and dropping it
+	// leaves the persisted token stale for every later process. An empty
+	// token in the response means "unchanged" and must not clear the record.
+	if agent != nil && agent.RegistrationToken != "" && agent.RegistrationToken != info.RegistrationToken {
+		info.RegistrationToken = agent.RegistrationToken
+		if err := SaveSessionAgent(sessionName, info.ProjectKey, info); err != nil {
+			return fmt.Errorf("persisting rotated registration token: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -381,6 +419,7 @@ func (c *Client) UpdateSessionActivity(ctx context.Context, sessionName, project
 // for a session. This enables message routing and reservation management across
 // session restarts.
 type SessionAgentRegistry struct {
+	Revision    uint64            `json:"revision,omitempty"`
 	SessionName string            `json:"session_name"`
 	ProjectKey  string            `json:"project_key"`
 	Agents      map[string]string `json:"agents"`      // pane_title -> agent_name
@@ -603,29 +642,175 @@ func SaveSessionAgentRegistry(registry *SessionAgentRegistry) error {
 	if registry == nil {
 		return fmt.Errorf("cannot save nil registry")
 	}
-	if err := validateSessionStorageName(registry.SessionName); err != nil {
+	return mutateSessionAgentRegistry(context.Background(), registry.SessionName, registry.ProjectKey, func(path string, current *SessionAgentRegistry) error {
+		if current != nil && current.Revision != registry.Revision {
+			return errors.New("agent registry changed; reload before saving")
+		}
+		if current == nil && registry.Revision != 0 {
+			return errors.New("agent registry disappeared; refusing stale replacement")
+		}
+		return saveSessionAgentRegistryLocked(path, registry)
+	})
+}
+
+// PaneIdentityBinding pins a registry identity to a specific tmux incarnation.
+// Titles remain routing hints; physical pane ID and PID authorize a transfer.
+type PaneIdentityBinding struct {
+	PaneID    string
+	PaneTitle string
+	PanePID   int
+	AgentName string
+}
+
+// This fence is shared by snapshot saves and continuation CAS updates. Atomic
+// replacement alone cannot prevent a stale snapshot from undoing a transfer.
+func mutateSessionAgentRegistry(ctx context.Context, session, projectKey string, apply func(string, *SessionAgentRegistry) error) error {
+	if ctx == nil || apply == nil {
+		return errors.New("registry mutation requires context and callback")
+	}
+	if err := validateSessionStorageName(session); err != nil {
 		return err
 	}
-
-	path := registryPath(registry.SessionName, registry.ProjectKey)
-	dir := filepath.Dir(path)
-
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("creating registry directory: %w", err)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	path := registryPath(session, projectKey)
+	unlock, err := acquireRegistryFileLock(ctx, path+".lock")
+	if err != nil {
+		return fmt.Errorf("locking agent registry: %w", err)
 	}
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	current, err := LoadSessionAgentRegistry(session, projectKey)
+	if err != nil {
+		return err
+	}
+	if current != nil && (current.SessionName != session || filepath.Clean(current.ProjectKey) != filepath.Clean(projectKey)) {
+		return errors.New("agent registry identity does not match mutation scope")
+	}
+	return apply(path, current)
+}
 
-	registry.UpdatedAt = time.Now()
-
-	data, err := json.MarshalIndent(registry, "", "  ")
+func saveSessionAgentRegistryLocked(path string, registry *SessionAgentRegistry) error {
+	if registry.Revision == ^uint64(0) {
+		return errors.New("agent registry revision exhausted")
+	}
+	copyRegistry := *registry
+	copyRegistry.Revision++
+	copyRegistry.UpdatedAt = time.Now().UTC()
+	data, err := json.MarshalIndent(&copyRegistry, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshaling agent registry: %w", err)
 	}
-
 	if err := util.AtomicWriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("writing agent registry: %w", err)
 	}
-
+	registry.Revision = copyRegistry.Revision
+	registry.UpdatedAt = copyRegistry.UpdatedAt
 	return nil
+}
+
+func validateContinuationBindings(current *SessionAgentRegistry, expected, replacement PaneIdentityBinding) (bool, error) {
+	oldID, oldOK := BareTmuxPaneID(expected.PaneID)
+	newID, newOK := BareTmuxPaneID(replacement.PaneID)
+	if !oldOK || !newOK || oldID == newID || expected.PanePID <= 0 || replacement.PanePID <= 0 ||
+		strings.TrimSpace(expected.AgentName) == "" || replacement.AgentName != expected.AgentName {
+		return false, errors.New("registry continuation requires distinct physical panes, known PIDs, and the same recipient")
+	}
+	if current == nil {
+		return false, errors.New("original agent registry is missing")
+	}
+	holder := ""
+	for paneID, name := range current.PaneIDMap {
+		if !strings.EqualFold(strings.TrimSpace(name), strings.TrimSpace(expected.AgentName)) {
+			continue
+		}
+		if holder != "" {
+			return false, errors.New("original recipient has multiple physical registry bindings")
+		}
+		holder = paneID
+	}
+	titleCount := 0
+	for title, name := range current.Agents {
+		if strings.EqualFold(strings.TrimSpace(name), strings.TrimSpace(expected.AgentName)) {
+			titleCount++
+		}
+		if title == replacement.PaneTitle && name != "" && name != expected.AgentName {
+			return false, errors.New("replacement title belongs to another recipient")
+		}
+	}
+	if titleCount > 1 {
+		return false, errors.New("original recipient has multiple registry title aliases")
+	}
+	if name := current.PaneIDMap[newID]; name != "" {
+		if name == expected.AgentName && holder == newID && current.PanePIDs[newID] == replacement.PanePID && current.PaneIDMap[oldID] == "" {
+			if replacement.PaneTitle != "" && current.Agents[replacement.PaneTitle] != expected.AgentName {
+				return false, errors.New("completed registry continuation no longer has its replacement title")
+			}
+			return true, nil
+		}
+		return false, errors.New("replacement pane already has another registry binding")
+	}
+	if current.PaneIDMap[oldID] != expected.AgentName || current.PanePIDs[oldID] != expected.PanePID {
+		return false, errors.New("original pane registry identity changed or lacks a recorded PID")
+	}
+	return false, nil
+}
+
+// PreparePaneContinuationIdentity publishes the original recipient before the
+// replacement process boots. It does not move the registry binding, register a
+// remote identity, or copy the predecessor's pane-generation receipt. Partial
+// writes leave the caller's durable continuation barrier in place.
+func PreparePaneContinuationIdentity(ctx context.Context, session, projectKey string, expected, replacement PaneIdentityBinding, aliases ...string) error {
+	if strings.TrimSpace(projectKey) == "" {
+		return errors.New("continuation identity requires an authoritative project key")
+	}
+	return mutateSessionAgentRegistry(ctx, session, projectKey, func(_ string, current *SessionAgentRegistry) error {
+		if _, err := validateContinuationBindings(current, expected, replacement); err != nil {
+			return err
+		}
+		seen := make(map[string]bool)
+		for _, key := range append([]string{projectKey}, aliases...) {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			key = strings.TrimSpace(key)
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			if _, err := WriteIdentity(key, replacement.PaneID, expected.AgentName); err != nil {
+				return fmt.Errorf("publish continuation identity: %w", err)
+			}
+			_ = WriteLegacyCompatIdentity(key, replacement.PaneID, expected.AgentName)
+		}
+		return nil
+	})
+}
+
+// RebindSessionAgentPaneContext replaces one exact physical binding after
+// verified handoff, preserving the freshest token and unrelated entries. The
+// flag also recognizes the same completed rebind for crash-recovery readback.
+func RebindSessionAgentPaneContext(ctx context.Context, session, projectKey string, expected, replacement PaneIdentityBinding) (*SessionAgentRegistry, bool, error) {
+	var result *SessionAgentRegistry
+	applied := false
+	err := mutateSessionAgentRegistry(ctx, session, projectKey, func(path string, current *SessionAgentRegistry) error {
+		already, err := validateContinuationBindings(current, expected, replacement)
+		if err != nil {
+			return err
+		}
+		if !already {
+			current.AddAgent(replacement.PaneTitle, replacement.PaneID, expected.AgentName)
+			current.SetPanePID(replacement.PaneID, replacement.PanePID)
+			if err := saveSessionAgentRegistryLocked(path, current); err != nil {
+				return err
+			}
+		}
+		result, applied = current, true
+		return nil
+	})
+	return result, applied, err
 }
 
 // AddAgent adds a pane -> agent name mapping to the registry.

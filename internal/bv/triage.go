@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/util"
+	"github.com/Dicklesworthstone/ntm/internal/worksource"
 )
 
 // ErrActionableLabelsUnverified marks a fail-closed planning error: bv plan
@@ -30,13 +31,24 @@ var ErrActionablePlanUnverified = errors.New("actionable bv plan could not be ve
 // TriageCacheTTL is the default cache TTL for triage results
 const TriageCacheTTL = 30 * time.Second
 
+// ErrStaleWorkCoordination means a work projection no longer matches its
+// local tracker/checkout source. Callers must refresh rather than dispatch it.
+var ErrStaleWorkCoordination = worksource.ErrChanged
+
 var (
-	triageCache     *TriageResponse
-	triageCacheDir  string
-	triageCacheTime time.Time
-	triageCacheTTL  = TriageCacheTTL
-	triageCacheMu   sync.RWMutex
-	triageRunMu     sync.Mutex
+	triageCache        *TriageResponse
+	triageCacheDir     string
+	triageCacheSource  worksource.Identity
+	triageCacheTime    time.Time
+	triageCacheExpired bool
+	triageCacheTTL     = TriageCacheTTL
+	triageCacheMu      sync.RWMutex
+	triageRunMu        sync.Mutex
+	// Observed source bindings outlive cached data, including a failed first
+	// collection or another project's use of the singleton response cache.
+	// A project that has supplied a canonical export cannot silently become
+	// DB-only later in this process.
+	triageBoundProjects sync.Map // map[canonical project directory]struct{}
 )
 
 func acquireTriageRunLock(ctx context.Context, deadline time.Time, timeout time.Duration) (func(), error) {
@@ -66,6 +78,18 @@ func acquireTriageRunLock(ctx context.Context, deadline time.Time, timeout time.
 		case <-timer.C:
 		}
 	}
+}
+
+// triageBudgetError reports expiry of this call's own triage budget the same
+// way as every other triage timeout ("bv timed out after ..."), instead of the
+// internal deadline context's bare "context deadline exceeded" (for example
+// while the tracker source is captured or the run lock is awaited). The cause
+// stays wrapped; the caller's own cancellation or deadline passes through.
+func triageBudgetError(parent context.Context, err error, timeout time.Duration) error {
+	if err == nil || parent.Err() != nil || !errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "timed out after") {
+		return err
+	}
+	return fmt.Errorf("bv timed out after %v: %w", timeout, err)
 }
 
 func normalizeTriageDir(dir string) (string, error) {
@@ -109,7 +133,7 @@ func GetTriageWithTimeout(dir string, timeout time.Duration) (*TriageResponse, e
 	return getTriageContext(context.Background(), dir, timeout)
 }
 
-func getTriageContext(ctx context.Context, dir string, timeout time.Duration) (*TriageResponse, error) {
+func getTriageContext(ctx context.Context, dir string, timeout time.Duration) (_ *TriageResponse, err error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("triage context is required")
 	}
@@ -124,10 +148,23 @@ func getTriageContext(ctx context.Context, dir string, timeout time.Duration) (*
 		timeout = CommandTimeout()
 	}
 	deadline := time.Now().Add(timeout)
+	parent := ctx
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	defer func() { err = triageBudgetError(parent, err, timeout) }()
+	source, err := captureTriageSource(ctx, normalizedDir)
+	if err != nil {
+		return nil, err
+	}
 
 	triageCacheMu.RLock()
-	// Return cached result if still valid and for the same directory
-	if triageCache != nil && triageCacheDir == normalizedDir && time.Since(triageCacheTime) < triageCacheTTL {
+	if triageCache != nil && triageCacheDir == normalizedDir && triageCacheSource.Bound() && !source.Bound() {
+		triageCacheMu.RUnlock()
+		return nil, fmt.Errorf("%w: previously bound tracker export is missing", ErrStaleWorkCoordination)
+	}
+	// A TTL is a performance policy, not authority to reuse different work.
+	// Check the actual tracker bytes and checkout even during a cache hit.
+	if triageCache != nil && !triageCacheExpired && triageCacheDir == normalizedDir && triageCacheSource == source && time.Since(triageCacheTime) < triageCacheTTL {
 		cached := triageCache
 		triageCacheMu.RUnlock()
 		return cached, nil
@@ -141,9 +178,19 @@ func getTriageContext(ctx context.Context, dir string, timeout time.Duration) (*
 	}
 	defer releaseRunLock()
 
+	// The source can change while another collector owns the runner lock.
+	source, err = captureTriageSource(ctx, normalizedDir)
+	if err != nil {
+		return nil, err
+	}
+
 	// Double-check cache after acquiring run lock
 	triageCacheMu.RLock()
-	if triageCache != nil && triageCacheDir == normalizedDir && time.Since(triageCacheTime) < triageCacheTTL {
+	if triageCache != nil && triageCacheDir == normalizedDir && triageCacheSource.Bound() && !source.Bound() {
+		triageCacheMu.RUnlock()
+		return nil, fmt.Errorf("%w: previously bound tracker export is missing", ErrStaleWorkCoordination)
+	}
+	if triageCache != nil && !triageCacheExpired && triageCacheDir == normalizedDir && triageCacheSource == source && time.Since(triageCacheTime) < triageCacheTTL {
 		cached := triageCache
 		triageCacheMu.RUnlock()
 		return cached, nil
@@ -164,23 +211,44 @@ func getTriageContext(ctx context.Context, dir string, timeout time.Duration) (*
 		return nil, fmt.Errorf("parsing triage: %w", err)
 	}
 
-	// Update cache
+	current, err := captureTriageSource(ctx, normalizedDir)
+	if err != nil {
+		return nil, err
+	}
+	if err := source.Verify(current); err != nil {
+		return nil, err
+	}
+
+	// Publish only results observed entirely within one source revision.
 	triageCacheMu.Lock()
 	triageCache = &resp
 	triageCacheDir = normalizedDir
+	triageCacheSource = source
 	triageCacheTime = time.Now()
+	triageCacheExpired = false
 	triageCacheMu.Unlock()
 
 	return &resp, nil
 }
 
-// InvalidateTriageCache clears the triage cache.
+// InvalidateTriageCache clears cached data, preserving observed source bindings.
 // Call this when beads data changes (e.g., after br sync --flush-only).
 func InvalidateTriageCache() {
 	triageCacheMu.Lock()
 	triageCache = nil
 	triageCacheDir = ""
+	triageCacheSource = worksource.Identity{}
+	triageCacheExpired = false
 	triageCacheTTL = TriageCacheTTL // Reset to default
+	triageCacheMu.Unlock()
+}
+
+// ExpireTriageCache forces the next read to recollect authoritative work while
+// retaining the last response's source identity, observation time, and TTL.
+// Neither expiration nor invalidation clears observed project bindings.
+func ExpireTriageCache() {
+	triageCacheMu.Lock()
+	triageCacheExpired = true
 	triageCacheMu.Unlock()
 }
 
@@ -193,7 +261,7 @@ func GetTriageQuickRef(dir string) (*TriageQuickRef, error) {
 	return &triage.Triage.QuickRef, nil
 }
 
-// GetActionableRecommendationsContext returns recommendations sourced from the FULL
+// getActionableRecommendationsFromToolsContext collects the FULL
 // dependency-aware actionable set (bv --robot-plan), ranked by triage scoring.
 //
 // bv --robot-triage is hardcoded to ≤10 recommendations (see beads_viewer
@@ -219,9 +287,18 @@ func GetTriageQuickRef(dir string) (*TriageQuickRef, error) {
 // authorizing raw triage candidates.
 //
 // It honors caller cancellation across triage, plan, and label enrichment.
-func GetActionableRecommendationsContext(ctx context.Context, dir string, n int) ([]TriageRecommendation, error) {
+func getActionableRecommendationsFromToolsContext(ctx context.Context, dir string, n int) ([]TriageRecommendation, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("actionable recommendations context is required")
+	}
+	resolvedDir, err := normalizeTriageDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	dir = resolvedDir
+	source, err := captureTriageSource(ctx, dir)
+	if err != nil {
+		return nil, err
 	}
 	triage, err := GetTriageContext(ctx, dir)
 	if err != nil {
@@ -271,10 +348,51 @@ func GetActionableRecommendationsContext(ctx context.Context, dir string, n int)
 	if labelsErr != nil {
 		return nil, classifyActionableLabelsError(ctx, labelsErr)
 	}
+
+	// bv --robot-plan is a ranked snapshot; Beads owns lifecycle state. A plan
+	// row that has vanished from both open-only label surfaces is either stale
+	// (closed/blocked/in_progress/deferred since the snapshot — satisfied or
+	// ineligible, skip it) or genuinely unaccounted for (fail closed). Resolve
+	// the distinction once against the complete tracker surface; the normal
+	// all-verified path never pays for the extra br call.
+	var missingFromOpen []string
 	for _, item := range planItems {
 		if _, verified := labelsByID[item.ID]; !verified {
-			return nil, fmt.Errorf("%w: open actionable plan item %q was absent from both br ready and br list --status open", ErrActionableLabelsUnverified, item.ID)
+			missingFromOpen = append(missingFromOpen, item.ID)
 		}
+	}
+	if len(missingFromOpen) > 0 {
+		statusesByID, statusErr := allBeadStatusesContext(ctx, dir)
+		if statusErr != nil {
+			return nil, classifyActionableLabelsError(ctx, statusErr)
+		}
+		stale := make(map[string]struct{}, len(missingFromOpen))
+		for _, id := range missingFromOpen {
+			status, tracked := statusesByID[id]
+			switch {
+			case !tracked:
+				return nil, fmt.Errorf("%w: actionable plan item %q was absent from br ready, br list --status open, and br list --all", ErrActionableLabelsUnverified, id)
+			case status == "open":
+				// Live-open yet invisible on both open surfaces: the label
+				// sources are inconsistent, not merely behind the plan. Keep
+				// failing closed rather than dispatch unverifiable work.
+				return nil, fmt.Errorf("%w: plan item %q is still open in br list --all but was absent from both br ready and br list --status open", ErrActionableLabelsUnverified, id)
+			default:
+				stale[id] = struct{}{}
+			}
+		}
+		filtered := planItems[:0]
+		for _, item := range planItems {
+			if _, drop := stale[item.ID]; drop {
+				delete(planByID, item.ID)
+				continue
+			}
+			filtered = append(filtered, item)
+		}
+		planItems = filtered
+	}
+
+	for _, item := range planItems {
 		// Type evidence follows the same coverage invariant as labels: without
 		// a verified issue type the classifier cannot prove a plan item is not
 		// a container (epic), so assignment must stop rather than dispatch it.
@@ -323,6 +441,14 @@ func GetActionableRecommendationsContext(ctx context.Context, dir string, n int)
 			Labels:      append([]string(nil), labelsByID[item.ID]...),
 			UnblocksIDs: append([]string(nil), item.Unblocks...),
 		})
+	}
+
+	current, err := captureTriageSource(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	if err := source.Verify(current); err != nil {
+		return nil, err
 	}
 
 	if n > 0 && len(recs) > n {
@@ -427,6 +553,38 @@ func readyBeadLabelsContext(ctx context.Context, dir string) (map[string][]strin
 	return labels, issueTypes, nil
 }
 
+// allBeadStatusesContext reads Beads' complete lifecycle surface (br list
+// --all) as an id→status map. It backs the stale-plan-row resolution above
+// and is only invoked when a plan item has already vanished from both
+// open-only label sources, so the common path stays at two br calls.
+func allBeadStatusesContext(ctx context.Context, dir string) (map[string]string, error) {
+	args := []string{"list", "--json", "--all", "--limit", "100000"}
+	output, err := RunBdContext(ctx, dir, args...)
+	if err != nil {
+		return nil, fmt.Errorf("read bead lifecycle (br %s): %w", strings.Join(args, " "), err)
+	}
+	items, err := UnmarshalBdList[struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	}](output)
+	if err != nil {
+		return nil, fmt.Errorf("parse bead lifecycle (br %s): %w", strings.Join(args, " "), err)
+	}
+	statuses := make(map[string]string, len(items))
+	for _, item := range items {
+		id := strings.TrimSpace(item.ID)
+		if id == "" {
+			continue
+		}
+		status := strings.ToLower(strings.TrimSpace(item.Status))
+		if status == "" {
+			return nil, fmt.Errorf("parse bead lifecycle (br %s): bead %q has a blank status", strings.Join(args, " "), id)
+		}
+		statuses[id] = status
+	}
+	return statuses, nil
+}
+
 // GetNextRecommendation returns the single top recommendation.
 // This is equivalent to bv -robot-next but uses cached triage data.
 func GetNextRecommendation(dir string) (*TriageRecommendation, error) {
@@ -445,8 +603,16 @@ func GetNextRecommendation(dir string) (*TriageRecommendation, error) {
 // IsCacheValid checks if the cache is still valid
 func IsCacheValid() bool {
 	triageCacheMu.RLock()
-	defer triageCacheMu.RUnlock()
-	return triageCache != nil && time.Since(triageCacheTime) < triageCacheTTL
+	valid := triageCache != nil && !triageCacheExpired && time.Since(triageCacheTime) < triageCacheTTL
+	dir, source := triageCacheDir, triageCacheSource
+	triageCacheMu.RUnlock()
+	if !valid {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	current, err := captureTriageSource(ctx, dir)
+	return err == nil && source.Verify(current) == nil
 }
 
 // GetCacheAge returns how long the cache has been in place
@@ -457,4 +623,42 @@ func GetCacheAge() time.Duration {
 		return 0
 	}
 	return time.Since(triageCacheTime)
+}
+
+// captureTriageSource fails closed on an unreadable or lost export. A project
+// that has never supplied JSONL keeps the historical DB-only behavior without
+// claiming a source binding. Bindings survive failed collections, cache resets,
+// and reads of other projects. Cancellation is never reclassified as drift.
+func captureTriageSource(ctx context.Context, dir string) (worksource.Identity, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return worksource.Identity{}, ctx.Err()
+	}
+	// Canonicalize the project independently of the export's existence so
+	// losing JSONL cannot hide a binding behind a different symlink spelling.
+	project, err := filepath.Abs(dir)
+	if err == nil {
+		project, err = filepath.EvalSymlinks(project)
+	}
+	if err != nil {
+		if ctx != nil && ctx.Err() != nil {
+			return worksource.Identity{}, ctx.Err()
+		}
+		return worksource.Identity{}, fmt.Errorf("%w: resolve work source project: %w", ErrStaleWorkCoordination, err)
+	}
+	source, err := worksource.Capture(ctx, project)
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return worksource.Identity{}, err
+	}
+	if source.Bound() || errors.Is(err, worksource.ErrSourceChanged) {
+		triageBoundProjects.Store(project, struct{}{})
+	}
+	if err == nil {
+		if !source.Bound() {
+			if _, bound := triageBoundProjects.Load(project); bound {
+				return worksource.Identity{}, fmt.Errorf("%w: previously bound tracker export is missing", ErrStaleWorkCoordination)
+			}
+		}
+		return source, nil
+	}
+	return worksource.Identity{}, fmt.Errorf("%w: cannot verify work source: %w", ErrStaleWorkCoordination, err)
 }

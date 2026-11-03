@@ -1,7 +1,10 @@
 package serve
 
 import (
+	"archive/tar"
+	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -18,6 +21,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,12 +34,14 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/sqliteutil"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 
+	"github.com/Dicklesworthstone/ntm/internal/assignment"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/cass"
 	"github.com/Dicklesworthstone/ntm/internal/checkpoint"
 	"github.com/Dicklesworthstone/ntm/internal/events"
 	"github.com/Dicklesworthstone/ntm/internal/kernel"
 	"github.com/Dicklesworthstone/ntm/internal/pipeline"
+	"github.com/Dicklesworthstone/ntm/internal/policy"
 	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
@@ -787,6 +793,7 @@ func TestHandleSession_Success(t *testing.T) {
 // handleSession — sub-resource routing (agents)
 func TestHandleSession_SubResourceAgents(t *testing.T) {
 	srv, store := setupTestServer(t)
+	installFakeListPanesTmux(t, fakeTmuxNoServer)
 	createTestSessionForServe(t, store, "sub-agents")
 
 	rec := httptest.NewRecorder()
@@ -924,52 +931,660 @@ func TestHandlePaneInputV1_EmptyText(t *testing.T) {
 	}
 }
 
-// GH#251 phase 2: grok panes are now valid automated prompt-delivery targets,
-// so pane input flows through send-keys exactly like claude/codex panes.
-func TestHandlePaneInputV1_GrokDeliversViaSendKeys(t *testing.T) {
-	srv, _ := setupTestServer(t)
-	resolveCalls := 0
-	sendCalls := 0
-	srv.resolvePane = func(_ context.Context, session string, paneIdx int) (tmux.Pane, error) {
-		resolveCalls++
-		if session != "grok-session" || paneIdx != 2 {
-			t.Fatalf("resolve pane called with session=%q pane=%d", session, paneIdx)
-		}
-		return tmux.Pane{ID: "%7", Index: paneIdx, Type: tmux.AgentType(" XAI_GROK_BUILD ")}, nil
-	}
-	srv.sendPaneKeys = func(target, text string, enter bool) error {
-		sendCalls++
-		if target != "%7" || text != "review this" || !enter {
-			t.Fatalf("send-keys called with target=%q text=%q enter=%v", target, text, enter)
-		}
-		return nil
-	}
+type paneInputTMUXFixture struct {
+	project, panes, nextPanes, screen, log, payload string
+}
 
+// The executable replaces only the external tmux boundary. Requests still go
+// through the real router, ownership locks, policy resolver, dispatch service,
+// agent preflight, and transport instead of a success-only send stub.
+func installPaneInputTMUX(t *testing.T, panes ...tmux.Pane) paneInputTMUXFixture {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake tmux executable requires a POSIX shell")
+	}
+	dir := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
+	f := paneInputTMUXFixture{
+		project: t.TempDir(), panes: filepath.Join(dir, "panes"), nextPanes: filepath.Join(dir, "next-panes"),
+		screen: filepath.Join(dir, "screen"), log: filepath.Join(dir, "commands"), payload: filepath.Join(dir, "payload"),
+	}
+	for path, contents := range map[string]string{f.screen: "❯ \n", f.log: "", f.nextPanes: ""} {
+		if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.writePanes(t, f.panes, panes...)
+	binary := filepath.Join(dir, "tmux")
+	if err := os.WriteFile(binary, []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$NTM_TEST_INPUT_LOG"
+case "$1" in
+  list-panes)
+    if [ "${NTM_TEST_INPUT_HANG:-}" = list ]; then exec sleep 30; fi
+    if [ -f "$NTM_TEST_INPUT_LISTED" ] && [ -s "$NTM_TEST_INPUT_NEXT_PANES" ]; then
+      pane_file=$NTM_TEST_INPUT_NEXT_PANES
+    else
+      pane_file=$NTM_TEST_INPUT_PANES
+    fi
+    case "$*" in *'#{window_activity}'*) pane_file=$pane_file.activity ;; esac
+    cat "$pane_file"
+    : > "$NTM_TEST_INPUT_LISTED"
+    ;;
+  display-message)
+    case "$*" in
+      *"@ntm_rotation_token"*) printf '[%s]\n' "${NTM_TEST_INPUT_ROTATION:-}" ;;
+      *'#{pane_id}'*'pane_current_path'*)
+        pane_file=$NTM_TEST_INPUT_PANES
+        project=$NTM_TEST_INPUT_PROJECT
+        if [ "$4" = %8 ]; then project=${NTM_TEST_INPUT_SECOND_PROJECT:-$project}; fi
+        if [ -n "${NTM_TEST_INPUT_LATE_CHANGE:-}" ] && [ -f "$NTM_TEST_INPUT_POLICY_CHECKED" ]; then
+          if [ -s "$NTM_TEST_INPUT_NEXT_PANES" ]; then pane_file=$NTM_TEST_INPUT_NEXT_PANES; fi
+          project=${NTM_TEST_INPUT_LATE_PROJECT:-$project}
+        fi
+        while IFS= read -r pane; do
+          case "$pane" in "$4"_NTM_SEP_*) printf '%s_NTM_SEP_%s\n' "$pane" "$project" ;; esac
+        done < "$pane_file.policy"
+        : > "$NTM_TEST_INPUT_POLICY_CHECKED"
+        ;;
+      *"%8"*"pane_current_path"*) printf '%s\n' "${NTM_TEST_INPUT_SECOND_PROJECT:-$NTM_TEST_INPUT_PROJECT}" ;;
+      *"pane_current_path"*) printf '%s\n' "$NTM_TEST_INPUT_PROJECT" ;;
+    esac
+    ;;
+  capture-pane) cat "$NTM_TEST_INPUT_SCREEN" ;;
+  load-buffer) cat > "$NTM_TEST_INPUT_PAYLOAD" ;;
+  send-keys)
+    if [ "${NTM_TEST_INPUT_FAIL:-}" = send ]; then echo 'transport failed' >&2; exit 1; fi
+    case "$*" in
+      *" -l -- "*) shift 5; printf '%s' "$1" >> "$NTM_TEST_INPUT_PAYLOAD" ;;
+    esac
+    ;;
+esac
+`), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range map[string]string{
+		"NTM_TMUX_BINARY": binary, "NTM_TEST_INPUT_PROJECT": f.project,
+		"NTM_TEST_INPUT_PANES": f.panes, "NTM_TEST_INPUT_NEXT_PANES": f.nextPanes,
+		"NTM_TEST_INPUT_LISTED": filepath.Join(dir, "listed"), "NTM_TEST_INPUT_SCREEN": f.screen,
+		"NTM_TEST_INPUT_LOG": f.log, "NTM_TEST_INPUT_PAYLOAD": f.payload,
+		"NTM_TEST_INPUT_ROTATION": "", "NTM_TEST_INPUT_HANG": "", "NTM_TEST_INPUT_FAIL": "",
+		"NTM_TEST_INPUT_SECOND_PROJECT": "",
+		"NTM_TEST_INPUT_LATE_CHANGE":    "", "NTM_TEST_INPUT_LATE_PROJECT": "",
+		"NTM_TEST_INPUT_POLICY_CHECKED": filepath.Join(dir, "policy-checked"),
+	} {
+		t.Setenv(key, value)
+	}
+	original := tmux.DefaultClient
+	tmux.DefaultClient = tmux.NewClient("")
+	t.Cleanup(func() { tmux.DefaultClient = original })
+	return f
+}
+
+func (f paneInputTMUXFixture) writePanes(t *testing.T, path string, panes ...tmux.Pane) {
+	t.Helper()
+	lines := make([]string, 0, len(panes))
+	activityLines := make([]string, 0, len(panes))
+	policyLines := make([]string, 0, len(panes))
+	for _, pane := range panes {
+		dead := "0"
+		if pane.Dead {
+			dead = "1"
+		}
+		fields := []string{
+			pane.ID, strconv.Itoa(pane.Index), pane.Title, pane.Command, "120", "30", "1",
+			strconv.Itoa(pane.PID), strconv.Itoa(pane.WindowIndex), string(pane.Type), "", pane.Service,
+			dead, "[" + pane.RotationToken + "]",
+		}
+		lines = append(lines, strings.Join(fields, tmux.FieldSeparator))
+		withActivity := append(append(append([]string{}, fields[:7]...), "0"), fields[7:]...)
+		activityLines = append(activityLines, strings.Join(withActivity, tmux.FieldSeparator))
+		policyLines = append(policyLines, strings.Join([]string{
+			pane.ID, strconv.Itoa(pane.PID), dead, pane.Command, string(pane.Type), "", pane.Service,
+		}, tmux.FieldSeparator))
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".activity", []byte(strings.Join(activityLines, "\n")+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".policy", []byte(strings.Join(policyLines, "\n")+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func paneInputRequest(t *testing.T, srv *Server, ctx context.Context, text string, enter bool) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := json.Marshal(PaneInputRequest{Text: text, Enter: enter})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/input-session/panes/2/input", bytes.NewReader(body)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "127.0.0.1:12345"
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/grok-session/panes/2/input", strings.NewReader(`{"text":"review this","enter":true}`))
-	rctx := chi.NewRouteContext()
-	rctx.URLParams.Add("sessionId", "grok-session")
-	rctx.URLParams.Add("paneIdx", "2")
-	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	srv.router.ServeHTTP(rec, req)
+	return rec
+}
 
-	srv.handlePaneInputV1(rec, req)
+func (f paneInputTMUXFixture) commands(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile(f.log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+func (f paneInputTMUXFixture) assertNoInput(t *testing.T) {
+	t.Helper()
+	commands := f.commands(t)
+	for _, command := range []string{"send-keys ", "load-buffer ", "paste-buffer "} {
+		if strings.Contains(commands, command) {
+			t.Fatalf("refused input actuated tmux:\n%s", commands)
+		}
 	}
-	var response struct {
-		Success bool   `json:"success"`
-		Sent    bool   `json:"sent"`
-		Pane    string `json:"pane"`
+	if data, err := os.ReadFile(f.payload); !os.IsNotExist(err) {
+		t.Fatalf("refused input created a payload: %q %v", data, err)
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-		t.Fatalf("unmarshal response: %v", err)
+}
+
+func TestHandlePaneInputV1CanonicalDelivery(t *testing.T) {
+	for _, tc := range []struct {
+		name, text, command string
+		kind                tmux.AgentType
+		enter, buffer       bool
+		enters              int
+	}{
+		{"stage multiline bytes", "  first line\nλ\t$HOME ;", "claude", tmux.AgentClaude, false, true, 0},
+		{"stage whitespace", " \t  ", "bash", tmux.AgentUser, false, false, 0},
+		{"submit user shell", "printf ready", "bash", tmux.AgentUser, true, false, 1},
+		{"submit claude", "review this", "claude", tmux.AgentClaude, true, false, 2},
+		{"submit grok alias", "review this", "grok", tmux.AgentType(" XAI_GROK_BUILD "), true, false, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := installPaneInputTMUX(t, tmux.Pane{ID: "%7", Index: 2, PID: 7007, Type: tc.kind, Command: tc.command})
+			srv, _ := setupTestServer(t)
+			rec := paneInputRequest(t, srv, context.Background(), tc.text, tc.enter)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+			}
+			var response struct {
+				Success bool   `json:"success"`
+				Sent    bool   `json:"sent"`
+				Pane    string `json:"pane"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil || !response.Success || !response.Sent || response.Pane != "%7" {
+				t.Fatalf("response contract = %+v, error = %v", response, err)
+			}
+			payload, err := os.ReadFile(f.payload)
+			if err != nil || string(payload) != tc.text {
+				t.Fatalf("transport changed literal input: got %q, want %q, error %v", payload, tc.text, err)
+			}
+			commands := f.commands(t)
+			if got := strings.Count(commands, "send-keys -t %7 Enter\n"); got != tc.enters {
+				t.Fatalf("Enter count = %d, want %d:\n%s", got, tc.enters, commands)
+			}
+			if strings.Contains(commands, "load-buffer ") != tc.buffer || strings.Contains(commands, "paste-buffer ") != tc.buffer {
+				t.Fatalf("wrong agent transport, want buffer=%v:\n%s", tc.buffer, commands)
+			}
+			for _, key := range []string{" C-u\n", " C-c\n", " Escape\n", " BSpace\n"} {
+				if strings.Contains(commands, key) {
+					t.Fatalf("input unexpectedly cleared or edited the composer:\n%s", commands)
+				}
+			}
+			if !strings.Contains(commands, "@ntm_rotation_token") || strings.Count(commands, "list-panes ") < 2 {
+				t.Fatalf("input bypassed live quarantine or ownership recheck:\n%s", commands)
+			}
+		})
 	}
-	if !response.Success || !response.Sent || response.Pane != "%7" {
-		t.Fatalf("response = %+v, want successful send to %%7", response)
+}
+
+func TestHandlePaneInputV1RefusesUnsafeTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*testing.T, paneInputTMUXFixture, *tmux.Pane)
+	}{
+		{"dead pane", func(_ *testing.T, _ paneInputTMUXFixture, p *tmux.Pane) { p.Dead = true }},
+		{"agent returned to shell", func(_ *testing.T, _ paneInputTMUXFixture, p *tmux.Pane) { p.Command = "bash" }},
+		{"service pane", func(_ *testing.T, _ paneInputTMUXFixture, p *tmux.Pane) {
+			// An explicit agent adoption overrides service tags. Leave the
+			// recorded type unset so this is a service, even with an agent command.
+			p.Service, p.Type = "cm", ""
+		}},
+		{"workspace trust dialog", func(t *testing.T, f paneInputTMUXFixture, _ *tmux.Pane) {
+			if err := os.WriteFile(f.screen, []byte("Do you trust this folder?\n❯ No, exit\n  Yes, I trust this folder\nEnter to confirm"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"initializing composer", func(t *testing.T, f paneInputTMUXFixture, _ *tmux.Pane) {
+			if err := os.WriteFile(f.screen, []byte("initializing the agent\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"rotation after topology snapshot", func(t *testing.T, _ paneInputTMUXFixture, _ *tmux.Pane) {
+			t.Setenv("NTM_TEST_INPUT_ROTATION", "rotation-in-progress")
+		}},
+		{"changed process", func(t *testing.T, f paneInputTMUXFixture, p *tmux.Pane) {
+			changed := *p
+			changed.PID++
+			f.writePanes(t, f.nextPanes, changed)
+		}},
+		{"reused numeric index", func(t *testing.T, f paneInputTMUXFixture, p *tmux.Pane) {
+			changed := *p
+			changed.ID = "%8"
+			f.writePanes(t, f.nextPanes, changed)
+		}},
+		{"changed agent type", func(t *testing.T, f paneInputTMUXFixture, p *tmux.Pane) {
+			changed := *p
+			changed.Type = tmux.AgentCodex
+			f.writePanes(t, f.nextPanes, changed)
+		}},
+		{"ambiguous index across windows", func(t *testing.T, f paneInputTMUXFixture, p *tmux.Pane) {
+			other := *p
+			other.ID, other.WindowIndex = "%8", 1
+			f.writePanes(t, f.nextPanes, *p, other)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pane := tmux.Pane{ID: "%7", Index: 2, PID: 7007, Type: tmux.AgentClaude, Command: "claude"}
+			f := installPaneInputTMUX(t, pane)
+			tc.change(t, f, &pane)
+			f.writePanes(t, f.panes, pane)
+			srv, _ := setupTestServer(t)
+			rec := paneInputRequest(t, srv, context.Background(), "review this", true)
+			if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), ErrCodeConflict) {
+				t.Fatalf("unsafe target status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			f.assertNoInput(t)
+		})
 	}
-	if resolveCalls != 1 || sendCalls != 1 {
-		t.Fatalf("resolve calls = %d, send calls = %d; want 1 and 1", resolveCalls, sendCalls)
+}
+
+func TestHandlePaneInputV1UsesTargetProjectPolicy(t *testing.T) {
+	for _, malformed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("malformed=%v", malformed), func(t *testing.T) {
+			f := installPaneInputTMUX(t, tmux.Pane{ID: "%7", Index: 2, PID: 7007, Type: tmux.AgentClaude, Command: "claude"})
+			policyDir := filepath.Join(f.project, ".ntm")
+			if err := os.MkdirAll(policyDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			contents := "version: 1\nblocked:\n  - pattern: \"review this\"\n    reason: \"target project restriction\"\n"
+			status, code := http.StatusForbidden, ErrCodeForbidden
+			if malformed {
+				contents = "blocked: [invalid YAML"
+				status, code = http.StatusServiceUnavailable, ErrCodeServiceUnavail
+			}
+			if err := os.WriteFile(filepath.Join(policyDir, "policy.yaml"), []byte(contents), 0600); err != nil {
+				t.Fatal(err)
+			}
+			// Agents commonly work in a package below their project root.
+			if err := os.WriteFile(filepath.Join(policyDir, "config.toml"), []byte("# project root\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(f.project, "components", "worker"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("NTM_TEST_INPUT_PROJECT", filepath.Join(f.project, "components", "worker"))
+			srv, _ := setupTestServer(t)
+			if srv.projectDir == f.project {
+				t.Fatal("fixture must use a server project different from the target pane")
+			}
+			rec := paneInputRequest(t, srv, context.Background(), "review this", true)
+			if rec.Code != status || !strings.Contains(rec.Body.String(), code) {
+				t.Fatalf("target project policy was bypassed: status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			f.assertNoInput(t)
+		})
+	}
+}
+
+func TestHandlePaneInputV1DeliveryFailureDoesNotReportSent(t *testing.T) {
+	for _, cancelAfterPaste := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancelAfterPaste=%v", cancelAfterPaste), func(t *testing.T) {
+			f := installPaneInputTMUX(t, tmux.Pane{ID: "%7", Index: 2, PID: 7007, Type: tmux.AgentClaude, Command: "claude"})
+			srv, _ := setupTestServer(t)
+			status, code := http.StatusInternalServerError, ErrCodeInternalError
+			if cancelAfterPaste {
+				// Canonical agent submission waits one second after typing. The
+				// request must cancel that delay without sending a late Enter.
+				srv.paneInputTimeout = 500 * time.Millisecond
+				status, code = http.StatusGatewayTimeout, ErrCodeTimeout
+			} else {
+				t.Setenv("NTM_TEST_INPUT_FAIL", "send")
+			}
+			rec := paneInputRequest(t, srv, context.Background(), "review this", true)
+			var response struct {
+				Success   bool   `json:"success"`
+				Sent      bool   `json:"sent"`
+				ErrorCode string `json:"error_code"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil || rec.Code != status || response.Success || response.Sent || response.ErrorCode != code {
+				t.Fatalf("failed transport reported sent: status=%d response=%+v error=%v", rec.Code, response, err)
+			}
+			commands := f.commands(t)
+			if strings.Count(commands, " -l -- review this\n") != 1 || strings.Contains(commands, " Enter\n") {
+				t.Fatalf("failed transport retried or submitted after cancellation:\n%s", commands)
+			}
+			if cancelAfterPaste {
+				data, err := os.ReadFile(f.payload)
+				if err != nil || string(data) != "review this" {
+					t.Fatalf("fixture did not exercise cancellation after typing: %q %v", data, err)
+				}
+			}
+		})
+	}
+}
+
+func TestHandlePaneInputV1CancellationAndOwnership(t *testing.T) {
+	for _, mode := range []string{"cancelled request", "hung topology", "hung git project lookup", "assignment owner", "pipeline owner", "remote endpoint", "relative project path", "missing project path"} {
+		t.Run(mode, func(t *testing.T) {
+			f := installPaneInputTMUX(t, tmux.Pane{ID: "%7", Index: 2, PID: 7007, Type: tmux.AgentClaude, Command: "claude"})
+			srv, _ := setupTestServer(t)
+			srv.paneInputTimeout = 60 * time.Millisecond
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			status, code := http.StatusGatewayTimeout, ErrCodeTimeout
+			var release func()
+			defer func() {
+				if release != nil {
+					release()
+				}
+			}()
+			switch mode {
+			case "cancelled request":
+				cancel()
+			case "hung topology":
+				t.Setenv("NTM_TEST_INPUT_HANG", "list")
+			case "hung git project lookup":
+				srv.paneInputTimeout = 250 * time.Millisecond
+				gitDir := t.TempDir()
+				if err := os.WriteFile(filepath.Join(gitDir, "git"), []byte("#!/bin/sh\nprintf started > \"$NTM_TEST_INPUT_GIT_STARTED\"\nexec sleep 30\n"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("NTM_TEST_INPUT_GIT_STARTED", filepath.Join(f.project, "git-started"))
+				t.Setenv("PATH", gitDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			case "assignment owner":
+				store, err := assignment.LoadStoreStrictReadOnly("input-session")
+				if err != nil {
+					t.Fatal(err)
+				}
+				release, err = store.AcquireTargetLock(context.Background(), "%7")
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "pipeline owner":
+				var err error
+				release, err = pipeline.AcquireSharedPaneLock(context.Background(), "%7", "")
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "remote endpoint":
+				tmux.DefaultClient.Remote = "remote-host"
+				status, code = http.StatusServiceUnavailable, ErrCodeServiceUnavail
+			case "relative project path":
+				t.Setenv("NTM_TEST_INPUT_PROJECT", "relative-project")
+				status, code = http.StatusServiceUnavailable, ErrCodeServiceUnavail
+			case "missing project path":
+				t.Setenv("NTM_TEST_INPUT_PROJECT", filepath.Join(f.project, "missing"))
+				status, code = http.StatusServiceUnavailable, ErrCodeServiceUnavail
+			}
+			started := time.Now()
+			rec := paneInputRequest(t, srv, ctx, "review this", true)
+			if rec.Code != status || !strings.Contains(rec.Body.String(), code) {
+				t.Fatalf("ownership/cancellation status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if elapsed := time.Since(started); elapsed > time.Second {
+				t.Fatalf("request ignored its bounded cancellation: %s", elapsed)
+			}
+			f.assertNoInput(t)
+			if mode == "hung git project lookup" {
+				if _, err := os.Stat(filepath.Join(f.project, "git-started")); err != nil {
+					t.Fatalf("fixture did not reach git project discovery: %v", err)
+				}
+			}
+			if release != nil {
+				release()
+				release = nil
+				srv.paneInputTimeout = 0
+				retry := paneInputRequest(t, srv, context.Background(), "stage after owner released", false)
+				if retry.Code != http.StatusOK {
+					t.Fatalf("failed request leaked delivery ownership: %d %s", retry.Code, retry.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestAgentMessagePolicyUsesTargetProjectBeforeInput(t *testing.T) {
+	for _, action := range []string{"send", "interrupt"} {
+		for _, mode := range []string{"blocked", "malformed", "invalid-path"} {
+			t.Run(action+"/"+mode, func(t *testing.T) {
+				f := installPaneInputTMUX(t, tmux.Pane{ID: "%7", Index: 2, PID: os.Getpid(), Type: tmux.AgentType("aider"), Command: "aider"})
+				policyDir := filepath.Join(f.project, ".ntm")
+				if err := os.MkdirAll(policyDir, 0700); err != nil {
+					t.Fatal(err)
+				}
+				contents := "version: 1\nblocked:\n  - pattern: 'review this'\n    reason: 'target project restriction'\n"
+				wantStatus, wantCode := http.StatusForbidden, ErrCodeForbidden
+				if mode != "blocked" {
+					wantStatus, wantCode = http.StatusServiceUnavailable, ErrCodeServiceUnavail
+					contents = "blocked: [invalid YAML"
+				}
+				if err := os.WriteFile(filepath.Join(policyDir, "policy.yaml"), []byte(contents), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(policyDir, "config.toml"), []byte("# project root\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				workingDir := filepath.Join(f.project, "components", "worker")
+				if err := os.MkdirAll(workingDir, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if mode == "invalid-path" {
+					workingDir = "relative/unverifiable/project"
+				}
+				t.Setenv("NTM_TEST_INPUT_PROJECT", workingDir)
+				t.Chdir(t.TempDir())
+				srv, store := setupTestServer(t)
+				body := `{"message":"review this","panes":["%7"]}`
+				if action == "interrupt" {
+					body = `{"message":"review this","panes":["%7"],"force":true,"no_wait":true}`
+				}
+				req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/input-session/agents/"+action, strings.NewReader(body))
+				req.Header.Set("Idempotency-Key", "policy-before-input")
+				rec := httptest.NewRecorder()
+				srv.Router().ServeHTTP(rec, req)
+				if rec.Code != wantStatus || !strings.Contains(rec.Body.String(), wantCode) {
+					t.Fatalf("target policy gate: %d %s; want %d %s", rec.Code, rec.Body, wantStatus, wantCode)
+				}
+				f.assertNoInput(t)
+				if op, err := store.GetSendOperation("policy-before-input", "input-session"); err != nil || op != nil {
+					t.Fatalf("policy refusal claimed an operation: %+v, %v", op, err)
+				}
+			})
+		}
+	}
+}
+
+func TestAgentMessagePolicyChecksEverySelectedProject(t *testing.T) {
+	for _, action := range []string{"send", "interrupt"} {
+		t.Run(action, func(t *testing.T) {
+			f := installPaneInputTMUX(t,
+				tmux.Pane{ID: "%7", Index: 1, PID: os.Getpid(), Type: tmux.AgentType("aider"), Command: "aider"},
+				tmux.Pane{ID: "%8", Index: 2, PID: os.Getpid(), Type: tmux.AgentType("aider"), Command: "aider"})
+			blockedProject, daemonProject := t.TempDir(), t.TempDir()
+			for _, project := range []string{blockedProject, daemonProject} {
+				if err := os.MkdirAll(filepath.Join(project, ".ntm"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(project, ".ntm", "policy.yaml"), []byte("version: 1\nblocked:\n  - pattern: 'review this'\n    reason: 'this project forbids the task'\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("NTM_TEST_INPUT_SECOND_PROJECT", blockedProject)
+			if err := os.WriteFile(f.screen, []byte("Ready for work\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			t.Chdir(daemonProject)
+			srv, _ := setupTestServer(t)
+			post := func(panes []string) *httptest.ResponseRecorder {
+				t.Helper()
+				body := map[string]interface{}{"message": "review this", "panes": panes, "agent_types": []string{"aider"}}
+				if action == "interrupt" {
+					body["force"], body["no_wait"] = true, true
+				}
+				data, err := json.Marshal(body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				rec := httptest.NewRecorder()
+				srv.Router().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/sessions/input-session/agents/"+action, bytes.NewReader(data)))
+				return rec
+			}
+			rec := post(nil)
+			if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "pane %8") {
+				t.Fatalf("batch did not check the second target's policy: %d %s", rec.Code, rec.Body)
+			}
+			f.assertNoInput(t)
+			// Restricting the command to the first project must succeed even
+			// though the daemon cwd and excluded pane both forbid the task.
+			rec = post([]string{"%7"})
+			if rec.Code != http.StatusOK {
+				t.Fatalf("unselected project policy blocked the allowed target: %d %s", rec.Code, rec.Body)
+			}
+			payload, err := os.ReadFile(f.payload)
+			if err != nil || string(payload) != "review this" {
+				t.Fatalf("allowed selected message did not reach tmux: %q, %v", payload, err)
+			}
+			if strings.Contains(f.commands(t), "send-keys -t %8") {
+				t.Fatal("filtered action actuated the excluded project's pane")
+			}
+		})
+	}
+}
+
+func TestAgentMessagePolicyRechecksBeforeDeliveryAndPreservesReceipts(t *testing.T) {
+	for _, action := range []string{"send", "interrupt"} {
+		for _, change := range []string{"respawn", "project policy"} {
+			t.Run(action+"/"+change, func(t *testing.T) {
+				pane := tmux.Pane{ID: "%7", Index: 2, PID: os.Getpid(), Type: tmux.AgentType("aider"), Command: "aider"}
+				f := installPaneInputTMUX(t, pane)
+				if err := os.WriteFile(f.screen, []byte("Ready for work\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("NTM_TEST_INPUT_LATE_CHANGE", "1")
+				wantStatus, wantCode := http.StatusConflict, ErrCodeConflict
+				if change == "respawn" {
+					replacement := pane
+					replacement.PID++
+					f.writePanes(t, f.nextPanes, replacement)
+				} else {
+					project := t.TempDir()
+					if err := os.MkdirAll(filepath.Join(project, ".ntm"), 0700); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(project, ".ntm", "policy.yaml"), []byte("version: 1\nblocked:\n  - pattern: 'review this'\n    reason: 'new project refuses the message'\n"), 0600); err != nil {
+						t.Fatal(err)
+					}
+					t.Setenv("NTM_TEST_INPUT_LATE_PROJECT", project)
+					wantStatus, wantCode = http.StatusForbidden, ErrCodeForbidden
+				}
+				srv, store := setupTestServer(t)
+				robot.SetProjectionStore(store)
+				t.Cleanup(func() { robot.SetProjectionStore(nil) })
+				const key = "policy-changed-after-admission"
+				post := func() *httptest.ResponseRecorder {
+					t.Helper()
+					body := `{"message":"review this","panes":["%7"]}`
+					if action == "interrupt" {
+						body = `{"message":"review this","panes":["%7"],"force":true,"no_wait":true}`
+					}
+					req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/input-session/agents/"+action, strings.NewReader(body))
+					req.Header.Set("Idempotency-Key", key)
+					rec := httptest.NewRecorder()
+					srv.Router().ServeHTTP(rec, req)
+					return rec
+				}
+				rec := post()
+				var response struct {
+					ErrorCode string `json:"error_code"`
+					Details   struct {
+						Operation *robot.OperationInfo `json:"operation"`
+						Actuation json.RawMessage      `json:"actuation"`
+					} `json:"details"`
+				}
+				if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+					t.Fatal(err)
+				}
+				if rec.Code != wantStatus || response.ErrorCode != wantCode {
+					t.Fatalf("late policy change was not refused: %d %s; want %d %s", rec.Code, rec.Body, wantStatus, wantCode)
+				}
+				operation := response.Details.Operation
+				if operation == nil || operation.OperationID != key || operation.Status != state.SendOperationCompleted || operation.DispatchStartedAt == nil || operation.CompletedAt == nil {
+					t.Fatalf("late refusal lost its terminal operation receipt: %s", rec.Body)
+				}
+				if len(operation.Admissions) != 1 || operation.Admissions[0].State != robot.AdmissionRejected {
+					t.Fatalf("late refusal lost the rejected target admission: %+v", operation)
+				}
+				if action == "interrupt" {
+					var output robot.InterruptOutput
+					if err := json.Unmarshal(response.Details.Actuation, &output); err != nil || len(output.Interrupted) != 1 || output.MessageSent || len(output.Failed) != 1 {
+						t.Fatalf("late refusal lost the prior interruption: %s, %v", rec.Body, err)
+					}
+					if strings.Count(f.commands(t), "send-keys -t %7 C-c\n") != 1 {
+						t.Fatalf("fixture did not change after the initial interrupt: %s", f.commands(t))
+					}
+					if payload, err := os.ReadFile(f.payload); !os.IsNotExist(err) {
+						t.Fatalf("refused follow-up reached the replacement target: %q, %v", payload, err)
+					}
+				} else {
+					f.assertNoInput(t)
+				}
+				receipt, err := robot.GetSendReceipt(key)
+				if err != nil || receipt == nil || !receipt.Success || receipt.Operation == nil || receipt.Operation.Status != state.SendOperationCompleted {
+					t.Fatalf("late refusal was not durably queryable: %+v, %v", receipt, err)
+				}
+				if action == "interrupt" && (receipt.InterruptOutcome == nil || len(receipt.InterruptOutcome.Interrupted) != 1 || receipt.InterruptOutcome.MessageSent) {
+					t.Fatalf("durable receipt lost partial interrupt actions: %+v", receipt)
+				}
+				if action == "send" && (receipt.Outcome == nil || receipt.Outcome.Success || len(receipt.Outcome.Successful) != 0) {
+					t.Fatalf("durable receipt falsely reported delivered input: %+v", receipt)
+				}
+				// Make the target safe again and discard the HTTP cache. A
+				// retry must replay the terminal refusal, never re-interrupt
+				// or deliver a message that the first attempt did not send.
+				t.Setenv("NTM_TEST_INPUT_LATE_CHANGE", "")
+				f.writePanes(t, f.nextPanes, pane)
+				previousCache := srv.idempotencyStore
+				srv.idempotencyStore = NewIdempotencyStore(24 * time.Hour)
+				previousCache.Stop()
+				retry := post()
+				if err := json.Unmarshal(retry.Body.Bytes(), &response); err != nil || response.Details.Operation == nil || !response.Details.Operation.Replayed {
+					t.Fatalf("retry did not replay the terminal refusal: %d %s, %v", retry.Code, retry.Body, err)
+				}
+				if action == "interrupt" && strings.Count(f.commands(t), "send-keys -t %7 C-c\n") != 1 {
+					t.Fatalf("retry repeated the interrupt: %s", f.commands(t))
+				}
+				if payload, err := os.ReadFile(f.payload); !os.IsNotExist(err) {
+					t.Fatalf("retry sent a previously refused message: %q, %v", payload, err)
+				}
+			})
+		}
+	}
+}
+
+func TestAgentInterruptWithoutMessageDoesNotRequireProjectPolicy(t *testing.T) {
+	f := installPaneInputTMUX(t, tmux.Pane{ID: "%7", Index: 1, PID: os.Getpid(), Type: tmux.AgentType("aider"), Command: "aider"})
+	t.Setenv("NTM_TEST_INPUT_PROJECT", "unavailable/project")
+	srv, _ := setupTestServer(t)
+	rec := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/sessions/input-session/agents/interrupt", strings.NewReader(`{"panes":["%7"],"force":true,"no_wait":true}`)))
+	if rec.Code != http.StatusOK || strings.Count(f.commands(t), "send-keys -t %7 C-c\n") != 1 {
+		t.Fatalf("control-only interruption was blocked by message policy: %d %s; calls=%s", rec.Code, rec.Body, f.commands(t))
 	}
 }
 
@@ -1319,6 +1934,7 @@ func TestHandleSafetyInstallV1_InvalidBody(t *testing.T) {
 
 func TestHandleSafetyUninstallV1_NothingInstalled(t *testing.T) {
 	srv, _ := setupTestServer(t)
+	t.Setenv("HOME", t.TempDir()) // never touch the developer's ~/.ntm or ~/.claude
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/safety/uninstall", nil)
@@ -1929,23 +2545,6 @@ func TestHandleListAgentsV1_EmptySession_Branch(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
-	}
-}
-
-// =============================================================================
-// handleSessionAgentsV1 — nil stateStore
-// =============================================================================
-
-func TestHandleSessionAgentsV1_NilStore_Branch(t *testing.T) {
-	srv := New(Config{})
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/sessions/test/agents-v1", nil)
-
-	srv.handleSessionAgentsV1(rec, req, "test")
-
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", rec.Code)
 	}
 }
 
@@ -2943,6 +3542,7 @@ func TestHandlePatchAutoRotateConfigV1_CooldownTooLow(t *testing.T) {
 }
 
 func TestHandlePatchAutoRotateConfigV1_ValidUpdate(t *testing.T) {
+	restoreAccountStateAfter(t)
 	srv, _ := setupTestServer(t)
 
 	rec := httptest.NewRecorder()
@@ -3405,7 +4005,7 @@ func TestPublishMailEvent_NilHubBranch(t *testing.T) {
 
 func TestPublishReservationEvent_NilHubBranch(t *testing.T) {
 	srv := &Server{} // no wsHub
-	srv.publishReservationEvent("agent1", "reservation.granted", map[string]interface{}{})
+	srv.publishReservationEvent("/project", "agent1", "reservation.granted", map[string]interface{}{})
 }
 
 func TestPublishMailEvent_EmptyAgentName(t *testing.T) {
@@ -3415,7 +4015,7 @@ func TestPublishMailEvent_EmptyAgentName(t *testing.T) {
 
 func TestPublishReservationEvent_EmptyAgentName(t *testing.T) {
 	srv := &Server{} // no wsHub
-	srv.publishReservationEvent("", "reservation.granted", map[string]interface{}{})
+	srv.publishReservationEvent("/project", "", "reservation.granted", map[string]interface{}{})
 }
 
 // --- checkMemoryDaemon with invalid PID file JSON ---
@@ -4794,7 +5394,12 @@ func TestHandleRunScan_SuccessWithPath(t *testing.T) {
 	resetScannerStoreForTest()
 	s, _ := setupTestServer(t)
 
-	customPath := t.TempDir()
+	// A custom scan path must stay inside the project directory (the handler
+	// refuses anything else with 400), so scan a subdirectory of it.
+	customPath := filepath.Join(s.projectDirSnapshot(), "scan-target")
+	if err := os.MkdirAll(customPath, 0o755); err != nil {
+		t.Fatalf("mkdir custom path: %v", err)
+	}
 	body := fmt.Sprintf(`{"path":%q}`, customPath)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/scanner/run", strings.NewReader(body))
 	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
@@ -5114,6 +5719,115 @@ func TestHandleBeadsStats_BrInstalledBadDir(t *testing.T) {
 	// br stats will fail in temp dir → 500
 	if w.Code == http.StatusServiceUnavailable {
 		t.Fatal("should not get 503 when br is installed")
+	}
+}
+
+// installFakeBeadsTools puts br and bv first on PATH. Uninitialized, they
+// answer like br 0.2 and bv in a project with no .beads (output captured
+// verbatim); otherwise they fail like a damaged workspace.
+func installFakeBeadsTools(t *testing.T, uninitialized bool) {
+	t.Helper()
+	bin := t.TempDir()
+	br := "#!/bin/sh\necho 'Error: database is unreadable: permission denied' >&2\nexit 1\n"
+	bvScript := "#!/bin/sh\necho \"Error loading beads: failed to inspect redirect file $PWD/.beads/redirect: stat $PWD/.beads/redirect: permission denied\" >&2\n" +
+		"echo \"Make sure you are in a project initialized with 'br init'.\" >&2\nexit 1\n"
+	if uninitialized {
+		br = "#!/bin/sh\ncat <<'EOF'\n{\"error\":{\"code\":\"NOT_INITIALIZED\",\"message\":\"Beads not initialized: run 'br init' first\",\"hint\":\"Run: br init\",\"retryable\":false,\"context\":null}}\nEOF\nexit 2\n"
+		bvScript = "#!/bin/sh\necho \"Error loading beads: failed to read beads directory: open $PWD/.beads: no such file or directory\" >&2\n" +
+			"echo \"Make sure you are in a project initialized with 'br init'.\" >&2\nexit 1\n"
+	}
+	for name, script := range map[string]string{"br": br, "bv": bvScript} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	bv.InvalidateTriageCache()
+	t.Cleanup(bv.InvalidateTriageCache)
+}
+
+// TestBeadsEndpointsWithoutWorkspace: in a project with no beads workspace,
+// br- and bv-backed endpoints answer 404 BEADS_NOT_INITIALIZED with a br init
+// message instead of a 500; a damaged workspace is still a 500.
+func TestBeadsEndpointsWithoutWorkspace(t *testing.T) {
+	endpoints := []struct {
+		path    string
+		handler func(*Server, http.ResponseWriter, *http.Request)
+	}{
+		{"/api/v1/beads/", (*Server).handleListBeads},
+		{"/api/v1/beads/stats", (*Server).handleBeadsStats},
+		{"/api/v1/beads/ready", (*Server).handleBeadsReady},
+		{"/api/v1/beads/insights", (*Server).handleBeadsInsights},
+		{"/api/v1/beads/triage", (*Server).handleBeadsTriage},
+	}
+	for _, uninitialized := range []bool{true, false} {
+		installFakeBeadsTools(t, uninitialized)
+		s, _ := setupTestServer(t)
+		s.projectDir = t.TempDir()
+		for _, ep := range endpoints {
+			w := httptest.NewRecorder()
+			ep.handler(s, w, httptest.NewRequest(http.MethodGet, ep.path, nil))
+			var body struct {
+				ErrorCode string `json:"error_code"`
+				Error     string `json:"error"`
+			}
+			_ = json.Unmarshal(w.Body.Bytes(), &body)
+			if uninitialized {
+				if w.Code != http.StatusNotFound || body.ErrorCode != ErrCodeBeadsNotInit || !strings.Contains(body.Error, "br init") {
+					t.Errorf("%s without a workspace: %d %s %q, want 404 %s with a br init hint", ep.path, w.Code, body.ErrorCode, body.Error, ErrCodeBeadsNotInit)
+				}
+			} else if w.Code != http.StatusInternalServerError || body.ErrorCode != ErrCodeInternalError {
+				t.Errorf("%s with a damaged workspace: %d %s, want 500 %s", ep.path, w.Code, body.ErrorCode, ErrCodeInternalError)
+			}
+		}
+	}
+}
+
+// TestCASSEndpointsWithoutIndex: an installed cass that has never indexed
+// (exit 3) makes timeline and search answer 503 CASS_UNAVAILABLE naming
+// `cass index --full`; any other cass failure stays a 500.
+func TestCASSEndpointsWithoutIndex(t *testing.T) {
+	for _, tc := range []struct {
+		exitCode   int
+		wantStatus int
+	}{
+		{3, http.StatusServiceUnavailable},
+		{1, http.StatusInternalServerError},
+	} {
+		bin := t.TempDir()
+		script := fmt.Sprintf("#!/bin/sh\necho '{\"error\":{\"code\":3,\"kind\":\"missing-index\",\"message\":\"cass has not been initialized yet\"}}'\nexit %d\n", tc.exitCode)
+		if err := os.WriteFile(filepath.Join(bin, "cass"), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+		s, _ := setupTestServer(t)
+
+		requests := map[string]func() *httptest.ResponseRecorder{
+			"timeline": func() *httptest.ResponseRecorder {
+				w := httptest.NewRecorder()
+				s.handleCASSTimeline(w, httptest.NewRequest(http.MethodGet, "/api/v1/cass/timeline", nil))
+				return w
+			},
+			"search": func() *httptest.ResponseRecorder {
+				w := httptest.NewRecorder()
+				s.handleCASSSearch(w, httptest.NewRequest(http.MethodPost, "/api/v1/cass/search", strings.NewReader(`{"query":"auth"}`)))
+				return w
+			},
+		}
+		for name, do := range requests {
+			w := do()
+			var body struct {
+				ErrorCode string `json:"error_code"`
+				Error     string `json:"error"`
+			}
+			_ = json.Unmarshal(w.Body.Bytes(), &body)
+			if w.Code != tc.wantStatus {
+				t.Errorf("cass exit %d, %s: status %d (%s %q), want %d", tc.exitCode, name, w.Code, body.ErrorCode, body.Error, tc.wantStatus)
+			}
+			if indexHint := strings.Contains(body.Error, "cass index --full"); indexHint != (tc.exitCode == 3) {
+				t.Errorf("cass exit %d, %s: error %q, index hint wanted=%v", tc.exitCode, name, body.Error, tc.exitCode == 3)
+			}
+		}
 	}
 }
 
@@ -5885,6 +6599,7 @@ func TestHandlePolicyAutomationUpdateV1_NoChanges(t *testing.T) {
 // --- handleAccountHistoryV1: limit truncation + reverse order ---
 
 func TestHandleAccountHistoryV1_LimitTruncation(t *testing.T) {
+	restoreAccountStateAfter(t)
 	// Pre-fill history with 5 events
 	accountState.mu.Lock()
 	accountState.history = []AccountRotationEvent{
@@ -7297,6 +8012,7 @@ func TestHandlePolicyValidateV1_FileBased(t *testing.T) {
 
 func TestHandleSafetyInstallV1_Force(t *testing.T) {
 	srv, _ := setupTestServer(t)
+	t.Setenv("HOME", t.TempDir()) // never touch the developer's ~/.ntm or ~/.claude
 
 	body := `{"force":true}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/safety/install", strings.NewReader(body))
@@ -7312,6 +8028,7 @@ func TestHandleSafetyInstallV1_Force(t *testing.T) {
 
 func TestHandleSafetyUninstallV1_Branch(t *testing.T) {
 	srv, _ := setupTestServer(t)
+	t.Setenv("HOME", t.TempDir()) // never touch the developer's ~/.ntm or ~/.claude
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/safety/uninstall", nil)
 	rec := httptest.NewRecorder()
@@ -7764,19 +8481,19 @@ func TestWSClient_SendAck_FullBuffer(t *testing.T) {
 	c.sendAck("req-full", map[string]interface{}{"dropped": true})
 }
 
-// --- handleSessionAgents exercises stateStore success path ---
+// --- handleSessionAgents: a session neither tmux nor the store knows ---
 
-func TestHandleSessionAgents_Success(t *testing.T) {
+func TestHandleSessionAgents_UnknownSessionNotFound(t *testing.T) {
 	s, _ := setupTestServer(t)
+	installFakeListPanesTmux(t, fakeTmuxNoSession)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/api/sessions/test-session/agents", nil)
 
 	s.handleSessionAgents(rec, req, "test-session")
 
-	// stateStore is set from setupTestServer, so should succeed
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -8447,8 +9164,28 @@ func TestHandleCASSInsights_WithRealCass(t *testing.T) {
 
 	s.handleCASSInsights(rec, req)
 
-	if rec.Code == http.StatusServiceUnavailable {
-		t.Fatal("cass is installed but got 503")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		TotalDocuments int                      `json:"total_documents"`
+		Agents         []cass.AggregationBucket `json:"agents"`
+		Workspaces     []cass.AggregationBucket `json:"workspaces"`
+		Warnings       []string                 `json:"warnings"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Warnings) != 0 {
+		t.Fatalf("insights degraded: %v", body.Warnings)
+	}
+	if body.TotalDocuments > 0 && len(body.Agents) == 0 {
+		t.Fatalf("total_documents=%d but no agent buckets (aggregations not decoded)", body.TotalDocuments)
+	}
+	for _, b := range body.Agents {
+		if b.Key == "" || b.Count <= 0 {
+			t.Fatalf("bad agent bucket %+v", b)
+		}
 	}
 }
 
@@ -8462,13 +9199,41 @@ func TestHandleCASSTimeline_WithRealCass(t *testing.T) {
 	}
 	s, _ := setupTestServer(t)
 
-	req := httptest.NewRequest("GET", "/api/v1/memory/cass/timeline?limit=5", nil)
+	req := httptest.NewRequest("GET", "/api/v1/memory/cass/timeline?limit=3&since=30d", nil)
 	rec := httptest.NewRecorder()
 
 	s.handleCASSTimeline(rec, req)
 
-	if rec.Code == http.StatusServiceUnavailable {
-		t.Fatal("cass is installed but got 503")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Entries []struct {
+			Agent     string `json:"agent"`
+			Path      string `json:"path"`
+			Timestamp string `json:"timestamp"`
+		} `json:"entries"`
+		Count         int `json:"count"`
+		TotalSessions int `json:"total_sessions"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Count != len(body.Entries) || body.Count > 3 || body.TotalSessions < body.Count {
+		t.Fatalf("count=%d entries=%d total=%d", body.Count, len(body.Entries), body.TotalSessions)
+	}
+	for _, e := range body.Entries {
+		if e.Agent == "" || e.Path == "" || e.Timestamp == "" {
+			t.Fatalf("timeline entry missing agent/path/timestamp: %+v", e)
+		}
+	}
+
+	// cass timeline has no workspace filter; refusing beats ignoring it.
+	req = httptest.NewRequest("GET", "/api/v1/memory/cass/timeline?workspace=/data/projects/ntm", nil)
+	rec = httptest.NewRecorder()
+	s.handleCASSTimeline(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("workspace filter status = %d, want 400", rec.Code)
 	}
 }
 
@@ -11300,8 +12065,8 @@ func TestHandleExportCheckpoint_PostTarGzFormat(t *testing.T) {
 // Batch 31 — WSEventStore, AuditStore, OpenAPI, Pipeline, RBAC branches
 // =============================================================================
 
-// TestWSEventStore_StorePersistError exercises the log.Printf error path
-// in Store when the DB insert fails (line 204-206 of ws_events.go).
+// TestWSEventStore_StorePersistError verifies that a failed durable append
+// does not publish a memory-only event as though it were replayable.
 func TestWSEventStore_StorePersistError(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -11316,16 +12081,15 @@ func TestWSEventStore_StorePersistError(t *testing.T) {
 	// Close the DB to trigger persist error on next Store
 	db.Close()
 
-	// Store should succeed (goes to ring buffer) but persist fails silently
 	ev, err := store.Store("test.topic", "test.event", map[string]string{"key": "value"})
-	if err != nil {
-		t.Fatalf("Store should not return error (persist error is logged): %v", err)
+	if err == nil {
+		t.Fatal("expected persistence error")
 	}
-	if ev == nil {
-		t.Fatal("expected non-nil event")
+	if ev != nil {
+		t.Fatalf("failed append returned an event: %+v", ev)
 	}
-	if ev.Topic != "test.topic" {
-		t.Errorf("topic = %q, want test.topic", ev.Topic)
+	if _, used, _, _ := store.BufferStats(); used != 0 {
+		t.Fatalf("failed append published %d buffered events", used)
 	}
 }
 
@@ -11489,23 +12253,21 @@ func TestHandleSwaggerUI_TLS(t *testing.T) {
 }
 
 // TestHandleListPipelines_WithFinishedAt exercises the FinishedAt != nil branch
-// in handleListPipelines (line 115-117 of pipelines.go).
+// in handleListPipelines. The list reads the configured project's durable run
+// state (02d7356f removed the unscoped process-registry fallback), so the run
+// is seeded as a persisted checkpoint rather than a registry entry.
 func TestHandleListPipelines_WithFinishedAt(t *testing.T) {
 	s, _ := setupTestServer(t)
 
-	// Register a pipeline with FinishedAt set
 	now := time.Now()
-	finished := now.Add(10 * time.Second)
-	exec := &pipeline.PipelineExecution{
+	exec := savePipelineStateForHandlerTest(t, s, &pipeline.ExecutionState{
 		RunID:      "test-run-finished-" + fmt.Sprintf("%d", now.UnixNano()),
 		WorkflowID: "test-workflow",
 		Session:    "test-session",
-		Status:     "completed",
+		Status:     pipeline.StatusCompleted,
 		StartedAt:  now,
-		FinishedAt: &finished,
-		Progress:   pipeline.PipelineProgress{Total: 3, Completed: 3, Percent: 100},
-	}
-	pipeline.RegisterPipeline(exec)
+		FinishedAt: now.Add(10 * time.Second),
+	})
 
 	req := httptest.NewRequest("GET", "/api/v1/pipelines", nil)
 	rec := httptest.NewRecorder()
@@ -11559,7 +12321,7 @@ func TestWSEventStore_GetSinceDB_TopicFilterWithLimit(t *testing.T) {
 	}
 
 	// Query from DB with topic filter and limit=2
-	events, reset, err := store.getFromDB(0, "topicA", 2)
+	events, reset, err := store.getFromDB(0, []string{"topicA"}, 2)
 	if err != nil {
 		t.Fatalf("getFromDB: %v", err)
 	}
@@ -11598,7 +12360,7 @@ func TestWSEventStore_GetSinceDB_CursorTooOldBranch(t *testing.T) {
 	// Query with since=1, topic="nonexistent" — SQL fetches events 100-104 (seq > 1),
 	// but Go topic filter removes all → len(events)=0.
 	// since=1 > 0, minSeq=100, 1 < 100-1=99 → reset=true
-	events, reset, err := store.getFromDB(1, "nonexistent", 10)
+	events, reset, err := store.getFromDB(1, []string{"nonexistent"}, 10)
 	if err != nil {
 		t.Fatalf("getFromDB: %v", err)
 	}
@@ -11651,25 +12413,23 @@ func TestRoleHierarchy_UnknownRole(t *testing.T) {
 // =============================================================================
 
 // TestHandleGetPipeline_FoundWithFinishedAt exercises the success path
-// with FinishedAt and Error fields populated (lines 258-276 of pipelines.go).
+// with FinishedAt and Error fields populated, read from the project's durable
+// run state.
 func TestHandleGetPipeline_FoundWithFinishedAt(t *testing.T) {
 	s, _ := setupTestServer(t)
 
 	now := time.Now()
-	finished := now.Add(5 * time.Second)
 	runID := fmt.Sprintf("get-test-%d", now.UnixNano())
-	exec := &pipeline.PipelineExecution{
+	savePipelineStateForHandlerTest(t, s, &pipeline.ExecutionState{
 		RunID:       runID,
 		WorkflowID:  "wf-1",
 		Session:     "sess-1",
-		Status:      "failed",
+		Status:      pipeline.StatusFailed,
 		StartedAt:   now,
-		FinishedAt:  &finished,
+		FinishedAt:  now.Add(5 * time.Second),
 		CurrentStep: "step-2",
-		Error:       "step-2 timed out",
-		Progress:    pipeline.PipelineProgress{Total: 3, Completed: 1, Failed: 1},
-	}
-	pipeline.RegisterPipeline(exec)
+		Errors:      []pipeline.ExecutionError{{StepID: "step-2", Message: "step-2 timed out", Fatal: true, Timestamp: now}},
+	})
 
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", runID)
@@ -11714,20 +12474,20 @@ func TestHandleGetPipeline_NotFoundBranch(t *testing.T) {
 }
 
 // TestHandleCancelPipeline_CompletedConflict exercises the conflict path
-// in handleCancelPipeline (lines 300-306 of pipelines.go) — can't cancel completed.
+// in handleCancelPipeline — a completed run can't be cancelled.
 func TestHandleCancelPipeline_CompletedConflict(t *testing.T) {
 	s, _ := setupTestServer(t)
 
 	now := time.Now()
 	runID := fmt.Sprintf("cancel-conflict-%d", now.UnixNano())
-	exec := &pipeline.PipelineExecution{
+	savePipelineStateForHandlerTest(t, s, &pipeline.ExecutionState{
 		RunID:      runID,
 		WorkflowID: "wf-1",
 		Session:    "sess-1",
-		Status:     "completed",
+		Status:     pipeline.StatusCompleted,
 		StartedAt:  now,
-	}
-	pipeline.RegisterPipeline(exec)
+		FinishedAt: now,
+	})
 
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", runID)
@@ -11742,21 +12502,24 @@ func TestHandleCancelPipeline_CompletedConflict(t *testing.T) {
 	}
 }
 
-// TestHandleCancelPipeline_RunningSuccess exercises the success path
-// in handleCancelPipeline (lines 308-315 of pipelines.go) — cancel a running pipeline.
-func TestHandleCancelPipeline_RunningSuccess(t *testing.T) {
+// TestHandleCancelPipeline_RunningWithoutOwnerConflicts exercises the
+// cancellation path for a running checkpoint that no live owner acknowledges.
+// Cancellation is only reported after the owning process acknowledges it
+// (02d7356f); an orphaned "running" checkpoint must answer 409, never a
+// fabricated "cancelled". The acknowledged path is covered by
+// TestPipelineCancelRequiresAcknowledgingOwner.
+func TestHandleCancelPipeline_RunningWithoutOwnerConflicts(t *testing.T) {
 	s, _ := setupTestServer(t)
 
 	now := time.Now()
 	runID := fmt.Sprintf("cancel-ok-%d", now.UnixNano())
-	exec := &pipeline.PipelineExecution{
+	savePipelineStateForHandlerTest(t, s, &pipeline.ExecutionState{
 		RunID:      runID,
 		WorkflowID: "wf-1",
 		Session:    "sess-1",
-		Status:     "running",
+		Status:     pipeline.StatusRunning,
 		StartedAt:  now,
-	}
-	pipeline.RegisterPipeline(exec)
+	})
 
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", runID)
@@ -11766,14 +12529,34 @@ func TestHandleCancelPipeline_RunningSuccess(t *testing.T) {
 
 	s.handleCancelPipeline(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 without an acknowledging owner, got %d: %s", rec.Code, rec.Body.String())
 	}
 	var resp map[string]interface{}
 	json.Unmarshal(rec.Body.Bytes(), &resp)
-	if resp["status"] != "cancelled" {
-		t.Errorf("status = %v, want cancelled", resp["status"])
+	if resp["status"] == "cancelled" || resp["status"] == "cancellation_requested" {
+		t.Errorf("unacknowledged cancellation reported status %v", resp["status"])
 	}
+	final, err := pipeline.LoadState(s.pipelineProjectDir(), runID)
+	if err != nil || final.Status != pipeline.StatusRunning {
+		t.Fatalf("rejected cancellation rewrote the checkpoint: %+v %v", final, err)
+	}
+}
+
+// savePipelineStateForHandlerTest persists a run checkpoint under the
+// server's configured project and returns the snapshot the handlers serve.
+func savePipelineStateForHandlerTest(t *testing.T, s *Server, state *pipeline.ExecutionState) *pipeline.ExecutionState {
+	t.Helper()
+	if state.Steps == nil {
+		state.Steps = map[string]pipeline.StepResult{}
+	}
+	if state.Variables == nil {
+		state.Variables = map[string]interface{}{}
+	}
+	if err := pipeline.SaveState(s.pipelineProjectDir(), state); err != nil {
+		t.Fatalf("save pipeline state: %v", err)
+	}
+	return state
 }
 
 // TestHandleResumePipeline_NoState exercises the 404 path when
@@ -11818,7 +12601,7 @@ func TestDiscoverPipelineTemplates(t *testing.T) {
 	os.Chdir(tmpDir)
 	defer os.Chdir(origDir)
 
-	templates := discoverPipelineTemplates()
+	templates := discoverPipelineTemplates(tmpDir)
 
 	// Should find 3 templates (yaml, yml, toml) but not .md or dirs
 	foundNames := map[string]bool{}
@@ -12099,6 +12882,21 @@ func TestHandleSafetyStatusV1_FullPath(t *testing.T) {
 	hookDir := filepath.Join(tmpDir, ".claude", "hooks", "PreToolUse")
 	os.MkdirAll(hookDir, 0755)
 	os.WriteFile(filepath.Join(hookDir, "ntm-safety.sh"), []byte("#!/bin/sh\n"), 0755)
+
+	// A hook script Claude Code's settings do not list never runs, so it is
+	// present but not installed.
+	reqUnregistered := httptest.NewRequest("GET", "/api/v1/safety/status", nil)
+	recUnregistered := httptest.NewRecorder()
+	s.handleSafetyStatusV1(recUnregistered, reqUnregistered)
+	var respUnregistered map[string]interface{}
+	json.Unmarshal(recUnregistered.Body.Bytes(), &respUnregistered)
+	if respUnregistered["hook_script_present"] != true || respUnregistered["hook_registered"] != false || respUnregistered["hook_installed"] != false {
+		t.Fatalf("unregistered hook script: present=%v registered=%v installed=%v, want true/false/false",
+			respUnregistered["hook_script_present"], respUnregistered["hook_registered"], respUnregistered["hook_installed"])
+	}
+	if _, err := policy.RegisterClaudeHook(policy.ClaudeUserSettingsPath(tmpDir), policy.ClaudeHookScriptPath(tmpDir)); err != nil {
+		t.Fatalf("register hook: %v", err)
+	}
 
 	req2 := httptest.NewRequest("GET", "/api/v1/safety/status", nil)
 	rec2 := httptest.NewRecorder()
@@ -13397,7 +14195,7 @@ func TestWSEventStore_CleanupDBExecError(t *testing.T) {
 	}
 }
 
-// --- WSEventStore.Store — DB persist error, log & continue (92.3% → ~100%) ---
+// A failed durable append must not be published as a resumable event.
 
 func TestWSEventStore_StoreDBPersistError(t *testing.T) {
 	db, cleanup := setupTestDB(t)
@@ -13411,18 +14209,21 @@ func TestWSEventStore_StoreDBPersistError(t *testing.T) {
 	store := NewWSEventStore(db, cfg)
 	defer store.Stop()
 
-	// Close the DB to trigger persist error (Store logs and continues)
+	// Close the DB to trigger a persistence error.
 	db.Close()
 
 	ev, err := store.Store("test.topic", "test.event", map[string]interface{}{"key": "val"})
-	if err != nil {
-		t.Fatalf("Store should not return error (logs instead), got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "persist event") {
+		t.Fatalf("expected persistence error, got: %v", err)
 	}
-	if ev == nil {
-		t.Fatal("expected non-nil event even with DB error")
+	if ev != nil {
+		t.Fatalf("failed append returned an event: %+v", ev)
 	}
-	if ev.Topic != "test.topic" {
-		t.Errorf("expected topic=test.topic, got %q", ev.Topic)
+	if store.CurrentSeq() != 0 {
+		t.Fatalf("failed append advanced cursor to %d", store.CurrentSeq())
+	}
+	if _, used, _, _ := store.BufferStats(); used != 0 {
+		t.Fatalf("failed append published %d buffered events", used)
 	}
 }
 
@@ -13453,8 +14254,8 @@ func TestWSEventStore_GetSinceDBQueryError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from GetSince with closed DB")
 	}
-	if !strings.Contains(err.Error(), "query events") {
-		t.Errorf("expected 'query events' in error, got: %v", err)
+	if !strings.Contains(err.Error(), "begin replay") {
+		t.Errorf("expected 'begin replay' in error, got: %v", err)
 	}
 }
 
@@ -13571,6 +14372,206 @@ func TestCheckWSOrigin_AllowedOriginEmptyScheme(t *testing.T) {
 	req2.Header.Set("Origin", "https://evil.example.com")
 	if srv.checkWSOrigin(req2) {
 		t.Error("should reject non-matching origin")
+	}
+}
+
+func TestCheckpointArchiveDisclosureInspection(t *testing.T) {
+	encodeGzip := func(header gzip.Header, content []byte) []byte {
+		t.Helper()
+		var out bytes.Buffer
+		writer := gzip.NewWriter(&out)
+		writer.Header = header
+		if _, err := writer.Write(content); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return out.Bytes()
+	}
+	encodeZip := func(header zip.FileHeader, comment string, content []byte) []byte {
+		t.Helper()
+		if header.Name == "" {
+			header.Name = "metadata.json"
+		}
+		var out bytes.Buffer
+		writer := zip.NewWriter(&out)
+		if err := writer.SetComment(comment); err != nil {
+			t.Fatal(err)
+		}
+		entry, err := writer.CreateHeader(&header)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := entry.Write(content); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return out.Bytes()
+	}
+	encodeTar := func(header tar.Header, outer gzip.Header, content []byte) []byte {
+		t.Helper()
+		if header.Name == "" {
+			header.Name = "metadata.json"
+		}
+		header.Mode, header.Size = 0600, int64(len(content))
+		header.Typeflag = tar.TypeReg
+		header.Format = tar.FormatPAX
+		var out bytes.Buffer
+		writer := tar.NewWriter(&out)
+		if err := writer.WriteHeader(&header); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write(content); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return encodeGzip(outer, out.Bytes())
+	}
+	clean := []byte(`{"command":"printf ready","count":9007199254740993}`)
+	sensitive := []byte(`{"api_token":"0123456789abcdefghijklmnopqrstuv"}`)
+	secret := []byte(wiringFakeSecret)
+	// An unknown ZIP extra field is still part of the disclosed archive.
+	extra := append([]byte{0xfe, 0xca, byte(len(secret)), 0}, secret...)
+	nestedSecret := encodeGzip(gzip.Header{}, secret)
+	nestedClean := encodeGzip(gzip.Header{}, clean)
+	cleanZip := encodeZip(zip.FileHeader{}, "", clean)
+	cleanTar := encodeTar(tar.Header{}, gzip.Header{}, clean)
+	badOuterTrailer := bytes.Clone(cleanTar)
+	badOuterTrailer[len(badOuterTrailer)-8] ^= 0x80
+	badInnerTrailer := bytes.Clone(nestedClean)
+	badInnerTrailer[len(badInnerTrailer)-8] ^= 0x80
+	laterHeader := append(bytes.Clone(nestedClean), encodeGzip(gzip.Header{Name: wiringFakeSecret}, []byte("second harmless member"))...)
+	splitSecret := append(encodeGzip(gzip.Header{}, secret[:10]), encodeGzip(gzip.Header{}, secret[10:])...)
+	cleanMembers := append(bytes.Clone(nestedClean), encodeGzip(gzip.Header{}, []byte("second harmless member"))...)
+	laterOuterHeader := append(bytes.Clone(cleanTar), encodeGzip(gzip.Header{Comment: wiringFakeSecret}, make([]byte, 512))...)
+	cleanOuterMembers := append(bytes.Clone(cleanTar), encodeGzip(gzip.Header{}, make([]byte, 512))...)
+
+	tests := []struct {
+		name   string
+		format checkpoint.ExportFormat
+		data   []byte
+		want   error
+	}{
+		{"clean zip", checkpoint.FormatZip, cleanZip, nil},
+		{"clean tar gzip", checkpoint.FormatTarGz, cleanTar, nil},
+		{"empty ordinary zip member", checkpoint.FormatZip, encodeZip(zip.FileHeader{Name: "panes/output.txt"}, "", nil), nil},
+		{"zero member outer gzip", checkpoint.FormatTarGz, nil, errCheckpointDisclosureInvalid},
+		{"zero member nested gzip", checkpoint.FormatZip, encodeZip(zip.FileHeader{Name: "panes/output.gz"}, "", nil), errCheckpointDisclosureInvalid},
+		{"zip credential value", checkpoint.FormatZip, encodeZip(zip.FileHeader{}, "", sensitive), errCheckpointDisclosureSensitive},
+		{"tar credential value", checkpoint.FormatTarGz, encodeTar(tar.Header{}, gzip.Header{}, sensitive), errCheckpointDisclosureSensitive},
+		{"zip entry name", checkpoint.FormatZip, encodeZip(zip.FileHeader{Name: wiringFakeSecret}, "", clean), errCheckpointDisclosureSensitive},
+		{"tar entry name", checkpoint.FormatTarGz, encodeTar(tar.Header{Name: wiringFakeSecret}, gzip.Header{}, clean), errCheckpointDisclosureSensitive},
+		{"zip archive comment", checkpoint.FormatZip, encodeZip(zip.FileHeader{}, wiringFakeSecret, clean), errCheckpointDisclosureSensitive},
+		{"zip entry comment", checkpoint.FormatZip, encodeZip(zip.FileHeader{Comment: wiringFakeSecret}, "", clean), errCheckpointDisclosureSensitive},
+		{"zip extra field", checkpoint.FormatZip, encodeZip(zip.FileHeader{Extra: extra}, "", clean), errCheckpointDisclosureSensitive},
+		{"tar owner", checkpoint.FormatTarGz, encodeTar(tar.Header{Uname: wiringFakeSecret}, gzip.Header{}, clean), errCheckpointDisclosureSensitive},
+		{"tar group", checkpoint.FormatTarGz, encodeTar(tar.Header{Gname: wiringFakeSecret}, gzip.Header{}, clean), errCheckpointDisclosureSensitive},
+		{"tar PAX metadata", checkpoint.FormatTarGz, encodeTar(tar.Header{PAXRecords: map[string]string{"NTM.note": wiringFakeSecret}}, gzip.Header{}, clean), errCheckpointDisclosureSensitive},
+		{"outer gzip name", checkpoint.FormatTarGz, encodeTar(tar.Header{}, gzip.Header{Name: wiringFakeSecret}, clean), errCheckpointDisclosureSensitive},
+		{"outer gzip comment", checkpoint.FormatTarGz, encodeTar(tar.Header{}, gzip.Header{Comment: wiringFakeSecret}, clean), errCheckpointDisclosureSensitive},
+		{"outer gzip extra field", checkpoint.FormatTarGz, encodeTar(tar.Header{}, gzip.Header{Extra: secret}, clean), errCheckpointDisclosureSensitive},
+		{"zip nested gzip payload", checkpoint.FormatZip, encodeZip(zip.FileHeader{Name: "panes/output.gz"}, "", nestedSecret), errCheckpointDisclosureSensitive},
+		{"tar nested gzip payload", checkpoint.FormatTarGz, encodeTar(tar.Header{Name: "panes/output.gz"}, gzip.Header{}, nestedSecret), errCheckpointDisclosureSensitive},
+		{"nested gzip magic without extension", checkpoint.FormatZip, encodeZip(zip.FileHeader{Name: "panes/output"}, "", nestedSecret), errCheckpointDisclosureSensitive},
+		{"nested gzip name", checkpoint.FormatZip, encodeZip(zip.FileHeader{Name: "panes/output.gz"}, "", encodeGzip(gzip.Header{Name: wiringFakeSecret}, clean)), errCheckpointDisclosureSensitive},
+		{"nested gzip comment", checkpoint.FormatZip, encodeZip(zip.FileHeader{Name: "panes/output.gz"}, "", encodeGzip(gzip.Header{Comment: wiringFakeSecret}, clean)), errCheckpointDisclosureSensitive},
+		{"nested gzip extra field", checkpoint.FormatZip, encodeZip(zip.FileHeader{Name: "panes/output.gz"}, "", encodeGzip(gzip.Header{Extra: secret}, clean)), errCheckpointDisclosureSensitive},
+		{"later nested gzip header", checkpoint.FormatZip, encodeZip(zip.FileHeader{Name: "panes/output.gz"}, "", laterHeader), errCheckpointDisclosureSensitive},
+		{"credential spans gzip members", checkpoint.FormatZip, encodeZip(zip.FileHeader{Name: "panes/output.gz"}, "", splitSecret), errCheckpointDisclosureSensitive},
+		{"clean nested gzip members", checkpoint.FormatZip, encodeZip(zip.FileHeader{Name: "panes/output.gz"}, "", cleanMembers), nil},
+		{"later outer gzip header", checkpoint.FormatTarGz, laterOuterHeader, errCheckpointDisclosureSensitive},
+		{"clean outer gzip members", checkpoint.FormatTarGz, cleanOuterMembers, nil},
+		{"bad outer gzip checksum", checkpoint.FormatTarGz, badOuterTrailer, errCheckpointDisclosureInvalid},
+		{"truncated outer gzip trailer", checkpoint.FormatTarGz, cleanTar[:len(cleanTar)-4], errCheckpointDisclosureInvalid},
+		{"bad nested gzip checksum", checkpoint.FormatZip, encodeZip(zip.FileHeader{Name: "panes/output.gz"}, "", badInnerTrailer), errCheckpointDisclosureInvalid},
+		{"truncated nested gzip trailer", checkpoint.FormatTarGz, encodeTar(tar.Header{Name: "panes/output.gz"}, gzip.Header{}, nestedClean[:len(nestedClean)-4]), errCheckpointDisclosureInvalid},
+		{"zip mislabeled as tar gzip", checkpoint.FormatTarGz, cleanZip, errCheckpointDisclosureInvalid},
+		{"tar gzip mislabeled as zip", checkpoint.FormatZip, cleanTar, errCheckpointDisclosureInvalid},
+		{"unsupported format", checkpoint.ExportFormat("unsupported"), cleanZip, errCheckpointDisclosureInvalid},
+		{"malformed archive with sensitive error context", checkpoint.FormatZip, secret, errCheckpointDisclosureInvalid},
+	}
+	for _, mode := range []redaction.Mode{redaction.ModeRedact, redaction.ModeBlock} {
+		t.Run(string(mode), func(t *testing.T) {
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					before := bytes.Clone(tt.data)
+					err := inspectCheckpointArchive(context.Background(), tt.data, tt.format, redaction.Config{Mode: mode})
+					if !errors.Is(err, tt.want) {
+						t.Fatalf("inspection error=%v, want %v", err, tt.want)
+					}
+					if err != nil && (err.Error() != tt.want.Error() || strings.Contains(err.Error(), wiringFakeSecret)) {
+						t.Fatalf("inspection returned source-dependent diagnostics: %v", err)
+					}
+					if !bytes.Equal(tt.data, before) {
+						t.Fatal("inspection altered the recoverable archive")
+					}
+				})
+			}
+		})
+	}
+
+	for _, format := range []checkpoint.ExportFormat{checkpoint.FormatZip, checkpoint.FormatTarGz} {
+		t.Run("canceled "+string(format), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			data := cleanZip
+			if format == checkpoint.FormatTarGz {
+				data = cleanTar
+			}
+			before := bytes.Clone(data)
+			if err := inspectCheckpointArchive(ctx, data, format, redaction.Config{Mode: redaction.ModeRedact}); !errors.Is(err, errCheckpointDisclosureInvalid) {
+				t.Fatalf("canceled inspection error=%v, want static refusal", err)
+			}
+			if !bytes.Equal(data, before) {
+				t.Fatal("canceled inspection altered the archive")
+			}
+		})
+	}
+}
+
+func TestCheckpointArchiveDisclosureInspectionLimits(t *testing.T) {
+	makeZip := func(entries int, advertisedSize uint64) []byte {
+		t.Helper()
+		var out bytes.Buffer
+		writer := zip.NewWriter(&out)
+		for i := 0; i < entries; i++ {
+			// Raw headers let an attacker advertise a huge expanded member
+			// without forcing this test to allocate or decompress that member.
+			if _, err := writer.CreateRaw(&zip.FileHeader{
+				Name: fmt.Sprintf("entry-%d", i), Method: zip.Store,
+				UncompressedSize64: advertisedSize,
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return out.Bytes()
+	}
+	for _, tt := range []struct {
+		name string
+		data []byte
+	}{
+		{"advertised expanded entry", makeZip(1, checkpointDisclosureEntryBytes+1)},
+		{"too many entries", makeZip(checkpointDisclosureEntries+1, 0)},
+		{"compressed snapshot limit", make([]byte, checkpointDisclosureArchiveBytes+1)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			before := bytes.Clone(tt.data)
+			err := inspectCheckpointArchive(context.Background(), tt.data, checkpoint.FormatZip, redaction.Config{Mode: redaction.ModeRedact})
+			if !errors.Is(err, errCheckpointDisclosureLimit) || err.Error() != errCheckpointDisclosureLimit.Error() {
+				t.Fatalf("oversized archive error=%v, want static limit refusal", err)
+			}
+			if !bytes.Equal(tt.data, before) {
+				t.Fatal("refused archive was changed")
+			}
+		})
 	}
 }
 

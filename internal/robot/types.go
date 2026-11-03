@@ -71,6 +71,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Dicklesworthstone/ntm/internal/worksource"
 )
 
 // EnvelopeVersion is the current version of the robot output envelope specification.
@@ -118,6 +120,16 @@ const (
 	// ErrCodeResourceBusy indicates a resource is locked or in use.
 	ErrCodeResourceBusy = "RESOURCE_BUSY"
 
+	// ErrCodeDestructiveCommandBlocked indicates dcg refused a destructive
+	// shell command in a message bound for a non-Claude agent.
+	ErrCodeDestructiveCommandBlocked = "DESTRUCTIVE_COMMAND_BLOCKED"
+
+	// ErrCodeStaleWorkCoordination indicates work could not be attributed to
+	// one verified source revision — the tracker or checkout changed while it
+	// was read, the canonical Beads JSONL is unavailable or invalid, or an
+	// opt-in ref/clean policy failed — so it was not dispatched (GH #283).
+	ErrCodeStaleWorkCoordination = worksource.StaleCode
+
 	// =============================================================================
 	// Restart/Exit Error Codes (bd-3vc3s)
 	// =============================================================================
@@ -152,6 +164,11 @@ const (
 	// ErrCodeDispatchUnknown means delivery may have occurred but no trustworthy
 	// final receipt was available, so blind retry could duplicate the prompt.
 	ErrCodeDispatchUnknown = "DISPATCH_UNKNOWN"
+
+	// ErrCodeReservationRequired means an assignment that must reserve its
+	// file scope was refused before its claim: the bead names no files, or
+	// Agent Mail is unavailable. `ntm assign --json` emits the same string.
+	ErrCodeReservationRequired = "RESERVATION_REQUIRED"
 )
 
 // ResponseMeta provides optional metadata about response generation.

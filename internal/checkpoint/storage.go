@@ -316,6 +316,12 @@ func (s *Storage) Save(cp *Checkpoint) error {
 		previousArtifacts = resolveCheckpointArtifactPathSetBestEffort(dir, existing)
 	}
 
+	// Seal new payloads before publishing metadata. Existing fingerprints must
+	// still match so a metadata-only update cannot bless corrupted content.
+	if err := cp.recordArtifactChecksums(dir); err != nil {
+		return fmt.Errorf("recording checkpoint artifact checksums: %w", err)
+	}
+
 	// Save metadata
 	metaPath := filepath.Join(dir, MetadataFile)
 	if err := writeJSON(metaPath, cp); err != nil {
@@ -810,76 +816,6 @@ func (s *Storage) SaveGitPatch(sessionName, checkpointID, patch string) error {
 	return util.AtomicWriteFile(path, []byte(patch), 0600)
 }
 
-func (s *Storage) loadGitArtifact(sessionName, checkpointID, relPath, defaultName, kind string) (string, error) {
-	dir, err := s.safeCheckpointDir(sessionName, checkpointID)
-	if err != nil {
-		return "", err
-	}
-
-	target := defaultName
-	if relPath != "" {
-		target = relPath
-	}
-
-	path, err := resolveExistingCheckpointArtifactPath(dir, target)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) && relPath == "" {
-			return "", nil
-		}
-		return "", fmt.Errorf("resolving %s path: %w", kind, err)
-	}
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) && relPath == "" {
-			return "", nil
-		}
-		return "", fmt.Errorf("reading %s: %w", kind, err)
-	}
-
-	return string(data), nil
-}
-
-func (s *Storage) loadGitPatchForState(sessionName, checkpointID string, git GitState) (string, error) {
-	return s.loadGitArtifact(sessionName, checkpointID, git.PatchFile, GitPatchFile, "git patch")
-}
-
-func (s *Storage) loadGitStatusForState(sessionName, checkpointID string, git GitState) (string, error) {
-	return s.loadGitArtifact(sessionName, checkpointID, git.StatusFile, GitStatusFile, "git status")
-}
-
-// LoadGitPatch reads the git diff patch from the checkpoint.
-func (s *Storage) LoadGitPatch(sessionName, checkpointID string) (string, error) {
-	dir, err := s.safeCheckpointDir(sessionName, checkpointID)
-	if err != nil {
-		return "", err
-	}
-	if checkpointStateExists(dir) {
-		cp, err := s.Load(sessionName, checkpointID)
-		if err != nil {
-			return "", err
-		}
-		return s.loadGitPatchForState(sessionName, checkpointID, cp.Git)
-	}
-	return s.loadGitArtifact(sessionName, checkpointID, "", GitPatchFile, "git patch")
-}
-
-// LoadGitStatus reads the git status text from the checkpoint.
-func (s *Storage) LoadGitStatus(sessionName, checkpointID string) (string, error) {
-	dir, err := s.safeCheckpointDir(sessionName, checkpointID)
-	if err != nil {
-		return "", err
-	}
-	if checkpointStateExists(dir) {
-		cp, err := s.Load(sessionName, checkpointID)
-		if err != nil {
-			return "", err
-		}
-		return s.loadGitStatusForState(sessionName, checkpointID, cp.Git)
-	}
-	return s.loadGitArtifact(sessionName, checkpointID, "", GitStatusFile, "git status")
-}
-
 // SaveGitStatus writes the git status output to the checkpoint.
 func (s *Storage) SaveGitStatus(sessionName, checkpointID, status string) error {
 	dir, err := s.safeCheckpointDir(sessionName, checkpointID)
@@ -891,19 +827,6 @@ func (s *Storage) SaveGitStatus(sessionName, checkpointID, status string) error 
 	}
 	path := filepath.Join(dir, GitStatusFile)
 	return util.AtomicWriteFile(path, []byte(status), 0600)
-}
-
-func checkpointStateExists(dir string) bool {
-	for _, name := range []string{MetadataFile, SessionFile} {
-		info, err := os.Lstat(filepath.Join(dir, name))
-		if err == nil {
-			return true
-		}
-		if !os.IsNotExist(err) && info != nil {
-			return true
-		}
-	}
-	return false
 }
 
 // writeJSON writes data as formatted JSON to a file atomically.

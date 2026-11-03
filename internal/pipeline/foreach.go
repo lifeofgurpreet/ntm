@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -35,6 +36,21 @@ type foreachIterationResult struct {
 	SkipReason string                 `json:"skip_reason,omitempty"`
 	SkipKind   SkipKind               `json:"skip_kind,omitempty"`
 	Error      string                 `json:"error,omitempty"`
+	// Admission can fail between rounds without creating a child result.
+	// Keep its local classification until the container aggregates outcomes.
+	admissionError *StepError
+}
+
+func (r foreachIterationResult) admissionFailure() *StepError {
+	if r.admissionError != nil {
+		return r.admissionError
+	}
+	for _, result := range r.Results {
+		if cause := findStepAdmissionError(result.Error); cause != nil {
+			return cause
+		}
+	}
+	return nil
 }
 
 func (r foreachIterationResult) failed() bool {
@@ -64,14 +80,53 @@ func (e *Executor) executeForeach(ctx context.Context, step *Step, workflow *Wor
 	if config == nil {
 		return finishForeachFailure(result, "foreach", "step has no foreach configuration")
 	}
+	bodyCount := len(config.Steps)
+	if bodyCount == 0 {
+		bodyCount = len(config.Body)
+	}
+	if bodyCount == 0 && config.Template != "" {
+		bodyCount = 1
+	}
+	releaseBody, err := e.acquireStepMaterialization(ctx, bodyCount)
+	if err != nil {
+		return finishForeachFailure(result, "step_limit", err.Error())
+	}
+	defer releaseBody()
 
 	body, err := foreachBodySteps(step, config)
 	if err != nil {
 		return finishForeachFailure(result, "foreach", err.Error())
 	}
 
-	items, err := e.resolveForeachItems(ctx, config, kind)
+	// Dynamic sources can execute arbitrary shell commands. A preview cannot
+	// safely discover their items; leave static item/model previews unchanged.
+	if e.config.DryRun && stepUsesCommandEvaluation(step) {
+		source := config.Beads
+		if source == "" {
+			source = config.Pairs
+		}
+		if source == "" {
+			source = config.Debates
+		}
+		if source == "" {
+			source = strings.Join(config.Models, ", ")
+		}
+		result.Status = StatusCompleted
+		result.Output = dryRunOutput(step, "Would resolve foreach iteration source: "+truncatePrompt(SanitizeDescriptionForTerminal(source), 200))
+		result.FinishedAt = time.Now()
+		return result
+	}
+
+	evaluationCtx, cancel := e.selectorEvaluationContext(ctx, step)
+	items, err := e.resolveForeachItems(evaluationCtx, config, kind)
+	if evaluationCtx.Err() != nil {
+		err = errors.Join(evaluationCtx.Err(), err)
+	}
+	cancel()
 	if err != nil {
+		if errors.Is(err, errCommandOutputUnsettled) {
+			return finishForeachFailure(result, "execution_unknown", err.Error())
+		}
 		return finishForeachFailure(result, "foreach_source", err.Error())
 	}
 	if len(items) > e.limits.MaxForeachIterations {
@@ -96,9 +151,47 @@ func (e *Executor) executeForeach(ctx context.Context, step *Step, workflow *Wor
 		fmt.Sprintf("Starting %s with %d iterations", kind, len(items)),
 		e.calculateProgress())
 
+	releasePlans, err := e.acquireDefinitionCopies(ctx, body, len(items))
+	if err != nil {
+		return finishForeachFailure(result, "step_limit", err.Error())
+	}
+	defer releasePlans()
 	plans, err := e.prepareForeachIterations(ctx, step, config, kind, body, items)
 	if err != nil {
 		return finishForeachFailure(result, "foreach", err.Error())
+	}
+	// Literal round counts are known without changing the existing timing of
+	// expression evaluation. Admit their complete expansion before any body.
+	if config.MaxRounds.Expr == "" {
+		rounds := config.MaxRounds.Value
+		if rounds <= 0 {
+			rounds = 1
+		}
+		err := e.admitRuntimeBatch(ctx, func(yield func(string) error) error {
+			for _, plan := range plans {
+				if plan.Skipped {
+					continue
+				}
+				for round := 1; ; round++ {
+					for _, child := range plan.Steps {
+						id := child.ID
+						if rounds > 1 {
+							id = fmt.Sprintf("%s_round%d", id, round)
+						}
+						if err := yield(id); err != nil {
+							return err
+						}
+					}
+					if round == rounds {
+						break
+					}
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return finishForeachFailure(result, "step_limit", err.Error())
+		}
 	}
 
 	// bd-gstw3: items-fingerprint drift detection (parity with bd-3awat for
@@ -146,9 +239,14 @@ func (e *Executor) executeForeach(ctx context.Context, step *Step, workflow *Wor
 	// for aggregate, map[string]string keyed by item identity for collect.
 	// Last mode keeps the per-iteration last-writer behavior (declared
 	// non-deterministic for parallel foreach by validateForeachOutputVarMode).
-	e.storeForeachOutputVars(step, config, plans, iterations)
+	outputBindings := e.storeForeachOutputVars(step, config, plans, iterations)
 	if failed > 0 {
 		result.Error = aggregateForeachErrors(iterations, step.ID, total)
+		if findStepAdmissionError(result.Error) != nil {
+			result.Status = StatusFailed
+			result.Error.Type = "step_limit"
+			return result
+		}
 		if onError != ErrorActionContinue {
 			result.Status = StatusFailed
 			e.emitProgress("step_error", step.ID, result.Error.Message, e.calculateProgress())
@@ -161,6 +259,7 @@ func (e *Executor) executeForeach(ctx context.Context, step *Step, workflow *Wor
 		return result
 	}
 	result.Status = StatusCompleted
+	captureParallelForeachOutputs(ctx, step.ID, outputBindings)
 	e.emitProgress("foreach_complete", step.ID, result.Output, e.calculateProgress())
 	slog.Info("foreach step completed",
 		"run_id", e.state.RunID,
@@ -227,6 +326,7 @@ func (e *Executor) resolveForeachItems(ctx context.Context, config *ForeachConfi
 
 	resolver := IterationSourceResolver{
 		ProjectDir: e.config.ProjectDir,
+		Limits:     e.limits,
 		RunBr:      e.config.BeadQueryRunBr,
 	}
 	switch {
@@ -504,6 +604,9 @@ func (e *Executor) executeForeachIterationsSequential(ctx context.Context, paren
 			}
 			break
 		}
+		if iterResult.admissionFailure() != nil {
+			break
+		}
 		if iterResult.failed() && onError == ErrorActionFailFast {
 			for _, remaining := range plans[i+1:] {
 				results = append(results, cancelledForeachIteration(remaining))
@@ -521,8 +624,12 @@ func (e *Executor) executeForeachIterationsParallel(ctx context.Context, parent 
 	if maxConcurrent <= 0 {
 		maxConcurrent = 1
 	}
+	if maxConcurrent > len(plans) {
+		maxConcurrent = len(plans)
+	}
 	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	runCtx, finish := withCommandCancellationScope(runCtx, cancel)
+	defer finish()
 
 	results := make([]foreachIterationResult, len(plans))
 	sem := make(chan struct{}, maxConcurrent)
@@ -542,6 +649,12 @@ func (e *Executor) executeForeachIterationsParallel(ctx context.Context, parent 
 		defer controlMu.Unlock()
 		return breakSeen
 	}
+	cancelledResult := func(plan foreachIterationPlan) foreachIterationResult {
+		if isBreak() {
+			return foreachBreakSkippedIteration(plan)
+		}
+		return cancelledForeachIteration(plan)
+	}
 
 	for i, plan := range plans {
 		if plan.Skipped {
@@ -555,19 +668,37 @@ func (e *Executor) executeForeachIterationsParallel(ctx context.Context, parent 
 			progress.iterationFinished()
 			continue
 		}
+		// Bound goroutine creation as well as active iteration bodies. Taking
+		// the permit inside a worker leaves one blocked goroutine per item.
+		if runCtx.Err() != nil {
+			results[i] = cancelledResult(plan)
+			progress.iterationFinished()
+			continue
+		}
+		select {
+		case sem <- struct{}{}:
+		case <-runCtx.Done():
+			results[i] = cancelledResult(plan)
+			progress.iterationFinished()
+			continue
+		}
+		// Cancellation and a released permit may become ready together.
+		// A successful select must not authorize another dispatch afterward.
+		if runCtx.Err() != nil {
+			<-sem
+			results[i] = cancelledResult(plan)
+			progress.iterationFinished()
+			continue
+		}
 		wg.Add(1)
 		go func(i int, plan foreachIterationPlan) {
-			defer wg.Done()
-			defer progress.iterationFinished()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-runCtx.Done():
-				if isBreak() {
-					results[i] = foreachBreakSkippedIteration(plan)
-				} else {
-					results[i] = cancelledForeachIteration(plan)
-				}
+			defer func() {
+				progress.iterationFinished()
+				<-sem
+				wg.Done()
+			}()
+			if runCtx.Err() != nil {
+				results[i] = cancelledResult(plan)
 				return
 			}
 			iterResult := e.executeForeachIteration(runCtx, parent, workflow, plan, onError)
@@ -658,6 +789,29 @@ func (e *Executor) executeForeachIteration(ctx context.Context, parent *Step, wo
 	}
 
 	for round := startRound; round <= maxRounds; round++ {
+		if err := e.admitRuntimeBatch(ctx, func(yield func(string) error) error {
+			for _, child := range plan.Steps {
+				id := child.ID
+				if maxRounds > 1 {
+					id = fmt.Sprintf("%s_round%d", id, round)
+				}
+				if err := yield(id); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			iterResult.Error = err.Error()
+			if isStepAdmissionError(err) {
+				iterResult.admissionError = &StepError{Type: "step_limit", Message: err.Error(), Timestamp: time.Now()}
+			} else if err == ctx.Err() {
+				// Cancellation can arrive before any child exists. Preserve
+				// its provenance so a sibling's loop break can normalize it.
+				iterResult.SkipKind = SkipKindCancelled
+				iterResult.SkipReason = err.Error()
+			}
+			return iterResult
+		}
 		// bd-2ubxp.20: bind round/rounds_remaining/loop.round on a derived
 		// context instead of writing to shared state.Variables, so parallel
 		// iterations don't race on each other's round values.
@@ -667,11 +821,25 @@ func (e *Executor) executeForeachIteration(ctx context.Context, parent *Step, wo
 		}
 
 		stepsForRound := plan.Steps
+		releaseRound := func() {}
 		if maxRounds > 1 {
+			var err error
+			releaseRound, err = e.acquireStepMaterialization(ctx, len(plan.Steps))
+			if err != nil {
+				iterResult.Error = err.Error()
+				if isStepAdmissionError(err) {
+					iterResult.admissionError = &StepError{Type: "step_limit", Message: err.Error(), Timestamp: time.Now()}
+				} else if err == ctx.Err() {
+					iterResult.SkipKind = SkipKindCancelled
+					iterResult.SkipReason = err.Error()
+				}
+				return iterResult
+			}
 			stepsForRound = rewriteRoundStepIDs(plan.Steps, round)
 		}
 
 		exit := e.runForeachIterationRound(roundCtx, parent, workflow, plan, parentOnError, stepsForRound, &iterResult)
+		releaseRound()
 		if exit {
 			return iterResult
 		}
@@ -735,8 +903,21 @@ func (e *Executor) runForeachIterationRound(ctx context.Context, parent *Step, w
 
 		step := stepsForRound[i]
 		result := e.executeForeachNestedStep(ctx, &step, workflow)
+		unsettled := findStepAdmissionError(result.Error) == nil &&
+			(e.hasUnresolvedCommandExecutionForOutcome(&step, &result) || e.hasUnresolvedCommandEvaluation(&step))
+		if unsettled {
+			result = unsettledProcessStepFailure(result, fmt.Errorf("%w for %q", errStepProcessUnsettled, step.ID))
+		}
 		iterResult.Results = append(iterResult.Results, result)
 		e.storeForeachNestedResult(&step, result)
+		if findStepAdmissionError(result.Error) != nil {
+			iterResult.Error = resultErrorMessage(result)
+			return true
+		}
+		if unsettled {
+			iterResult.Error = resultErrorMessage(result)
+			return true
+		}
 
 		if result.Status == StatusSkipped {
 			if step.LoopControl == LoopControlBreak || step.LoopControl == LoopControlContinue {
@@ -874,6 +1055,12 @@ func (e *Executor) logForeachLoopControl(control LoopControl, workflow *Workflow
 }
 
 func (e *Executor) executeForeachNestedStep(ctx context.Context, step *Step, workflow *Workflow) StepResult {
+	if err := e.admitRuntimeIDs(ctx, []string{step.ID}); err != nil {
+		return stepAdmissionResult(step, err)
+	}
+	e.markStepInFlight(step.ID, stepKind(step), -1)
+	e.persistState()
+	defer e.clearStepInFlight(step.ID)
 	if step.When != "" {
 		skip, err := e.evaluateConditionCtx(ctx, step.When)
 		if err != nil {
@@ -918,12 +1105,34 @@ func (e *Executor) executeForeachNestedStep(ctx context.Context, step *Step, wor
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		result = e.executeForeachNestedStepOnce(ctx, step, workflow)
 		result.Attempts = attempt
+		if result.Status == StatusCancelled && result.SkipKind == SkipKindCancelledBeforeDispatch {
+			result.Attempts = attempt - 1
+		}
+		if findStepAdmissionError(result.Error) != nil {
+			return result
+		}
+		if err := e.stepAdmissionFailure(ctx); err != nil {
+			if result.Status == StatusCompleted && len(step.OnSuccess) > 0 {
+				return stepAdmissionExecutionFailure(result, err)
+			}
+			return result
+		}
 		if result.Status == StatusCompleted {
-			e.runOnSuccessSteps(ctx, step, workflow)
+			if e.hasUnresolvedCommandExecutionForOutcome(step, &result) || e.hasUnresolvedCommandEvaluation(step) {
+				return unsettledProcessStepFailure(result, fmt.Errorf("%w for %q", errStepProcessUnsettled, step.ID))
+			}
+			if err := e.runOnSuccessSteps(ctx, step, workflow); err != nil {
+				return successHookExecutionFailure(result, err)
+			}
 			return result
 		}
 		if result.Status == StatusSkipped || result.Status == StatusCancelled {
 			return result
+		}
+		if _, pending := e.pendingOnFailureDelivery(step); pending {
+			// Revisit the existing recovery delivery without spending retries
+			// on the settled failure that originally dispatched it.
+			break
 		}
 		if attempt < maxAttempts {
 			select {
@@ -982,12 +1191,12 @@ func (e *Executor) executeForeachNestedStepOnce(ctx context.Context, step *Step,
 // StatusCompleted (skipped, failed, cancelled) contribute no entry — their
 // output is intentionally absent from the aggregate so consumers can
 // distinguish "no result" from "empty result".
-func (e *Executor) storeForeachOutputVars(parent *Step, config *ForeachConfig, plans []foreachIterationPlan, iterations []foreachIterationResult) {
+func (e *Executor) storeForeachOutputVars(parent *Step, config *ForeachConfig, plans []foreachIterationPlan, iterations []foreachIterationResult) map[string]interface{} {
 	if e == nil || e.state == nil || parent == nil || parent.OutputVar == "" {
-		return
+		return nil
 	}
 	if config == nil {
-		return
+		return nil
 	}
 
 	mode := effectiveForeachOutputVarMode(parent, config)
@@ -996,7 +1205,9 @@ func (e *Executor) storeForeachOutputVars(parent *Step, config *ForeachConfig, p
 		// wrote last. Sequential foreach lands on the final iteration's
 		// output deterministically; parallel foreach lands on completion-
 		// order last (validation already warns this is non-deterministic).
-		return
+		e.varMu.RLock()
+		defer e.varMu.RUnlock()
+		return snapshotForeachOutputBindings(e.state, parent.OutputVar)
 	}
 
 	type collected struct {
@@ -1032,6 +1243,9 @@ func (e *Executor) storeForeachOutputVars(parent *Step, config *ForeachConfig, p
 	if e.state.Variables == nil {
 		e.state.Variables = make(map[string]interface{})
 	}
+	// An earlier attempt may have parsed output when this attempt has none.
+	// Absence is part of the checkpoint too; never bind stale parsed values.
+	delete(e.state.Variables, parent.OutputVar+"_parsed")
 
 	switch mode {
 	case OutputVarModeCollect:
@@ -1065,6 +1279,7 @@ func (e *Executor) storeForeachOutputVars(parent *Step, config *ForeachConfig, p
 			e.state.Variables[parent.OutputVar+"_parsed"] = parsed
 		}
 	}
+	return snapshotForeachOutputBindings(e.state, parent.OutputVar)
 }
 
 // effectiveForeachOutputVarMode resolves the cascade Step.OutputVarMode →
@@ -1138,6 +1353,9 @@ func foreachIterationKey(iter foreachIterationResult) string {
 }
 
 func (e *Executor) storeForeachNestedResult(step *Step, result StepResult) {
+	if !e.runtimeIDAdmitted(result.StepID) {
+		return
+	}
 	e.stateMu.Lock()
 	if e.state.Steps == nil {
 		e.state.Steps = make(map[string]StepResult)
@@ -1540,6 +1758,11 @@ func (e *Executor) foreachCompletedIterationIDs(stepID string) map[string]struct
 }
 
 func foreachIterationCancelled(result foreachIterationResult) bool {
+	// A prior cancelled child may have been handled with on_error: continue.
+	// A later admission refusal must remain visible even if a sibling breaks.
+	if result.admissionFailure() != nil {
+		return false
+	}
 	if result.SkipKind == SkipKindCancelled {
 		return true
 	}
@@ -1617,7 +1840,7 @@ func cloneForeachConfig(config *ForeachConfig) *ForeachConfig {
 }
 
 func cloneInterfaceMap(in map[string]interface{}) map[string]interface{} {
-	if len(in) == 0 {
+	if in == nil {
 		return nil
 	}
 	out := make(map[string]interface{}, len(in))
@@ -1631,14 +1854,31 @@ func cloneInterfaceValue(value interface{}) interface{} {
 	switch v := value.(type) {
 	case map[string]interface{}:
 		return cloneInterfaceMap(v)
+	case map[string]string:
+		if v == nil {
+			return map[string]string(nil)
+		}
+		out := make(map[string]string, len(v))
+		for key, value := range v {
+			out[key] = value
+		}
+		return out
 	case []interface{}:
+		if v == nil {
+			return []interface{}(nil)
+		}
 		out := make([]interface{}, len(v))
 		for i, item := range v {
 			out[i] = cloneInterfaceValue(item)
 		}
 		return out
 	case []string:
-		return append([]string(nil), v...)
+		if v == nil {
+			return []string(nil)
+		}
+		out := make([]string, len(v))
+		copy(out, v)
+		return out
 	default:
 		return value
 	}

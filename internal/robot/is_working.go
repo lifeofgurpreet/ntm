@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
-	"github.com/Dicklesworthstone/ntm/internal/process"
 	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/internal/util"
 )
 
 // =============================================================================
@@ -122,6 +122,12 @@ type PaneWorkStatus struct {
 	// present only under --semantic and omitted entirely otherwise. It is
 	// advisory: it never changes IsWorking/IsIdle/Recommendation above.
 	SemanticProgress *SemanticProgress `json:"semantic_progress,omitempty"`
+
+	// paneType is the pane's tmux-recorded agent type (paneAgentType), or ""
+	// when the pane was not observed. Unlike AgentType it is never rewritten
+	// by output parsing, so it can tell a user shell from an agent whose
+	// type the parser could not confirm (ntm#335). Not serialized.
+	paneType string
 }
 
 // IsWorkingSummary provides aggregate statistics across all panes.
@@ -442,6 +448,13 @@ func GetIsWorking(ctx context.Context, opts IsWorkingOptions) (*IsWorkingOutput,
 			continue
 		}
 		content := paneObservation.RawOutput
+		// Use the same visible frame as the canonical observer. capture-pane
+		// includes scrollback above short panes; treating that history as live
+		// can restore a stale spinner, limit, or dialog after the observer has
+		// already established that the current composer is idle.
+		if paneObservation.Metadata.Height > 0 {
+			content = util.GetLastNLines(content, paneObservation.Metadata.Height)
+		}
 
 		if paneObservation.Current.Status.State == statuspkg.StateUnknown {
 			// The richer parser below may still recognize provider-specific UI
@@ -461,6 +474,7 @@ func GetIsWorking(ctx context.Context, opts IsWorkingOptions) (*IsWorkingOutput,
 			workStatus.Confidence = 0
 			workStatus.Indicators = WorkIndicators{Work: []string{}, Limit: []string{}}
 			workStatus.IndicatorBasis = "parse_error"
+			workStatus.SafeToDispatch = false
 			output.Panes[paneKey] = workStatus
 			output.Summary.ErrorCount++
 			continue
@@ -530,6 +544,13 @@ func GetIsWorking(ctx context.Context, opts IsWorkingOptions) (*IsWorkingOutput,
 		applyCanonicalWorkSafety(&status, paneObservation, liveBusy)
 		status.IndicatorBasis = workIndicatorBasis(state, liveBusy, parsedStatus, status, paneObservation)
 		applyInteractiveGateOverride(&status, state.Type, content, paneObservation.Metadata.Width)
+		applyProviderErrorOverride(&status, state.Type, content)
+		// The observation is necessary but not sufficient: a parser or modal
+		// override can discover a blocker in an otherwise idle frame. Never
+		// advertise dispatchability alongside a final blocking verdict.
+		status.SafeToDispatch = status.SafeToDispatch && status.IsIdle &&
+			!status.IsWorking && !status.IsRateLimited && !status.AgentCLIDead &&
+			status.Recommendation == string(agent.RecommendSafeToRestart)
 
 		// Ensure indicators are never nil
 		if status.Indicators.Work == nil {
@@ -540,7 +561,15 @@ func GetIsWorking(ctx context.Context, opts IsWorkingOptions) (*IsWorkingOutput,
 		}
 
 		if opts.Verbose {
+			// Keep the full-capture diagnostic sample even though readiness is
+			// classified from the visible frame only. Let the parser retain its
+			// existing ANSI and carriage-return normalization for that sample.
 			status.RawSample = state.RawSample
+			if content != paneObservation.RawOutput {
+				if diagnostic, err := parser.ParseWithHint(paneObservation.RawOutput, paneHint); err == nil {
+					status.RawSample = diagnostic.RawSample
+				}
+			}
 		}
 
 		// OPTIONAL semantic-progress signal (#199). Computed ONLY under
@@ -624,18 +653,17 @@ func paneWorkStatusFromObservation(observation statuspkg.PaneObservation) PaneWo
 		ObservationError:      observation.Current.Error,
 		SafeToDispatch:        observation.SafeToDispatch(),
 	}
-	// Pane age comes from the shell PID's process start time: tmux has no
-	// per-pane creation-time format variable, and the shell PID is replaced
-	// on respawn — exactly the "current incarnation" semantics age-based
-	// replacement policies need (ntm-qvpm). Best-effort: a vanished PID
-	// simply omits the fields.
-	if pid := observation.Metadata.PID; pid > 0 {
-		if startedAt, err := process.StartTime(pid); err == nil {
-			result.PaneStartedAt = FormatTimestamp(startedAt)
-			if uptime := int64(time.Since(startedAt).Seconds()); uptime > 0 {
-				result.AgentUptimeSeconds = uptime
-			}
+	// Pane age is the current shell incarnation's (PaneStartedAt) — exactly
+	// the semantics age-based replacement policies need (ntm-qvpm).
+	// Best-effort: a vanished PID simply omits the fields.
+	if startedAt, ok := PaneStartedAt(observation.Metadata.PID); ok {
+		result.PaneStartedAt = FormatTimestamp(startedAt)
+		if uptime := int64(time.Since(startedAt).Seconds()); uptime > 0 {
+			result.AgentUptimeSeconds = uptime
 		}
+	}
+	if strings.TrimSpace(observation.Metadata.ID) != "" {
+		result.paneType = paneAgentType(observation.Metadata)
 	}
 	result.PanePID = observation.Metadata.PID
 	result.PaneCurrentCommand = observation.Metadata.Command
@@ -681,6 +709,27 @@ func applyInteractiveGateOverride(workStatus *PaneWorkStatus, agentType agent.Ag
 	workStatus.Recommendation = "MANUAL_INTERVENTION"
 	workStatus.RecommendationReason = fmt.Sprintf("Blocked on interactive gate screen (%q); needs a keystroke before the pane can accept work", gate)
 	workStatus.IndicatorBasis = "interactive_gate"
+	return true
+}
+
+// applyProviderErrorOverride names a retryable provider failure. Oh My Pi ends
+// a failed turn with a dismissable error block above its quiet composer
+// ("server_error: ERROR" from a live OpenRouter failure); the pane accepts
+// input and any new message retries, so it is neither idle-after-completion
+// (orchestrators must not treat the task as done or feed unrelated work) nor
+// a dead pane that needs a restart. Reports true when the override fired.
+func applyProviderErrorOverride(workStatus *PaneWorkStatus, agentType agent.AgentType, content string) bool {
+	if workStatus == nil || workStatus.IsWorking || agentType.Canonical() != agent.AgentTypeOmp {
+		return false
+	}
+	summary, ok := agent.OmpProviderError(content)
+	if !ok {
+		return false
+	}
+	workStatus.IsIdle = false
+	workStatus.Recommendation = string(agent.RecommendErrorState)
+	workStatus.RecommendationReason = fmt.Sprintf("Provider error %q ended the turn; %s", summary, agent.OmpProviderErrorRecovery)
+	workStatus.IndicatorBasis = "provider_error"
 	return true
 }
 
@@ -855,7 +904,8 @@ func selectIsWorkingPanes(session string, allPanes []tmux.Pane, requested []int)
 			}
 			continue
 		}
-		// Multiple panes: skip this window's lowest-index pane (control pane).
+		// Multiple panes: skip this window's lowest-index pane (control pane)
+		// unless ntm knows it runs an agent (see paneIsDefaultControlPane).
 		minIdx := wp[0].Index
 		for _, p := range wp[1:] {
 			if p.Index < minIdx {
@@ -863,12 +913,28 @@ func selectIsWorkingPanes(session string, allPanes []tmux.Pane, requested []int)
 			}
 		}
 		for _, p := range wp {
-			if p.Index != minIdx {
+			if p.Index != minIdx || !paneIsDefaultControlPane(p) {
 				out = append(out, build(p))
 			}
 		}
 	}
 	return out
+}
+
+// paneIsDefaultControlPane reports whether a lowest-index pane that the "all
+// agent panes" defaults would skip really is a control pane. A pane whose agent
+// type ntm knows — recorded by `ntm adopt` / spawn in @ntm_agent_type, carried
+// in an NTM title, or detected from its process — is an agent even at the
+// lowest index: adopted sessions and --no-user spawns have no user pane, and
+// with pane-base-index 1 their first agent is pane 1. Only user and
+// unclassifiable panes keep the historical control-pane skip.
+func paneIsDefaultControlPane(p tmux.Pane) bool {
+	switch paneAgentType(p) {
+	case "user", "unknown":
+		return true
+	default:
+		return false
+	}
 }
 
 // sessionSpansMultipleWindows reports whether the session's panes live in more

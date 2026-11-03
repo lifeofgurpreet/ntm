@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -456,16 +457,66 @@ func TestHandlePatchConfigV1(t *testing.T) {
 	})
 
 	t.Run("update project dir", func(t *testing.T) {
-		body := `{"project_dir":"/new/dir"}`
-		req := httptest.NewRequest(http.MethodPatch, "/api/v1/config", strings.NewReader(body))
+		project := t.TempDir()
+		want, err := filepath.EvalSymlinks(project)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cwd, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		relative, err := filepath.Rel(cwd, project)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := json.Marshal(map[string]string{"project_dir": relative})
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv.mailUnavailableUntil = time.Now().Add(time.Hour)
+		req := httptest.NewRequest(http.MethodPatch, "/api/v1/config", strings.NewReader(string(body)))
 		rec := httptest.NewRecorder()
 		srv.handlePatchConfigV1(rec, req)
 
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200", rec.Code)
 		}
-		if srv.projectDir != "/new/dir" {
-			t.Errorf("projectDir = %q, want /new/dir", srv.projectDir)
+		if srv.projectDir != want {
+			t.Errorf("projectDir = %q, want %q", srv.projectDir, want)
+		}
+		if srv.mailClient != nil || !srv.mailUnavailableUntil.IsZero() {
+			t.Fatal("project change did not reset the cached mail client and availability verdict")
+		}
+	})
+
+	t.Run("invalid project leaves configuration intact", func(t *testing.T) {
+		file := filepath.Join(t.TempDir(), "file")
+		if err := os.WriteFile(file, []byte("not a directory"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		beforeProject := srv.projectDir
+		beforeOrigins := append([]string(nil), srv.corsAllowedOrigins...)
+		srv.mailClient = deadAgentMailClient(t)
+		beforeClient := srv.mailClient
+		srv.mailUnavailableUntil = time.Now().Add(time.Hour)
+		beforeUnavailable := srv.mailUnavailableUntil
+		for _, path := range []string{filepath.Join(t.TempDir(), "missing"), file} {
+			body, err := json.Marshal(map[string]interface{}{
+				"project_dir": path, "allowed_origins": []string{"https://should-not-apply.example"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPatch, "/api/v1/config", strings.NewReader(string(body)))
+			rec := httptest.NewRecorder()
+			srv.handlePatchConfigV1(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("invalid project %q accepted: %d %s", path, rec.Code, rec.Body)
+			}
+			if srv.projectDir != beforeProject || !reflect.DeepEqual(srv.corsAllowedOrigins, beforeOrigins) || srv.mailClient != beforeClient || !srv.mailUnavailableUntil.Equal(beforeUnavailable) {
+				t.Fatalf("rejected project %q changed server configuration or mail cache", path)
+			}
 		}
 	})
 
@@ -552,22 +603,6 @@ func TestHandleSessionV1EmptyID(t *testing.T) {
 	srv.handleSessionV1(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
-	}
-}
-
-func TestHandleSessionAgentsV1(t *testing.T) {
-	srv, _ := setupTestServer(t)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/sessions/test/agents", nil)
-	rec := httptest.NewRecorder()
-
-	srv.handleSessionAgentsV1(rec, req, "test-session")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	var resp map[string]interface{}
-	json.NewDecoder(rec.Body).Decode(&resp)
-	if resp["count"] == nil {
-		t.Error("expected count field")
 	}
 }
 
@@ -738,6 +773,16 @@ func TestHandleCASSStatus(t *testing.T) {
 	// "installed" field should be present regardless
 	if _, ok := resp["installed"]; !ok {
 		t.Error("expected 'installed' field")
+	}
+	// cass status carries no version and no index byte size: the version comes
+	// from `cass --version` and the size from database.db_bytes.
+	if resp["installed"] == true {
+		if v, _ := resp["version"].(string); v == "" {
+			t.Errorf("version = %v, want the installed cass version", resp["version"])
+		}
+		if size, _ := resp["database_size"].(float64); size <= 0 {
+			t.Errorf("database_size = %v, want cass's database.db_bytes", resp["database_size"])
+		}
 	}
 }
 
@@ -2439,6 +2484,7 @@ func TestApprovalEndToEnd(t *testing.T) {
 
 func TestHandleSafetyInstallV1(t *testing.T) {
 	srv, _ := setupTestServer(t)
+	t.Setenv("HOME", t.TempDir()) // never touch the developer's ~/.ntm or ~/.claude
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/safety/install",
 		strings.NewReader(`{"force":true}`))
 	req.Header.Set("Content-Length", "15")
@@ -2452,6 +2498,7 @@ func TestHandleSafetyInstallV1(t *testing.T) {
 
 func TestHandleSafetyUninstallV1(t *testing.T) {
 	srv, _ := setupTestServer(t)
+	t.Setenv("HOME", t.TempDir()) // never touch the developer's ~/.ntm or ~/.claude
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/safety/uninstall", nil)
 	rec := httptest.NewRecorder()
 	srv.handleSafetyUninstallV1(rec, req)

@@ -5,6 +5,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,8 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+
+	"github.com/Dicklesworthstone/ntm/internal/bv"
 )
 
 // IterationSourceResolver expands foreach iteration source expressions into
@@ -19,8 +22,24 @@ import (
 // runners default to real /bin/sh and `br` exec.
 type IterationSourceResolver struct {
 	ProjectDir string
+	Limits     LimitsConfig
 	RunShell   func(ctx context.Context, shellCmd string) ([]byte, error)
 	RunBr      func(ctx context.Context, args []string) ([]byte, error)
+}
+
+// A source evaluation has the same timeout selection as a command step, but
+// its deadline must not become the lifetime of a branch or foreach body.
+// Callers release this context immediately after resolving the source.
+func (e *Executor) selectorEvaluationContext(ctx context.Context, step *Step) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timeout := e.config.DefaultTimeout
+	if step.Timeout.Duration > 0 {
+		timeout = step.Timeout.Duration
+	}
+	bounded, cancel := context.WithTimeout(ctx, timeout)
+	return e.commandEvaluationContext(bounded, step), cancel
 }
 
 // ResolveItems expands a foreach.Items expression to a uniform item list.
@@ -540,26 +559,56 @@ func (r *IterationSourceResolver) ResolveDebates(ctx context.Context, expr strin
 
 // runShell executes a shell command, defaulting to /bin/sh -c in ProjectDir.
 func (r *IterationSourceResolver) runShell(ctx context.Context, shellCmd string) ([]byte, error) {
-	if r.RunShell != nil {
-		return r.RunShell(ctx, shellCmd)
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", shellCmd)
-	configureCommandProcessGroup(cmd)
-	cmd.Cancel = func() error { return cancelCommandProcessGroup(cmd) }
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	limits := r.Limits.EffectiveLimits()
+	if r.RunShell != nil {
+		out, err := r.RunShell(ctx, shellCmd)
+		return checkedIterationSourceOutput(ctx, out, err, limits.MaxCommandStdoutBytes)
+	}
+	cmd := exec.Command("/bin/sh", "-c", shellCmd)
 	if r.ProjectDir != "" {
 		cmd.Dir = r.ProjectDir
 	}
-	return cmd.Output()
+	return runCommandOutput(ctx, cmd, limits.MaxCommandStdoutBytes, limits.MaxCommandStderrBytes)
 }
 
 // runBr executes the br CLI with the given args, defaulting to ProjectDir.
 func (r *IterationSourceResolver) runBr(ctx context.Context, args []string) ([]byte, error) {
-	if r.RunBr != nil {
-		return r.RunBr(ctx, args)
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	cmd := exec.CommandContext(ctx, "br", args...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	limits := r.Limits.EffectiveLimits()
+	if r.RunBr != nil {
+		out, err := r.RunBr(ctx, args)
+		return checkedIterationSourceOutput(ctx, out, err, limits.MaxCommandStdoutBytes)
+	}
+	cmd := exec.Command("br", bv.BeadsReadArgs(r.ProjectDir, args)...)
 	if r.ProjectDir != "" {
 		cmd.Dir = r.ProjectDir
 	}
-	return cmd.Output()
+	return runCommandOutput(ctx, cmd, limits.MaxCommandStdoutBytes, limits.MaxCommandStderrBytes)
+}
+
+// Injected runners own their execution and allocation, but their results must
+// obey the same admission boundary. Never parse cancelled or oversized output
+// into a partial foreach work set, even if a runner returns it with nil error.
+func checkedIterationSourceOutput(ctx context.Context, out []byte, err error, stdoutLimit int64) ([]byte, error) {
+	if ctx.Err() != nil {
+		return nil, errors.Join(ctx.Err(), err)
+	}
+	if int64(len(out)) > stdoutLimit {
+		return nil, errors.Join(fmt.Errorf("%w: iteration source returned %d bytes (limit %d)", errCommandOutputLimit, len(out), stdoutLimit), err)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }

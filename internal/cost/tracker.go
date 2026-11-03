@@ -66,16 +66,49 @@ func normalizeModelName(model string) string {
 	return model
 }
 
-// GetModelPricing returns the pricing for a model.
-// If the model is not found, returns default pricing.
-func GetModelPricing(model string) ModelPricing {
-	if pricing, ok := modelPricing[model]; ok {
-		return pricing
+// PricingMatch describes how a price was resolved, because "we have a number"
+// and "we know this model's price" are different claims.
+type PricingMatch int
+
+const (
+	// PricingUnknown means nothing matched and the default row was used. The
+	// amount is a guessed rate, not this model's price.
+	PricingUnknown PricingMatch = iota
+	// PricingFamily means a shorter family prefix matched — claude-opus-5
+	// priced from the claude-opus row. The family's rate is a reasonable
+	// stand-in but was never verified for this model, and a new generation
+	// routinely reprices.
+	PricingFamily
+	// PricingExact means this model is in the table by name.
+	PricingExact
+)
+
+// Known reports whether the price came from an entry for this model or its
+// family, as opposed to the default row.
+func (m PricingMatch) Known() bool { return m != PricingUnknown }
+
+// PricingTableVintage is when the price table below was last revised. Surface
+// it anywhere prices are shown: it is over a year old, and models released
+// since are priced by family prefix or by the default row rather than by any
+// figure anyone checked.
+const PricingTableVintage = "May 2025"
+
+// GetModelPricingInfo returns the pricing for a model and how it was resolved.
+//
+// Anything other than PricingExact means the caller is holding a rate that was
+// never verified for this model: gpt-6-astra and gemini-3.1-pro-preview fall to
+// the default row (which overstates Gemini severalfold), and claude-opus-5 is
+// priced from the claude-opus family entry. Callers that show money must
+// surface the difference rather than presenting any of it as this model's
+// price.
+func GetModelPricingInfo(model string) (ModelPricing, PricingMatch) {
+	if pricing, ok := modelPricing[model]; ok && model != "default" {
+		return pricing, PricingExact
 	}
 
 	normalized := normalizeModelName(model)
-	if pricing, ok := modelPricing[normalized]; ok {
-		return pricing
+	if pricing, ok := modelPricing[normalized]; ok && normalized != "default" {
+		return pricing, PricingExact
 	}
 
 	// Prefix match for variants (longest key first).
@@ -91,14 +124,14 @@ func GetModelPricing(model string) ModelPricing {
 	})
 	for _, key := range keys {
 		if strings.HasPrefix(normalized, key) {
-			return modelPricing[key]
+			return modelPricing[key], PricingFamily
 		}
 	}
 
 	if pricing, ok := modelPricing["default"]; ok {
-		return pricing
+		return pricing, PricingUnknown
 	}
-	return ModelPricing{}
+	return ModelPricing{}, PricingUnknown
 }
 
 // EstimateTokens estimates the token count for text.
@@ -107,7 +140,8 @@ func EstimateTokens(text string) int {
 	return tokens.EstimateTokens(text)
 }
 
-// FormatCost formats a USD amount as a string.
+// FormatCost formats a USD amount as a string. Use it for amounts that came
+// from a provider; for locally estimated amounts use FormatCostEstimate.
 func FormatCost(usd float64) string {
 	if usd < 0.01 {
 		return fmt.Sprintf("$%.4f", usd)
@@ -116,4 +150,21 @@ func FormatCost(usd float64) string {
 		return fmt.Sprintf("$%.3f", usd)
 	}
 	return fmt.Sprintf("$%.2f", usd)
+}
+
+// FormatCostEstimate formats a locally estimated USD amount.
+//
+// Estimates come from a ~3.5-chars-per-token count of scraped pane output
+// multiplied by a price table, so the input is accurate to roughly a factor of
+// two. Rendering that as "$0.0137" claims precision to a hundredth of a cent
+// that the number does not have, so estimates carry a "~" and stop at cents,
+// and anything under a cent says so rather than inventing digits.
+func FormatCostEstimate(usd float64) string {
+	if usd <= 0 {
+		return "~$0"
+	}
+	if usd < 0.01 {
+		return "<$0.01"
+	}
+	return fmt.Sprintf("~$%.2f", usd)
 }

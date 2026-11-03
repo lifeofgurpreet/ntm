@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -84,14 +85,23 @@ func (e *Executor) executeBeadQuery(ctx context.Context, step *Step, workflow *W
 
 	resolver := IterationSourceResolver{
 		ProjectDir: e.config.ProjectDir,
+		Limits:     e.limits,
 		RunBr:      e.config.BeadQueryRunBr,
 	}
-	out, err := resolver.runBr(ctx, args)
+	evaluationCtx, cancel := e.selectorEvaluationContext(ctx, step)
+	defer cancel()
+	out, err := resolver.runBr(evaluationCtx, args)
 	if err != nil {
 		result.Status = StatusFailed
-		result.Error = stepRuntimeError(step, "bead_query", "bead_query",
+		errorType := "bead_query"
+		hint := "verify br is installed and project_dir points at a Beads repo"
+		if errors.Is(err, errCommandOutputUnsettled) {
+			errorType = "execution_unknown"
+			hint = "inspect the original query process and its effects before explicitly authorizing replay"
+		}
+		result.Error = stepRuntimeError(step, "bead_query", errorType,
 			fmt.Sprintf("br list failed: %v", err),
-			"verify br is installed and project_dir points at a Beads repo",
+			hint,
 			err.Error())
 		result.FinishedAt = time.Now()
 		return result
@@ -124,6 +134,15 @@ func (e *Executor) executeBeadQuery(ctx context.Context, step *Step, workflow *W
 		result.Error = stepRuntimeError(step, "bead_query", "bead_query",
 			fmt.Sprintf("failed to encode bead records: %v", err),
 			"check for unsupported values in br output",
+			err.Error())
+		result.FinishedAt = time.Now()
+		return result
+	}
+	if err := evaluationCtx.Err(); err != nil {
+		result.Status = StatusFailed
+		result.Error = stepRuntimeError(step, "bead_query", "bead_query",
+			fmt.Sprintf("query evaluation cancelled: %v", err),
+			"check the query deadline before retrying",
 			err.Error())
 		result.FinishedAt = time.Now()
 		return result

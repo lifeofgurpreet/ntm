@@ -6,14 +6,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
+	approvalpkg "github.com/Dicklesworthstone/ntm/internal/approval"
 	"github.com/Dicklesworthstone/ntm/internal/policy"
 	"github.com/Dicklesworthstone/ntm/internal/robot/adapters"
 )
@@ -110,6 +115,7 @@ type ForceReleaseRequest struct {
 	AgentName      string `json:"agent_name"`
 	Note           string `json:"note,omitempty"`
 	NotifyPrevious bool   `json:"notify_previous,omitempty"`
+	NewApproval    string `json:"new_approval,omitempty"` // Explicit terminal predecessor; repeated requests reuse its successor.
 }
 
 type MailInboxMessageResponse struct {
@@ -293,29 +299,35 @@ func writeAgentMailHandlerError(
 	notFoundMatch func(error) bool,
 	notImplementedMessage string,
 	hint string,
+	contextDetails ...map[string]interface{},
 ) {
+	var details map[string]interface{}
+	if len(contextDetails) > 0 {
+		details = contextDetails[0]
+	}
 	switch {
 	case agentmail.IsNotImplemented(err):
-		var details map[string]interface{}
 		if hint != "" {
-			details = map[string]interface{}{}
+			if details == nil {
+				details = map[string]interface{}{}
+			}
 			details["hint"] = hint
 		}
 		writeErrorResponse(w, http.StatusNotImplemented, ErrCodeNotImplemented, notImplementedMessage, details, reqID)
 	case notFoundMatch != nil && notFoundMatch(err):
-		writeErrorResponse(w, http.StatusNotFound, notFoundCode, err.Error(), nil, reqID)
+		writeErrorResponse(w, http.StatusNotFound, notFoundCode, err.Error(), details, reqID)
 	case agentmail.IsInvalidRequest(err):
-		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, err.Error(), nil, reqID)
+		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, err.Error(), details, reqID)
 	case agentmail.IsUnauthorized(err):
-		writeErrorResponse(w, http.StatusUnauthorized, ErrCodeUnauthorized, err.Error(), nil, reqID)
+		writeErrorResponse(w, http.StatusUnauthorized, ErrCodeUnauthorized, err.Error(), details, reqID)
 	case agentmail.IsServerUnavailable(err):
-		writeErrorResponse(w, http.StatusServiceUnavailable, ErrCodeMailUnavailable, err.Error(), nil, reqID)
+		writeErrorResponse(w, http.StatusServiceUnavailable, ErrCodeMailUnavailable, err.Error(), details, reqID)
 	case agentmail.IsTransientBusy(err):
-		writeErrorResponse(w, http.StatusServiceUnavailable, ErrCodeServiceUnavail, err.Error(), nil, reqID)
+		writeErrorResponse(w, http.StatusServiceUnavailable, ErrCodeServiceUnavail, err.Error(), details, reqID)
 	case agentmail.IsTimeout(err):
-		writeErrorResponse(w, http.StatusGatewayTimeout, ErrCodeTimeout, err.Error(), nil, reqID)
+		writeErrorResponse(w, http.StatusGatewayTimeout, ErrCodeTimeout, err.Error(), details, reqID)
 	default:
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
+		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), details, reqID)
 	}
 }
 
@@ -338,14 +350,18 @@ func writeAgentMailMessageActionError(w http.ResponseWriter, reqID string, err e
 	}
 }
 
-func writeAgentMailReservationError(w http.ResponseWriter, reqID string, err error, notImplementedMessage string) {
+func writeAgentMailReservationError(w http.ResponseWriter, reqID string, err error, notImplementedMessage string, contextDetails ...map[string]interface{}) {
+	var details map[string]interface{}
+	if len(contextDetails) > 0 {
+		details = contextDetails[0]
+	}
 	switch {
 	case errors.Is(err, agentmail.ErrAgentNotRegistered):
-		writeErrorResponse(w, http.StatusNotFound, ErrCodeAgentNotFound, err.Error(), nil, reqID)
+		writeErrorResponse(w, http.StatusNotFound, ErrCodeAgentNotFound, err.Error(), details, reqID)
 	case agentmail.IsReservationConflict(err):
-		writeErrorResponse(w, http.StatusConflict, ErrCodeConflict, err.Error(), nil, reqID)
+		writeErrorResponse(w, http.StatusConflict, ErrCodeConflict, err.Error(), details, reqID)
 	default:
-		writeAgentMailHandlerError(w, reqID, err, ErrCodeNotFound, agentmail.IsNotFound, notImplementedMessage, "")
+		writeAgentMailHandlerError(w, reqID, err, ErrCodeNotFound, agentmail.IsNotFound, notImplementedMessage, "", details)
 	}
 }
 
@@ -369,6 +385,62 @@ func writeAgentMailSendActionError(w http.ResponseWriter, reqID string, err erro
 	}
 }
 
+type mailProjectScopeKey struct{}
+
+type mailProjectScope struct {
+	project string
+	err     error
+}
+
+func isAgentMailProjectRoute(path string) bool {
+	return path == "/api/v1/reservations" || strings.HasPrefix(path, "/api/v1/reservations/") ||
+		(strings.HasPrefix(path, "/api/v1/mail/") && strings.TrimSuffix(path, "/") != "/api/v1/mail/health")
+}
+
+// mailProjectScopeMiddleware freezes the effective project before idempotency
+// lookup for both mail and file reservations. A concurrent configuration PATCH
+// must not redirect an in-flight operation or replay a previous project's
+// successful mutation. Resolution errors are handled after the route's
+// permission check, not here.
+func (s *Server) mailProjectScopeMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isAgentMailProjectRoute(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		scope := mailProjectScope{project: s.projectDirSnapshot()}
+		query, err := url.ParseQuery(r.URL.RawQuery)
+		if err != nil {
+			scope.err = fmt.Errorf("invalid project query: %w", err)
+		} else if projects, present := query["project"]; present {
+			if len(projects) != 1 || !filepath.IsAbs(projects[0]) {
+				scope.err = errors.New("project must be a single absolute directory path")
+			} else {
+				scope.project, scope.err = ResolveProjectDir(projects[0])
+			}
+		}
+		ctx := context.WithValue(r.Context(), mailProjectScopeKey{}, scope)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func validateMailProjectScope(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if scope, ok := r.Context().Value(mailProjectScopeKey{}).(mailProjectScope); ok && scope.err != nil {
+			writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, scope.err.Error(), nil, requestIDFromContext(r.Context()))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) mailProjectKey(r *http.Request) string {
+	if scope, ok := r.Context().Value(mailProjectScopeKey{}).(mailProjectScope); ok {
+		return scope.project
+	}
+	return s.projectDirSnapshot()
+}
+
 // registerMailRoutes registers mail and reservation REST endpoints
 func (s *Server) registerMailRoutes(r chi.Router) {
 	r.Route("/mail", func(r chi.Router) {
@@ -376,55 +448,55 @@ func (s *Server) registerMailRoutes(r chi.Router) {
 		r.With(s.RequirePermission(PermReadHealth)).Get("/health", s.handleMailHealth)
 
 		// Projects
-		r.With(s.RequirePermission(PermReadMail)).Get("/projects", s.handleListMailProjects)
+		r.With(s.RequirePermission(PermReadMail), validateMailProjectScope).Get("/projects", s.handleListMailProjects)
 
 		// Agents
 		r.Route("/agents", func(r chi.Router) {
-			r.With(s.RequirePermission(PermReadMail)).Get("/", s.handleListMailAgents)
-			r.With(s.RequirePermission(PermWriteMail)).Post("/", s.handleCreateMailAgent)
-			r.With(s.RequirePermission(PermReadMail)).Get("/{name}", s.handleGetMailAgent)
+			r.With(s.RequirePermission(PermReadMail), validateMailProjectScope).Get("/", s.handleListMailAgents)
+			r.With(s.RequirePermission(PermWriteMail), validateMailProjectScope).Post("/", s.handleCreateMailAgent)
+			r.With(s.RequirePermission(PermReadMail), validateMailProjectScope).Get("/{name}", s.handleGetMailAgent)
 		})
 
 		// Inbox
-		r.With(s.RequirePermission(PermReadMail)).Get("/inbox", s.handleMailInbox)
+		r.With(s.RequirePermission(PermReadMail), validateMailProjectScope).Get("/inbox", s.handleMailInbox)
 
 		// Messages
 		r.Route("/messages", func(r chi.Router) {
-			r.With(s.RequirePermission(PermWriteMail)).Post("/", s.handleSendMessage)
+			r.With(s.RequirePermission(PermWriteMail), validateMailProjectScope).Post("/", s.handleSendMessage)
 			r.Route("/{id}", func(r chi.Router) {
-				r.With(s.RequirePermission(PermReadMail)).Get("/", s.handleGetMessage)
-				r.With(s.RequirePermission(PermWriteMail)).Post("/reply", s.handleReplyMessage)
-				r.With(s.RequirePermission(PermWriteMail)).Post("/read", s.handleMarkMessageRead)
-				r.With(s.RequirePermission(PermWriteMail)).Post("/ack", s.handleAckMessage)
+				r.With(s.RequirePermission(PermReadMail), validateMailProjectScope).Get("/", s.handleGetMessage)
+				r.With(s.RequirePermission(PermWriteMail), validateMailProjectScope).Post("/reply", s.handleReplyMessage)
+				r.With(s.RequirePermission(PermWriteMail), validateMailProjectScope).Post("/read", s.handleMarkMessageRead)
+				r.With(s.RequirePermission(PermWriteMail), validateMailProjectScope).Post("/ack", s.handleAckMessage)
 			})
 		})
 
 		// Search
-		r.With(s.RequirePermission(PermReadMail)).Get("/search", s.handleSearchMessages)
+		r.With(s.RequirePermission(PermReadMail), validateMailProjectScope).Get("/search", s.handleSearchMessages)
 
 		// Threads
-		r.With(s.RequirePermission(PermReadMail)).Get("/threads/{id}/summary", s.handleThreadSummary)
+		r.With(s.RequirePermission(PermReadMail), validateMailProjectScope).Get("/threads/{id}/summary", s.handleThreadSummary)
 
 		// Contacts
 		r.Route("/contacts", func(r chi.Router) {
-			r.With(s.RequirePermission(PermReadMail)).Get("/", s.handleListContacts)
-			r.With(s.RequirePermission(PermWriteMail)).Post("/request", s.handleRequestContact)
-			r.With(s.RequirePermission(PermWriteMail)).Post("/respond", s.handleRespondContact)
-			r.With(s.RequirePermission(PermWriteMail)).Put("/policy", s.handleSetContactPolicy)
+			r.With(s.RequirePermission(PermReadMail), validateMailProjectScope).Get("/", s.handleListContacts)
+			r.With(s.RequirePermission(PermWriteMail), validateMailProjectScope).Post("/request", s.handleRequestContact)
+			r.With(s.RequirePermission(PermWriteMail), validateMailProjectScope).Post("/respond", s.handleRespondContact)
+			r.With(s.RequirePermission(PermWriteMail), validateMailProjectScope).Put("/policy", s.handleSetContactPolicy)
 		})
 	})
 
 	r.Route("/reservations", func(r chi.Router) {
-		r.With(s.RequirePermission(PermReadReservations)).Get("/", s.handleListReservations)
-		r.With(s.RequirePermission(PermWriteReservations)).Post("/", s.handleReservePaths)
-		r.With(s.RequirePermission(PermWriteReservations)).Delete("/", s.handleReleaseReservations)
-		r.With(s.RequirePermission(PermReadReservations)).Get("/conflicts", s.handleReservationConflicts)
+		r.With(s.RequirePermission(PermReadReservations), validateMailProjectScope).Get("/", s.handleListReservations)
+		r.With(s.RequirePermission(PermWriteReservations), validateMailProjectScope).Post("/", s.handleReservePaths)
+		r.With(s.RequirePermission(PermWriteReservations), validateMailProjectScope).Delete("/", s.handleReleaseReservations)
+		r.With(s.RequirePermission(PermReadReservations), validateMailProjectScope).Get("/conflicts", s.handleReservationConflicts)
 
 		r.Route("/{id}", func(r chi.Router) {
-			r.With(s.RequirePermission(PermReadReservations)).Get("/", s.handleGetReservation)
-			r.With(s.RequirePermission(PermWriteReservations)).Post("/release", s.handleReleaseReservationByID)
-			r.With(s.RequirePermission(PermWriteReservations)).Post("/renew", s.handleRenewReservation)
-			r.With(s.RequirePermission(PermForceRelease)).Post("/force-release", s.handleForceReleaseReservation)
+			r.With(s.RequirePermission(PermReadReservations), validateMailProjectScope).Get("/", s.handleGetReservation)
+			r.With(s.RequirePermission(PermWriteReservations), validateMailProjectScope).Post("/release", s.handleReleaseReservationByID)
+			r.With(s.RequirePermission(PermWriteReservations), validateMailProjectScope).Post("/renew", s.handleRenewReservation)
+			r.With(s.RequirePermission(PermForceRelease), validateMailProjectScope).Post("/force-release", s.handleForceReleaseReservation)
 		})
 	})
 }
@@ -496,10 +568,14 @@ func (s *Server) publishMailEvent(agentName, eventType string, payload map[strin
 	s.wsHub.Publish(topic, eventType, payload)
 }
 
-func (s *Server) publishReservationEvent(agentName, eventType string, payload map[string]interface{}) {
+func (s *Server) publishReservationEvent(projectKey, agentName, eventType string, payload map[string]interface{}) {
 	if s.wsHub == nil {
 		return
 	}
+	if payload == nil {
+		payload = make(map[string]interface{})
+	}
+	payload["project_key"] = projectKey
 	topic := "reservations:*"
 	if agentName != "" {
 		topic = "reservations:" + agentName
@@ -563,7 +639,7 @@ func (s *Server) handleListMailProjects(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	project, err := client.EnsureProject(ctx, s.projectDirSnapshot())
+	project, err := client.EnsureProject(ctx, s.mailProjectKey(r))
 	if err != nil {
 		writeAgentMailHandlerError(w, reqID, err, ErrCodeNotFound, agentmail.IsNotFound, "project inspection is not supported by the configured Agent Mail server", "")
 		return
@@ -593,7 +669,7 @@ func (s *Server) handleListMailAgents(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	agents, err := client.ListAgents(ctx, s.projectDirSnapshot())
+	agents, err := client.ListAgents(ctx, s.mailProjectKey(r))
 	if err != nil {
 		writeAgentMailHandlerError(w, reqID, err, ErrCodeNotFound, agentmail.IsNotFound, "agent listing is not supported by the configured Agent Mail server", "")
 		return
@@ -635,7 +711,7 @@ func (s *Server) handleCreateMailAgent(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	agent, err := client.RegisterAgent(ctx, agentmail.RegisterAgentOptions{
-		ProjectKey:      s.projectDirSnapshot(),
+		ProjectKey:      s.mailProjectKey(r),
 		Program:         req.Program,
 		Model:           req.Model,
 		Name:            req.Name,
@@ -676,7 +752,7 @@ func (s *Server) handleGetMailAgent(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	agent, err := client.Whois(ctx, s.projectDirSnapshot(), agentName, true)
+	agent, err := client.Whois(ctx, s.mailProjectKey(r), agentName, true)
 	if err != nil {
 		writeAgentMailAgentActionError(w, reqID, err, "agent lookup is not supported by the configured Agent Mail server")
 		return
@@ -713,7 +789,7 @@ func (s *Server) handleMailInbox(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	opts := agentmail.FetchInboxOptions{
-		ProjectKey: s.projectDirSnapshot(),
+		ProjectKey: s.mailProjectKey(r),
 		AgentName:  agentName,
 	}
 
@@ -795,7 +871,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	result, err := client.SendMessage(ctx, agentmail.SendMessageOptions{
-		ProjectKey:  s.projectDirSnapshot(),
+		ProjectKey:  s.mailProjectKey(r),
 		SenderName:  req.SenderName,
 		To:          req.To,
 		Subject:     req.Subject,
@@ -843,7 +919,7 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	message, err := client.GetMessage(ctx, s.projectDirSnapshot(), messageID)
+	message, err := client.GetMessage(ctx, s.mailProjectKey(r), messageID)
 	if err != nil {
 		writeAgentMailHandlerError(w, reqID, err, ErrCodeMessageNotFound, func(err error) bool {
 			return errors.Is(err, agentmail.ErrMessageNotFound) || agentmail.IsNotFound(err)
@@ -894,7 +970,7 @@ func (s *Server) handleReplyMessage(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	message, err := client.ReplyMessage(ctx, agentmail.ReplyMessageOptions{
-		ProjectKey:    s.projectDirSnapshot(),
+		ProjectKey:    s.mailProjectKey(r),
 		MessageID:     messageID,
 		SenderName:    req.SenderName,
 		BodyMD:        req.BodyMD,
@@ -948,7 +1024,7 @@ func (s *Server) handleMarkMessageRead(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	readResult, err := client.MarkMessageRead(ctx, s.projectDirSnapshot(), agentName, messageID)
+	readResult, err := client.MarkMessageRead(ctx, s.mailProjectKey(r), agentName, messageID)
 	if err != nil {
 		writeAgentMailMessageActionError(w, reqID, err, "marking messages as read is not supported by the configured Agent Mail server")
 		return
@@ -960,8 +1036,9 @@ func (s *Server) handleMarkMessageRead(w http.ResponseWriter, r *http.Request) {
 	}
 	if readResult.Read {
 		eventPayload := map[string]interface{}{
-			"agent_name": agentName,
-			"message_id": messageID,
+			"project_key": s.mailProjectKey(r),
+			"agent_name":  agentName,
+			"message_id":  messageID,
 		}
 		if readResult.ReadAt != nil {
 			eventPayload["read_at"] = readResult.ReadAt
@@ -1008,7 +1085,7 @@ func (s *Server) handleAckMessage(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	ackResult, err := client.AcknowledgeMessage(ctx, s.projectDirSnapshot(), agentName, messageID)
+	ackResult, err := client.AcknowledgeMessage(ctx, s.mailProjectKey(r), agentName, messageID)
 	if err != nil {
 		writeAgentMailMessageActionError(w, reqID, err, "message acknowledgements are not supported by the configured Agent Mail server")
 		return
@@ -1020,8 +1097,9 @@ func (s *Server) handleAckMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	if ackResult.Acknowledged {
 		eventPayload := map[string]interface{}{
-			"agent_name": agentName,
-			"message_id": messageID,
+			"project_key": s.mailProjectKey(r),
+			"agent_name":  agentName,
+			"message_id":  messageID,
 		}
 		if ackResult.AcknowledgedAt != nil {
 			eventPayload["acknowledged_at"] = ackResult.AcknowledgedAt
@@ -1076,7 +1154,7 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results, err := client.SearchMessages(ctx, agentmail.SearchOptions{
-		ProjectKey: s.projectDirSnapshot(),
+		ProjectKey: s.mailProjectKey(r),
 		Query:      query,
 		Limit:      limit,
 	})
@@ -1138,7 +1216,7 @@ func (s *Server) handleThreadSummary(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := client.SummarizeThread(ctx, agentmail.SummarizeThreadOptions{
-		ProjectKey:      s.projectDirSnapshot(),
+		ProjectKey:      s.mailProjectKey(r),
 		ThreadID:        threadID,
 		IncludeExamples: includeExamples,
 		LLMMode:         llmMode,
@@ -1190,7 +1268,7 @@ func (s *Server) handleListContacts(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	contacts, err := client.ListContacts(ctx, s.projectDirSnapshot(), agentName)
+	contacts, err := client.ListContacts(ctx, s.mailProjectKey(r), agentName)
 	if err != nil {
 		writeAgentMailAgentActionError(w, reqID, err, "listing contacts is not supported by the configured Agent Mail server")
 		return
@@ -1232,7 +1310,7 @@ func (s *Server) handleRequestContact(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	result, err := client.RequestContact(ctx, agentmail.RequestContactOptions{
-		ProjectKey: s.projectDirSnapshot(),
+		ProjectKey: s.mailProjectKey(r),
 		FromAgent:  req.FromAgent,
 		ToAgent:    req.ToAgent,
 		ToProject:  req.ToProject,
@@ -1289,7 +1367,7 @@ func (s *Server) handleRespondContact(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	result, err := client.RespondContact(ctx, agentmail.RespondContactOptions{
-		ProjectKey: s.projectDirSnapshot(),
+		ProjectKey: s.mailProjectKey(r),
 		ToAgent:    req.ToAgent,
 		FromAgent:  req.FromAgent,
 		Accept:     req.Accept,
@@ -1357,7 +1435,7 @@ func (s *Server) handleSetContactPolicy(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	result, err := client.SetContactPolicy(ctx, s.projectDirSnapshot(), req.AgentName, req.Policy)
+	result, err := client.SetContactPolicy(ctx, s.mailProjectKey(r), req.AgentName, req.Policy)
 	if err != nil {
 		writeAgentMailAgentActionError(w, reqID, err, "setting contact policy is not supported by the configured Agent Mail server")
 		return
@@ -1384,6 +1462,7 @@ func (s *Server) handleSetContactPolicy(w http.ResponseWriter, r *http.Request) 
 // handleListReservations handles GET /api/v1/reservations
 func (s *Server) handleListReservations(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
+	projectKey := s.mailProjectKey(r)
 
 	agentName := r.URL.Query().Get("agent_name")
 	slog.Info("list reservations", "request_id", reqID, "agent", agentName)
@@ -1403,7 +1482,7 @@ func (s *Server) handleListReservations(w http.ResponseWriter, r *http.Request) 
 
 	// If no agent specified, list all reservations
 	allAgents := agentName == ""
-	reservations, err := client.ListReservations(ctx, s.projectDirSnapshot(), agentName, allAgents)
+	reservations, err := client.ListReservations(ctx, projectKey, agentName, allAgents)
 	if err != nil {
 		writeAgentMailReservationError(w, reqID, err, "listing reservations is not supported by the configured Agent Mail server")
 		return
@@ -1418,6 +1497,7 @@ func (s *Server) handleListReservations(w http.ResponseWriter, r *http.Request) 
 // handleReservePaths handles POST /api/v1/reservations
 func (s *Server) handleReservePaths(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
+	projectKey := s.mailProjectKey(r)
 	slog.Info("reserve paths", "request_id", reqID)
 
 	var req ReservePathsRequest
@@ -1450,7 +1530,7 @@ func (s *Server) handleReservePaths(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := client.ReservePaths(ctx, agentmail.FileReservationOptions{
-		ProjectKey: s.projectDirSnapshot(),
+		ProjectKey: projectKey,
 		AgentName:  req.AgentName,
 		Paths:      req.Paths,
 		TTLSeconds: ttl,
@@ -1466,7 +1546,7 @@ func (s *Server) handleReservePaths(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(result.Granted) > 0 {
-		s.publishReservationEvent(req.AgentName, "reservation.granted", map[string]interface{}{
+		s.publishReservationEvent(projectKey, req.AgentName, "reservation.granted", map[string]interface{}{
 			"agent_name":    req.AgentName,
 			"exclusive":     req.Exclusive,
 			"ttl_seconds":   ttl,
@@ -1476,7 +1556,7 @@ func (s *Server) handleReservePaths(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	if len(result.Conflicts) > 0 {
-		s.publishReservationEvent(req.AgentName, "reservation.conflict", map[string]interface{}{
+		s.publishReservationEvent(projectKey, req.AgentName, "reservation.conflict", map[string]interface{}{
 			"agent_name":     req.AgentName,
 			"paths":          req.Paths,
 			"conflicts":      result.Conflicts,
@@ -1502,6 +1582,7 @@ func (s *Server) handleReservePaths(w http.ResponseWriter, r *http.Request) {
 // handleReleaseReservations handles DELETE /api/v1/reservations
 func (s *Server) handleReleaseReservations(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
+	projectKey := s.mailProjectKey(r)
 	slog.Info("release reservations", "request_id", reqID)
 
 	var req ReleaseReservationsRequest
@@ -1528,7 +1609,7 @@ func (s *Server) handleReleaseReservations(w http.ResponseWriter, r *http.Reques
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	releaseResult, err := client.ReleaseReservations(ctx, s.projectDirSnapshot(), req.AgentName, req.Paths, req.IDs)
+	releaseResult, err := client.ReleaseReservations(ctx, projectKey, req.AgentName, req.Paths, req.IDs)
 	if err != nil {
 		writeAgentMailReservationError(w, reqID, err, "releasing reservations is not supported by the configured Agent Mail server")
 		return
@@ -1547,7 +1628,7 @@ func (s *Server) handleReleaseReservations(w http.ResponseWriter, r *http.Reques
 		if releaseResult.ReleasedAt != nil {
 			eventPayload["released_at"] = releaseResult.ReleasedAt
 		}
-		s.publishReservationEvent(req.AgentName, "reservation.released", eventPayload)
+		s.publishReservationEvent(projectKey, req.AgentName, "reservation.released", eventPayload)
 	}
 
 	response := map[string]interface{}{
@@ -1563,6 +1644,7 @@ func (s *Server) handleReleaseReservations(w http.ResponseWriter, r *http.Reques
 // handleReservationConflicts handles GET /api/v1/reservations/conflicts
 func (s *Server) handleReservationConflicts(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
+	projectKey := s.mailProjectKey(r)
 
 	paths := r.URL.Query()["paths"]
 	if len(paths) == 0 {
@@ -1585,14 +1667,14 @@ func (s *Server) handleReservationConflicts(w http.ResponseWriter, r *http.Reque
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	conflicts, err := client.CheckConflicts(ctx, s.projectDirSnapshot(), paths)
+	conflicts, err := client.CheckConflicts(ctx, projectKey, paths)
 	if err != nil {
 		writeAgentMailReservationError(w, reqID, err, "reservation conflict inspection is not supported by the configured Agent Mail server")
 		return
 	}
 
 	if len(conflicts) > 0 {
-		s.publishReservationEvent("", "reservation.conflict", map[string]interface{}{
+		s.publishReservationEvent(projectKey, "", "reservation.conflict", map[string]interface{}{
 			"paths":          paths,
 			"conflicts":      conflicts,
 			"conflict_count": len(conflicts),
@@ -1608,6 +1690,7 @@ func (s *Server) handleReservationConflicts(w http.ResponseWriter, r *http.Reque
 // handleGetReservation handles GET /api/v1/reservations/{id}
 func (s *Server) handleGetReservation(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
+	projectKey := s.mailProjectKey(r)
 	idStr := chi.URLParam(r, "id")
 
 	slog.Info("get reservation", "request_id", reqID, "reservation_id", idStr)
@@ -1631,7 +1714,7 @@ func (s *Server) handleGetReservation(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	reservation, err := client.GetReservation(ctx, s.projectDirSnapshot(), reservationID)
+	reservation, err := client.GetReservation(ctx, projectKey, reservationID)
 	if err != nil {
 		writeAgentMailReservationError(w, reqID, err, "reservation lookup is not supported by the configured Agent Mail server")
 		return
@@ -1645,6 +1728,7 @@ func (s *Server) handleGetReservation(w http.ResponseWriter, r *http.Request) {
 // handleReleaseReservationByID handles POST /api/v1/reservations/{id}/release
 func (s *Server) handleReleaseReservationByID(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
+	projectKey := s.mailProjectKey(r)
 	idStr := chi.URLParam(r, "id")
 
 	reservationID, err := strconv.Atoi(idStr)
@@ -1674,7 +1758,7 @@ func (s *Server) handleReleaseReservationByID(w http.ResponseWriter, r *http.Req
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	releaseResult, err := client.ReleaseReservations(ctx, s.projectDirSnapshot(), agentName, nil, []int{reservationID})
+	releaseResult, err := client.ReleaseReservations(ctx, projectKey, agentName, nil, []int{reservationID})
 	if err != nil {
 		writeAgentMailReservationError(w, reqID, err, "releasing reservations is not supported by the configured Agent Mail server")
 		return
@@ -1691,7 +1775,7 @@ func (s *Server) handleReleaseReservationByID(w http.ResponseWriter, r *http.Req
 	if releaseResult.ReleasedAt != nil {
 		eventPayload["released_at"] = releaseResult.ReleasedAt
 	}
-	s.publishReservationEvent(agentName, "reservation.released", eventPayload)
+	s.publishReservationEvent(projectKey, agentName, "reservation.released", eventPayload)
 
 	response := map[string]interface{}{
 		"reservation_id": reservationID,
@@ -1707,6 +1791,7 @@ func (s *Server) handleReleaseReservationByID(w http.ResponseWriter, r *http.Req
 // handleRenewReservation handles POST /api/v1/reservations/{id}/renew
 func (s *Server) handleRenewReservation(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
+	projectKey := s.mailProjectKey(r)
 	idStr := chi.URLParam(r, "id")
 
 	reservationID, err := strconv.Atoi(idStr)
@@ -1747,7 +1832,7 @@ func (s *Server) handleRenewReservation(w http.ResponseWriter, r *http.Request) 
 	}
 
 	result, err := client.RenewReservationsWithOptions(ctx, agentmail.RenewReservationsOptions{
-		ProjectKey:     s.projectDirSnapshot(),
+		ProjectKey:     projectKey,
 		AgentName:      req.AgentName,
 		ExtendSeconds:  extendSeconds,
 		ReservationIDs: []int{reservationID},
@@ -1764,7 +1849,7 @@ func (s *Server) handleRenewReservation(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	s.publishReservationEvent(req.AgentName, "reservation.renewed", map[string]interface{}{
+	s.publishReservationEvent(projectKey, req.AgentName, "reservation.renewed", map[string]interface{}{
 		"agent_name":     req.AgentName,
 		"reservation_id": reservationID,
 		"extend_seconds": extendSeconds,
@@ -1777,93 +1862,156 @@ func (s *Server) handleRenewReservation(w http.ResponseWriter, r *http.Request) 
 	}, reqID)
 }
 
-// handleForceReleaseReservation handles POST /api/v1/reservations/{id}/force-release
+// handleForceReleaseReservation handles POST /api/v1/reservations/{id}/force-release.
 func (s *Server) handleForceReleaseReservation(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
-	idStr := chi.URLParam(r, "id")
-
-	reservationID, err := strconv.Atoi(idStr)
-	if err != nil {
-		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "invalid reservation ID", nil, reqID)
+	reservationID, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil || reservationID < 1 {
+		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "reservation ID must be a positive number", nil, reqID)
 		return
 	}
-
 	var req ForceReleaseRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "invalid request body", nil, reqID)
 		return
 	}
-
-	if req.AgentName == "" {
+	if strings.TrimSpace(req.AgentName) == "" {
 		writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest, "agent_name is required", nil, reqID)
 		return
 	}
-
-	// bd-2y2on: the policy's automation.force_release knob governs EVERY
-	// surface that reaches Agent Mail's force_release_file_reservation, not
-	// just the CLI gate — otherwise this endpoint is a trivial bypass around
-	// the two-person workflow. The serve approval endpoints now share the
-	// durable approval store with the CLI (bd-d2uxt), but this endpoint does
-	// not evaluate the approve-and-consume gate itself, so anything but an
-	// explicit "auto" still fails closed and directs callers to the gated
-	// `ntm locks force-release` + `ntm approve` workflow.
-	pol, err := policy.LoadOrDefault()
+	// The lease's project also owns its policy. A server may serve projects
+	// whose force-release settings differ from its working directory; loading
+	// the cwd policy here could silently authorize a release the target forbids.
+	projectKey := s.mailProjectKey(r)
+	var pol *policy.Policy
+	if projectKey == "" {
+		pol, err = policy.LoadOrDefault()
+	} else {
+		pol, err = policy.LoadForProject(projectKey)
+	}
 	if err != nil {
-		// Log the detail server-side only: the load error can embed the policy
-		// file's filesystem path and YAML parse context (quoted file content),
-		// which must not leak to HTTP clients.
 		slog.Error("force-release policy load failed", "request_id", reqID, "error", err)
-		writeErrorResponse(w, http.StatusForbidden, ErrCodeForbidden,
-			"cannot load policy for force-release gate; see server logs", nil, reqID)
-		return
-	}
-	switch pol.ForceReleasePolicy() {
-	case "auto":
-		// Policy explicitly allows unattended force-release.
-	case "never":
-		writeErrorResponse(w, http.StatusForbidden, ErrCodeForbidden,
-			"force-release is disabled by policy (automation.force_release=never)", nil, reqID)
-		return
-	default: // "approval" (and anything unknown) fails closed
-		writeErrorResponse(w, http.StatusForbidden, ErrCodeForbidden,
-			"force-release requires approval (automation.force_release=approval); use the gated `ntm locks force-release` + `ntm approve` workflow — this endpoint has no approval integration", nil, reqID)
+		writeErrorResponse(w, http.StatusForbidden, ErrCodeForbidden, "cannot load policy for force-release gate; see server logs", nil, reqID)
 		return
 	}
 
-	slog.Info("force release reservation", "request_id", reqID, "reservation_id", reservationID, "agent", req.AgentName)
-
-	client, err := s.getMailClient()
-	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to create mail client", nil, reqID)
-		return
+	// Snapshot the canonical project and trusted principal once. Neither a
+	// changed server selection nor an agent_name body field can redirect an
+	// approval to a different project, requester, or Agent Mail actor.
+	operation := approvalpkg.ForceReleaseOperation{
+		ProjectKey:    agentmail.CanonicalProjectKey(projectKey),
+		ReservationID: reservationID, RequestedBy: approvalIdentity(r),
+		AgentName: req.AgentName, Note: req.Note, NotifyPrevious: req.NotifyPrevious,
 	}
-	if client == nil {
-		writeErrorResponse(w, http.StatusServiceUnavailable, ErrCodeMailUnavailable, "Agent Mail server is not available", nil, reqID)
-		return
+	var engine *approvalpkg.Engine
+	if pol.ForceReleasePolicy() != "never" && pol.ForceReleasePolicy() != "auto" {
+		engine = s.requireApprovalEngine(w, reqID)
+		if engine == nil {
+			return
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
+	var client *agentmail.Client
+	loadClient := func() error {
+		if client != nil {
+			return nil
+		}
+		var err error
+		client, err = s.getMailClient()
+		if err != nil {
+			return err
+		}
+		if client == nil {
+			return agentmail.ErrServerUnavailable
+		}
+		return nil
+	}
+	decision, gateErr := engine.EvaluateForceRelease(ctx, pol.ForceReleasePolicy(), operation, req.NewApproval, func(ctx context.Context) (approvalpkg.ForceReleaseLease, error) {
+		if err := loadClient(); err != nil {
+			return approvalpkg.ForceReleaseLease{}, err
+		}
+		reservation, err := client.GetReservation(ctx, operation.ProjectKey, reservationID)
+		if err != nil {
+			return approvalpkg.ForceReleaseLease{}, err
+		}
+		if reservation == nil {
+			return approvalpkg.ForceReleaseLease{}, fmt.Errorf("reservation inspection returned no result")
+		}
+		return approvalpkg.ForceReleaseLease{
+			Holder: reservation.AgentName, Path: reservation.PathPattern,
+			CreatedAt: reservation.CreatedTS.Time.UTC().Format(time.RFC3339Nano),
+			ExpiresAt: reservation.ExpiresTS.Time.UTC().Format(time.RFC3339Nano),
+			ProjectID: reservation.ProjectID, Exclusive: reservation.Exclusive,
+		}, nil
+	})
+	details := map[string]interface{}{
+		"approval_status":         decision.ApprovalStatus,
+		"operation_key":           decision.OperationKey,
+		"force_release_attempted": false,
+	}
+	if decision.ApprovalID != "" {
+		details["approval_id"] = decision.ApprovalID
+	}
+	if decision.Created {
+		if record, err := engine.Check(ctx, decision.ApprovalID); err == nil {
+			snapshot := approvalFromState(record)
+			s.publishApprovalEvent("approval.requested", map[string]interface{}{
+				"project_key": operation.ProjectKey,
+				"approval_id": snapshot.ID, "action": snapshot.Action, "resource": snapshot.Resource,
+				"requestor": snapshot.Requestor, "reason": snapshot.Reason,
+				"slb_required": snapshot.SLBRequired, "status": snapshot.Status,
+				"expires_at":   snapshot.ExpiresAt.Format(time.RFC3339Nano),
+				"requested_at": snapshot.CreatedAt.Format(time.RFC3339Nano),
+			})
+		}
+	}
+	if gateErr != nil {
+		switch {
+		case errors.Is(gateErr, approvalpkg.ErrNotFound):
+			writeErrorResponse(w, http.StatusNotFound, ErrCodeNotFound, "previous approval not found", details, reqID)
+		case errors.Is(gateErr, approvalpkg.ErrForceReleaseScope):
+			writeErrorResponse(w, http.StatusForbidden, ErrCodeForbidden, gateErr.Error(), details, reqID)
+		default:
+			writeAgentMailReservationError(w, reqID, gateErr, "reservation inspection is not supported by the configured Agent Mail server", details)
+		}
+		return
+	}
+	if !decision.Allowed {
+		status, code := http.StatusForbidden, ErrCodeForbidden
+		switch decision.ApprovalStatus {
+		case "consumed", "expired", "target_changed", "approved":
+			status, code = http.StatusConflict, ErrCodeConflict
+		}
+		writeErrorResponse(w, status, code, decision.Message, details, reqID)
+		return
+	}
 
+	if err := loadClient(); err != nil {
+		writeAgentMailReservationError(w, reqID, err, "force releasing reservations is not supported by the configured Agent Mail server", details)
+		return
+	}
+	details["force_release_attempted"] = true
+	details["execution_status"] = "unconfirmed"
 	result, err := client.ForceReleaseReservation(ctx, agentmail.ForceReleaseOptions{
-		ProjectKey:     s.projectDirSnapshot(),
-		AgentName:      req.AgentName,
-		ReservationID:  reservationID,
-		Note:           req.Note,
-		NotifyPrevious: req.NotifyPrevious,
+		ProjectKey: operation.ProjectKey, AgentName: operation.AgentName, ReservationID: reservationID,
+		Note: operation.Note, NotifyPrevious: operation.NotifyPrevious,
 	})
 	if err != nil {
-		writeAgentMailReservationError(w, reqID, err, "force releasing reservations is not supported by the configured Agent Mail server")
+		if decision.ApprovalID != "" {
+			details["hint"] = "Approval remains consumed. Inspect the reservation before requesting a new authorization with new_approval set to this approval_id."
+		}
+		writeAgentMailReservationError(w, reqID, err, "force releasing reservations is not supported by the configured Agent Mail server", details)
 		return
 	}
 	if result == nil {
-		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, "force release returned no result", nil, reqID)
+		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, "force-release returned no result; inspect reservation state before retrying", details, reqID)
 		return
 	}
 	if !result.Success {
-		details := map[string]interface{}{
-			"notified": result.Notified,
-		}
+		details["execution_status"] = "refused"
+		details["notified"] = result.Notified
 		if result.PreviousHolder != "" {
 			details["previous_holder"] = result.PreviousHolder
 		}
@@ -1875,8 +2023,12 @@ func (s *Server) handleForceReleaseReservation(w http.ResponseWriter, r *http.Re
 	}
 
 	response := map[string]interface{}{
-		"reservation_id": reservationID,
-		"force_released": true,
+		"reservation_id": reservationID, "force_released": true,
+		"notified": result.Notified, "approval_status": decision.ApprovalStatus,
+		"execution_status": "confirmed",
+	}
+	if decision.ApprovalID != "" {
+		response["approval_id"] = decision.ApprovalID
 	}
 	if result.ReleasedAt != nil {
 		response["released_at"] = result.ReleasedAt
@@ -1887,13 +2039,9 @@ func (s *Server) handleForceReleaseReservation(w http.ResponseWriter, r *http.Re
 	if result.PathPattern != "" {
 		response["path_pattern"] = result.PathPattern
 	}
-	response["notified"] = result.Notified
-
 	eventPayload := map[string]interface{}{
-		"agent_name":     req.AgentName,
-		"reservation_id": reservationID,
-		"force_released": true,
-		"notified":       result.Notified,
+		"agent_name": req.AgentName, "reservation_id": reservationID, "force_released": true,
+		"notified": result.Notified, "approval_id": decision.ApprovalID, "requested_by": operation.RequestedBy,
 	}
 	if result.PreviousHolder != "" {
 		eventPayload["previous_holder"] = result.PreviousHolder
@@ -1904,7 +2052,6 @@ func (s *Server) handleForceReleaseReservation(w http.ResponseWriter, r *http.Re
 	if result.ReleasedAt != nil {
 		eventPayload["released_at"] = result.ReleasedAt
 	}
-	s.publishReservationEvent(req.AgentName, "reservation.released", eventPayload)
-
+	s.publishReservationEvent(operation.ProjectKey, req.AgentName, "reservation.released", eventPayload)
 	writeSuccessResponse(w, http.StatusOK, response, reqID)
 }

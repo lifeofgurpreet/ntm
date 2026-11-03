@@ -23,6 +23,8 @@ func (f smartRestartPromptDispatcherFunc) Execute(ctx context.Context, req dispa
 type deterministicSmartRestartExecutor struct {
 	launches                  []string
 	mutations                 []string
+	exitErr                   error
+	shellReturned             *bool
 	shellPID                  int
 	shellPIDErr               error
 	ready                     bool
@@ -51,10 +53,13 @@ func (e *cancelAfterSmartRestartLaunchExecutor) sendKeys(ctx context.Context, se
 func (e *deterministicSmartRestartExecutor) exitAgent(_ context.Context, _ string, _, _ int, _ string, seq *RestartSequence) error {
 	e.mutations = append(e.mutations, "exit")
 	seq.ExitMethod = "test_exit"
-	return nil
+	return e.exitErr
 }
 
-func (*deterministicSmartRestartExecutor) waitForShellReturn(context.Context, string, int, int, time.Duration) (bool, string, error) {
+func (e *deterministicSmartRestartExecutor) waitForShellReturn(context.Context, string, int, int, time.Duration) (bool, string, error) {
+	if e.shellReturned != nil {
+		return *e.shellReturned, "", nil
+	}
 	return true, "", nil
 }
 
@@ -67,6 +72,42 @@ func (e *deterministicSmartRestartExecutor) sendKeys(_ context.Context, _ string
 	e.mutations = append(e.mutations, "send-keys")
 	e.launches = append(e.launches, fmt.Sprintf("%d.%d:%s", win, pane, keys))
 	return nil
+}
+
+func TestSmartRestartEscalationHintPreservesWindow(t *testing.T) {
+	panes := []tmux.Pane{
+		{ID: "%3", WindowIndex: 1, Index: 1, NTMIndex: 21, Type: tmux.AgentCodex},
+		{ID: "%7", WindowIndex: 2, Index: 1, NTMIndex: 99, Type: tmux.AgentCodex},
+	}
+	for _, phase := range []string{"soft-exit", "shell-return"} {
+		t.Run(phase, func(t *testing.T) {
+			executor := &deterministicSmartRestartExecutor{}
+			if phase == "soft-exit" {
+				executor.exitErr = errors.New("agent ignored exit")
+			} else {
+				returned := false
+				executor.shellReturned = &returned
+			}
+			_, err := executeRestart(t.Context(), "project", 2, 1, "codex", SmartRestartOptions{executor: executor})
+			var failure *StructuredError
+			if !errors.As(err, &failure) {
+				t.Fatalf("restart failure=%v, want structured escalation", err)
+			}
+			var selector string
+			for _, word := range strings.Fields(failure.RecoveryHint) {
+				if strings.HasPrefix(word, "--panes=") {
+					selector = strings.TrimPrefix(word, "--panes=")
+				}
+			}
+			selected, resolveErr := tmux.ResolvePaneSelectors(panes, []string{selector}, true)
+			if resolveErr != nil || len(selected) != 1 || selected[0].ID != "%7" {
+				t.Fatalf("escalation hint %q resolves to %+v err=%v, want only %%7", failure.RecoveryHint, selected, resolveErr)
+			}
+			if len(executor.launches) != 0 {
+				t.Fatalf("declined restart launched an agent: %v", executor.launches)
+			}
+		})
+	}
 }
 
 // GH#251 phase 2: grok supports automated relaunch, so grok-only and mixed
@@ -108,6 +149,70 @@ func TestExecuteRestartRelaunchesGrokWithGrokCommand(t *testing.T) {
 	}
 	if len(executor.launches) != 1 || !strings.Contains(executor.launches[0], "grok --always-approve") {
 		t.Fatalf("executeRestart() launches = %v, want the grok launch command", executor.launches)
+	}
+}
+
+func TestExecuteRestartRequiresLocalProcessOperations(t *testing.T) {
+	original := tmux.DefaultClient
+	t.Cleanup(func() { tmux.DefaultClient = original })
+	for _, tc := range []struct {
+		name               string
+		remote             bool
+		hardKill, hardOnly bool
+	}{
+		{name: "remote-soft", remote: true},
+		{name: "remote-fallback", remote: true, hardKill: true},
+		{name: "remote-hard-only", remote: true, hardOnly: true},
+		{name: "local-ordinary"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			remote := ""
+			if tc.remote {
+				remote = "operator@remote-fixture"
+			}
+			tmux.DefaultClient = tmux.NewClient(remote)
+			executor := &deterministicSmartRestartExecutor{
+				shellPID: 321, ready: true, readyConfigured: true, childAlive: true,
+			}
+			seq, err := executeRestart(t.Context(), "remote-fixture", 0, 1, "codex", SmartRestartOptions{
+				HardKill: tc.hardKill, HardKillOnly: tc.hardOnly, executor: executor,
+			})
+			if !tc.remote {
+				if err != nil || seq == nil || !seq.AgentLaunched || len(executor.launches) != 1 {
+					t.Fatalf("ordinary local restart was refused: sequence=%+v err=%v", seq, err)
+				}
+				return
+			}
+			var failure *StructuredError
+			if !errors.As(err, &failure) || failure.Code != ErrCodeInvalidFlag || failure.Phase != "preflight" {
+				t.Fatalf("remote smart restart error=%v, want typed preflight refusal", err)
+			}
+			if seq == nil || seq.LaunchAttempted || seq.HardKillUsed || len(executor.mutations) != 0 ||
+				len(executor.observationContextsActive) != 0 {
+				t.Fatalf("remote smart-restart admission occurred after lifecycle work: sequence=%+v mutations=%v observations=%v", seq, executor.mutations, executor.observationContextsActive)
+			}
+		})
+	}
+}
+
+func TestExecuteRestartReportsReadyRootExecAsAlive(t *testing.T) {
+	for _, kind := range []string{"codex", "cc"} {
+		t.Run(kind, func(t *testing.T) {
+			executor := &deterministicSmartRestartExecutor{
+				shellPID:        321,
+				ready:           true,
+				readyConfigured: true,
+				childAlive:      false,
+			}
+			seq, err := executeRestart(t.Context(), "proj", 0, 1, kind, SmartRestartOptions{executor: executor})
+			if err != nil {
+				t.Fatalf("executeRestart() error=%v", err)
+			}
+			if seq == nil || !seq.AgentLaunched || seq.AgentLaunchStatus != SmartRestartLaunchReady ||
+				seq.ShellPID != 321 || seq.ProcessAlive == nil || !*seq.ProcessAlive {
+				t.Fatalf("ready childless agent lost foreground liveness: %+v", seq)
+			}
+		})
 	}
 }
 
@@ -155,6 +260,18 @@ func TestObserveSmartRestartLaunchAfterCancellationReportsStrongestKnownState(t 
 				ready:           true,
 				readyConfigured: true,
 				childAlive:      true,
+			},
+			wantStatus:       SmartRestartLaunchReady,
+			wantLaunched:     true,
+			wantProcessAlive: pointerToBool(true),
+		},
+		{
+			name: "ready agent execs over root",
+			executor: &deterministicSmartRestartExecutor{
+				shellPID:        104,
+				ready:           true,
+				readyConfigured: true,
+				childAlive:      false,
 			},
 			wantStatus:       SmartRestartLaunchReady,
 			wantLaunched:     true,

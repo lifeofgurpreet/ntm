@@ -157,6 +157,9 @@ type RuntimeAgent struct {
 	LastOutputAgeSec int        `json:"last_output_age_sec"`
 	OutputTailLines  int        `json:"output_tail_lines"`
 
+	// Nil means no usable reading; a measured empty context is a non-nil zero.
+	ContextPercent *float64 `json:"context_percent,omitempty"`
+
 	// Coordination
 	CurrentBead   string `json:"current_bead,omitempty"`
 	PendingMail   int    `json:"pending_mail"`
@@ -668,7 +671,7 @@ type AuditDecision struct {
 }
 
 // =============================================================================
-// Send Operations (idempotent robot send, #245)
+// Send Operations (idempotent robot actuations: send #245, interrupt)
 // =============================================================================
 
 // Send operation lifecycle states.
@@ -677,30 +680,46 @@ const (
 	SendOperationCompleted  = "completed"
 )
 
-// SendOperation is the durable record of one idempotent send operation.
-// It binds a caller-supplied operation ID to the canonical targets and the
-// exact payload NTM attempted to deliver (digest + byte count only — the
-// payload bytes themselves are never persisted), and carries the recorded
-// outcome once the operation completes.
+// Operation kinds: the robot actuation an operation ID is bound to. Operation
+// IDs share one namespace per session across kinds, so reusing an ID for a
+// different kind is a conflict, never a replay.
+const (
+	OperationKindSend      = "send"
+	OperationKindInterrupt = "interrupt"
+)
+
+// SendOperation is the durable record of one idempotent robot actuation
+// (--robot-send or --robot-interrupt with --op-id, or the REST
+// Idempotency-Key equivalents). It binds a caller-supplied operation ID to
+// the actuation kind, the caller's canonical command spec, and the exact
+// payload NTM attempted to deliver (digest + byte count only — the payload
+// bytes themselves are never persisted), and carries the recorded outcome
+// once the operation completes.
 type SendOperation struct {
 	// Identity
 	OperationID string `json:"operation_id"`
 	SessionName string `json:"session_name"`
-	// Provenance is mandatory for newly-created receipts. Historical rows may
-	// be empty because the migration preserves their read compatibility.
-	Actor               string `json:"actor,omitempty"`
-	Origin              string `json:"origin,omitempty"`
-	TargetAuthorization string `json:"target_authorization,omitempty"`
+	// Kind is the actuation the operation ID is bound to (OperationKindSend
+	// or OperationKindInterrupt). Empty is treated as OperationKindSend when
+	// claiming, matching rows written before kinds existed.
+	Kind string `json:"kind"`
 
 	// Binding — BindingHash covers canonical targets + payload digest so a
 	// conflicting reuse of the same operation ID is detectable.
-	BindingHash   string `json:"binding_hash"`
-	PayloadSHA256 string `json:"payload_sha256"`
-	PayloadBytes  int64  `json:"payload_bytes"`
+	BindingHash   string   `json:"binding_hash"`
+	PayloadSHA256 string   `json:"payload_sha256"`
+	PayloadBytes  int64    `json:"payload_bytes"`
+	Targets       []string `json:"targets"`
+
+	// ClaimToken fences each execution attempt. It is replaced on takeover
+	// and never exposed in public receipts. A stale claimant cannot start,
+	// release, or complete a successor's operation.
+	ClaimToken string `json:"-"`
 
 	// Lifecycle
-	Status      string     `json:"status"` // in_progress | completed
-	OutcomeJSON string     `json:"outcome_json,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
-	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	Status            string     `json:"status"` // in_progress | completed
+	OutcomeJSON       string     `json:"outcome_json,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	DispatchStartedAt *time.Time `json:"dispatch_started_at,omitempty"`
+	CompletedAt       *time.Time `json:"completed_at,omitempty"`
 }

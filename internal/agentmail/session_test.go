@@ -1,9 +1,15 @@
 package agentmail
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -115,6 +121,217 @@ func containsHelper(s, substr string) bool {
 }
 
 // Tests for SessionAgentRegistry
+
+func seedRegistryContinuation(t *testing.T) (*SessionAgentRegistry, PaneIdentityBinding, PaneIdentityBinding) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	registry := NewSessionAgentRegistry("continuation", filepath.Join(home, "project"))
+	registry.AddAgent("work__cod_1", "%7", "BlueLake")
+	registry.SetPanePID("%7", 700)
+	registry.SetRegistrationToken("BlueLake", "original-token")
+	registry.AddAgent("other__cc_1", "%8", "RedOak")
+	registry.SetPanePID("%8", 800)
+	registry.SetRegistrationToken("RedOak", "unrelated-token")
+	if err := SaveSessionAgentRegistry(registry); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadSessionAgentRegistry(registry.SessionName, registry.ProjectKey)
+	if err != nil || loaded == nil {
+		t.Fatalf("load seeded registry: %+v, %v", loaded, err)
+	}
+	// The agent may have changed its title since registration. Its exact
+	// physical pane and PID remain the authority for transferring identity.
+	source := PaneIdentityBinding{PaneID: "%7", PaneTitle: "custom working title", PanePID: 700, AgentName: "BlueLake"}
+	replacement := PaneIdentityBinding{PaneID: "%19", PaneTitle: source.PaneTitle, PanePID: 1900, AgentName: source.AgentName}
+	return loaded, source, replacement
+}
+
+func TestRegistryContinuationPreservesRecipientAndFreshCredential(t *testing.T) {
+	registry, source, replacement := seedRegistryContinuation(t)
+	oldReceipt := []byte("{\"name\":\"BlueLake\",\"generation\":17,\"pane_id\":\"%7\"}\n")
+	oldPath := CanonicalIdentityPath(registry.ProjectKey, source.PaneID)
+	if err := os.MkdirAll(filepath.Dir(oldPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldPath, oldReceipt, 0600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(filepath.Dir(registry.ProjectKey), "worktree")
+	for _, project := range []string{registry.ProjectKey, alias} {
+		legacyPath := "/tmp/agent-mail-name." + projectSha1Short(project) + "." + sanitizePaneID(replacement.PaneID)
+		t.Cleanup(func() { _ = os.Remove(legacyPath) })
+	}
+	if err := PreparePaneContinuationIdentity(t.Context(), registry.SessionName, registry.ProjectKey, source, replacement, alias); err != nil {
+		t.Fatal(err)
+	}
+	for _, project := range []string{registry.ProjectKey, alias} {
+		data, err := os.ReadFile(CanonicalIdentityPath(project, replacement.PaneID))
+		if err != nil || string(data) != "BlueLake\n" {
+			t.Fatalf("prelaunch identity for %s = %q, %v", project, data, err)
+		}
+		if _, _, ok := ReadPaneIdentityReceipt(project, replacement.PaneID); ok {
+			t.Fatal("replacement inherited the predecessor's pane-generation receipt")
+		}
+	}
+	data, err := os.ReadFile(oldPath)
+	if err != nil || string(data) != string(oldReceipt) {
+		t.Fatalf("predecessor identity changed: %q, %v", data, err)
+	}
+	fresh, err := LoadSessionAgentRegistry(registry.SessionName, registry.ProjectKey)
+	if err != nil || !reflect.DeepEqual(fresh, registry) {
+		t.Fatalf("prelaunch publication moved registry ownership: %+v, %v", fresh, err)
+	}
+	// Token rotation between preparation and handoff must survive cutover.
+	fresh.SetRegistrationToken(source.AgentName, "freshly-rotated-token")
+	if err := SaveSessionAgentRegistry(fresh); err != nil {
+		t.Fatal(err)
+	}
+	rebound, applied, err := RebindSessionAgentPaneContext(t.Context(), registry.SessionName, registry.ProjectKey, source, replacement)
+	if err != nil || !applied || rebound == nil {
+		t.Fatalf("rebind = %+v, %v, %v", rebound, applied, err)
+	}
+	if !reflect.DeepEqual(rebound.PaneIDMap, map[string]string{"%19": "BlueLake", "%8": "RedOak"}) ||
+		!reflect.DeepEqual(rebound.PanePIDs, map[string]int{"%19": 1900, "%8": 800}) ||
+		!reflect.DeepEqual(rebound.Agents, map[string]string{replacement.PaneTitle: "BlueLake", "other__cc_1": "RedOak"}) ||
+		!reflect.DeepEqual(rebound.RegistrationTokens, fresh.RegistrationTokens) ||
+		!rebound.RegisteredAt.Equal(registry.RegisteredAt) || rebound.Revision != fresh.Revision+1 {
+		t.Fatalf("rebind lost identity, latest credential, or unrelated entries: %+v", rebound)
+	}
+	again, applied, err := RebindSessionAgentPaneContext(t.Context(), registry.SessionName, registry.ProjectKey, source, replacement)
+	if err != nil || !applied || !reflect.DeepEqual(again, rebound) {
+		t.Fatalf("idempotent readback changed registry: %+v, %v, %v", again, applied, err)
+	}
+	registry.SetRegistrationToken(source.AgentName, "stale-writer-token")
+	if err := SaveSessionAgentRegistry(registry); err == nil {
+		t.Fatal("stale registry snapshot overwrote completed ownership transfer")
+	}
+	latest, err := LoadSessionAgentRegistry(registry.SessionName, registry.ProjectKey)
+	if err != nil || !reflect.DeepEqual(latest, rebound) {
+		t.Fatalf("stale save changed durable ownership: %+v, %v", latest, err)
+	}
+}
+
+func TestRegistryContinuationRefusesUnverifiedBinding(t *testing.T) {
+	for _, kind := range []string{"source PID", "unknown PID", "recipient", "occupied replacement", "canceled"} {
+		t.Run(kind, func(t *testing.T) {
+			registry, source, replacement := seedRegistryContinuation(t)
+			ctx := t.Context()
+			switch kind {
+			case "source PID":
+				source.PanePID++
+			case "unknown PID":
+				registry.SetPanePID(source.PaneID, 0)
+			case "recipient":
+				source.AgentName, replacement.AgentName = "RedOak", "RedOak"
+			case "occupied replacement":
+				registry.AddAgent("occupied", replacement.PaneID, "GreenHill")
+				registry.SetPanePID(replacement.PaneID, replacement.PanePID)
+			case "canceled":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			if err := SaveSessionAgentRegistry(registry); err != nil {
+				t.Fatal(err)
+			}
+			err := PreparePaneContinuationIdentity(ctx, registry.SessionName, registry.ProjectKey, source, replacement)
+			if err == nil || kind == "canceled" && !errors.Is(err, context.Canceled) {
+				t.Fatalf("unsafe prelaunch publication = %v", err)
+			}
+			if _, err := os.Stat(CanonicalIdentityPath(registry.ProjectKey, replacement.PaneID)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("rejected preparation published replacement identity: %v", err)
+			}
+			_, applied, err := RebindSessionAgentPaneContext(ctx, registry.SessionName, registry.ProjectKey, source, replacement)
+			if err == nil || applied || kind == "canceled" && !errors.Is(err, context.Canceled) {
+				t.Fatalf("unsafe registry cutover = %v, %v", applied, err)
+			}
+			latest, err := LoadSessionAgentRegistry(registry.SessionName, registry.ProjectKey)
+			if err != nil || !reflect.DeepEqual(latest, registry) {
+				t.Fatalf("rejected continuation changed registry: %+v, %v", latest, err)
+			}
+		})
+	}
+}
+
+func TestRegistryContinuationRejectsAmbiguousCompletedReadback(t *testing.T) {
+	for _, completed := range []bool{false, true} {
+		for _, kind := range []string{"physical alias", "title alias", "title collision"} {
+			name := kind
+			if completed {
+				name += " after commit"
+			}
+			t.Run(name, func(t *testing.T) {
+				registry, source, replacement := seedRegistryContinuation(t)
+				if completed {
+					var applied bool
+					var err error
+					registry, applied, err = RebindSessionAgentPaneContext(t.Context(), registry.SessionName, registry.ProjectKey, source, replacement)
+					if err != nil || !applied {
+						t.Fatalf("initial cutover = %v, %v", applied, err)
+					}
+				}
+				switch kind {
+				case "physical alias":
+					registry.PaneIDMap["%30"] = "bluelake"
+					registry.SetPanePID("%30", 3000)
+				case "title alias":
+					registry.Agents["stale alias"] = "bluelake"
+				case "title collision":
+					registry.Agents[replacement.PaneTitle] = "RedOak"
+				}
+				if err := SaveSessionAgentRegistry(registry); err != nil {
+					t.Fatal(err)
+				}
+				_, applied, err := RebindSessionAgentPaneContext(t.Context(), registry.SessionName, registry.ProjectKey, source, replacement)
+				if err == nil || applied {
+					t.Fatalf("ambiguous ownership was acknowledged: %v, %v", applied, err)
+				}
+				latest, err := LoadSessionAgentRegistry(registry.SessionName, registry.ProjectKey)
+				if err != nil || !reflect.DeepEqual(latest, registry) {
+					t.Fatalf("rejected readback changed registry: %+v, %v", latest, err)
+				}
+			})
+		}
+	}
+}
+
+func TestSessionAgentRegistryConcurrentSnapshotSavesUseOneFence(t *testing.T) {
+	registry, _, _ := seedRegistryContinuation(t)
+	left, err := LoadSessionAgentRegistry(registry.SessionName, registry.ProjectKey)
+	if err != nil || left == nil {
+		t.Fatalf("load left snapshot: %+v, %v", left, err)
+	}
+	right, err := LoadSessionAgentRegistry(registry.SessionName, registry.ProjectKey)
+	if err != nil || right == nil {
+		t.Fatalf("load right snapshot: %+v, %v", right, err)
+	}
+	left.AddAgent("left", "%30", "WhiteRiver")
+	right.AddAgent("right", "%31", "BlackTree")
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, snapshot := range []*SessionAgentRegistry{left, right} {
+		go func(snapshot *SessionAgentRegistry) {
+			<-start
+			results <- SaveSessionAgentRegistry(snapshot)
+		}(snapshot)
+	}
+	close(start)
+	succeeded := 0
+	for range 2 {
+		if err := <-results; err == nil {
+			succeeded++
+		} else if !strings.Contains(err.Error(), "registry changed") {
+			t.Fatalf("unexpected snapshot save failure: %v", err)
+		}
+	}
+	latest, err := LoadSessionAgentRegistry(registry.SessionName, registry.ProjectKey)
+	if err != nil || succeeded != 1 || latest == nil || latest.Revision != registry.Revision+1 || len(latest.PaneIDMap) != 3 ||
+		latest.PaneIDMap["%7"] != "BlueLake" || latest.PaneIDMap["%8"] != "RedOak" || !reflect.DeepEqual(latest.RegistrationTokens, registry.RegistrationTokens) {
+		t.Fatalf("concurrent save lost or merged stale state: successes=%d registry=%+v err=%v", succeeded, latest, err)
+	}
+}
 
 func TestNewSessionAgentRegistry(t *testing.T) {
 	sessionName := "test-session"
@@ -630,5 +847,223 @@ func TestLoadSessionAgentRegistryContinuesPastMismatchedCandidate(t *testing.T) 
 	}
 	if loaded.ProjectKey != projectKey {
 		t.Fatalf("expected project key %s, got %s", projectKey, loaded.ProjectKey)
+	}
+}
+
+// A fresh coordinator registration must persist the server-issued identity
+// AND its registration token, and prime the client's in-process token cache,
+// so every later ntm process re-claims the same adjective+noun identity
+// instead of sending as an unregistered literal (GH coordinator-identity fix;
+// PR #274/#275 context).
+func TestRegisterSessionAgent_PersistsIdentityAndToken(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpDir, ".config"))
+
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+		"health_check": func(map[string]interface{}) (interface{}, *JSONRPCError) {
+			return map[string]interface{}{"status": "ok"}, nil
+		},
+		"ensure_project": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			key, _ := args["human_key"].(string)
+			return Project{ID: 1, HumanKey: key}, nil
+		},
+		"register_agent": func(map[string]interface{}) (interface{}, *JSONRPCError) {
+			return Agent{ID: 2, Name: "GreenCastle", RegistrationToken: "tok-abc123"}, nil
+		},
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(WithBaseURL(server.URL + "/"))
+	info, err := client.RegisterSessionAgent(context.Background(), "coord-fresh", "/proj/coord-fresh")
+	if err != nil {
+		t.Fatalf("RegisterSessionAgent: %v", err)
+	}
+	if info == nil || info.AgentName != "GreenCastle" || info.RegistrationToken != "tok-abc123" {
+		t.Fatalf("info = %+v, want GreenCastle with tok-abc123", info)
+	}
+
+	loaded, err := LoadSessionAgent("coord-fresh", "/proj/coord-fresh")
+	if err != nil || loaded == nil {
+		t.Fatalf("LoadSessionAgent = (%+v, %v)", loaded, err)
+	}
+	if loaded.RegistrationToken != "tok-abc123" {
+		t.Fatalf("persisted token = %q, want tok-abc123", loaded.RegistrationToken)
+	}
+	if tok := client.RegistrationToken("/proj/coord-fresh", "GreenCastle"); tok != "tok-abc123" {
+		t.Fatalf("client token cache = %q, want tok-abc123", tok)
+	}
+}
+
+// Re-registration for an already-persisted session identity must send the
+// persisted registration token so the server authenticates the re-claim
+// rather than rejecting the name as already taken.
+func TestRegisterSessionAgent_ReusesPersistedTokenOnReclaim(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpDir, ".config"))
+
+	if err := SaveSessionAgent("coord-reuse", "/proj/coord-reuse", &SessionAgentInfo{
+		AgentName:         "GreenCastle",
+		ProjectKey:        "/proj/coord-reuse",
+		RegistrationToken: "tok-persisted",
+		RegisteredAt:      time.Now().Add(-time.Hour),
+		LastActiveAt:      time.Now().Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("seed session agent: %v", err)
+	}
+
+	var gotToken string
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+		"ensure_project": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			return Project{ID: 2, HumanKey: args["human_key"].(string)}, nil
+		},
+		"register_agent": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			gotToken, _ = args["registration_token"].(string)
+			return Agent{ID: 2, Name: "GreenCastle", RegistrationToken: "tok-persisted"}, nil
+		},
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(WithBaseURL(server.URL + "/"))
+	info, err := client.RegisterSessionAgent(context.Background(), "coord-reuse", "/proj/coord-reuse")
+	if err != nil {
+		t.Fatalf("RegisterSessionAgent: %v", err)
+	}
+	if info == nil || info.AgentName != "GreenCastle" {
+		t.Fatalf("info = %+v, want reused GreenCastle identity", info)
+	}
+	if gotToken != "tok-persisted" {
+		t.Fatalf("register_agent received token %q, want the persisted tok-persisted", gotToken)
+	}
+}
+
+// TestRegisterSessionAgentProbesWithEnsureProject verifies the availability
+// probe is the lightweight ensure_project call rather than the heavier
+// health_check diagnostic: a loaded-but-healthy server that would blow the
+// health_check budget must still yield a session identity.
+func TestRegisterSessionAgentProbesWithEnsureProject(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+
+	var mu sync.Mutex
+	var called []string
+	record := func(name string) {
+		mu.Lock()
+		called = append(called, name)
+		mu.Unlock()
+	}
+
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+		"ensure_project": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			record("ensure_project")
+			return Project{ID: 7, HumanKey: args["human_key"].(string)}, nil
+		},
+		"register_agent": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			record("register_agent")
+			return Agent{ID: 8, Name: "WhiteHorse", Program: args["program"].(string), Model: args["model"].(string), RegistrationToken: "session-token"}, nil
+		},
+		// No health_check handler: mockMCPHandler fails the exchange for any
+		// unhandled tool, so a health_check probe would surface as an error.
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(WithBaseURL(server.URL + "/"))
+	info, err := client.RegisterSessionAgent(context.Background(), "session-probe-test", "/project/probe-test")
+	if err != nil {
+		t.Fatalf("RegisterSessionAgent: %v", err)
+	}
+	if info == nil || info.AgentName != "WhiteHorse" || info.RegistrationToken != "session-token" {
+		t.Fatalf("session info = %+v", info)
+	}
+
+	mu.Lock()
+	tools := append([]string(nil), called...)
+	mu.Unlock()
+	if len(tools) < 2 || tools[0] != "ensure_project" {
+		t.Fatalf("ensure_project must be the first (probe) call, got %v", tools)
+	}
+	for _, tool := range tools {
+		if tool == "health_check" {
+			t.Fatalf("registration must not be gated on health_check, got %v", tools)
+		}
+	}
+
+	loaded, err := LoadSessionAgent("session-probe-test", "/project/probe-test")
+	if err != nil || loaded == nil || loaded.RegistrationToken != "session-token" {
+		t.Fatalf("persisted session info = %+v, error=%v", loaded, err)
+	}
+	if token := client.RegistrationToken("/project/probe-test", "WhiteHorse"); token != "session-token" {
+		t.Fatalf("client token cache = %q, want session-token", token)
+	}
+}
+
+// TestRegisterSessionAgentEnsuresProjectOnReRegister verifies the existing
+// registration fast path still runs ensure_project first: Agent Mail may have
+// rebuilt its database since the identity was persisted locally.
+func TestRegisterSessionAgentEnsuresProjectOnReRegister(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+
+	if err := SaveSessionAgent("session-rebuild-test", "/project/rebuild-test", &SessionAgentInfo{
+		AgentName:  "WhiteHorse",
+		ProjectKey: "/project/rebuild-test",
+	}); err != nil {
+		t.Fatalf("seed session agent: %v", err)
+	}
+
+	var mu sync.Mutex
+	ensures := 0
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+		"ensure_project": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			mu.Lock()
+			ensures++
+			mu.Unlock()
+			return Project{ID: 7, HumanKey: args["human_key"].(string)}, nil
+		},
+		"register_agent": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			return Agent{ID: 8, Name: args["name"].(string)}, nil
+		},
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(WithBaseURL(server.URL + "/"))
+	info, err := client.RegisterSessionAgent(context.Background(), "session-rebuild-test", "/project/rebuild-test")
+	if err != nil {
+		t.Fatalf("RegisterSessionAgent: %v", err)
+	}
+	if info == nil || info.AgentName != "WhiteHorse" {
+		t.Fatalf("session info = %+v", info)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if ensures != 1 {
+		t.Fatalf("ensure_project calls = %d, want 1", ensures)
+	}
+}
+
+// TestRegisterSessionAgentFailsClosedWhenProjectEnsureFails verifies the probe
+// failure is reported instead of the old silent (nil, nil) skip.
+func TestRegisterSessionAgentFailsClosedWhenProjectEnsureFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+		"ensure_project": func(map[string]interface{}) (interface{}, *JSONRPCError) {
+			return nil, &JSONRPCError{Code: -32000, Message: "database unavailable"}
+		},
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(WithBaseURL(server.URL + "/"))
+	info, err := client.RegisterSessionAgent(context.Background(), "session-down-test", "/project/down-test")
+	if err == nil || info != nil {
+		t.Fatalf("RegisterSessionAgent = (%+v, %v), want ensure-project error", info, err)
+	}
+	if !strings.Contains(err.Error(), "ensuring project") {
+		t.Fatalf("error should identify the failed probe, got %v", err)
 	}
 }

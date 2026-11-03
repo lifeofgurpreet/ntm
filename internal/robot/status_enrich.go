@@ -2,6 +2,7 @@ package robot
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"regexp"
@@ -12,8 +13,10 @@ import (
 
 	gopsprocess "github.com/shirou/gopsutil/v4/process"
 
+	ntmctx "github.com/Dicklesworthstone/ntm/internal/context"
 	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
+	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tokens"
 	"github.com/Dicklesworthstone/ntm/internal/util"
@@ -94,18 +97,37 @@ func enrichAgentStatus(agent *Agent, sessionName, modelName string, content stri
 		agent.RateLimitDetected = detected
 		agent.RateLimitMatch = match
 
-		// Output activity
+		// Output activity. The in-process tracker only has a baseline for
+		// panes this process has already looked at; a fresh CLI invocation
+		// starts with none, so it reports no activity rather than fabricating
+		// a "just changed" reading (#288).
+		observedAt := time.Now().UTC()
 		lastOutputTS, linesDelta := updateActivity(agent.Pane, content)
-		agent.LastOutputTS = lastOutputTS
-		agent.OutputLinesSinceLast = linesDelta
-
-		if !agent.LastOutputTS.IsZero() {
-			agent.SecondsSinceOutput = int(time.Since(agent.LastOutputTS).Seconds())
-		}
 
 		// Durable output-change sequence (#246). agent.Pane carries the tmux
 		// pane ID on this path, matching the scope used by --robot-activity.
-		agent.OutputSequence = observeOutputSequence(sessionName, agent.Pane, content, time.Now().UTC())
+		agent.OutputSequence = observeOutputSequence(sessionName, agent.Pane, content, observedAt)
+
+		if lastOutputTS.IsZero() {
+			// No in-process baseline: fall back to the durable sequence, which
+			// survives across CLI processes. A sequence advance during THIS
+			// observation means the tail changed since the previous observer
+			// looked, which is real output evidence; an older changed_at is a
+			// last-output clock without a line delta; no changed_at at all
+			// leaves the pane without an output clock so the classifier must
+			// decide from the captured tail alone.
+			if changedAt, ok := outputSequenceChangedAt(agent.OutputSequence); ok {
+				lastOutputTS = changedAt
+				if agent.OutputSequence.advanced {
+					linesDelta = 1
+				}
+			}
+		}
+		agent.LastOutputTS = lastOutputTS
+		agent.OutputLinesSinceLast = linesDelta
+		if !agent.LastOutputTS.IsZero() {
+			agent.SecondsSinceOutput = int(time.Since(agent.LastOutputTS).Seconds())
+		}
 
 		// Composer visibility (bd-v8dqd).
 		composer := tmux.InspectComposer(content, tmux.AgentType(agent.Type))
@@ -113,16 +135,60 @@ func enrichAgentStatus(agent *Agent, sessionName, modelName string, content stri
 		agent.QueuedMessages = composer.QueuedMessages
 
 		if modelName != "" {
-			agent.ContextModel = modelName
-			usage := tokens.GetUsageInfo(content, modelName)
-			if usage != nil {
-				agent.ContextTokens = usage.EstimatedTokens
-				agent.ContextLimit = usage.ContextLimit
-				agent.ContextPercent = usage.UsagePercent
-				agent.ContextModel = usage.Model
-			}
+			enrichAgentContext(agent, modelName, content, nil)
 		}
 	}
+}
+
+// enrichAgentContext shares context attribution between live snapshots and
+// persisted projections. The pane's own gauge wins, followed by its attributed
+// transcript, then a scrollback estimate. Missing evidence clears old readings.
+func enrichAgentContext(agent *Agent, modelName, content string, transcript *ntmctx.TranscriptUsage) {
+	agent.ContextTokens = 0
+	agent.ContextLimit = 0
+	agent.ContextPercent = 0
+	agent.ContextModel = ""
+	if agent.CaptureError != "" || isNonAgentPaneType(agent.Type) {
+		return
+	}
+	if modelName != "" && strings.TrimSpace(content) != "" {
+		if usage := tokens.GetUsageInfo(content, modelName); usage != nil && usage.ContextLimit > 0 {
+			agent.ContextTokens = usage.EstimatedTokens
+			agent.ContextLimit = usage.ContextLimit
+			agent.ContextPercent = usage.UsagePercent
+			agent.ContextModel = usage.Model
+		}
+	}
+	usage, fromGauge := ompStatusBarUsage(agent.Type, status.StripANSI(content), time.Now())
+	if !fromGauge {
+		usage = transcript
+	}
+	if usage == nil || usage.Tokens < 0 {
+		return
+	}
+	model, percent, limit, _ := transcriptContextReading(modelName, usage)
+	if limit <= 0 {
+		return
+	}
+	if fromGauge {
+		// Match --robot-context's exact whole-percent gauge arithmetic.
+		percent = float64(usage.Tokens) * 100 / float64(limit)
+	}
+	agent.ContextTokens = usage.Tokens
+	agent.ContextLimit = limit
+	agent.ContextPercent = percent
+	agent.ContextModel = model
+}
+
+func contextPercentForAgent(agent *Agent) *float64 {
+	if agent == nil || agent.ContextLimit <= 0 || agent.CaptureError != "" || isNonAgentPaneType(agent.Type) {
+		return nil
+	}
+	percent := agent.ContextPercent
+	if percent < 0 || math.IsNaN(percent) || math.IsInf(percent, 0) {
+		return nil
+	}
+	return &percent
 }
 
 func getProcessMemoryMB(pid int) (int, error) {
@@ -195,13 +261,16 @@ func updateActivity(paneID, content string) (time.Time, int) {
 	currentLines := util.CountNonEmptyLines(content)
 	state, ok := paneStates[paneID]
 	if !ok {
-		state = &paneState{
-			lastTS:        time.Now(), // Initialize with current time
+		// First observation in this process: record the baseline but report
+		// no activity. There is no prior capture to diff against, so neither
+		// the timestamp nor the line count is evidence of output — treating
+		// the whole visible buffer as "lines written just now" is what made
+		// every pane look busy on each fresh --robot-status process (#288).
+		paneStates[paneID] = &paneState{
 			lastHash:      content,
 			lastLineCount: currentLines,
 		}
-		paneStates[paneID] = state
-		return state.lastTS, currentLines
+		return time.Time{}, 0
 	}
 
 	linesDelta := currentLines - state.lastLineCount
@@ -220,4 +289,18 @@ func updateActivity(paneID, content string) (time.Time, int) {
 	state.lastLineCount = currentLines
 
 	return state.lastTS, linesDelta
+}
+
+// outputSequenceChangedAt extracts the durable last-change timestamp carried
+// by an output-sequence observation. ok is false when the scope has never
+// advanced (first observation ever, or the store is unavailable).
+func outputSequenceChangedAt(info *OutputSequenceInfo) (time.Time, bool) {
+	if info == nil || info.ChangedAt == "" {
+		return time.Time{}, false
+	}
+	ts, err := time.Parse(time.RFC3339, info.ChangedAt)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return ts.UTC(), true
 }

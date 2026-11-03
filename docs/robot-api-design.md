@@ -50,19 +50,18 @@ Commands that operate globally (no session context) are bool flags:
 
 ### 1.3 Tool Bridges
 
-External tool integrations follow `--robot-<tool>-<action>` pattern with **separate modifier flags**:
+External tool integrations follow the `--robot-<tool>-<action>` pattern. Search
+bridges take the query as the flag's value; shared modifiers stay unprefixed:
 
 ```bash
-# CORRECT: Bool flag + separate modifiers
-ntm --robot-jfp-search --query="debugging" --limit=10
-ntm --robot-cass-search --query="auth error" --since=7d
-ntm --robot-xf-search --query="rust async" --limit=20
+ntm --robot-cass-search="auth error" --since=7d --limit=20
+ntm --robot-jfp-search="debugging"
+ntm --robot-xf-search="rust async" --xf-limit=20
 ntm --robot-dcg-check --command="rm -rf /data"
-ntm --robot-mail-check --project=myproj --agent=cc_1
+ntm --robot-mail-check --mail-project=myproj --mail-agent=cc_1
 
-# AVOID: Inline values in main flag (legacy pattern)
-ntm --robot-jfp-search="debugging"      # Deprecated
-ntm --robot-cass-search="auth error"    # Deprecated
+# AVOID: tool-prefixed copies of shared modifiers (deprecated aliases)
+ntm --robot-cass-search="auth error" --cass-since=7d --cass-limit=20
 ```
 
 ### 1.3.1 Flywheel Tool Bridges (Inventory + Wrappers)
@@ -76,7 +75,7 @@ ntm --robot-tools
 Tool bridges are **optional**. When a tool is missing, robot commands return `DEPENDENCY_MISSING` with an actionable hint. Use `--robot-tools` and `--robot-capabilities` to confirm which wrappers are supported in your build.
 
 **Implemented today**
-- **JFP** (JeffreysPrompts): `--robot-jfp-status`, `--robot-jfp-list`, `--robot-jfp-search`, `--robot-jfp-show`, `--robot-jfp-suggest`, `--robot-jfp-install`, `--robot-jfp-export`, `--robot-jfp-update`, `--robot-jfp-installed`, `--robot-jfp-categories`, `--robot-jfp-tags`, `--robot-jfp-bundles`
+- **JFP** (JeffreysPrompts): `--robot-jfp-status`, `--robot-jfp-list`, `--robot-jfp-search`, `--robot-jfp-show`, `--robot-jfp-suggest`, `--robot-jfp-export`, `--robot-jfp-update`, `--robot-jfp-categories`, `--robot-jfp-tags`, `--robot-jfp-bundles`
 - **ACFS** (Flywheel setup/bootstrapping): `--robot-acfs-status` (alias: `--robot-setup`)
 - **MS** (Meta Skill): `--robot-ms-search`, `--robot-ms-show`
 - **DCG** (Destructive Command Guard): `--robot-dcg-status`
@@ -129,15 +128,15 @@ Note: `--robot-limit` and `--robot-offset` are accepted as explicit aliases for 
 
 **Example (Correct):**
 ```bash
-ntm --robot-cass-search --query="auth" --limit=20 --since=7d
-ntm --robot-alerts --alerts-type=error --alerts-session=myproject
+ntm --robot-cass-search="auth" --limit=20 --since=7d
+ntm --robot-alerts --alerts-type=error --session=myproject
 ntm --robot-wait=myproject --timeout=2m --panes=1,2
 ```
 
 **Example (Deprecated):**
 ```bash
 ntm --robot-cass-search="auth" --cass-limit=20 --cass-since=7d  # Old pattern
-ntm --robot-alerts --type=error --session=myproject  # Old pattern
+ntm --robot-alerts --alerts-session=myproject                  # Old pattern
 ```
 
 ### 2.2 Tool-Specific Modifiers
@@ -149,16 +148,19 @@ Only use tool prefix for options unique to that tool:
 | `--spawn-cc=N` | Claude agents to spawn | spawn-specific |
 | `--spawn-cod=N` | Codex agents to spawn | spawn-specific |
 | `--spawn-agy=N` | Antigravity agents to spawn | spawn-specific |
-| `--spawn-grok=N` | Grok Build agents to spawn (phase one: launch only) | spawn-specific |
+| `--spawn-grok=N` | Grok Build agents to spawn | spawn-specific |
+| `--spawn-omp=N[:model[:effort]]` | Oh My Pi (`omp`) agents to spawn; effort maps to `--thinking` | spawn-specific |
+| `--spawn-oc=N[:model]` | OpenCode (`oc`) agents to spawn; model is `provider/model` | spawn-specific |
 | `--spawn-gmi=N` | Gemini agents to spawn (legacy) | spawn-specific |
 | `--spawn-preset=NAME` | Use preset recipe | spawn-specific |
 | `--probe-method=M` | Probe detection method | probe-specific |
 | `--xf-mode=semantic` | XF search mode | xf-specific |
 | `--bulk-strategy=S` | Bulk assign strategy | bulk-assign-specific |
 
-Grok Build phase one does not automate the authenticated fullscreen TUI. Robot
-send, retasking interrupt, restart, readiness waits, assignment, and restore-time
-relaunch return `NOT_IMPLEMENTED` before mutating a Grok pane.
+Grok Build phase 2 (GH#251) automates the authenticated fullscreen TUI: robot
+send, retasking interrupt, restart, readiness waits (`--spawn-wait`), assignment
+(`--spawn-assign-work`), and restore-time relaunch work on Grok panes. Personas
+are refused because the Grok Build CLI has no system-prompt mechanism.
 
 ### 2.3 Aliases for Backward Compatibility
 
@@ -243,16 +245,65 @@ as complete.
 | Operation | Evidence to inspect | Meaning and limitations |
 |---|---|---|
 | `--robot-send` | `targets`, `successful`, and `failed` | A successful target received the tmux delivery attempt. This is dispatch evidence only; it does not prove the agent processed the prompt. |
-| `--robot-send` with `--verify-render` | One `render_evidence` entry per target; require `delivered_and_rendered: true` for every target | NTM captures bounded pane output before and after dispatch. `delivered_and_rendered` requires dispatch success, both captures, and a changed rendered output. Missing, unchanged, or unavailable evidence makes the overall response `success: false`; it proves rendered delivery, not prompt comprehension. |
-| `--robot-send` with `--track` | `send` plus `ack.confirmations`, `ack.pending`, `ack.failed`, and `ack.timed_out` | The strongest prompt-consumption evidence. A confirmation reports its `ack_type`, time, and latency. Pending or timed-out panes require follow-up; do not retry blindly. |
+| `--robot-send` with `--verify-render` | One `render_evidence` entry per target; require `delivered_and_rendered: true` for every target | NTM captures bounded pane output before and after dispatch; a delivered pane whose screen still matches the baseline is re-captured for up to ~2s, because TUIs such as Claude Code redraw their composer shortly after a paste lands (this matters most for `--enter=false`). `delivered_and_rendered` requires dispatch success, both captures, and a changed rendered output. Missing, unchanged, or unavailable evidence makes the overall response `success: false`; it proves rendered delivery, not prompt comprehension. |
+| `--robot-send` with `--track` | `send` plus `ack.confirmations`, `ack.pending`, `ack.failed`, and `ack.timed_out` | A confirmation reports new response evidence, its `ack_type`, time, and latency. Echoing the input alone is insufficient, including multiline or wrapped prompts. Failed baseline captures make verification and the overall operation fail even when dispatch succeeded. Failed, pending, or timed-out panes require follow-up; do not retry blindly. |
 | `--robot-tail=SESSION --fresh` | Per-pane `capture_collected_at`, `capture_provenance`, and optional `capture_error` | A direct post-action observation. `capture_provenance: "live"` is fresh capture evidence; `"unavailable"` means the pane was not observed and is not evidence of no effect. |
 | `--robot-spawn` with `--spawn-wait` | The command waits up to `--spawn-timeout` for ready observations | Readiness-gated spawn evidence. A timeout is an error rather than a claim that all agents booted; inspect the resulting session with a fresh tail. |
+| `--robot-spawn` with `--spawn-prompt` | Per-agent `prompt_deliveries[]` (`prompt_sent`, `delivered_at`, `error`) and the `stagger.schedule[]` it was paced on | Dispatch evidence after the implied readiness wait, through the same idle-gated dispatch port as robot send. Any `prompt_sent: false` fails the envelope with `PROMPT_SEND_FAILED`; like `--robot-send` without `--track`, it does not prove the agent processed the prompt. |
 | `--robot-exit-cli`, `--robot-kill-agent`, and restart/relaunch paths | Per-pane `results`, including `shell_pid`, `agent_pids`, `shell_preserved`, and `verification_failed`; restart output also includes `pane_shell_pids`, `process_alive`, and relaunch status | Process/lifecycle evidence. `verification_failed` means observation failed, not that a pane was destroyed. A respawn must show a changed `pane_shell_pids.after`; unchanged or absent PID evidence is not a verified restart. |
+
+#### Explicit environment recovery for a saved launch
+
+NTM records the names of operator-supplied launch environment variables, but
+deliberately omits their values from durable launch metadata. A dead agent may
+therefore need explicit recovery input before it can be restarted in place.
+Neither `ntm respawn` nor `--robot-restart-pane` substitutes the current shell's
+environment for those missing values.
+
+Supply `--restart-env-file=PATH` with exactly one explicit `--panes` selector.
+The file must be a private, owner-readable regular file (mode `0600` or `0400`),
+not a symlink. It contains one JSON object with string values and exactly the
+environment names required by that pane's saved launch. For example, a pane
+whose refusal lists the five names below can use:
+
+```json
+{
+  "AGENT_MAIL_AGENT": "BlueLake",
+  "BEADS_DIR": "/work/project/.beads",
+  "BV_ROBOT_NOT_READY_LABELS": "not-ready",
+  "PATH": "/usr/local/bin:/usr/bin:/bin",
+  "ZAI_SEAT_ROLE": "reviewer"
+}
+```
+
+Create the file privately before entering values with an editor or a trusted
+credential provider. Do not put secret values in CLI arguments or shell history.
+The input is JSON data, never sourced as a shell script. NTM rejects duplicate
+names, non-string values, malformed or oversized input, and unsafe environment
+controls. Empty strings are explicit values; an absent key is missing input.
+An unscoped file cannot be applied to a batch of panes because their identities,
+roles, and credentials may differ.
+
+```bash
+ntm respawn myproject --panes=%7 --restart-env-file=/private/recovery.json --dry-run
+ntm respawn myproject --panes=%7 --restart-env-file=/private/recovery.json --force
+
+ntm --robot-restart-pane=myproject --panes=%7 --restart-env-file=/private/recovery.json --dry-run
+ntm --robot-restart-pane=myproject --panes=%7 --restart-env-file=/private/recovery.json
+```
+
+Both dry-run interfaces perform the same launch and environment preflight as
+execution, without respawning the pane. A failed preflight reports failure and
+leaves the pane untouched. Each invocation reads the file once; recovery values
+are not added to saved launch metadata and must be supplied again for a future
+restart. Keep or remove the operator-managed input file according to your own
+credential policy. Existing model, reasoning effort, launcher profile, prompt
+integrity, PID-change verification, and readiness checks still apply.
 
 The durable attention feed mirrors actuation progress as `request`, `outcome`,
 and `verification` events. For tracked sends, the verification event records
-the target set, confirmations, pending targets, timeout state, and one of
-`confirmed`, `partial_timeout`, `timed_out`, or `pending`. It is suitable for
+the target set, confirmations, failed and pending targets, timeout state, and one of
+`confirmed`, `failed`, `partial_timeout`, `timed_out`, or `pending`. It is suitable for
 asynchronous monitoring; command responses remain the primary evidence for the
 specific invocation.
 
@@ -260,7 +311,7 @@ Example: dispatch a prompt and require bounded downstream evidence rather than
 assuming that an accepted keypress was consumed.
 
 ```bash
-ntm --robot-send=payments --msg='Run focused tests and report the result.' --track --ack-timeout=30s
+ntm --robot-send=payments --msg='Run focused tests and report the result.' --track --timeout=30s
 ntm --robot-send=payments --msg='Run focused tests and report the result.' --verify-render
 ntm --robot-tail=payments --fresh --panes=1,2
 ```
@@ -729,7 +780,7 @@ ntm --robot-schema=all
 | `inspect` | Pane inspection | `--robot-inspect-pane` |
 | `ensemble` | Ensemble state | `--robot-ensemble` |
 | `ensemble_spawn` | Ensemble creation | `--robot-ensemble-spawn` |
-| `beads_list` | Bead listing | `--robot-bead-list` |
+| `beads_list` | Bead listing | `--robot-beads-list` |
 | `assign` | Work assignment | `--robot-assign` |
 | `triage` | Triage analysis | `--robot-triage` |
 | `health` | Health check | `--robot-health` |

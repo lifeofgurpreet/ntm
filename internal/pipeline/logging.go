@@ -60,16 +60,19 @@ const (
 )
 
 const (
-	StepKindUnknown     = "unknown"
-	StepKindPrompt      = "prompt"
-	StepKindCommand     = "command"
-	StepKindTemplate    = "template"
-	StepKindParallel    = "parallel"
-	StepKindLoop        = "loop"
-	StepKindLoopControl = "loop_control"
-	StepKindForeach     = "foreach"
-	StepKindForeachPane = "foreach_pane"
-	StepKindBranch      = "branch"
+	StepKindUnknown            = "unknown"
+	StepKindPrompt             = "prompt"
+	StepKindCommand            = "command"
+	StepKindMailSend           = "mail_send"
+	StepKindReservationAcquire = "file_reservation_paths"
+	StepKindReservationRelease = "file_reservation_release"
+	StepKindTemplate           = "template"
+	StepKindParallel           = "parallel"
+	StepKindLoop               = "loop"
+	StepKindLoopControl        = "loop_control"
+	StepKindForeach            = "foreach"
+	StepKindForeachPane        = "foreach_pane"
+	StepKindBranch             = "branch"
 )
 
 // Logger returns a slog logger with the current pipeline run identity attached.
@@ -138,6 +141,12 @@ func stepKind(step *Step) string {
 		return StepKindPrompt
 	case step.LoopControl != "":
 		return StepKindLoopControl
+	case step.MailSend != nil:
+		return StepKindMailSend
+	case step.FileReservationPaths != nil:
+		return StepKindReservationAcquire
+	case step.FileReservationRelease != nil:
+		return StepKindReservationRelease
 	default:
 		return StepKindUnknown
 	}

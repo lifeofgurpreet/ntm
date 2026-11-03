@@ -47,7 +47,7 @@ var promptPatterns = []PromptPattern{
 
 	// Codex CLI patterns
 	{AgentType: "cod", Regex: regexp.MustCompile(`(?i)codex>?\s*$`), Description: "Codex prompt"},
-	{AgentType: "cod", Regex: regexp.MustCompile(`^\s*›\s*.*$`), Description: "Codex chevron prompt"},
+	{AgentType: "cod", Regex: regexp.MustCompile(`^\s*[›»]\s*.*$`), Description: "Codex chevron prompt (\"»\" at effort ultra, GH#273)"},
 
 	// Gemini CLI patterns
 	{AgentType: "gmi", Regex: regexp.MustCompile(`(?i)gemini>?\s*$`), Description: "Gemini prompt"},
@@ -152,12 +152,14 @@ var knownAgentTypes = map[string]bool{
 	"cc":       true, // Claude Code uses "claude>" or ">" prompts
 	"cod":      true, // Codex uses "codex>" prompt
 	"gmi":      true, // Gemini uses "gemini>" prompt
+	"agy":      true, // Antigravity uses a bare > composer, not a shell $ prompt
 	"cursor":   true,
 	"windsurf": true,
 	"aider":    true,
 	"ollama":   true,
 	"grok":     true, // Grok Build renders a bordered "│ ❯" composer (GH#251)
 	"oc":       true, // OpenCode renders an "Ask anything..." composer (ntm#261)
+	"omp":      true, // Oh My Pi renders a status-line composer box
 }
 
 // knownAgentPromptPrefixes matches prompts that belong to specific agent types.
@@ -212,6 +214,24 @@ const maxIdleScanLines = 12
 func DetectIdleFromOutput(output string, agentType string) bool {
 	agentType = string(agent.AgentType(agentType).Canonical())
 
+	// These composers remain visible during work. The unified detector
+	// already trusts their live markers, but health checks and startup wait
+	// loops also call this helper directly. A marker ABOVE the prompt must
+	// veto idle here too; activeWorkBelow alone cannot protect those callers.
+	if agentType == string(agent.AgentTypeCodex) && agent.CodexActivelyWorking(output, 0) {
+		return false
+	}
+	if agentType == string(agent.AgentTypeAntigravity) && agent.AntigravityActivelyWorking(output, 0) {
+		return false
+	}
+
+	// Gemini's current composer and quota footer need structural handling.
+	// The shared classifier vetoes idle during live work or real rate limits
+	// and never treats a draft or a prompt above new output as readiness.
+	if agentType == string(agent.AgentTypeGemini) {
+		return agent.DetectGeminiTurn(StripANSI(output)) == agent.GeminiTurnIdle
+	}
+
 	// Claude Code: the shared classifier (internal/agent.ClaudeActivelyWorking)
 	// owns the working verdict and is authoritative. Claude pins its "❯ " input
 	// box to the BOTTOM of the screen at all times, so an idle-prompt match
@@ -249,6 +269,14 @@ func DetectIdleFromOutput(output string, agentType string) bool {
 	// and vetoes the composer-hint idle pattern (ntm#261).
 	if agentType == string(agent.AgentTypeOpencode) && agent.OpencodeActivelyWorking(output, 0) {
 		return false
+	}
+
+	// Oh My Pi has no prompt glyph to scan for: its idle signal is the
+	// structurally parsed composer box with no in-flight spinner/timer or
+	// Esc-hint line and nothing rendered below it. A line scan would match
+	// look-alike tool-output box borders, so the shared parser decides.
+	if agentType == string(agent.AgentTypeOmp) {
+		return agent.OmpIdlePromptShowing(output)
 	}
 
 	// Registered plugin agents: declared Working patterns veto idle; declared

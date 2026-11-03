@@ -6,9 +6,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"github.com/Dicklesworthstone/ntm/internal/robot"
-	"github.com/go-chi/chi/v5"
 )
 
 func TestParseRole(t *testing.T) {
@@ -110,106 +107,6 @@ func TestRoleFromContext(t *testing.T) {
 	}
 	if extracted.UserID != "test-user" {
 		t.Errorf("UserID = %q, want %q", extracted.UserID, "test-user")
-	}
-}
-
-func TestSendReceiptProvenanceUsesAuthenticatedPrincipalAndTargetAuthorization(t *testing.T) {
-	t.Run("authenticated principal", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/robot/send", nil)
-		req = req.WithContext(withRoleContext(req.Context(), &RoleContext{
-			Role:   RoleOperator,
-			UserID: "operator-42",
-		}))
-		actor, origin, authorization := sendReceiptProvenance(req, "proj")
-		if actor != "operator-42" || origin != "http.api.v1" {
-			t.Fatalf("receipt provenance = actor=%q origin=%q, want authenticated HTTP principal", actor, origin)
-		}
-		if authorization != `{"scheme":"rbac","role":"operator","permission":"agents:write","resource":"session:proj"}` {
-			t.Fatalf("target authorization = %q", authorization)
-		}
-	})
-
-	for _, tc := range []struct {
-		name string
-		rc   *RoleContext
-	}{
-		{name: "no role context"},
-		{name: "anonymous principal", rc: &RoleContext{Role: RoleAdmin, UserID: "anonymous"}},
-		{name: "empty principal", rc: &RoleContext{Role: RoleAdmin}},
-		{name: "unauthorized role", rc: &RoleContext{Role: RoleViewer, UserID: "viewer-1"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/robot/send", nil)
-			if tc.rc != nil {
-				req = req.WithContext(withRoleContext(req.Context(), tc.rc))
-			}
-			actor, origin, authorization := sendReceiptProvenance(req, "proj")
-			if actor != "" || origin != "" || authorization != "" {
-				t.Fatalf("receipt provenance = actor=%q origin=%q authorization=%q, want none", actor, origin, authorization)
-			}
-		})
-	}
-}
-
-func TestPaneInputIsRetiredBeforeTmuxForSessionsWriteCaller(t *testing.T) {
-	srv, _ := setupTestServer(t)
-	sendCalls := 0
-	srv.sendPaneKeys = func(_, _ string, _ bool) error {
-		sendCalls++
-		return nil
-	}
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/proj/panes/2/input", strings.NewReader(`{"text":"RAW_INPUT_MUST_NOT_REACH_TMUX","enter":true}`))
-	rctx := chi.NewRouteContext()
-	rctx.URLParams.Add("sessionId", "proj")
-	rctx.URLParams.Add("paneIdx", "2")
-	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
-	req = req.WithContext(withRoleContext(req.Context(), &RoleContext{Role: RoleOperator, UserID: "operator-42"}))
-	rec := httptest.NewRecorder()
-
-	srv.handlePaneInputV1(rec, req)
-
-	if rec.Code != http.StatusGone {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusGone)
-	}
-	if sendCalls != 0 {
-		t.Fatalf("raw pane input reached tmux %d time(s)", sendCalls)
-	}
-}
-
-func TestInterruptMutationRoutesAreRetiredBeforeTransport(t *testing.T) {
-	srv, _ := setupTestServer(t)
-	interruptCalls := 0
-	srv.interruptAgents = func(robot.InterruptOptions) (*robot.InterruptOutput, error) {
-		interruptCalls++
-		return nil, nil
-	}
-
-	for _, tc := range []struct {
-		name string
-		path string
-		h    http.HandlerFunc
-	}{
-		{"pane", "/api/v1/sessions/proj/panes/2/interrupt", srv.handlePaneInterruptV1},
-		{"agents", "/api/v1/sessions/proj/agents/interrupt", srv.handleAgentInterruptV1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, tc.path, nil)
-			rctx := chi.NewRouteContext()
-			rctx.URLParams.Add("sessionId", "proj")
-			if tc.name == "pane" {
-				rctx.URLParams.Add("paneIdx", "2")
-			}
-			req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
-			req = req.WithContext(withRoleContext(req.Context(), &RoleContext{Role: RoleAdmin, UserID: "admin-42"}))
-			rec := httptest.NewRecorder()
-			tc.h(rec, req)
-			if rec.Code != http.StatusGone {
-				t.Fatalf("status = %d, want %d", rec.Code, http.StatusGone)
-			}
-		})
-	}
-	if interruptCalls != 0 {
-		t.Fatalf("retired agent interrupt reached robot transport %d time(s)", interruptCalls)
 	}
 }
 

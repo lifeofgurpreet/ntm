@@ -12,7 +12,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +28,8 @@ import (
 
 	assignmentstore "github.com/Dicklesworthstone/ntm/internal/assignment"
 	"github.com/Dicklesworthstone/ntm/internal/sqliteutil"
+	"github.com/Dicklesworthstone/ntm/internal/util"
+	"github.com/Dicklesworthstone/ntm/internal/worksource"
 )
 
 // ErrNotInstalled indicates bv is not available
@@ -32,6 +37,36 @@ var ErrNotInstalled = errors.New("bv is not installed")
 
 // ErrNoBaseline indicates no baseline exists for drift checking
 var ErrNoBaseline = errors.New("no baseline found")
+
+// IsNotInitialized reports whether a br or bv call failed only because the
+// project has no beads workspace (no .beads directory or database), a state
+// of the project rather than a fault. It matches the phrasings br has used
+// across versions, including its NOT_INITIALIZED JSON code, and bv's
+// "failed to read beads directory" for a directory that does not exist.
+func IsNotInitialized(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "error loading beads") {
+		// bv appends "initialized with 'br init'" to every load failure,
+		// permission errors included; only a missing directory means no
+		// workspace.
+		return strings.Contains(msg, "failed to read beads directory") && strings.Contains(msg, "no such file or directory")
+	}
+	for _, fragment := range []string{
+		"no .beads",
+		"not initialized",
+		"not_initialized",
+		"no beads database",
+		"br init",
+	} {
+		if strings.Contains(msg, fragment) {
+			return true
+		}
+	}
+	return false
+}
 
 // DefaultTimeout is the default timeout for external command execution
 const DefaultTimeout = 30 * time.Second
@@ -173,13 +208,15 @@ func runWithContextTimeout(parent context.Context, dir string, timeout time.Dura
 			return "", ErrNoBaseline
 		}
 
-		// Handle transient database locks (SQLite)
-		if attempt < maxAttempts && (strings.Contains(stderrStr, "database is locked") ||
-			strings.Contains(stdoutStr, "database is locked") ||
-			strings.Contains(stderrStr, "database is busy")) {
-			backoff := transientBeadsDBBackoff(attempt)
-			if time.Until(deadline) <= backoff {
-				return "", fmt.Errorf("bv timed out after %v: %w", timeout, ErrTimeout)
+		// Handle transient workspace contention (SQLite locks, br write lock).
+		if isTransientBeadsDBError(stderrStr, stdoutStr) {
+			backoff, retry := transientBeadsRetryDelay(attempt, maxAttempts, deadline)
+			if !retry {
+				if attempt < maxAttempts {
+					return "", fmt.Errorf("bv timed out after %v: %w", timeout, ErrTimeout)
+				}
+				return "", fmt.Errorf("bv %s: workspace still contended after %d attempt(s): %w: %s",
+					strings.Join(args, " "), attempt, err, stderrStr)
 			}
 			if err := waitForBeadsRetry(parent, backoff); err != nil {
 				return "", err
@@ -721,13 +758,15 @@ func GetDependencyContext(dir string, n int) (*DependencyContext, error) {
 	// Get blocked tasks (what is blocking progress)
 	blockedOutput, err := RunBd(dir, "blocked", "--json")
 	if err == nil {
-		var blocked []struct {
+		// br blocked --json answers {"issues":[...],"total":...}; decoding it
+		// as a bare array failed silently and left TopBlockers empty.
+		blocked, decodeErr := UnmarshalBdList[struct {
 			ID             string   `json:"id"`
 			Title          string   `json:"title"`
 			BlockedByCount int      `json:"blocked_by_count"`
 			BlockedBy      []string `json:"blocked_by"`
-		}
-		if json.Unmarshal([]byte(blockedOutput), &blocked) == nil {
+		}](blockedOutput)
+		if decodeErr == nil {
 			for _, task := range blocked {
 				if len(ctx.TopBlockers) >= n {
 					break
@@ -782,6 +821,106 @@ func HasLocalBeadsDB(dir string) bool {
 	return info.IsDir()
 }
 
+// beadsReadOnlyFlags stop br changing the tracker it reads. Without them an
+// ordinary read upgrades an older-schema database in place and can rebuild it
+// from JSONL, leaving events and non-default config only in .br_recovery.
+var beadsReadOnlyFlags = []string{"--no-auto-import", "--no-auto-flush"}
+
+// isBeadsReadCommand reports whether args is a br read that honors
+// beadsReadOnlyFlags. `info` is left out because br rewrites an older-schema
+// tracker under it even with those flags.
+func isBeadsReadCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "list", "ready", "show", "stats", "blocked":
+		return true
+	case "dep":
+		return len(args) > 1 && (args[1] == "list" || args[1] == "tree")
+	}
+	return false
+}
+
+// readsWalkedUpTracker reports whether a br read for dir lands on a tracker that
+// was found by walking up and is not this project's own. dir alone cannot always
+// say: a caller that resolved the project first passes the tracker root itself,
+// so the walk from the process's own directory counts too.
+func readsWalkedUpTracker(dir string) bool {
+	if !HasLocalBeadsDB(dir) {
+		root, err := util.FindBeadsRoot(dir)
+		return err != nil || !trackerInSameRepo(dir, root)
+	}
+	cwd, err := os.Getwd()
+	if err != nil || HasLocalBeadsDB(cwd) {
+		return false
+	}
+	root, err := util.FindBeadsRoot(cwd)
+	if err != nil {
+		return false
+	}
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		return false
+	}
+	dirInfo, err := os.Stat(dir)
+	if err != nil || !os.SameFile(rootInfo, dirInfo) {
+		return false
+	}
+	return !trackerInSameRepo(cwd, root)
+}
+
+// trackerInSameRepo reports whether start and the tracker at root, an ancestor
+// of start, belong to one git repository: no directory from start up to but not
+// including root has a .git entry, and one exists at or above root. A .git file
+// (worktree or submodule) counts like a directory. Stat calls only, so a tree
+// with no repository, or a .git that cannot be read, stays on the safe side.
+func trackerInSameRepo(start, root string) bool {
+	dir, err := filepath.Abs(start)
+	if err != nil {
+		return false
+	}
+	for dir != root {
+		if _, err := os.Lstat(filepath.Join(dir, ".git")); !errors.Is(err, fs.ErrNotExist) {
+			return false
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return false
+		}
+		dir = parent
+	}
+	for {
+		if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
+			return true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return false
+		}
+		dir = parent
+	}
+}
+
+// BeadsReadArgs returns a copy of args for running br from dir. When br would
+// reach a tracker by walking up, and that tracker is outside dir's own git
+// repository, ntm did not choose it, so a read of it gets beadsReadOnlyFlags. The
+// read can then lag a newer issues.jsonl until an ordinary br command imports it.
+// Writes, reads from a directory with its own .beads, and reads from anywhere
+// inside the tracker's repository are unchanged.
+func BeadsReadArgs(dir string, args []string) []string {
+	result := append([]string(nil), args...)
+	if !isBeadsReadCommand(result) || !readsWalkedUpTracker(dir) {
+		return result
+	}
+	for _, flag := range beadsReadOnlyFlags {
+		if !containsString(result, flag) {
+			result = append(result, flag)
+		}
+	}
+	return result
+}
+
 // RunBd executes br (beads_rust) with given args and returns stdout.
 // If br reports a missing database and suggests `--no-db`, it retries once with `--no-db`
 // and caches that preference for the remainder of the process.
@@ -804,20 +943,68 @@ func RunBdContext(ctx context.Context, dir string, args ...string) (string, erro
 // runBdContext executes br with the workspace serialization and retry policy
 // used by RunBd. allowNoDB must be false for compare-and-set mutations such as
 // claims because JSONL-only fallback cannot provide the SQLite transaction.
+// These guarded commands also require the caller's exact local workspace:
+// inherited tracker overrides and parent discovery cannot redirect their CAS.
 func runBdContext(parent context.Context, dir string, allowNoDB bool, args ...string) (string, error) {
+	return runBdCommandContext(parent, dir, beadsCommandOptions{
+		allowNoDB: allowNoDB, retryTransient: true, projectBound: !allowNoDB,
+	}, args...)
+}
+
+type beadsCommandOptions struct {
+	allowNoDB      bool
+	retryTransient bool
+	projectBound   bool
+}
+
+// beadsCommandError retains machine-readable output without changing the
+// diagnostics or error chain exposed by RunBd. In particular, doctor can
+// report a verified partial repair on stdout while exiting nonzero.
+type beadsCommandError struct {
+	args   []string
+	err    error
+	stdout string
+	stderr string
+}
+
+func (e *beadsCommandError) Error() string {
+	diagnostics := e.stderr
+	if strings.TrimSpace(diagnostics) == "" {
+		diagnostics = e.stdout
+	}
+	return fmt.Sprintf("br %s: %v: %s", strings.Join(e.args, " "), e.err, diagnostics)
+}
+
+func (e *beadsCommandError) Unwrap() error { return e.err }
+
+func runBdCommandContext(parent context.Context, dir string, options beadsCommandOptions, args ...string) (string, error) {
 	if parent == nil {
 		return "", errors.New("br command context is required")
 	}
 	if err := parent.Err(); err != nil {
 		return "", err
 	}
-	// Normalize dir to ensure consistent cache keys.
-	normalizedDir, err := normalizeTriageDir(dir)
+	// Guarded mutations must validate the literal selected workspace before
+	// any discovery can replace it with a parent's tracker. Generic read
+	// helpers retain their intentional walk-up behavior.
+	var normalizedDir string
+	var err error
+	if options.projectBound {
+		normalizedDir, err = worksource.ResolveBeadsProjectDir(dir)
+	} else {
+		normalizedDir, err = normalizeTriageDir(dir)
+	}
 	if err != nil {
 		return "", err
 	}
+	// Decide on the literal dir: normalization has already moved normalizedDir
+	// to the discovered tracker root, which always has a .beads of its own.
+	if options.projectBound {
+		args = append([]string(nil), args...)
+	} else {
+		args = BeadsReadArgs(dir, args)
+	}
 	dir = normalizedDir
-	args = append([]string(nil), args...)
 
 	// br's SQLite-backed workspace can self-contend when a single ntm process
 	// launches multiple br subprocesses against the same directory in parallel.
@@ -828,7 +1015,7 @@ func runBdContext(parent context.Context, dir string, allowNoDB bool, args ...st
 	defer mu.Unlock()
 
 	// Check cache for this specific directory
-	if allowNoDB && getNoDBState(dir) && !containsString(args, "--no-db") {
+	if options.allowNoDB && getNoDBState(dir) && !containsString(args, "--no-db") {
 		args = append([]string{"--no-db"}, args...)
 	}
 	if !containsString(args, "--no-db") && !containsString(args, "--lock-timeout") {
@@ -836,12 +1023,19 @@ func runBdContext(parent context.Context, dir string, allowNoDB bool, args ...st
 	}
 
 	const maxAttempts = 6 // Canonical default: config.RetryConfig.DB.MaxAttempts
+	retryDeadline := time.Now().Add(transientBeadsRetryBudget)
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		ctx, cancel := context.WithTimeout(parent, DefaultTimeout)
 
 		cmd := exec.CommandContext(ctx, "br", args...)
 		cmd.WaitDelay = time.Second // Prevent hanging on open pipes
 		cmd.Dir = dir
+		if options.projectBound {
+			if err := worksource.BindBeadsCommand(cmd, dir); err != nil {
+				cancel()
+				return "", err
+			}
+		}
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
@@ -865,19 +1059,26 @@ func runBdContext(parent context.Context, dir string, allowNoDB bool, args ...st
 			diagnostics = stdoutStr
 		}
 		// If we haven't already forced no-db, check if we should
-		if allowNoDB && !getNoDBState(dir) && !containsString(args, "--no-db") && isNoBeadsDBError(stderrStr, stdoutStr) {
+		if options.allowNoDB && !getNoDBState(dir) && !containsString(args, "--no-db") && isNoBeadsDBError(stderrStr, stdoutStr) {
 			setNoDBState(dir, true)
 			args = append([]string{"--no-db"}, stripFlagWithValue(args, "--lock-timeout")...)
 			attempt = 0
 			continue
 		}
-		if attempt < maxAttempts && isTransientBeadsDBError(stderrStr, stdoutStr) {
-			if err := waitForBeadsRetry(parent, transientBeadsDBBackoff(attempt)); err != nil {
+		if options.retryTransient && isTransientBeadsDBError(stderrStr, stdoutStr) {
+			delay, retry := transientBeadsRetryDelay(attempt, maxAttempts, retryDeadline)
+			if !retry {
+				return "", fmt.Errorf(
+					"br %s: workspace still contended after %d attempt(s): %w: %s",
+					strings.Join(args, " "), attempt, err, diagnostics,
+				)
+			}
+			if err := waitForBeadsRetry(parent, delay); err != nil {
 				return "", err
 			}
 			continue
 		}
-		return "", fmt.Errorf("br %s: %w: %s", strings.Join(args, " "), err, diagnostics)
+		return "", &beadsCommandError{args: args, err: err, stdout: stdoutStr, stderr: stderrStr}
 	}
 
 	return "", fmt.Errorf("br %s: exceeded retry budget", strings.Join(args, " "))
@@ -928,6 +1129,12 @@ func isBeadsDBCorruptionError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Typed authorization/ownership refusals can contain task IDs or mutex
+	// names that happen to match a SQLite diagnostic. They are not evidence
+	// of database corruption and must never trigger a destructive rebuild.
+	if errors.Is(err, ErrBeadAssignmentIneligible) || errors.Is(err, ErrBeadAlreadyClaimed) || errors.Is(err, ErrBeadTerminal) {
+		return false
+	}
 	message := strings.ToLower(err.Error())
 	for _, signature := range beadsDBCorruptionSignatures {
 		if strings.Contains(message, signature) {
@@ -937,13 +1144,468 @@ func isBeadsDBCorruptionError(err error) bool {
 	return false
 }
 
+// ReadForMutationContext reads the Beads evidence needed to prepare an actual
+// mutation. If a failed br command proves index corruption, it repairs the local
+// workspace and repeats the read once. The callback must only read: never pass a
+// claim, reservation, dispatch, or an entire assignment operation here. Ordinary
+// read and preview APIs deliberately do not opt into this recovery.
+//
+// Planning callers must repeat the whole evidence collection, not just one
+// nested command, so the retry verifies source identity and eligibility anew.
+func ReadForMutationContext[T any](ctx context.Context, dir string, read func() (T, error)) (T, error) {
+	var zero T
+	if err := requireBeadsMutationContext(ctx); err != nil {
+		return zero, err
+	}
+	if read == nil {
+		return zero, errors.New("Beads mutation preparation requires a read callback")
+	}
+	result, err := read()
+	if ctx.Err() != nil {
+		return zero, ctx.Err()
+	}
+	if err == nil || !isBeadsReadCorruptionError(err) {
+		return result, err
+	}
+	recoveryDir, workspaceErr := localBeadsRecoveryDir(ctx, dir)
+	if workspaceErr != nil {
+		return zero, fmt.Errorf("Beads read failed (%v); refusing database recovery: %w", err, workspaceErr)
+	}
+	slog.Warn("Beads database corruption detected while preparing a mutation; repairing before rereading",
+		"dir", recoveryDir, "error", err)
+	if recoveryErr := recoverCorruptBeadsDatabase(ctx, recoveryDir); recoveryErr != nil {
+		return zero, fmt.Errorf("Beads read failed (%v); database recovery failed: %w", err, recoveryErr)
+	}
+	InvalidateTriageCache()
+	if err := ctx.Err(); err != nil {
+		return zero, err
+	}
+	result, err = read()
+	if ctx.Err() != nil {
+		return zero, ctx.Err()
+	}
+	return result, err
+}
+
+// Read errors can include untrusted task text and parser diagnostics. Require
+// a failed br command's structured database error, not just matching prose.
+func isBeadsReadCorruptionError(err error) bool {
+	if errors.Is(err, ErrBeadAssignmentIneligible) || errors.Is(err, ErrBeadAlreadyClaimed) || errors.Is(err, ErrBeadTerminal) {
+		return false
+	}
+	if isBeadsPreservationRefusal(err) {
+		return true
+	}
+	var commandErr *beadsCommandError
+	if !errors.As(err, &commandErr) {
+		return false
+	}
+	for _, output := range []string{commandErr.stdout, commandErr.stderr} {
+		var result struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal([]byte(output), &result) == nil && result.Error.Code == "DATABASE_ERROR" &&
+			isBeadsDBCorruptionError(errors.New(result.Error.Message)) {
+			return true
+		}
+	}
+	return false
+}
+
+// Recovery must not follow br's normal walk-up discovery or a database/source
+// redirected into another workspace. A symlink alias of the project itself is
+// fine; the .beads directory and the resolved files must belong to that project.
+func localBeadsRecoveryDir(ctx context.Context, dir string) (string, error) {
+	if !HasLocalBeadsDB(dir) {
+		return "", errors.New("the requested directory has no local Beads workspace")
+	}
+	localDir, err := filepath.Abs(strings.TrimSpace(dir))
+	if err != nil {
+		return "", err
+	}
+	localDir, err = filepath.EvalSymlinks(localDir)
+	if err != nil {
+		return "", err
+	}
+	beadsDir := filepath.Join(localDir, ".beads")
+	beadsInfo, err := os.Lstat(beadsDir)
+	if err != nil || !beadsInfo.IsDir() {
+		return "", errors.New("database recovery requires a local .beads directory, not a symlink")
+	}
+	output, err := runBdContext(ctx, localDir, false, "info", "--json", "--no-auto-import", "--no-auto-flush")
+	if err != nil {
+		return "", fmt.Errorf("resolve Beads recovery workspace: %w", err)
+	}
+	var info struct {
+		DatabasePath string `json:"database_path"`
+		JSONLPath    string `json:"jsonl_path"`
+	}
+	if err := json.Unmarshal([]byte(output), &info); err != nil {
+		return "", fmt.Errorf("parse Beads recovery workspace: %w", err)
+	}
+	for _, path := range []string{info.DatabasePath, info.JSONLPath} {
+		if strings.TrimSpace(path) == "" {
+			return "", errors.New("database recovery requires identified SQLite and JSONL files")
+		}
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(localDir, path)
+		}
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return "", fmt.Errorf("resolve Beads recovery file: %w", err)
+		}
+		relative, err := filepath.Rel(beadsDir, resolved)
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+			return "", errors.New("database recovery files must remain inside the local .beads directory")
+		}
+	}
+	return localDir, nil
+}
+
 // recoverCorruptBeadsDatabase runs br's supported JSONL-authoritative repair
 // (`br sync --import-only --rebuild`), which recreates the SQLite index from
 // JSONL and removes orphaned DB entries. br >= 0.2.19 requires an explicit
-// sync mode flag; --rebuild alone fails validation.
+// sync mode flag; --rebuild alone fails validation. If corruption prevents
+// br >= 0.7 from establishing preservation guarantees, its explicit doctor
+// repair can still restore a verified index while retaining recovery evidence.
 func recoverCorruptBeadsDatabase(ctx context.Context, normalizedDir string) error {
 	_, err := runBdContext(ctx, normalizedDir, false, "sync", "--import-only", "--rebuild", "--json")
-	return err
+	if !isBeadsPreservationRefusal(err) {
+		return err
+	}
+	slog.Warn("Beads rebuild could not enumerate tombstones; checking preservation before doctor repair",
+		"dir", normalizedDir, "error", err)
+	if repairErr := repairBeadsDatabaseWithDoctor(ctx, normalizedDir); repairErr != nil {
+		return errors.Join(err, fmt.Errorf("doctor repair failed: %w", repairErr))
+	}
+	return nil
+}
+
+// Other SYNC_CONFLICT errors protect changed JSONL, write authority, and merge
+// state. Only this specific structured refusal permits the repair fallback.
+func isBeadsPreservationRefusal(err error) bool {
+	var commandErr *beadsCommandError
+	var exitErr *exec.ExitError
+	if !errors.As(err, &commandErr) || !errors.As(err, &exitErr) || exitErr.ExitCode() != 6 {
+		return false
+	}
+	for _, output := range []string{commandErr.stdout, commandErr.stderr} {
+		var result struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal([]byte(output), &result) != nil || result.Error.Code != "SYNC_CONFLICT" {
+			continue
+		}
+		const prefix = "Sync conflict: Automatic database recovery refused because unflushed-state preservation could not be established:\n- "
+		message, ok := strings.CutPrefix(result.Error.Message, prefix)
+		if !ok {
+			continue
+		}
+		warning, _, ok := strings.Cut(message, "\nThe database was not replaced.")
+		if ok && isBeadsTombstoneEnumerationWarning(warning) {
+			return true
+		}
+	}
+	return false
+}
+
+// Only corruption while enumerating tombstones is eligible for the independent
+// preservation check below. Unreadable dirty rows, relationships, or history
+// are not permission to invoke a destructive best-effort repair.
+func isBeadsTombstoneEnumerationWarning(warning string) bool {
+	return strings.HasPrefix(warning, "the tombstone issue IDs could not be read before the rebuild (") &&
+		strings.HasSuffix(warning, "); preservation of unflushed local state could not be established") &&
+		!strings.ContainsAny(warning, "\r\n") && isBeadsDBCorruptionError(errors.New(warning))
+}
+
+type beadsDoctorRepairResult struct {
+	ExitCode                    *int     `json:"exit_code"`
+	Code                        string   `json:"code"`
+	OK                          *bool    `json:"ok"`
+	Repaired                    *bool    `json:"repaired"`
+	DatabaseVerified            *bool    `json:"database_verified"`
+	Verified                    *bool    `json:"verified"`
+	PreservationVerified        *bool    `json:"preservation_verified"`
+	Skipped                     *int     `json:"skipped"`
+	FKViolationsCleaned         *int     `json:"fk_violations_cleaned"`
+	DirtyPreservationWarnings   []string `json:"dirty_preservation_warnings"`
+	HistoryPreservationWarnings []string `json:"history_preservation_warnings"`
+	PreservedHistory            []struct {
+		Skipped *int `json:"skipped"`
+	} `json:"preserved_history"`
+	VerifiedBackups []struct {
+		Backup string `json:"backup"`
+	} `json:"verified_backups"`
+	RecoveryFailureMarker      string  `json:"recovery_failure_marker"`
+	RecoveryFailureMarkerError *string `json:"recovery_failure_marker_error"`
+}
+
+// Exit 2 alone also covers failed database verification and lost local data.
+// Validate the JSONL-rebuild evidence, while retaining the distinct verified
+// local-repair/healthy-no-op contract that omits rebuild-specific fields.
+func validateBeadsDoctorRepair(output string, exitCode int) (beadsDoctorRepairResult, error) {
+	var result beadsDoctorRepairResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		return result, fmt.Errorf("parse br doctor repair result: %w", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(output), &fields); err != nil {
+		return result, fmt.Errorf("parse br doctor repair evidence: %w", err)
+	}
+	rebuildReport := false
+	for _, field := range []string{
+		"database_verified", "preservation_verified", "imported", "skipped", "fk_violations_cleaned",
+		"preserved_tombstones", "preserved_dirty_issues", "preserved_dirty_issue_ids", "preserved_history",
+		"history_preservation_warnings", "dirty_preservation_warnings", "verified_backups",
+		"recovery_failure_marker", "recovery_failure_marker_error",
+	} {
+		if _, present := fields[field]; present {
+			rebuildReport = true
+			break
+		}
+	}
+	if !rebuildReport && exitCode == 0 && result.Verified != nil && *result.Verified &&
+		(result.OK == nil || *result.OK) && (result.ExitCode == nil || *result.ExitCode == 0) &&
+		(result.Code == "" || result.Code == "healthy") {
+		return result, nil
+	}
+	if result.ExitCode == nil || *result.ExitCode != exitCode ||
+		result.OK == nil || result.Verified == nil || result.PreservationVerified == nil ||
+		result.Repaired == nil || !*result.Repaired || result.DatabaseVerified == nil || !*result.DatabaseVerified {
+		return result, errors.New("br doctor repair did not verify the repaired database and exit status")
+	}
+	if result.Skipped == nil || *result.Skipped != 0 || result.FKViolationsCleaned == nil || *result.FKViolationsCleaned != 0 ||
+		result.HistoryPreservationWarnings == nil || len(result.HistoryPreservationWarnings) != 0 ||
+		result.DirtyPreservationWarnings == nil || result.PreservedHistory == nil {
+		return result, errors.New("br doctor repair has missing or unsuccessful preservation evidence")
+	}
+	for _, history := range result.PreservedHistory {
+		if history.Skipped == nil || *history.Skipped != 0 {
+			return result, errors.New("br doctor repair skipped local history")
+		}
+	}
+	if len(result.VerifiedBackups) == 0 || result.RecoveryFailureMarkerError != nil {
+		return result, errors.New("br doctor repair did not retain verified recovery evidence")
+	}
+	for _, backup := range result.VerifiedBackups {
+		if strings.TrimSpace(backup.Backup) == "" {
+			return result, errors.New("br doctor repair omitted a verified backup path")
+		}
+	}
+	if exitCode == 0 && result.Code == "healthy" && *result.OK && *result.Verified && *result.PreservationVerified &&
+		len(result.DirtyPreservationWarnings) == 0 && strings.TrimSpace(result.RecoveryFailureMarker) == "" {
+		return result, nil
+	}
+	if exitCode == 2 && result.Code == "fix_partial" && !*result.OK && !*result.Verified && !*result.PreservationVerified &&
+		len(result.DirtyPreservationWarnings) == 1 && isBeadsTombstoneEnumerationWarning(result.DirtyPreservationWarnings[0]) &&
+		strings.TrimSpace(result.RecoveryFailureMarker) != "" {
+		return result, nil
+	}
+	return result, errors.New("br doctor repair was not a verified recovery with an allowed preservation warning")
+}
+
+type beadsRepairTombstones struct {
+	databasePath string
+	ids          []string
+}
+
+// The covering indexes can be read even when the issues table root cannot.
+// Both status indexes must agree, and every known tombstone must be in JSONL:
+// clean tombstones may have been deliberately omitted from the export. An
+// unknown schema or unreadable index fails closed without replacing files.
+func verifyBeadsTombstonesForRepair(ctx context.Context, dir string) (beadsRepairTombstones, error) {
+	var snapshot beadsRepairTombstones
+	output, err := runBdContext(ctx, dir, false, "info", "--json", "--no-auto-import", "--no-auto-flush")
+	if err != nil {
+		return snapshot, err
+	}
+	var info beadsWorkspaceInfo
+	if err := json.Unmarshal([]byte(output), &info); err != nil {
+		return snapshot, fmt.Errorf("parse Beads repair workspace info: %w", err)
+	}
+	snapshot.databasePath = strings.TrimSpace(info.DatabasePath)
+	if snapshot.databasePath == "" {
+		return snapshot, errors.New("tombstone preservation requires a SQLite Beads database")
+	}
+	mu := workspaceBDMutex(dir)
+	if err := mu.LockContext(ctx); err != nil {
+		return snapshot, err
+	}
+	defer mu.Unlock()
+	database, err := sql.Open(sqliteutil.DriverName, sqliteutil.FileDSN(snapshot.databasePath, "busy_timeout(5000)")+"&mode=ro")
+	if err != nil {
+		return snapshot, err
+	}
+	defer database.Close()
+	tx, err := database.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return snapshot, err
+	}
+	defer tx.Rollback()
+	var disagree bool
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT rowid FROM issues INDEXED BY idx_issues_status WHERE status = 'tombstone'
+		EXCEPT SELECT rowid FROM issues INDEXED BY idx_issues_tombstone WHERE status = 'tombstone'
+	) OR EXISTS (
+		SELECT rowid FROM issues INDEXED BY idx_issues_tombstone WHERE status = 'tombstone'
+		EXCEPT SELECT rowid FROM issues INDEXED BY idx_issues_status WHERE status = 'tombstone'
+	)`).Scan(&disagree)
+	if err != nil {
+		return snapshot, fmt.Errorf("verify tombstone indexes before repair: %w", err)
+	}
+	if disagree {
+		return snapshot, errors.New("tombstone indexes disagree; preservation cannot be established")
+	}
+	var expected int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM issues INDEXED BY idx_issues_tombstone WHERE status = 'tombstone'`).Scan(&expected); err != nil {
+		return snapshot, fmt.Errorf("count tombstones before repair: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM issues INDEXED BY sqlite_autoindex_issues_1
+		WHERE rowid IN (SELECT rowid FROM issues INDEXED BY idx_issues_tombstone WHERE status = 'tombstone')`)
+	if err != nil {
+		return snapshot, fmt.Errorf("read tombstone IDs before repair: %w", err)
+	}
+	defer rows.Close()
+	tombstones := make(map[string]bool, expected)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return snapshot, err
+		}
+		if _, duplicate := tombstones[id]; duplicate || strings.TrimSpace(id) == "" {
+			return snapshot, errors.New("invalid tombstone IDs before repair")
+		}
+		tombstones[id] = false
+	}
+	if err := rows.Err(); err != nil {
+		return snapshot, fmt.Errorf("read tombstone IDs before repair: %w", err)
+	}
+	if len(tombstones) != expected {
+		return snapshot, errors.New("tombstone count disagrees with readable IDs before repair")
+	}
+	if len(tombstones) == 0 {
+		return snapshot, ctx.Err()
+	}
+	if strings.TrimSpace(info.JSONLPath) == "" {
+		return snapshot, errors.New("tombstone preservation requires the Beads JSONL path")
+	}
+	jsonl, err := os.Open(info.JSONLPath)
+	if err != nil {
+		return snapshot, fmt.Errorf("read tombstone preservation source: %w", err)
+	}
+	defer jsonl.Close()
+	decoder := json.NewDecoder(jsonl)
+	seen := make(map[string]bool)
+	for {
+		if err := ctx.Err(); err != nil {
+			return snapshot, err
+		}
+		var issue struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+		}
+		if err := decoder.Decode(&issue); err == io.EOF {
+			break
+		} else if err != nil {
+			return snapshot, fmt.Errorf("parse tombstone preservation source: %w", err)
+		}
+		if issue.ID == "" || issue.Status == "" || seen[issue.ID] {
+			return snapshot, errors.New("invalid or duplicate issue in tombstone preservation source")
+		}
+		seen[issue.ID] = true
+		if _, needed := tombstones[issue.ID]; needed {
+			if issue.Status != "tombstone" {
+				return snapshot, fmt.Errorf("JSONL would resurrect tombstone %s", issue.ID)
+			}
+			tombstones[issue.ID] = true
+		}
+	}
+	for id, preserved := range tombstones {
+		if !preserved {
+			return snapshot, fmt.Errorf("JSONL does not preserve tombstone %s", id)
+		}
+		snapshot.ids = append(snapshot.ids, id)
+	}
+	sort.Strings(snapshot.ids)
+	return snapshot, nil
+}
+
+// Doctor takes its own later snapshot. Verify known IDs in the repaired DB so
+// JSONL changes between the preflight and repair cannot silently drop them.
+func verifyBeadsTombstonesAfterRepair(ctx context.Context, dir string, snapshot beadsRepairTombstones) error {
+	if len(snapshot.ids) == 0 {
+		return ctx.Err()
+	}
+	mu := workspaceBDMutex(dir)
+	if err := mu.LockContext(ctx); err != nil {
+		return err
+	}
+	defer mu.Unlock()
+	database, err := sql.Open(sqliteutil.DriverName, sqliteutil.FileDSN(snapshot.databasePath, "busy_timeout(5000)")+"&mode=ro")
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+	tx, err := database.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, id := range snapshot.ids {
+		var status string
+		if err := tx.QueryRowContext(ctx, "SELECT status FROM issues WHERE id = ?", id).Scan(&status); err != nil {
+			return fmt.Errorf("br doctor repair lost tombstone %s: %w", id, err)
+		}
+		if status != "tombstone" {
+			return fmt.Errorf("br doctor repair resurrected tombstone %s", id)
+		}
+	}
+	return ctx.Err()
+}
+
+func repairBeadsDatabaseWithDoctor(ctx context.Context, normalizedDir string) error {
+	snapshot, err := verifyBeadsTombstonesForRepair(ctx, normalizedDir)
+	if err != nil {
+		return fmt.Errorf("refuse br doctor repair without tombstone preservation: %w", err)
+	}
+	// Do not retry doctor on diagnostic substrings: a completed partial repair
+	// may mention locks in its preservation warnings. Never bypass its repeated
+	// repair guard or remove the backups/verification-failure marker it retains.
+	output, err := runBdCommandContext(ctx, normalizedDir, beadsCommandOptions{projectBound: true}, "doctor", "--repair", "--json")
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	exitCode := 0
+	if err != nil {
+		var commandErr *beadsCommandError
+		var exitErr *exec.ExitError
+		if !errors.As(err, &commandErr) || !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+			return err
+		}
+		exitCode = exitErr.ExitCode()
+		output = commandErr.stdout
+	}
+	result, validationErr := validateBeadsDoctorRepair(output, exitCode)
+	if validationErr != nil {
+		return errors.Join(err, validationErr)
+	}
+	if verifyErr := verifyBeadsTombstonesAfterRepair(ctx, normalizedDir, snapshot); verifyErr != nil {
+		return errors.Join(err, verifyErr)
+	}
+	if exitCode == 2 {
+		slog.Warn("Beads doctor verified the database after the independent tombstone check; retaining recovery evidence",
+			"dir", normalizedDir,
+			"dirty_preservation_warnings", result.DirtyPreservationWarnings,
+			"recovery_failure_marker", result.RecoveryFailureMarker,
+			"verified_backups", result.VerifiedBackups)
+	}
+	return nil
 }
 
 // withBeadsCorruptionRecovery executes op and, when it fails with a
@@ -954,6 +1616,10 @@ func recoverCorruptBeadsDatabase(ctx context.Context, normalizedDir string) erro
 // and keeps a transient index corruption from becoming a persistent
 // assignment-factory stall (#227).
 func withBeadsCorruptionRecovery[T any](ctx context.Context, normalizedDir string, op func() (T, error)) (T, error) {
+	if err := requireBeadsMutationContext(ctx); err != nil {
+		var zero T
+		return zero, err
+	}
 	result, err := op()
 	if err == nil || !isBeadsDBCorruptionError(err) {
 		return result, err
@@ -967,6 +1633,10 @@ func withBeadsCorruptionRecovery[T any](ctx context.Context, normalizedDir strin
 	}
 	slog.Info("beads database rebuilt from JSONL after corruption; retrying guarded mutation once",
 		"dir", normalizedDir)
+	if err := ctx.Err(); err != nil {
+		var zero T
+		return zero, err
+	}
 	return op()
 }
 
@@ -1229,7 +1899,7 @@ func ClaimBeadForAssignmentWithOperatorGatedLabels(ctx context.Context, dir, bea
 	if actor == "" {
 		return BeadClaimResult{}, errors.New("claim actor is required")
 	}
-	normalizedDir, err := normalizeTriageDir(dir)
+	normalizedDir, err := worksource.ResolveBeadsProjectDir(dir)
 	if err != nil {
 		return BeadClaimResult{}, err
 	}
@@ -1299,7 +1969,7 @@ func ReleaseBeadClaim(ctx context.Context, dir, beadID, actor string) (bool, err
 	if actor == "" {
 		return false, errors.New("claim actor is required")
 	}
-	normalizedDir, err := normalizeTriageDir(dir)
+	normalizedDir, err := worksource.ResolveBeadsProjectDir(dir)
 	if err != nil {
 		return false, err
 	}
@@ -1389,6 +2059,7 @@ func ClaimBead(ctx context.Context, dir, beadID, actor string) (BeadClaimResult,
 
 type beadsWorkspaceInfo struct {
 	DatabasePath string `json:"database_path"`
+	JSONLPath    string `json:"jsonl_path"`
 }
 
 type guardedClaimIssue struct {
@@ -1455,7 +2126,7 @@ func requireBeadsMutationContext(ctx context.Context) error {
 }
 
 func claimBeadNonTerminalMode(ctx context.Context, dir, beadID, actor string, expectedStaleUpdatedAt time.Time, gatedLabels []string) (BeadClaimResult, error) {
-	normalizedDir, err := normalizeTriageDir(dir)
+	normalizedDir, err := worksource.ResolveBeadsProjectDir(dir)
 	if err != nil {
 		return BeadClaimResult{}, err
 	}
@@ -1560,6 +2231,9 @@ func claimBeadForAssignmentTransaction(ctx context.Context, databasePath, beadID
 			Deferred: issue.Deferred, Pinned: issue.Pinned, Ephemeral: issue.Ephemeral,
 			Template: issue.Template, Wisp: wisp,
 		}
+	}
+	if err := requireAssignmentMutexes(ctx, tx, beadID); err != nil {
+		return BeadClaimResult{}, false, err
 	}
 	if sameActorInProgress {
 		if err := tx.Commit(); err != nil {
@@ -1747,6 +2421,9 @@ func claimBeadNonTerminalTransaction(ctx context.Context, databasePath, beadID, 
 			Deferred: issue.Deferred, Pinned: issue.Pinned, Ephemeral: issue.Ephemeral,
 			Template: issue.Template, Wisp: wisp,
 		}
+	}
+	if err := requireAssignmentMutexes(ctx, tx, beadID); err != nil {
+		return BeadClaimResult{}, false, err
 	}
 	if status == "in_progress" && currentAssignee == actor {
 		if err := tx.Commit(); err != nil {
@@ -2179,13 +2856,23 @@ func beadClaimArgs(beadID, actor string) []string {
 }
 
 func parseBeadClaimOutput(output string) (BeadClaimResult, error) {
-	var rows []struct {
+	type claimRow struct {
 		ID     string `json:"id"`
 		Title  string `json:"title"`
 		Status string `json:"status"`
 	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(output)), &rows); err != nil {
-		return BeadClaimResult{}, fmt.Errorf("parse atomic claim output: %w", err)
+	var rows []claimRow
+	trimmed := strings.TrimSpace(output)
+	if err := json.Unmarshal([]byte(trimmed), &rows); err != nil {
+		// Under a workflow capacity soft limit br wraps the rows as
+		// {"updated":[...],"warnings":[...]}; the claim itself succeeded.
+		var envelope struct {
+			Updated []claimRow `json:"updated"`
+		}
+		if envErr := json.Unmarshal([]byte(trimmed), &envelope); envErr != nil || envelope.Updated == nil {
+			return BeadClaimResult{}, fmt.Errorf("parse atomic claim output: %w", err)
+		}
+		rows = envelope.Updated
 	}
 	if len(rows) != 1 {
 		return BeadClaimResult{}, fmt.Errorf("atomic claim returned %d rows, want 1", len(rows))
@@ -2292,23 +2979,80 @@ func isNoBeadsDBError(streams ...string) bool {
 	return strings.Contains(s, "no beads database found") || strings.Contains(s, "use 'br --no-db'")
 }
 
+// isTransientBeadsDBError reports whether a failed br/bv invocation died on
+// workspace contention that a later attempt can reasonably expect to clear:
+//
+//   - SQLite "database is busy" / "database is locked" (another writer holds
+//     the SQLite lock);
+//   - br's cross-process workspace write lock timing out ("Timed out after
+//     Nms waiting for write lock (...) at .beads/.write.lock"). br reports
+//     this as a CONFIG_ERROR, but it is contention, not configuration: the
+//     command never ran, so retrying it is safe for reads and for
+//     compare-and-set mutations alike.
+//
+// Every other diagnostic (including other CONFIG_ERRORs such as a genuinely
+// unwritable lock file) is terminal and must not be retried.
 func isTransientBeadsDBError(streams ...string) bool {
 	s := strings.ToLower(strings.Join(streams, "\n"))
-	return strings.Contains(s, "database is busy") || strings.Contains(s, "database is locked")
+	if strings.Contains(s, "database is busy") || strings.Contains(s, "database is locked") {
+		return true
+	}
+	return strings.Contains(s, "timed out after") && strings.Contains(s, "waiting for write lock")
 }
 
-func transientBeadsDBBackoff(attempt int) time.Duration {
+const (
+	// transientBeadsDBBackoffBase is the first retry delay after workspace
+	// contention; each later attempt doubles it up to transientBeadsDBBackoffCap.
+	transientBeadsDBBackoffBase = 50 * time.Millisecond
+	transientBeadsDBBackoffCap  = 800 * time.Millisecond
+)
+
+// transientBeadsRetryBudget bounds the total wall-clock time one br/bv
+// invocation may spend retrying workspace contention, measured from the first
+// attempt. It is a var so tests can shrink it; production code never writes it.
+var transientBeadsRetryBudget = 20 * time.Second
+
+// transientBeadsDBBackoffBounds returns the inclusive [min, max] delay window
+// for the given 1-based attempt: exponential growth capped at
+// transientBeadsDBBackoffCap, with the lower bound at half the ceiling so
+// jitter spreads contending processes without collapsing to zero.
+func transientBeadsDBBackoffBounds(attempt int) (time.Duration, time.Duration) {
 	if attempt < 1 {
 		attempt = 1
 	}
-	backoff := 50 * time.Millisecond
-	for i := 1; i < attempt; i++ {
-		backoff *= 2
-		if backoff >= 800*time.Millisecond {
-			return 800 * time.Millisecond
-		}
+	ceiling := transientBeadsDBBackoffBase
+	for i := 1; i < attempt && ceiling < transientBeadsDBBackoffCap; i++ {
+		ceiling *= 2
 	}
-	return backoff
+	if ceiling > transientBeadsDBBackoffCap {
+		ceiling = transientBeadsDBBackoffCap
+	}
+	return ceiling / 2, ceiling
+}
+
+// transientBeadsDBBackoff returns the jittered delay before retrying the
+// given 1-based attempt, uniformly drawn from transientBeadsDBBackoffBounds.
+func transientBeadsDBBackoff(attempt int) time.Duration {
+	low, high := transientBeadsDBBackoffBounds(attempt)
+	if high <= low {
+		return low
+	}
+	return low + rand.N(high-low+1)
+}
+
+// transientBeadsRetryDelay decides whether a transient failure on the given
+// attempt should be retried and, if so, how long to wait first. It returns
+// false when the attempt budget is spent or when the next delay would push the
+// invocation past deadline; the caller then surfaces the last br error.
+func transientBeadsRetryDelay(attempt, maxAttempts int, deadline time.Time) (time.Duration, bool) {
+	if attempt >= maxAttempts {
+		return 0, false
+	}
+	delay := transientBeadsDBBackoff(attempt)
+	if time.Until(deadline) <= delay {
+		return 0, false
+	}
+	return delay, true
 }
 
 func containsString(list []string, value string) bool {
@@ -2359,8 +3103,11 @@ func GetBeadStatusContext(ctx context.Context, dir, beadID string) (string, erro
 // Unlike triage output, br show is keyed by the requested ID and is not capped
 // or ranking-dependent.
 type BeadAssignmentDetails struct {
-	ID                   string
-	Title                string
+	ID    string
+	Title string
+	// Description is the bead body. Assignment reads the paths it must
+	// reserve from it as well as from the title (ntm#336).
+	Description          string
 	IssueType            string
 	Status               string
 	Priority             int
@@ -2486,6 +3233,7 @@ type beadShowDependency struct {
 type beadShowAssignmentRow struct {
 	ID           string               `json:"id"`
 	Title        string               `json:"title"`
+	Description  string               `json:"description"`
 	IssueType    string               `json:"issue_type"`
 	Status       string               `json:"status"`
 	Priority     int                  `json:"priority"`
@@ -2551,6 +3299,26 @@ func GetBeadAssignmentDetailsContext(ctx context.Context, dir, beadID string) (*
 	return details, nil
 }
 
+// BeadTextReader narrows a live assignment-details reader to a bead's title
+// and description, the shape reservation discovery reads
+// (assign.DiscoverReservationPaths), so `ntm assign` and the robot assignment
+// surfaces discover a bead's file scope from the same read.
+func BeadTextReader(read func(context.Context, string, string) (*BeadAssignmentDetails, error)) func(context.Context, string, string) (string, string, error) {
+	return func(ctx context.Context, dir, beadID string) (string, string, error) {
+		if read == nil {
+			return "", "", errors.New("bead reader is not configured")
+		}
+		details, err := read(ctx, dir, beadID)
+		if err != nil {
+			return "", "", err
+		}
+		if details == nil {
+			return "", "", errors.New("live work-item details are missing")
+		}
+		return details.Title, details.Description, nil
+	}
+}
+
 // GetBeadBlockingDependentsContext returns every local work item whose
 // readiness depends on beadID. The source is one uncapped br show response,
 // rather than a ranked triage list, so no dependent is dropped by a limit.
@@ -2608,7 +3376,7 @@ func parseBeadAssignmentDetailsOutput(output string) (*BeadAssignmentDetails, er
 	sort.Strings(labels)
 
 	return &BeadAssignmentDetails{
-		ID: row.ID, Title: row.Title, IssueType: row.IssueType, Status: row.Status, Priority: row.Priority,
+		ID: row.ID, Title: row.Title, Description: row.Description, IssueType: row.IssueType, Status: row.Status, Priority: row.Priority,
 		Assignee: row.Assignee, DeferUntil: row.DeferUntil, Pinned: row.Pinned, Ephemeral: row.Ephemeral,
 		Template: row.Template, Wisp: strings.Contains(strings.ToLower(row.ID), "-wisp-"), Labels: labels,
 		BlockedBy: blockedBy, BlockingDependencies: dependencyStates,

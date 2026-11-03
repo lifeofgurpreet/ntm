@@ -28,15 +28,20 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/bv"
 	"github.com/Dicklesworthstone/ntm/internal/completion"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/coordinator"
 	dispatchsvc "github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/events"
+	"github.com/Dicklesworthstone/ntm/internal/output"
+	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/pressure"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
+	"github.com/Dicklesworthstone/ntm/internal/resilience"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 	"github.com/Dicklesworthstone/ntm/internal/webhook"
+	"github.com/Dicklesworthstone/ntm/internal/worksource"
 )
 
 var (
@@ -53,7 +58,7 @@ var (
 	assignVerbose      bool
 	assignQuiet        bool
 	assignTimeout      time.Duration
-	assignDryRun       bool // Alias for no --auto
+	assignDryRun       bool // Preview recommendations or watch mode
 	assignReserveFiles bool // Enable Agent Mail file reservations
 
 	// Direct pane assignment flags
@@ -89,6 +94,12 @@ var (
 	// caller's CWD. Used by long-running watchers (launchd/cron/systemd) where
 	// CWD-walk discovery would otherwise pick up the wrong `.beads/`.
 	assignRepoPath string
+
+	// Prompt-context enrichment, with send's flag/config precedence: CASS
+	// history and CM rules are prepended to each fresh assignment prompt.
+	assignWithCASS   bool // force CASS history injection on
+	assignNoCASS     bool // force CASS history injection off, overriding [cass.context] enabled=true
+	assignWithMemory bool // inject CM rules even when [memory] send_injection=false
 )
 
 const (
@@ -204,6 +215,82 @@ type assignAgentInfo struct {
 	resourceHeadroom  float64
 }
 
+// assignPaneRoleSet captures the persona roles a pane is explicitly bound to.
+// A pane with neither flag set is untagged and eligible for every template.
+type assignPaneRoleSet struct {
+	implementer bool
+	reviewer    bool
+}
+
+// assignPaneRoles resolves a pane's role bindings from (a) the pane title's
+// user tags, (b) the persona profile named by the pane's durable variant —
+// matching both the persona's name and its tags. Only the explicit role
+// tokens "implementer" and "reviewer" count; broader descriptive tags
+// ("review", "coding", …) are deliberately ignored so mixed-focus personas
+// like the builtin architect stay eligible for both templates.
+func assignPaneRoles(registry *persona.Registry, pane tmux.Pane) assignPaneRoleSet {
+	var roles assignPaneRoleSet
+	note := func(token string) {
+		switch strings.ToLower(strings.TrimSpace(token)) {
+		case "implementer":
+			roles.implementer = true
+		case "reviewer":
+			roles.reviewer = true
+		}
+	}
+	for _, tag := range pane.Tags {
+		note(tag)
+	}
+	if registry != nil {
+		// Variant is a persona name for persona-spawned panes and model[@effort]
+		// for model panes; ParsePaneVariant strips a reasoning-effort suffix.
+		name, _ := tmux.ParsePaneVariant(pane.Variant)
+		if profile, ok := registry.Get(name); ok {
+			note(profile.Name)
+			for _, tag := range profile.Tags {
+				note(tag)
+			}
+		}
+	}
+	return roles
+}
+
+// filterAssignAgentsForTemplate drops panes explicitly bound to the opposite
+// role of the impl/review templates: reviewer-only panes never receive
+// implementation work and implementer-only panes never receive review work.
+// Untagged, model-only, and dual-role panes stay eligible; other templates
+// pass through unfiltered.
+func filterAssignAgentsForTemplate(agents []assignAgentInfo, registry *persona.Registry, template string) []assignAgentInfo {
+	template = strings.ToLower(strings.TrimSpace(template))
+	if template != "impl" && template != "review" {
+		return agents
+	}
+	eligible := make([]assignAgentInfo, 0, len(agents))
+	for _, candidate := range agents {
+		roles := assignPaneRoles(registry, candidate.pane)
+		if template == "impl" && roles.reviewer && !roles.implementer {
+			continue
+		}
+		if template == "review" && roles.implementer && !roles.reviewer {
+			continue
+		}
+		eligible = append(eligible, candidate)
+	}
+	return eligible
+}
+
+// assignRoleEligibleAgents loads the project persona registry and applies the
+// template role filter. A registry that fails to load fails closed: assigning
+// review work to a reviewer-tagged pane requires knowing which panes those
+// are, so a corrupt personas.toml must surface, not be skipped.
+func assignRoleEligibleAgents(agents []assignAgentInfo, projectDir, template string) ([]assignAgentInfo, error) {
+	registry, err := persona.LoadRegistry(projectDir)
+	if err != nil {
+		return nil, fmt.Errorf("load persona registry for role-aware assignment: %w", err)
+	}
+	return filterAssignAgentsForTemplate(agents, registry, template), nil
+}
+
 func newAssignCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "assign [session]",
@@ -304,7 +391,7 @@ Examples:
 	cmd.Flags().IntVar(&assignLimit, "limit", 0, "Maximum number of assignments (0 = unlimited)")
 
 	// Agent type filters
-	cmd.Flags().StringVar(&assignAgentType, "agent", "", "Filter by agent type: any (no filter), claude, codex, gemini")
+	cmd.Flags().StringVar(&assignAgentType, "agent", "", "Filter by agent type: any (no filter), claude, codex, gemini, antigravity, grok, omp, oc")
 	cmd.Flags().BoolVar(&assignCCOnly, "cc-only", false, "Only assign to Claude agents (alias for --agent=claude)")
 	cmd.Flags().BoolVar(&assignCodOnly, "cod-only", false, "Only assign to Codex agents (alias for --agent=codex)")
 	cmd.Flags().BoolVar(&assignGmiOnly, "gmi-only", false, "Only assign to Gemini agents (alias for --agent=gemini)")
@@ -317,12 +404,12 @@ Examples:
 	cmd.Flags().BoolVarP(&assignVerbose, "verbose", "v", false, "Show detailed scoring/decision logs")
 	cmd.Flags().BoolVarP(&assignQuiet, "quiet", "q", false, "Suppress non-essential output")
 	cmd.Flags().DurationVar(&assignTimeout, "timeout", 30*time.Second, "Timeout for tmux observation and external calls (bv, br, Agent Mail)")
-	cmd.Flags().BoolVar(&assignDryRun, "dry-run", false, "Preview mode (alias for no --auto)")
+	cmd.Flags().BoolVar(&assignDryRun, "dry-run", false, "Preview recommendations or watch mode without executing")
 	cmd.Flags().BoolVar(&assignReserveFiles, "reserve-files", true, "Reserve file paths via Agent Mail before assignment")
 
 	// Direct pane assignment flags
 	cmd.Flags().StringVar(&assignPane, "pane", "", "Assign bead directly to exactly one N, W.P, or %N pane selector (requires --beads)")
-	cmd.Flags().BoolVar(&assignForce, "force", false, "Force assignment even if pane is busy (also allows --clear to remove completed assignments)")
+	cmd.Flags().BoolVar(&assignForce, "force", false, "Force assignment even if pane is busy (also lets --clear remove completed or outcome-unknown assignments; forcing an outcome-unknown clear may duplicate an already-delivered dispatch)")
 	cmd.Flags().BoolVar(&assignIgnoreDeps, "ignore-deps", false, "Ignore dependency checks for assignment")
 	cmd.Flags().StringVar(&assignPrompt, "prompt", "", "Custom prompt for direct assignment")
 
@@ -351,7 +438,17 @@ Examples:
 	// Repository binding (issue #123)
 	cmd.Flags().StringVar(&assignRepoPath, "repo", "", "Pin the bead-source repository path (overrides CWD discovery; required for daemon/cron use)")
 
+	registerAssignPromptContextFlags(cmd)
+
 	return cmd
+}
+
+// registerAssignPromptContextFlags adds send's --with-cass / --no-cass /
+// --with-memory to an assignment command.
+func registerAssignPromptContextFlags(cmd *cobra.Command) {
+	cmd.Flags().BoolVar(&assignWithCASS, "with-cass", false, "Inject relevant CASS session history above each assignment prompt (query: bead title, labels, description); degrades gracefully when cass is unavailable. Config: [cass.context] enabled/max_sessions/lookback_days/max_tokens/min_relevance/skip_if_context_above/prefer_same_project")
+	cmd.Flags().BoolVar(&assignNoCASS, "no-cass", false, "Disable CASS history injection for this assignment, overriding [cass.context] enabled=true")
+	cmd.Flags().BoolVar(&assignWithMemory, "with-memory", false, "Inject relevant CM (cass-memory) rules above each assignment prompt; degrades gracefully when cm is unavailable. Config: [memory] send_injection/send_max_rules/send_budget_tokens")
 }
 
 func resolveAssignProjectDir(ctx context.Context, session string) (string, error) {
@@ -388,20 +485,33 @@ func resolveAssignProjectDir(ctx context.Context, session string) (string, error
 // continue after an invalid project overlay silently drops safety policy.
 func configureAuthoritativeAssignmentPolicy(projectDir string) error {
 	projectDir = strings.TrimSpace(projectDir)
-	if projectDir == "" {
-		return markCLIInvalidInput(errors.New("assignment safety policy requires an authoritative project directory"))
-	}
-	globalPath := selectedConfigPath()
-	requireGlobal := cfgFile != "" || os.Getenv("NTM_CONFIG") != ""
-	effective, err := config.LoadAssignmentPolicyStrict(projectDir, globalPath, requireGlobal)
+	effective, err := loadAuthoritativeAssignmentPolicy(projectDir)
 	if err != nil {
-		return markCLIInvalidInput(fmt.Errorf("load assignment safety policy for %s using %s: %w", projectDir, globalPath, err))
+		return markCLIInvalidInput(err)
 	}
 	bv.ConfigureOperatorGatedLabels(effective.Assign.OperatorGatedLabels)
 	if err := bv.ConfigureProjectOperatorGatedLabels(projectDir, effective.Assign.OperatorGatedLabels); err != nil {
 		return markCLIInvalidInput(fmt.Errorf("register assignment safety policy for %s: %w", projectDir, err))
 	}
+	if err := bv.ConfigureProjectWorkSourcePolicy(projectDir, effective.Assign.WorkSource.Policy()); err != nil {
+		return markCLIInvalidInput(fmt.Errorf("register work-source policy for %s: %w", projectDir, err))
+	}
 	return nil
+}
+
+// loadAuthoritativeAssignmentPolicy strictly loads the effective assignment
+// policy for projectDir without installing it.
+func loadAuthoritativeAssignmentPolicy(projectDir string) (*config.Config, error) {
+	if strings.TrimSpace(projectDir) == "" {
+		return nil, errors.New("assignment safety policy requires an authoritative project directory")
+	}
+	globalPath := selectedConfigPath()
+	requireGlobal := cfgFile != "" || os.Getenv("NTM_CONFIG") != ""
+	effective, err := config.LoadAssignmentPolicyStrict(projectDir, globalPath, requireGlobal)
+	if err != nil {
+		return nil, fmt.Errorf("load assignment safety policy for %s using %s: %w", projectDir, globalPath, err)
+	}
+	return effective, nil
 }
 
 // ensureAuthoritativeAssignmentPolicy installs assignment policy once for the
@@ -427,7 +537,42 @@ func ensureAuthoritativeAssignmentPolicy(projectDir string, configuredProject *s
 func isAutomatedAssignmentSafetyError(err error) bool {
 	return errors.Is(err, errCLIInvalidInput) ||
 		errors.Is(err, bv.ErrActionablePlanUnverified) ||
-		errors.Is(err, bv.ErrActionableLabelsUnverified)
+		errors.Is(err, bv.ErrActionableLabelsUnverified) ||
+		errors.Is(err, bv.ErrStaleWorkCoordination) ||
+		errors.Is(err, bv.ErrBeadAlreadyClaimed) ||
+		errors.Is(err, assignment.ErrClaimConflict) ||
+		errors.Is(err, assignment.ErrTargetOccupied)
+}
+
+// isRetryableAssignmentSourceChange accepts only a positively observed source
+// race and its verification wrappers. STALE_WORK_COORDINATION also describes
+// missing exports, malformed JSONL and policy violations, none of which is a
+// reason to keep an automated watcher running. An unrelated joined error (in
+// particular cancellation or an ownership conflict) must not inherit retryability.
+func isRetryableAssignmentSourceChange(err error) bool {
+	if !errors.Is(err, worksource.ErrSourceChanged) {
+		return false
+	}
+	var sourceChangeOnly func(error) bool
+	sourceChangeOnly = func(cause error) bool {
+		switch cause {
+		case worksource.ErrSourceChanged, bv.ErrStaleWorkCoordination, bv.ErrActionablePlanUnverified:
+			return true
+		}
+		if joined, ok := cause.(interface{ Unwrap() []error }); ok {
+			for _, child := range joined.Unwrap() {
+				if !sourceChangeOnly(child) {
+					return false
+				}
+			}
+			return true
+		}
+		if child := errors.Unwrap(cause); child != nil {
+			return sourceChangeOnly(child)
+		}
+		return false
+	}
+	return sourceChangeOnly(err)
 }
 
 // prepareResolvedAssignCommand is the policy and webhook preflight shared by
@@ -451,6 +596,14 @@ func prepareResolvedAssignCommand(cmd *cobra.Command, session, projectDir string
 }
 
 func runAssign(cmd *cobra.Command, args []string) error {
+	// Execution-only routes bypass the normal recommendation preview. Reject
+	// incompatible dry runs before session discovery, repair, or other effects.
+	if assignDryRun && (strings.TrimSpace(assignPane) != "" || assignReassign != "" ||
+		assignRetry != "" || assignRetryFailed || assignClear != "" ||
+		strings.TrimSpace(assignClearPane) != "" || assignClearFailed) {
+		return markCLIInvalidInput(errors.New("--dry-run supports assignment recommendations and --watch; it cannot be combined with direct, retry, reassign, or clear operations"))
+	}
+
 	var session string
 	if len(args) > 0 {
 		session = args[0]
@@ -559,6 +712,9 @@ func runAssign(cmd *cobra.Command, args []string) error {
 		Force:           assignForce,
 		IgnoreDeps:      assignIgnoreDeps,
 		Prompt:          assignPrompt,
+		WithCASS:        assignWithCASS,
+		NoCASS:          assignNoCASS,
+		WithMemory:      assignWithMemory,
 		policyProject:   policyProject,
 	}
 
@@ -641,6 +797,9 @@ func runWatchMode(cmd *cobra.Command, session, projectDir, policyProject string)
 		AgentTypeFilter: agentTypeFilter,
 		DryRun:          assignDryRun,
 		IdleThreshold:   idleThreshold,
+		WithCASS:        assignWithCASS,
+		NoCASS:          assignNoCASS,
+		WithMemory:      assignWithMemory,
 		policyProject:   policyProject,
 	}
 
@@ -698,17 +857,28 @@ func runWatchMode(cmd *cobra.Command, session, projectDir, policyProject string)
 		TemplateFile:    assignTemplateFile,
 		Verbose:         assignVerbose,
 		Quiet:           true, // Suppress normal output during initial pass
+		Auto:            !assignDryRun,
 		Timeout:         assignTimeout,
 		ReserveFiles:    assignReserveFiles,
+		WithCASS:        assignWithCASS,
+		NoCASS:          assignNoCASS,
+		WithMemory:      assignWithMemory,
 		policyProject:   policyProject,
 	}
 
+	initialScanDeferred := false
 	initialOutput, err := getAssignOutputEnhanced(ctx, assignOpts)
 	if err != nil {
-		if isAutomatedAssignmentSafetyError(err) {
-			return err
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		watchLoop.logf("Warning: Initial assignment failed: %v", err)
+		if watchLoop.deferSourceChange("initial assignment", err) {
+			initialScanDeferred = true
+		} else if isAutomatedAssignmentSafetyError(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		} else {
+			watchLoop.logf("Warning: Initial assignment failed: %v", err)
+		}
 	} else if len(initialOutput.Assignments) > 0 {
 		assignOpts.Quiet = assignQuiet // Restore quiet setting for execution
 		if assignDryRun {
@@ -746,7 +916,7 @@ func runWatchMode(cmd *cobra.Command, session, projectDir, policyProject string)
 	}
 
 	// Check stop-when-done before entering watch loop
-	if assignStopWhenDone {
+	if assignStopWhenDone && !initialScanDeferred {
 		stop, err := watchLoop.shouldStop(ctx)
 		if err != nil {
 			return fmt.Errorf("check initial watch completion: %w", err)
@@ -940,8 +1110,34 @@ func classifyTriageRecForAssignmentWithGate(rec bv.TriageRecommendation, activeA
 	return nil
 }
 
-func loadActionableRecommendationsForAssignment(ctx context.Context, projectDir string) ([]bv.TriageRecommendation, error) {
-	return getActionableRecommendationsForAssign(ctx, projectDir, 0)
+// readAssignmentPreflight may repair a corrupt index only after the caller has
+// selected an executing assignment mode. Preview and dry-run readers retain
+// their read-only behavior. The callback must contain reads only: reservation,
+// ledger, and dispatch operations are never retried here.
+func readAssignmentPreflight[T any](ctx context.Context, projectDir string, execute bool, read func() (T, error)) (T, error) {
+	if execute {
+		return bv.ReadForMutationContext(ctx, projectDir, read)
+	}
+	return read()
+}
+
+func loadActionableRecommendationsForAssignment(ctx context.Context, projectDir string, execute bool) ([]bv.TriageRecommendation, error) {
+	return readAssignmentPreflight(ctx, projectDir, execute, func() ([]bv.TriageRecommendation, error) {
+		return getActionableRecommendationsForAssign(ctx, projectDir, 0)
+	})
+}
+
+func readBeadAssignmentDetailsForMutation(ctx context.Context, projectDir, beadID string) (*bv.BeadAssignmentDetails, error) {
+	return bv.ReadForMutationContext(ctx, projectDir, func() (*bv.BeadAssignmentDetails, error) {
+		details, err := getBeadAssignmentDetailsForAssignment(ctx, projectDir, beadID)
+		if err != nil {
+			return nil, err
+		}
+		if details == nil {
+			return nil, errors.New("live work-item details are missing")
+		}
+		return details, nil
+	})
 }
 
 func partitionActionableRecommendationsForAssignment(
@@ -1038,8 +1234,11 @@ func loadActiveAssignmentBeadIDs(session string) (map[string]struct{}, error) {
 // Errors are intentionally swallowed (an unreadable store is treated as empty,
 // matching loadActiveAssignmentBeadIDs): briefly double-dispatching is less bad
 // than blocking all assignment on a transient store-read failure.
-func loadActiveAssignmentPanes(session string) (map[string]struct{}, error) {
-	active := make(map[string]struct{})
+//
+// The map is keyed by canonical pane identity and carries the bead ID holding
+// the pane, so placeability output can name the fence.
+func loadActiveAssignmentPanes(session string) (map[string]string, error) {
+	active := make(map[string]string)
 	store, err := assignment.LoadStoreStrict(session)
 	if err != nil {
 		return active, fmt.Errorf("load active assignment panes: %w", err)
@@ -1049,22 +1248,9 @@ func loadActiveAssignmentPanes(session string) (map[string]struct{}, error) {
 		if identityErr != nil {
 			return active, identityErr
 		}
-		active[key] = struct{}{}
+		active[key] = item.BeadID
 	}
 	return active, nil
-}
-
-func assignmentPaneIsActive(active map[string]struct{}, pane tmux.Pane) bool {
-	keys := []string{
-		assignmentPaneStableKey(pane),
-		assignmentPaneTarget(pane),
-	}
-	for _, key := range keys {
-		if _, ok := active[key]; ok {
-			return true
-		}
-	}
-	return false
 }
 
 // countSkippedByReason counts SkippedItems matching a specific reason. Used to
@@ -1120,6 +1306,12 @@ type AssignCommandOptions struct {
 	Clear     string // Clear specific bead assignments (comma-separated)
 	ClearPane string // Clear all assignments for one canonical pane selector
 
+	// Prompt-context flags (--with-cass / --no-cass / --with-memory). All
+	// false follows [cass.context] enabled and [memory] send_injection.
+	WithCASS   bool
+	NoCASS     bool
+	WithMemory bool
+
 	// policyProject records the exact authoritative project whose assignment
 	// policy was already installed during this command path.
 	policyProject string
@@ -1131,12 +1323,16 @@ type AssignCommandOptions struct {
 
 // AssignOutputEnhanced is the enhanced output structure matching the spec.
 type AssignOutputEnhanced struct {
-	Strategy    string                `json:"strategy"`
-	Assignments []AssignmentItem      `json:"assignments"`
-	Skipped     []SkippedItem         `json:"skipped"`
-	Summary     AssignSummaryEnhanced `json:"summary"`
-	Allocation  *AssignAllocationView `json:"allocation,omitempty"`
-	Errors      []string              `json:"-"`
+	Strategy    string           `json:"strategy"`
+	Assignments []AssignmentItem `json:"assignments"`
+	Skipped     []SkippedItem    `json:"skipped"`
+	// Panes carries one placeability verdict per pane in the session, in
+	// tmux order, so a zero idle-agent count can be traced to the gate that
+	// produced it. Present whenever the session was evaluated.
+	Panes      []AssignPanePlaceability `json:"pane_placeability,omitempty"`
+	Summary    AssignSummaryEnhanced    `json:"summary"`
+	Allocation *AssignAllocationView    `json:"allocation,omitempty"`
+	Errors     []string                 `json:"-"`
 }
 
 // AssignmentItem represents a single assignment in JSON output.
@@ -1156,6 +1352,10 @@ type AssignmentItem struct {
 	Reasoning       string                            `json:"reasoning,omitempty"`
 	ReasonCodes     []string                          `json:"reason_codes,omitempty"`
 	ScoreComponents *assign.AllocationScoreComponents `json:"score_components,omitempty"`
+	// CASSInjection and MemoryInjection report this assignment's prompt
+	// enrichment, as on send; absent when enrichment was not requested.
+	CASSInjection   *robot.CASSInjectionInfo `json:"cass_injection,omitempty"`
+	MemoryInjection *robot.CMInjectionInfo   `json:"memory_injection,omitempty"`
 }
 
 // AssignAllocationView is a compact JSON summary of the pressure-aware
@@ -1185,6 +1385,10 @@ type AssignSummaryEnhanced struct {
 	SkippedCount      int `json:"skipped_count"`
 	IdleAgents        int `json:"idle_agent_count"`
 	CycleWarningCount int `json:"cycle_warning_count,omitempty"` // Beads in dependency cycles
+	// PlaceabilityCounts tallies Panes by verdict (placeable, not_agent_pane,
+	// agent_type_filtered, active_assignment, observation_*, low_confidence,
+	// not_idle, role_ineligible). IdleAgents equals the placeable count.
+	PlaceabilityCounts map[string]int `json:"placeability_counts,omitempty"`
 }
 
 // AssignError represents an error in assign JSON output.
@@ -1221,6 +1425,11 @@ type DirectAssignItem struct {
 	PaneWasBusy  bool     `json:"pane_was_busy,omitempty"`
 	DepsIgnored  bool     `json:"deps_ignored,omitempty"`
 	BlockedByIDs []string `json:"blocked_by_ids,omitempty"`
+	// CASSInjection and MemoryInjection report the prompt enrichment of a
+	// fresh intent; absent when not requested or when a recorded intent was
+	// replayed without re-querying.
+	CASSInjection   *robot.CASSInjectionInfo `json:"cass_injection,omitempty"`
+	MemoryInjection *robot.CMInjectionInfo   `json:"memory_injection,omitempty"`
 }
 
 // DirectAssignFileReservations holds file reservation details for direct assignment.
@@ -1266,6 +1475,10 @@ func detectAgentTypeFromTitle(title string) string {
 			return "aider"
 		case agent.AgentTypeOpencode:
 			return "oc"
+		case agent.AgentTypeGrok:
+			return "grok"
+		case agent.AgentTypeOmp:
+			return "omp"
 		case agent.AgentTypeOllama:
 			return "ollama"
 		case agent.AgentTypeUser:
@@ -1395,6 +1608,10 @@ func calculateMatchConfidence(agentType string, bead bv.BeadPreview, strategy st
 		"claude": {"analysis": 0.9, "refactor": 0.9, "documentation": 0.8, "feature": 0.8, "bug": 0.7},
 		"codex":  {"feature": 0.9, "bug": 0.8, "task": 0.8, "refactor": 0.6},
 		"gemini": {"documentation": 0.9, "analysis": 0.8, "feature": 0.8},
+		// omp follows whichever frontier model its roles select: the midpoint
+		// of the claude and codex rows (0.7 base where a row is silent), the
+		// same basis as its assign.DefaultCapabilities profile.
+		"omp": {"analysis": 0.8, "refactor": 0.75, "documentation": 0.75, "feature": 0.85, "bug": 0.75, "task": 0.75},
 	}
 
 	if agentStrengths, ok := strengths[agentType]; ok {
@@ -1601,9 +1818,6 @@ func getAssignOutputEnhanced(ctx context.Context, opts *AssignCommandOptions) (*
 		return nil, fmt.Errorf("failed to get panes: %w", err)
 	}
 
-	// Build agent info and filter by type if needed
-	var idleAgents []assignAgentInfo
-
 	// Panes holding an active assignment must be excluded from the idle pool
 	// even if they momentarily show an idle prompt between turns (FIX C). This
 	// is the watch-dispatch path, so the guard is what keeps the periodic
@@ -1619,38 +1833,12 @@ func getAssignOutputEnhanced(ctx context.Context, opts *AssignCommandOptions) (*
 		return nil, err
 	}
 
-	for _, pane := range panes {
-		at := agentTypeForPane(pane)
-		if at == "user" || at == "unknown" {
-			continue
-		}
-
-		// Apply agent type filter
-		if opts.AgentTypeFilter != "" && at != opts.AgentTypeFilter {
-			continue
-		}
-
-		// Skip panes that already hold an active assignment.
-		if assignmentPaneIsActive(activePanes, pane) {
-			continue
-		}
-
-		paneObservation, observationErr := currentAssignPaneObservation(observation, pane.ID, time.Now())
-		if observationErr != nil {
-			return nil, observationErr
-		}
-		model := detectModelFromTitle(at, pane.Title)
-		state := string(paneObservation.Current.Status.State)
-
-		if paneObservation.SafeToDispatch() {
-			idleAgents = append(idleAgents, assignAgentInfo{
-				pane:       pane,
-				agentType:  at,
-				model:      model,
-				state:      state,
-				scrollback: paneObservation.RawOutput,
-			})
-		}
+	// Run every pane through the dispatch gates, keeping one verdict per pane
+	// so the output can say which gate excluded it rather than only how many
+	// agents survived.
+	idleAgents, paneVerdicts, err := evaluateAssignPanePlaceability(panes, activePanes, observation, opts.AgentTypeFilter, time.Now())
+	if err != nil {
+		return nil, err
 	}
 
 	// Get beads from bv. Source candidates from the FULL dependency-aware
@@ -1663,7 +1851,7 @@ func getAssignOutputEnhanced(ctx context.Context, opts *AssignCommandOptions) (*
 	if opts.actionablePreflightVerified {
 		allRecs = cloneSpawnActionableRecommendations(opts.verifiedActionable)
 	} else {
-		allRecs, err = loadActionableRecommendationsForAssignment(ctx, projectDir)
+		allRecs, err = loadActionableRecommendationsForAssignment(ctx, projectDir, opts.Auto)
 	}
 
 	if err != nil {
@@ -1754,10 +1942,19 @@ func getAssignOutputEnhanced(ctx context.Context, opts *AssignCommandOptions) (*
 	// Combine all skipped beads
 	allSkipped := append(blockedBeads, cyclicBeads...)
 
+	// Persona role gating: reviewer-only panes never receive impl work and
+	// implementer-only panes never receive review work.
+	idleAgents, err = assignRoleEligibleAgents(idleAgents, projectDir, opts.Template)
+	if err != nil {
+		return nil, err
+	}
+	markRoleIneligiblePanes(paneVerdicts, idleAgents, opts.Template)
+
 	result := &AssignOutputEnhanced{
 		Strategy:    opts.Strategy,
 		Assignments: make([]AssignmentItem, 0),
 		Skipped:     allSkipped, // Blocked + cyclic beads
+		Panes:       paneVerdicts,
 		Summary: AssignSummaryEnhanced{
 			TotalBeadCount:  len(readyBeads) + len(blockedBeads) + cycleWarnings,
 			ActionableCount: len(readyBeads),
@@ -1765,18 +1962,20 @@ func getAssignOutputEnhanced(ctx context.Context, opts *AssignCommandOptions) (*
 			// by an upstream dependency. Other non-actionable reasons
 			// (in_progress, operator_gated, already_assigned) inflate the
 			// generic Skipped slice but not this metric.
-			BlockedCount:      countSkippedByReason(blockedBeads, "blocked_by_dependency"),
-			IdleAgents:        len(idleAgents),
-			CycleWarningCount: cycleWarnings,
+			BlockedCount:       countSkippedByReason(blockedBeads, "blocked_by_dependency"),
+			IdleAgents:         len(idleAgents),
+			CycleWarningCount:  cycleWarnings,
+			PlaceabilityCounts: placeabilityCounts(paneVerdicts),
 		},
 	}
 
-	// No idle agents available
+	// No pane cleared the placeability gates. The per-pane verdicts in
+	// result.Panes say which gate rejected each one.
 	if len(idleAgents) == 0 {
 		for _, bead := range readyBeads {
 			result.Skipped = append(result.Skipped, SkippedItem{
 				BeadID: bead.ID,
-				Reason: "no_idle_agents",
+				Reason: SkipReasonNoPlaceableAgents,
 			})
 		}
 		result.Summary.SkippedCount = len(readyBeads)
@@ -2429,13 +2628,34 @@ func displayAssignOutputEnhanced(out *AssignOutputEnhanced, verbose bool) {
 			}
 			fmt.Println()
 		}
+		if verbose {
+			for _, line := range formatPanePlaceabilityLines(out.Panes) {
+				fmt.Println(subtitleStyle.Render(line))
+			}
+		}
 	} else {
 		fmt.Println()
 		fmt.Println(subtitleStyle.Render("No assignments to recommend."))
 		if out.Summary.IdleAgents == 0 {
-			fmt.Println(subtitleStyle.Render("  Reason: No idle agents available"))
+			// "No idle agents" reads as "the seats are busy", which is only one
+			// of the gates. Name the breakdown and then every pane, so an
+			// operator looking at panes that visibly sit at an empty prompt
+			// sees the gate that actually excluded them.
+			reason := "  Reason: No placeable agents"
+			if breakdown := placeabilityBreakdown(out.Summary.PlaceabilityCounts); breakdown != "" {
+				reason += " (" + breakdown + ")"
+			}
+			fmt.Println(subtitleStyle.Render(reason))
+			for _, line := range formatPanePlaceabilityLines(out.Panes) {
+				fmt.Println(subtitleStyle.Render(line))
+			}
 		} else if out.Summary.TotalBeadCount == 0 {
 			fmt.Println(subtitleStyle.Render("  Reason: No ready beads to assign"))
+			if verbose {
+				for _, line := range formatPanePlaceabilityLines(out.Panes) {
+					fmt.Println(subtitleStyle.Render(line))
+				}
+			}
 		}
 	}
 
@@ -2581,6 +2801,7 @@ func executeAssignmentsEnhanced(ctx context.Context, session string, out *Assign
 		}
 	}
 	atomicCoordinator := newCLIAtomicAssignmentCoordinator(store, projectDir, reservationMgr, opts.Force)
+	promptContext := resolvePromptContextOptions(opts.WithCASS, opts.NoCASS, opts.WithMemory, cfg)
 	activeBeads := make(map[string]struct{})
 	for _, active := range store.ListActive() {
 		if active != nil && strings.TrimSpace(active.BeadID) != "" {
@@ -2606,7 +2827,7 @@ func executeAssignmentsEnhanced(ctx context.Context, session string, out *Assign
 		}
 		item := &out.Assignments[i]
 		detailsCtx, detailsCancel := context.WithTimeout(ctx, resolveAssignTimeout(opts.Timeout))
-		liveDetails, detailsErr := bv.GetBeadAssignmentDetailsContext(detailsCtx, projectDir, item.BeadID)
+		liveDetails, detailsErr := readBeadAssignmentDetailsForMutation(detailsCtx, projectDir, item.BeadID)
 		detailsCancel()
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("assignment execution canceled while validating %s: %w", item.BeadID, err)
@@ -2624,6 +2845,25 @@ func executeAssignmentsEnhanced(ctx context.Context, session string, out *Assign
 		item.rawBeadTitle = liveDetails.Title
 		item.BeadTitle = forcedRedactedAssignmentText(liveDetails.Title)
 		rawBeadTitle := liveDetails.Title
+
+		// Resolve the reservation surface from the live title AND description
+		// before anything is claimed (ntm#336). Discovery inside the atomic
+		// coordinator only sees the title, so a bead whose paths live in its
+		// description used to be claimed and then fail its reservation. A
+		// bead with no discoverable paths now fails here, unclaimed.
+		var requestedPaths []string
+		if opts.ReserveFiles {
+			var reservationErr error
+			requestedPaths, reservationErr = assign.ReservationPathsForAssignment(liveDetails.Title, liveDetails.Description)
+			if reservationErr != nil {
+				out.Errors = append(out.Errors, fmt.Sprintf("%s: reserve files: %v", item.BeadID, reservationErr))
+				if !opts.Quiet {
+					fmt.Printf("  Not assigning %s: %v\n", item.BeadID, reservationErr)
+				}
+				failCount++
+				continue
+			}
+		}
 
 		// Build the prompt using template
 		prompt := expandPromptTemplate(item.BeadID, rawBeadTitle, opts.Template, opts.TemplateFile)
@@ -2663,6 +2903,18 @@ func executeAssignmentsEnhanced(ctx context.Context, session string, out *Assign
 			continue
 		}
 
+		// Enrich the fresh intent with CASS history and CM rules before
+		// Execute records it (each item mints a new idempotency key), so the
+		// ledger holds exactly the prompt the agent receives. Enrichment never
+		// blocks: an unavailable cass or cm leaves a recorded skip.
+		var baseIntentSHA256 string
+		prompt, baseIntentSHA256, item.CASSInjection, item.MemoryInjection = enrichAssignmentPrompt(ctx, promptContext, robot.AssignmentPrompt{
+			Prompt: prompt, Title: rawBeadTitle, AgentType: item.AgentType, Session: session, ProjectDir: projectDir,
+		}, item.BeadID, liveDetails, opts.Timeout)
+		if !opts.Quiet {
+			printAssignmentPromptContext(item.BeadID, item.CASSInjection, item.MemoryInjection)
+		}
+
 		// Stamp the per-pane NTM-Pane work-token instruction (#199). No-op when
 		// the semantic feature is off, so the dispatched prompt is unchanged. Use
 		// the same window.pane addressing --robot-is-working reports so the token
@@ -2688,19 +2940,20 @@ func executeAssignmentsEnhanced(ctx context.Context, session string, out *Assign
 		}
 		assignmentCtx, cancel := context.WithTimeout(ctx, resolveAssignTimeout(opts.Timeout))
 		atomicResult, assignErr := atomicCoordinator.Execute(assignmentCtx, assignment.AtomicRequest{
-			BeadID:                    item.BeadID,
-			BeadTitle:                 rawBeadTitle,
-			Target:                    paneID,
-			OccupancyKey:              paneID,
-			Pane:                      item.Pane,
-			AgentType:                 item.AgentType,
-			AgentName:                 handoffAgent,
-			Actor:                     actor,
-			Prompt:                    promptForPane,
-			IdempotencyKey:            idempotencyKey,
-			RequireReservation:        opts.ReserveFiles,
-			AllowReservationDiscovery: opts.ReserveFiles,
-			ReservationTTL:            time.Hour,
+			BeadID:             item.BeadID,
+			BeadTitle:          rawBeadTitle,
+			Target:             paneID,
+			OccupancyKey:       paneID,
+			Pane:               item.Pane,
+			AgentType:          item.AgentType,
+			AgentName:          handoffAgent,
+			Actor:              actor,
+			Prompt:             promptForPane,
+			IdempotencyKey:     idempotencyKey,
+			BaseIntentSHA256:   baseIntentSHA256,
+			RequireReservation: opts.ReserveFiles,
+			RequestedPaths:     requestedPaths,
+			ReservationTTL:     time.Hour,
 		})
 		cancel()
 		if err := ctx.Err(); err != nil {
@@ -2788,7 +3041,7 @@ func newCLIAtomicAssignmentCoordinator(store *assignment.AssignmentStore, projec
 
 	var reservationPort assignment.ReservationPort
 	if reservationMgr != nil {
-		reservationPort = &cliAtomicReservationPort{manager: reservationMgr}
+		reservationPort = &cliAtomicReservationPort{manager: reservationMgr, projectDir: projectDir}
 	}
 
 	redactionConfig := config.Default().Redaction.ToRedactionLibConfig()
@@ -2900,17 +3153,22 @@ func normalizedAssignmentReleasePaths(paths []string) []string {
 }
 
 type cliAtomicReservationPort struct {
-	manager *assign.FileReservationManager
+	manager    *assign.FileReservationManager
+	projectDir string
 }
 
 func (p *cliAtomicReservationPort) Reserve(ctx context.Context, req assignment.ReservationRequest) (assignment.LeaseReceipt, error) {
 	if p == nil || p.manager == nil {
 		return assignment.LeaseReceipt{AgentName: req.AgentName, Target: req.Target}, assignment.GuaranteeNoReservation(errors.New("file reservation manager is not configured"))
 	}
+	paths := req.RequestedPaths
+	if len(paths) == 0 {
+		paths = assign.DiscoverReservationPaths(ctx, p.projectDir, req, bv.BeadTextReader(getBeadAssignmentDetailsForAssignment))
+	}
 	var result *assign.FileReservationResult
 	var err error
-	if len(req.RequestedPaths) > 0 {
-		result, err = p.manager.ReservePathsForBead(ctx, req.BeadID, req.AgentName, req.RequestedPaths)
+	if len(paths) > 0 {
+		result, err = p.manager.ReservePathsForBead(ctx, req.BeadID, req.AgentName, paths)
 	} else {
 		result, err = p.manager.ReserveForBead(ctx, req.BeadID, req.BeadTitle, "", req.AgentName)
 	}
@@ -2919,8 +3177,8 @@ func (p *cliAtomicReservationPort) Reserve(ctx context.Context, req assignment.R
 
 func (p *cliAtomicReservationPort) ReconcileReservation(ctx context.Context, req assignment.ReservationRequest, _ assignment.LeaseReceipt) (assignment.ReservationReconciliation, error) {
 	requested := append([]string(nil), req.RequestedPaths...)
-	if len(requested) == 0 {
-		requested = assign.ExtractFilePaths(req.BeadTitle, "")
+	if len(requested) == 0 && p != nil {
+		requested = assign.DiscoverReservationPaths(ctx, p.projectDir, req, bv.BeadTextReader(getBeadAssignmentDetailsForAssignment))
 	}
 	if p == nil || p.manager == nil {
 		return assignment.ReservationReconciliation{State: assignment.ReservationReconciliationUnknown}, errors.New("file reservation manager is not configured")
@@ -3063,6 +3321,13 @@ func (p *cliAtomicPaneDispatchPort) Dispatch(ctx context.Context, req assignment
 	result, dispatchErr := service.Dispatch(ctx, prepared)
 	receipt := assignment.DispatchReceipt{Duration: time.Since(started)}
 	if dispatchErr != nil {
+		// A refusal raised before the first keystroke — pane not ready, dead
+		// agent CLI, an uncleared composer — cannot have delivered anything, so
+		// it is retryable behind the durable idempotency barrier rather than a
+		// permanent failure of the assignment (ntm#294).
+		if dispatchsvc.IsGuaranteedNoDeliveryActuation(dispatchErr) {
+			return receipt, assignment.GuaranteeNoActuation(dispatchErr)
+		}
 		return receipt, dispatchErr
 	}
 	delivery, err := validateSinglePaneDispatchResult(result, req.Target)
@@ -3123,6 +3388,62 @@ func renderPromptTemplate(beadID, title, template string) string {
 // expandPromptTemplate expands a prompt template with bead variables.
 func expandPromptTemplate(beadID, title, templateName, templateFile string) string {
 	return renderPromptTemplate(beadID, title, promptTemplateSource(templateName, templateFile))
+}
+
+// enrichAssignmentPrompt prepends CASS history and CM rules to one fresh
+// assignment prompt through the pipeline --robot-send uses
+// (robot.EnrichAssignmentPrompt). Callers run it before the atomic
+// coordinator records the intent, so the ledger hashes and persists the
+// enriched prompt, and never for a recorded intent being recovered or
+// replayed. details supplies the bead's labels and description for the
+// retrieval query; when nil they are read best-effort, and a failed read only
+// narrows the query to the title. The returned pre-enrichment checksum is
+// empty when no enrichment was requested.
+func enrichAssignmentPrompt(
+	ctx context.Context,
+	opts robot.PromptContextOptions,
+	request robot.AssignmentPrompt,
+	beadID string,
+	details *bv.BeadAssignmentDetails,
+	timeout time.Duration,
+) (string, string, *robot.CASSInjectionInfo, *robot.CMInjectionInfo) {
+	if !opts.Enabled() {
+		return request.Prompt, "", nil, nil
+	}
+	if details == nil {
+		detailsCtx, cancel := context.WithTimeout(ctx, resolveAssignTimeout(timeout))
+		details, _ = getBeadAssignmentDetailsForAssignment(detailsCtx, request.ProjectDir, beadID)
+		cancel()
+	}
+	if details != nil {
+		if strings.TrimSpace(request.Title) == "" {
+			request.Title = details.Title
+		}
+		request.Labels, request.Description = details.Labels, details.Description
+	}
+	enriched, cassInjection, memoryInjection := robot.EnrichAssignmentPrompt(ctx, request, opts)
+	return enriched, assignment.PromptSHA256(request.Prompt), cassInjection, memoryInjection
+}
+
+// printAssignmentPromptContext reports one assignment's enrichment in human
+// output, worded like `ntm send`.
+func printAssignmentPromptContext(beadID string, cassInjection *robot.CASSInjectionInfo, memoryInjection *robot.CMInjectionInfo) {
+	if cassInjection != nil {
+		switch {
+		case cassInjection.ItemsInjected > 0:
+			fmt.Printf("  CASS context injected for %s: %d item(s), ~%d tokens\n", beadID, cassInjection.ItemsInjected, cassInjection.TokensAdded)
+		case cassInjection.SkippedReason != "":
+			fmt.Printf("  CASS context injection skipped for %s: %s\n", beadID, cassInjection.SkippedReason)
+		}
+	}
+	if memoryInjection != nil {
+		switch {
+		case memoryInjection.TokensAdded > 0:
+			fmt.Printf("  CM rules injected for %s: ~%d tokens\n", beadID, memoryInjection.TokensAdded)
+		case memoryInjection.SkippedReason != "":
+			fmt.Printf("  CM rule injection skipped for %s: %s\n", beadID, memoryInjection.SkippedReason)
+		}
+	}
 }
 
 // ============================================================================
@@ -3225,6 +3546,10 @@ type ReassignData struct {
 	FileReservationsTransferred  bool   `json:"file_reservations_transferred"`
 	FileReservationsReleasedFrom int    `json:"file_reservations_released_from,omitempty"`
 	FileReservationsCreatedFor   int    `json:"file_reservations_created_for,omitempty"`
+	// CASSInjection and MemoryInjection report the replacement prompt's
+	// enrichment; absent when enrichment was not requested.
+	CASSInjection   *robot.CASSInjectionInfo `json:"cass_injection,omitempty"`
+	MemoryInjection *robot.CMInjectionInfo   `json:"memory_injection,omitempty"`
 }
 
 // ReassignError represents an error in the reassignment envelope.
@@ -3260,6 +3585,11 @@ type RetryItem struct {
 	PreviousAgent      string `json:"previous_agent,omitempty"`
 	PreviousFailReason string `json:"previous_fail_reason,omitempty"`
 	RetryCount         int    `json:"retry_count"`
+	// CASSInjection and MemoryInjection report the prompt enrichment of a new
+	// attempt; absent when not requested or when a pending intent was
+	// recovered with its recorded prompt.
+	CASSInjection   *robot.CASSInjectionInfo `json:"cass_injection,omitempty"`
+	MemoryInjection *robot.CMInjectionInfo   `json:"memory_injection,omitempty"`
 }
 
 // RetrySkippedItem holds data for a skipped retry.
@@ -3422,6 +3752,7 @@ func runRetryAssignments(ctx context.Context, session string) error {
 		return emitRetryFailure(session, "PROJECT_ERROR", fmt.Errorf("resolve bead project for atomic retry: %w", err))
 	}
 	multiWindow := tmux.PanesSpanMultipleWindows(panes)
+	promptContext := resolvePromptContextOptions(assignWithCASS, assignNoCASS, assignWithMemory, cfg)
 
 	// Pending atomic retries are already bound to a physical pane, and an
 	// explicit --to-pane selects one directly. Observe the whole idle pool only
@@ -3447,6 +3778,10 @@ func runRetryAssignments(ctx context.Context, session string) error {
 				))
 			}
 			return fmt.Errorf("failed to get idle agents: %w", err)
+		}
+		idleAgents, err = assignRoleEligibleAgents(idleAgents, projectDir, assignTemplate)
+		if err != nil {
+			return emitRetryFailure(session, "PERSONA_ERROR", err)
 		}
 	}
 
@@ -3571,12 +3906,22 @@ func runRetryAssignments(ctx context.Context, session string) error {
 			continue
 		}
 
-		// Get bead title if not stored
+		// Restore a readable tracker before the atomic coordinator's read-only
+		// authorization gates. Never replay the whole claim/reserve/send flow.
+		liveDetails, detailsErr := readBeadAssignmentDetailsForMutation(ctx, projectDir, failed.BeadID)
+		if detailsErr != nil {
+			if errors.Is(detailsErr, context.Canceled) || errors.Is(detailsErr, context.DeadlineExceeded) {
+				return emitRetryFailure(session, robot.ErrCodeTimeout, detailsErr)
+			}
+			skippedItems = append(skippedItems, RetrySkippedItem{BeadID: failed.BeadID, Reason: fmt.Sprintf("read bead before retry: %v", detailsErr)})
+			continue
+		}
+		// Get bead title if not stored.
 		beadTitle := failed.BeadTitle
 		if beadTitle == "" && !recoverAtomic {
-			beadTitle, err = getBeadTitle(ctx, projectDir, failed.BeadID)
-			if err != nil {
-				skippedItems = append(skippedItems, RetrySkippedItem{BeadID: failed.BeadID, Reason: fmt.Sprintf("look up bead title: %v", err)})
+			beadTitle = liveDetails.Title
+			if strings.TrimSpace(beadTitle) == "" {
+				skippedItems = append(skippedItems, RetrySkippedItem{BeadID: failed.BeadID, Reason: "live bead title is empty"})
 				continue
 			}
 		}
@@ -3587,7 +3932,12 @@ func runRetryAssignments(ctx context.Context, session string) error {
 		prompt := expandPromptTemplate(failed.BeadID, beadTitle, assignTemplate, assignTemplateFile)
 		actor := newAgentName
 		idempotencyKey := ""
+		baseIntentSHA256 := ""
+		var cassInjection *robot.CASSInjectionInfo
+		var memoryInjection *robot.CMInjectionInfo
 		if recoverAtomic {
+			// Recovery replays the recorded (possibly enriched) prompt exactly;
+			// cass and cm are never queried again for a recorded intent.
 			newAgentName = failed.AgentName
 			actor = failed.ClaimActor
 			idempotencyKey = failed.IdempotencyKey
@@ -3598,12 +3948,19 @@ func runRetryAssignments(ctx context.Context, session string) error {
 				skippedItems = append(skippedItems, RetrySkippedItem{BeadID: failed.BeadID, Reason: err.Error()})
 				continue
 			}
+			prompt, baseIntentSHA256, cassInjection, memoryInjection = enrichAssignmentPrompt(ctx, promptContext, robot.AssignmentPrompt{
+				Prompt: prompt, Title: beadTitle, AgentType: targetAgentType, Session: session, ProjectDir: projectDir,
+			}, failed.BeadID, nil, assignTimeout)
 		}
 		reservationRequired := assignReserveFiles
 		reservationDiscovery := assignReserveFiles
+		var requestedPaths []string
 		if recoverAtomic {
 			reservationRequired = failed.ReservationRequired
 			reservationDiscovery = failed.ReservationDiscovery
+			// The recorded intent includes the paths resolved before the claim;
+			// replay them, as bulk, coordinator and rebalance recovery do.
+			requestedPaths = append([]string(nil), failed.ReservationInputPaths...)
 		}
 		reservationNeedsRefresh := !failed.ReservationCompleted ||
 			(failed.ReservationExpiresAt != nil && !failed.ReservationExpiresAt.After(time.Now().UTC()))
@@ -3640,8 +3997,10 @@ func runRetryAssignments(ctx context.Context, session string) error {
 			Prompt:                    prompt,
 			IdempotencyKey:            idempotencyKey,
 			RecoveredIntentSHA256:     recoveredIntentSHA256,
+			BaseIntentSHA256:          baseIntentSHA256,
 			RequireReservation:        reservationRequired,
 			AllowReservationDiscovery: reservationDiscovery,
+			RequestedPaths:            requestedPaths,
 			ReservationTTL:            time.Hour,
 		})
 		cancel()
@@ -3679,6 +4038,8 @@ func runRetryAssignments(ctx context.Context, session string) error {
 			PreviousAgent:      failed.AgentName,
 			PreviousFailReason: failed.FailReason,
 			RetryCount:         failed.RetryCount + 1,
+			CASSInjection:      cassInjection,
+			MemoryInjection:    memoryInjection,
 		})
 	}
 
@@ -3831,10 +4192,23 @@ func clearStoredAssignmentIfStatus(ctx context.Context, store *assignment.Assign
 		return nil, fmt.Errorf("assignment %s reached terminal status %s while waiting to clear", current.BeadID, refreshed.Status)
 	}
 	current = refreshed
+	if assignForce && current.DispatchState == assignment.DispatchSending && !IsJSONOutput() {
+		output.PrintWarningf(
+			"Force-clearing %s while its dispatch outcome is unknown: the original message may already have been delivered, so re-assigning can duplicate work. Verify pane %d before re-dispatching.",
+			current.BeadID, current.Pane,
+		)
+	}
 	var clearing *assignment.Assignment
-	if len(expected) == 0 {
+	switch {
+	case assignForce && len(expected) == 0:
+		// Operator escape hatch: --force also releases assignments stuck at
+		// the outcome-unknown dispatch boundary (see BeginClearForce).
+		clearing, err = store.BeginClearForce(ctx, current.BeadID, time.Now().UTC())
+	case assignForce:
+		clearing, err = store.BeginClearForceIfStatus(ctx, current.BeadID, time.Now().UTC(), expected...)
+	case len(expected) == 0:
 		clearing, err = store.BeginClear(ctx, current.BeadID, time.Now().UTC())
-	} else {
+	default:
 		clearing, err = store.BeginClearIfStatus(ctx, current.BeadID, time.Now().UTC(), expected...)
 	}
 	if err != nil {
@@ -4385,6 +4759,10 @@ func runReassignment(ctx context.Context, session string) error {
 		if idleErr != nil {
 			return emitContextAwareReassignFailure(ctx, session, "TMUX_ERROR", idleErr, nil)
 		}
+		idleAgents, idleErr = assignRoleEligibleAgents(idleAgents, projectDir, assignTemplate)
+		if idleErr != nil {
+			return emitReassignFailure(session, "PERSONA_ERROR", idleErr.Error(), nil)
+		}
 		if len(idleAgents) == 0 {
 			return emitReassignFailure(session, "NO_IDLE_AGENT", fmt.Sprintf("no idle %s agents available", assignToType), map[string]interface{}{"agent_type": assignToType})
 		}
@@ -4425,11 +4803,15 @@ func runReassignment(ctx context.Context, session string) error {
 		return emitReassignFailure(session, "TARGET_BUSY", fmt.Sprintf("pane %s is busy (state: %s), use --force to override", assignmentPaneTarget(*targetPane), state), map[string]interface{}{"pane_state": state})
 	}
 
+	liveDetails, detailsErr := readBeadAssignmentDetailsForMutation(ctx, projectDir, beadID)
+	if detailsErr != nil {
+		return emitContextAwareReassignFailure(ctx, session, "BEAD_LOOKUP_FAILED", detailsErr, nil)
+	}
 	beadTitle := currentAssignment.BeadTitle
 	if beadTitle == "" {
-		beadTitle, err = getBeadTitle(ctx, projectDir, beadID)
-		if err != nil {
-			return emitContextAwareReassignFailure(ctx, session, "BEAD_LOOKUP_FAILED", err, nil)
+		beadTitle = liveDetails.Title
+		if strings.TrimSpace(beadTitle) == "" {
+			return emitReassignFailure(session, "BEAD_LOOKUP_FAILED", fmt.Sprintf("br show returned an empty title for %s", beadID), nil)
 		}
 	}
 	prompt := assignPrompt
@@ -4441,6 +4823,13 @@ func runReassignment(ctx context.Context, session string) error {
 	if err != nil {
 		return emitReassignFailure(session, "STORE_ERROR", fmt.Sprintf("generate reassignment identity: %v", err), nil)
 	}
+	// The replacement generation is a fresh intent: the new agent starts the
+	// bead without its predecessor's context, so it gets the history too.
+	prompt, baseIntentSHA256, cassInjection, memoryInjection := enrichAssignmentPrompt(
+		ctx, resolvePromptContextOptions(assignWithCASS, assignNoCASS, assignWithMemory, cfg),
+		robot.AssignmentPrompt{Prompt: prompt, Title: beadTitle, AgentType: targetAgentType, Session: session, ProjectDir: projectDir},
+		beadID, nil, assignTimeout,
+	)
 
 	reservationRequired := currentAssignment.ReservationRequired || assignReserveFiles
 	reservationDiscovery := currentAssignment.ReservationDiscovery || assignReserveFiles
@@ -4475,6 +4864,7 @@ func runReassignment(ctx context.Context, session string) error {
 		Actor:                     currentAssignment.ClaimActor,
 		Prompt:                    prompt,
 		IdempotencyKey:            idempotencyKey,
+		BaseIntentSHA256:          baseIntentSHA256,
 		RequireReservation:        reservationRequired,
 		AllowReservationDiscovery: reservationDiscovery,
 		RequestedPaths:            requestedPaths,
@@ -4517,6 +4907,8 @@ func runReassignment(ctx context.Context, session string) error {
 		FileReservationsTransferred:  releasedReservationCount > 0 || len(atomicResult.Lease.Granted) > 0,
 		FileReservationsReleasedFrom: releasedReservationCount,
 		FileReservationsCreatedFor:   len(atomicResult.Lease.Granted),
+		CASSInjection:                cassInjection,
+		MemoryInjection:              memoryInjection,
 	}
 	if IsJSONOutput() {
 		return json.NewEncoder(os.Stdout).Encode(ReassignEnvelope{
@@ -5469,6 +5861,7 @@ func runDirectPaneAssignment(ctx context.Context, opts *AssignCommandOptions) er
 	agentType := agentTypeForPane(targetPane)
 	agentName := assignmentAgentIdentityForPane(opts.ProjectDir, opts.Session, agentType, targetPane, multiWindow)
 	beadTitle := ""
+	var directRequestedPaths []string
 	if executeBeforePreflight {
 		beadTitle = prior.BeadTitle
 		if sameIntent {
@@ -5494,6 +5887,7 @@ func runDirectPaneAssignment(ctx context.Context, opts *AssignCommandOptions) er
 		DepsIgnored: opts.IgnoreDeps,
 	}
 
+	baseIntentSHA256 := ""
 	if !executeBeforePreflight {
 		if agentType == "user" || agentType == "unknown" {
 			err = fmt.Errorf("pane %s is not an agent pane (type: %s)", canonicalTarget, agentType)
@@ -5536,7 +5930,9 @@ func runDirectPaneAssignment(ctx context.Context, opts *AssignCommandOptions) er
 		assignItem.PaneWasBusy = !paneObservation.SafeToDispatch()
 
 		if !opts.IgnoreDeps {
-			blockers, blockersErr := getBeadBlockers(ctx, projectDir, beadID)
+			blockers, blockersErr := bv.ReadForMutationContext(ctx, projectDir, func() ([]string, error) {
+				return getBeadBlockers(ctx, projectDir, beadID)
+			})
 			if blockersErr != nil {
 				errMsg := fmt.Sprintf("could not verify dependencies for %s: %v; use --ignore-deps to override", beadID, blockersErr)
 				if IsJSONOutput() {
@@ -5557,7 +5953,9 @@ func runDirectPaneAssignment(ctx context.Context, opts *AssignCommandOptions) er
 		}
 
 		if opts.Prompt == "" || opts.ReserveFiles {
-			beadTitle, err = getBeadTitle(ctx, projectDir, beadID)
+			beadTitle, err = bv.ReadForMutationContext(ctx, projectDir, func() (string, error) {
+				return getBeadTitle(ctx, projectDir, beadID)
+			})
 			if err != nil {
 				errMsg := fmt.Sprintf("look up bead %s title: %v", beadID, err)
 				if IsJSONOutput() {
@@ -5567,6 +5965,38 @@ func runDirectPaneAssignment(ctx context.Context, opts *AssignCommandOptions) er
 			}
 		}
 		prompt = intent.prompt(beadID, beadTitle)
+
+		// Work out the reservation surface from the live title and
+		// description before the claim, as assign --auto does (ntm#336): a
+		// bead that names no files is refused here, unclaimed. When the
+		// details cannot be read, the coordinator's discovery decides.
+		var liveDetails *bv.BeadAssignmentDetails
+		if opts.ReserveFiles {
+			if details, detailsErr := getBeadAssignmentDetailsForAssignment(ctx, projectDir, beadID); detailsErr == nil && details != nil {
+				liveDetails = details
+				paths, pathsErr := assign.ReservationPathsForAssignment(details.Title, details.Description)
+				if pathsErr != nil {
+					errMsg := fmt.Sprintf("not assigning %s: %v", beadID, pathsErr)
+					if IsJSONOutput() {
+						return emitJSONFailureEnvelope(makeDirectAssignEnvelope(opts.Session, false, &DirectAssignData{Assignment: assignItem}, "RESERVATION_REQUIRED", errMsg, warnings))
+					}
+					return errors.New(errMsg)
+				}
+				directRequestedPaths = paths
+			}
+		}
+
+		// Only a fresh intent is enriched. A same-intent re-run replays the
+		// recorded prompt through RecoveredIntentSHA256 below and never
+		// queries cass or cm again.
+		prompt, baseIntentSHA256, assignItem.CASSInjection, assignItem.MemoryInjection = enrichAssignmentPrompt(
+			ctx, resolvePromptContextOptions(opts.WithCASS, opts.NoCASS, opts.WithMemory, cfg),
+			robot.AssignmentPrompt{Prompt: prompt, Title: beadTitle, AgentType: agentType, Session: opts.Session, ProjectDir: projectDir},
+			beadID, liveDetails, opts.Timeout,
+		)
+		if !opts.Quiet && !IsJSONOutput() {
+			printAssignmentPromptContext(beadID, assignItem.CASSInjection, assignItem.MemoryInjection)
+		}
 	}
 
 	request := assignment.AtomicRequest{
@@ -5580,7 +6010,9 @@ func runDirectPaneAssignment(ctx context.Context, opts *AssignCommandOptions) er
 		Actor:                     directAssignmentActor(opts.Session, targetPane.ID),
 		Prompt:                    prompt,
 		IdempotencyKey:            idempotencyKey,
+		BaseIntentSHA256:          baseIntentSHA256,
 		RequireReservation:        opts.ReserveFiles,
+		RequestedPaths:            directRequestedPaths,
 		AllowReservationDiscovery: opts.ReserveFiles,
 		ReservationTTL:            time.Hour,
 	}
@@ -5601,6 +6033,18 @@ func runDirectPaneAssignment(ctx context.Context, opts *AssignCommandOptions) er
 	var reservationMgr *assign.FileReservationManager
 	needsReservationPort := !executeBeforePreflight || (sameIntent && prior.DispatchState != assignment.DispatchSent && prior.DispatchState != assignment.DispatchSending)
 	if needsReservationPort {
+		// This also covers a custom prompt with dependency lookup disabled and
+		// a known-unsent replay. Completed or uncertain sends remain ledger-only.
+		if _, readErr := readBeadAssignmentDetailsForMutation(ctx, projectDir, beadID); readErr != nil {
+			if IsJSONOutput() {
+				code := "BEAD_LOOKUP_FAILED"
+				if errors.Is(readErr, context.Canceled) || errors.Is(readErr, context.DeadlineExceeded) {
+					code = robot.ErrCodeTimeout
+				}
+				return emitTypedAssignmentFailure(readErr, makeDirectAssignEnvelope(opts.Session, false, &DirectAssignData{Assignment: assignItem}, code, readErr.Error(), warnings))
+			}
+			return readErr
+		}
 		reservationMgr, err = directAssignmentReservationManager(opts, projectDir)
 	}
 	if err != nil {
@@ -5740,7 +6184,7 @@ func runDirectPaneAssignment(ctx context.Context, opts *AssignCommandOptions) er
 
 // getBeadBlockers returns the list of beads blocking the given bead
 func getBeadBlockers(ctx context.Context, projectDir, beadID string) ([]string, error) {
-	details, err := bv.GetBeadAssignmentDetailsContext(ctx, projectDir, beadID)
+	details, err := getBeadAssignmentDetailsForAssignment(ctx, projectDir, beadID)
 	if err != nil {
 		return nil, err
 	}
@@ -5749,7 +6193,7 @@ func getBeadBlockers(ctx context.Context, projectDir, beadID string) ([]string, 
 
 // getBeadTitle retrieves the title for a bead
 func getBeadTitle(ctx context.Context, projectDir, beadID string) (string, error) {
-	details, err := bv.GetBeadAssignmentDetailsContext(ctx, projectDir, beadID)
+	details, err := getBeadAssignmentDetailsForAssignment(ctx, projectDir, beadID)
 	if err != nil {
 		return "", err
 	}
@@ -5784,6 +6228,10 @@ type AutoReassignOptions struct {
 	// fails quietly-working agents (silent while an external subprocess runs)
 	// and then injects the next bead's prompt into them mid-task.
 	IdleThreshold time.Duration
+	// Prompt-context flags carried into every watch-mode assignment pass.
+	WithCASS   bool
+	NoCASS     bool
+	WithMemory bool
 
 	// policyProject records the exact authoritative project whose assignment
 	// policy was already installed during this command path.
@@ -5843,7 +6291,9 @@ func PerformAutoReassignment(ctx context.Context, completedBeadID string, opts *
 		return nil, err
 	}
 	// Step 1: Get newly unblocked beads
-	depResult, err := GetNewlyUnblockedBeads(ctx, projectDir, completedBeadID, opts.Verbose)
+	depResult, err := readAssignmentPreflight(ctx, projectDir, !opts.DryRun, func() (*DependencyAwareResult, error) {
+		return GetNewlyUnblockedBeads(ctx, projectDir, completedBeadID, opts.Verbose)
+	})
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return result, fmt.Errorf("auto-reassignment canceled while checking newly unblocked work: %w", ctxErr)
 	}
@@ -5866,7 +6316,9 @@ func PerformAutoReassignment(ctx context.Context, completedBeadID string, opts *
 		return result, nil
 	}
 
-	verifiedActionable, err := getActionableRecommendationsForWatch(ctx, projectDir, 0)
+	verifiedActionable, err := readAssignmentPreflight(ctx, projectDir, !opts.DryRun, func() ([]bv.TriageRecommendation, error) {
+		return getActionableRecommendationsForWatch(ctx, projectDir, 0)
+	})
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return result, fmt.Errorf("auto-reassignment canceled while verifying actionable work: %w", ctxErr)
@@ -5970,8 +6422,18 @@ func PerformAutoReassignment(ctx context.Context, completedBeadID string, opts *
 		Quiet:           opts.Quiet,
 		Timeout:         opts.Timeout,
 		ReserveFiles:    opts.ReserveFiles,
+		WithCASS:        opts.WithCASS,
+		NoCASS:          opts.NoCASS,
+		WithMemory:      opts.WithMemory,
 		policyProject:   opts.policyProject,
 	}
+
+	idleAgents, err = assignRoleEligibleAgents(idleAgents, projectDir, assignOpts.Template)
+	if err != nil {
+		result.Errors = append(result.Errors, err.Error())
+		return result, nil
+	}
+	result.IdleAgents = len(idleAgents)
 
 	assignments := generateAssignmentsEnhanced(ctx, idleAgents, filteredBeads, assignOpts)
 	result.Assignments = assignments
@@ -6084,8 +6546,6 @@ func getIdleAgents(ctx context.Context, session, agentTypeFilter string, verbose
 		return nil, err
 	}
 
-	var idleAgents []assignAgentInfo
-
 	// Panes holding an active assignment must be excluded from the idle pool
 	// even if they momentarily show an idle prompt between turns (FIX C).
 	activePanes, err := loadActiveAssignmentPanes(session)
@@ -6093,47 +6553,26 @@ func getIdleAgents(ctx context.Context, session, agentTypeFilter string, verbose
 		return nil, err
 	}
 
-	for _, pane := range panes {
-		agentType := agentTypeForPane(pane)
-		if agentType == "user" || agentType == "unknown" {
-			continue
-		}
-
-		// Apply agent type filter
-		if normalizedFilter != "" && agentType != normalizedFilter {
-			continue
-		}
-
-		// Skip panes that already hold an active assignment.
-		if assignmentPaneIsActive(activePanes, pane) {
-			if assignHumanDiagnostics(verbose) {
-				fmt.Fprintf(os.Stderr, "[AUTO] Skipping pane %d (%s): holds an active assignment\n", pane.Index, agentType)
-			}
-			continue
-		}
-
-		paneObservation, observationErr := currentAssignPaneObservation(observation, pane.ID, time.Now())
-		if observationErr != nil {
-			return nil, observationErr
-		}
-		model := detectModelFromTitle(agentType, pane.Title)
-		state := string(paneObservation.Current.Status.State)
-
-		if paneObservation.SafeToDispatch() {
-			idleAgents = append(idleAgents, assignAgentInfo{
-				pane:       pane,
-				agentType:  agentType,
-				model:      model,
-				state:      state,
-				scrollback: paneObservation.RawOutput,
-			})
-			if assignHumanDiagnostics(verbose) {
-				fmt.Fprintf(os.Stderr, "[AUTO] Found idle agent: pane %d (%s)\n", pane.Index, agentType)
-			}
-		}
+	idleAgents, verdicts, err := evaluateAssignPanePlaceability(panes, activePanes, observation, normalizedFilter, time.Now())
+	if err != nil {
+		return nil, err
 	}
 
 	if assignHumanDiagnostics(verbose) {
+		for _, verdict := range verdicts {
+			switch verdict.Verdict {
+			case PlaceabilityNotAgentPane:
+				continue
+			case PlaceabilityPlaceable:
+				fmt.Fprintf(os.Stderr, "[AUTO] Found idle agent: pane %s (%s)\n", verdict.PaneTarget, verdict.AgentType)
+			default:
+				detail := verdict.Verdict
+				if verdict.Detail != "" {
+					detail += " (" + verdict.Detail + ")"
+				}
+				fmt.Fprintf(os.Stderr, "[AUTO] Skipping pane %s (%s): %s\n", verdict.PaneTarget, verdict.AgentType, detail)
+			}
+		}
 		fmt.Fprintf(os.Stderr, "[AUTO] Total idle agents available: %d\n", len(idleAgents))
 	}
 
@@ -6231,7 +6670,39 @@ func terminalReconciliationAlreadyCompleted(current *assignment.Assignment, stat
 	return status == assignment.StatusCompleted
 }
 
-// WatchLoop manages the continuous auto-assignment watch mode
+// assignWatchMaintainer is the existing assignment lifecycle, without new work.
+type assignWatchMaintainer interface {
+	MaintainAssignments(context.Context) error
+}
+
+func newAssignWatchMaintainer(ctx context.Context, session, projectDir string) (assignWatchMaintainer, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	projectDir = strings.TrimSpace(projectDir)
+	if projectDir == "" {
+		var err error
+		projectDir, err = resolveAssignProjectDir(ctx, session)
+		if err != nil {
+			return nil, fmt.Errorf("resolve assignment maintenance project: %w", err)
+		}
+	}
+	if projectDir == "" {
+		return nil, errors.New("assignment maintenance requires an authoritative project directory")
+	}
+	projectDir, err := filepath.Abs(projectDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve assignment maintenance project: %w", err)
+	}
+	projectDir = agentmail.CanonicalProjectKey(projectDir)
+	// Existing assignments already carry their registered pane owner. Reading
+	// the saved coordinator identity is sufficient; maintenance must not create
+	// a new identity, send mail, or start the coordinator's other automations.
+	name := resolveCoordinatorIdentity(ctx, nil, session, projectDir)
+	return coordinator.New(session, projectDir, newAgentMailClient(projectDir), name).WithCompletionEvents(), nil
+}
+
+// WatchLoop manages the continuous auto-assignment watch mode.
 type WatchLoop struct {
 	session  string
 	strategy string
@@ -6266,6 +6737,16 @@ type WatchLoop struct {
 	// overridable in tests to observe ticker-driven scans without tmux/bv.
 	scanFn func(context.Context) error
 
+	// Reservation maintenance owns an independent worker so a slow ready-work
+	// scan, completion handler, or --delay cannot expire active assignments.
+	// It reuses the coordinator's exact-receipt maintenance without starting
+	// background coordination or admitting any new work.
+	maintenanceInterval time.Duration
+	maintenanceTimeout  time.Duration
+	newMaintainer       func(context.Context, string, string) (assignWatchMaintainer, error)
+	maintenanceMu       sync.Mutex
+	maintenanceError    string
+
 	// Concurrency control
 	completionCh            chan completion.CompletionEvent
 	stopCh                  chan struct{}
@@ -6280,12 +6761,14 @@ type WatchLoop struct {
 	renewCompletionEventFn  func(context.Context, string, string, string, time.Duration) (bool, error)
 
 	// Statistics
-	mu               sync.Mutex
-	totalAssigned    int
-	totalCompleted   int
-	totalFailed      int
-	startTime        time.Time
-	lastAssignmentAt time.Time
+	mu                   sync.Mutex
+	totalAssigned        int
+	totalCompleted       int
+	totalFailed          int
+	startTime            time.Time
+	lastAssignmentAt     time.Time
+	deferredSourceChecks int
+	sourceCheckDeferred  bool
 }
 
 // NewWatchLoop creates a new watch loop for a session
@@ -6300,17 +6783,19 @@ func NewWatchLoop(session string, store *assignment.AssignmentStore, opts *AutoR
 	}
 
 	return &WatchLoop{
-		session:       session,
-		strategy:      opts.Strategy,
-		store:         store,
-		opts:          opts,
-		stopWhenDone:  assignStopWhenDone,
-		delay:         assignDelay,
-		limit:         assignLimit,
-		quiet:         opts.Quiet,
-		verbose:       opts.Verbose,
-		idleThreshold: opts.IdleThreshold,
-		scanInterval:  scanInterval,
+		session:             session,
+		strategy:            opts.Strategy,
+		store:               store,
+		opts:                opts,
+		stopWhenDone:        assignStopWhenDone,
+		delay:               assignDelay,
+		limit:               assignLimit,
+		quiet:               opts.Quiet,
+		verbose:             opts.Verbose,
+		idleThreshold:       opts.IdleThreshold,
+		scanInterval:        scanInterval,
+		maintenanceInterval: 30 * time.Second,
+		maintenanceTimeout:  30 * time.Second,
 		scanOpts: &AssignCommandOptions{
 			Session:         session,
 			ProjectDir:      opts.ProjectDir,
@@ -6321,8 +6806,12 @@ func NewWatchLoop(session string, store *assignment.AssignmentStore, opts *AutoR
 			TemplateFile:    opts.TemplateFile,
 			Verbose:         opts.Verbose,
 			Quiet:           opts.Quiet,
+			Auto:            !opts.DryRun,
 			Timeout:         opts.Timeout,
 			ReserveFiles:    opts.ReserveFiles,
+			WithCASS:        opts.WithCASS,
+			NoCASS:          opts.NoCASS,
+			WithMemory:      opts.WithMemory,
 			policyProject:   opts.policyProject,
 		},
 		stopCh:                  make(chan struct{}),
@@ -6342,6 +6831,32 @@ func (w *WatchLoop) logf(format string, args ...interface{}) {
 	fmt.Printf("[%s] %s\n", timestamp, msg)
 }
 
+// deferSourceChange discards the scan's freshness without discarding its bound
+// source identity. The next scheduled scan must collect and verify authoritative
+// state again; no claim, reservation or dispatch is retried here.
+func (w *WatchLoop) deferSourceChange(phase string, err error) bool {
+	if !isRetryableAssignmentSourceChange(err) {
+		return false
+	}
+	bv.ExpireTriageCache()
+	w.mu.Lock()
+	w.deferredSourceChecks++
+	w.sourceCheckDeferred = true
+	w.mu.Unlock()
+	w.logf("Deferred %s after tracker or checkout changed; refreshing on the next ready-work scan: %v", phase, err)
+	return true
+}
+
+func (w *WatchLoop) sourceCheckRecovered() {
+	w.mu.Lock()
+	deferred := w.sourceCheckDeferred
+	w.sourceCheckDeferred = false
+	w.mu.Unlock()
+	if deferred {
+		w.logf("Work-source verification recovered")
+	}
+}
+
 // Run starts the watch loop and blocks until stopped
 func (w *WatchLoop) Run(ctx context.Context) error {
 	if ctx == nil {
@@ -6359,6 +6874,40 @@ func (w *WatchLoop) Run(ctx context.Context) error {
 	runDone := w.runDone
 	w.lifecycleMu.Unlock()
 	defer close(runDone)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	var maintainer assignWatchMaintainer
+	if w.opts != nil && w.opts.ReserveFiles && !w.opts.DryRun {
+		// Watch maintenance publishes completion events that this loop
+		// consumes. The session monitor's coordinator maintains the same
+		// ledger without them and could retire a finished assignment first,
+		// so it pauses until watch mode exits.
+		claim, claimErr := resilience.ClaimSessionCoordinator(ctx, w.session)
+		if claimErr != nil {
+			return fmt.Errorf("claim session coordination for assignment maintenance: %w", claimErr)
+		}
+		defer claim.Release()
+		if claim.Preempted {
+			w.logf("Paused the session monitor's coordinator while watch mode maintains assignments")
+		}
+		factory := w.newMaintainer
+		if factory == nil {
+			factory = newAssignWatchMaintainer
+		}
+		initCtx, cancel := context.WithTimeout(ctx, w.assignmentMaintenanceTimeout())
+		var err error
+		maintainer, err = factory(initCtx, w.session, w.opts.ProjectDir)
+		contextErr := initCtx.Err()
+		cancel()
+		if err != nil || contextErr != nil {
+			return fmt.Errorf("initialize assignment maintenance: %w", errors.Join(err, contextErr))
+		}
+		if maintainer == nil {
+			return errors.New("assignment maintenance is unavailable")
+		}
+	}
 
 	// Create completion detector. The idle threshold deliberately defaults to
 	// config.DefaultAssignIdleThreshold (15m), NOT the detector package's
@@ -6381,6 +6930,9 @@ func (w *WatchLoop) Run(ctx context.Context) error {
 		DedupWindow:       5 * time.Second,
 		GracefulDegrading: true,
 		CaptureLines:      50,
+	}
+	if w.opts != nil {
+		detectorCfg.ProjectDir = w.opts.ProjectDir
 	}
 	w.detector = completion.NewWithConfig(w.session, w.store, detectorCfg)
 	if err := w.detector.InitializationError(); err != nil {
@@ -6422,11 +6974,26 @@ func (w *WatchLoop) Run(ctx context.Context) error {
 		}
 	}()
 	var scanWG sync.WaitGroup
+	var maintenanceWG sync.WaitGroup
 	defer func() {
 		watchCancel()
 		w.wg.Wait()
+		// Join the detector's polling goroutine too: it closes eventsCh only
+		// after its last pass returns, and the forwarder may have stopped
+		// reading before then. Without this, Run could return while a detector
+		// pass is still capturing panes and writing assignment state.
+		for range eventsCh {
+		}
 		scanWG.Wait()
+		maintenanceWG.Wait()
 	}()
+	if maintainer != nil {
+		maintenanceWG.Add(1)
+		go func() {
+			defer maintenanceWG.Done()
+			w.maintainAssignmentLeases(watchCtx, maintainer)
+		}()
+	}
 
 	w.logf("Starting watch mode with strategy=%s", w.strategy)
 
@@ -6464,7 +7031,7 @@ func (w *WatchLoop) Run(ctx context.Context) error {
 			}
 
 			// Check stop-when-done condition
-			if w.stopWhenDone {
+			if w.stopWhenDone && !scanInFlight {
 				stop, stopErr := w.shouldStop(watchCtx)
 				if stopErr != nil {
 					return fmt.Errorf("check watch completion: %w", stopErr)
@@ -6501,10 +7068,19 @@ func (w *WatchLoop) Run(ctx context.Context) error {
 				if watchCtx.Err() != nil {
 					return watchCtx.Err()
 				}
-				if isAutomatedAssignmentSafetyError(scanErr) {
+				if w.deferSourceChange("ready-work scan", scanErr) {
+					// A slow failed scan may have left a ticker event pending.
+					// Wait a full interval, and never use a failed verification
+					// as evidence that --stop-when-done has drained the queue.
+					ticker.Reset(scanInterval)
+					continue
+				}
+				if isAutomatedAssignmentSafetyError(scanErr) || errors.Is(scanErr, context.Canceled) || errors.Is(scanErr, context.DeadlineExceeded) {
 					return scanErr
 				}
 				w.logf("Error during ready-work scan: %v", scanErr)
+			} else {
+				w.sourceCheckRecovered()
 			}
 
 			// A scan can be the thing that drains the queue, so honor
@@ -6528,6 +7104,65 @@ func (w *WatchLoop) Run(ctx context.Context) error {
 			w.logf("Watch mode stopped.")
 			return nil
 		}
+	}
+}
+
+func (w *WatchLoop) assignmentMaintenanceTimeout() time.Duration {
+	if w.maintenanceTimeout > 0 && w.maintenanceTimeout < 30*time.Second {
+		return w.maintenanceTimeout
+	}
+	return 30 * time.Second
+}
+
+func (w *WatchLoop) maintainAssignmentLeases(ctx context.Context, maintainer assignWatchMaintainer) {
+	interval := w.maintenanceInterval
+	if interval <= 0 || interval > 30*time.Second {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		// Maintain once immediately: a restarted watcher can inherit receipts
+		// already due for renewal. The single worker never overlaps passes.
+		passCtx, cancel := context.WithTimeout(ctx, w.assignmentMaintenanceTimeout())
+		err := maintainer.MaintainAssignments(passCtx)
+		err = errors.Join(err, passCtx.Err())
+		cancel()
+		if ctx.Err() != nil {
+			return
+		}
+		w.reportAssignmentMaintenance(err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-w.stopCh:
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (w *WatchLoop) reportAssignmentMaintenance(err error) {
+	message := ""
+	if err != nil {
+		message = err.Error()
+	}
+	w.maintenanceMu.Lock()
+	previous := w.maintenanceError
+	w.maintenanceError = message
+	w.maintenanceMu.Unlock()
+	if message == previous {
+		return
+	}
+	if message != "" {
+		// Loss of protection is essential even with --quiet. The canonical
+		// maintainer retains affected assignments and never reacquires leases.
+		fmt.Fprintf(os.Stderr, "[%s] Warning: assignment reservation maintenance degraded: %s\n", time.Now().Format("15:04:05"), message)
+	} else {
+		w.logf("Assignment reservation maintenance recovered")
 	}
 }
 
@@ -6790,10 +7425,19 @@ func (w *WatchLoop) shouldStop(ctx context.Context) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	// Check if there are any active assignments
-	active := w.store.ListActive()
+	// Dispatch and maintenance persist through separate store instances. The
+	// watcher's original snapshot can predate initial dispatch or terminal
+	// cleanup, so only the current durable ledger can authorize stopping.
+	store, err := assignment.LoadStoreStrictReadOnly(w.session)
+	if err != nil {
+		return false, fmt.Errorf("read assignment ledger before stopping watch: %w", err)
+	}
+	active := store.ListActive()
 	if len(active) > 0 {
 		return false, nil // Still have work in progress
+	}
+	if len(store.ListPendingCompletionEvents()) > 0 {
+		return false, nil // Completion consumption must finish before stopping.
 	}
 
 	// Check the same dependency-aware, label-verified candidate surface used by
@@ -6819,13 +7463,25 @@ func (w *WatchLoop) shouldStop(ctx context.Context) (bool, error) {
 	if err := ensureAuthoritativeAssignmentPolicy(projectDir, policyProject); err != nil {
 		return false, err
 	}
-	actionable, err := getActionableRecommendationsForWatch(ctx, projectDir, 0)
+	actionable, err := readAssignmentPreflight(ctx, projectDir, w.opts != nil && !w.opts.DryRun, func() ([]bv.TriageRecommendation, error) {
+		return getActionableRecommendationsForWatch(ctx, projectDir, 0)
+	})
 	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		if w.deferSourceChange("watch completion check", err) {
+			return false, nil // Unverified does not mean empty; retry next scan.
+		}
 		if isAutomatedAssignmentSafetyError(err) {
 			return false, fmt.Errorf("automated assignment stopped because actionable work could not be verified: %w", err)
 		}
 		return false, fmt.Errorf("read actionable work for watch completion: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	w.sourceCheckRecovered()
 	for _, rec := range actionable {
 		if classifyTriageRecForAssignmentForProject(projectDir, rec, nil) == nil {
 			return false, nil // Still have work available
@@ -6838,6 +7494,12 @@ func (w *WatchLoop) shouldStop(ctx context.Context) (bool, error) {
 		agentTypeFilter = w.opts.AgentTypeFilter
 	}
 	idleAgents, err := getIdleAgentsForWatchStop(ctx, w.session, agentTypeFilter, false)
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false, err
+	}
 	if err == nil && len(idleAgents) == 0 {
 		w.logf("Warning: No idle agents available")
 	}
@@ -6847,6 +7509,9 @@ func (w *WatchLoop) shouldStop(ctx context.Context) (bool, error) {
 
 // Summary returns statistics about the watch session
 func (w *WatchLoop) Summary() string {
+	w.maintenanceMu.Lock()
+	maintenanceError := w.maintenanceError
+	w.maintenanceMu.Unlock()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -6854,6 +7519,12 @@ func (w *WatchLoop) Summary() string {
 	suffix := ""
 	if w.opts != nil && w.opts.DryRun {
 		suffix = " [dry-run: no panes were dispatched]"
+	}
+	if maintenanceError != "" {
+		suffix += " [reservation maintenance degraded: " + maintenanceError + "]"
+	}
+	if w.deferredSourceChecks > 0 {
+		suffix += fmt.Sprintf(" [source verification deferred %d times]", w.deferredSourceChecks)
 	}
 	return fmt.Sprintf("Watch session: %d assigned, %d completed, %d failed in %v%s",
 		w.totalAssigned, w.totalCompleted, w.totalFailed, duration, suffix)

@@ -3,9 +3,11 @@ package config
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strconv"
@@ -13,6 +15,9 @@ import (
 	"sync"
 	"text/template"
 	"text/template/parse"
+
+	"github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/shellword"
 )
 
 // AgentTemplateVars contains variables available for agent command templates
@@ -32,6 +37,14 @@ type AgentTemplateVars struct {
 	// model_reasoning_effort=...`). Empty falls back to the
 	// template-level default. See ntm#140.
 	ReasoningEffort string
+	// ReasoningEffortRequested requires a plugin template to honor an explicit
+	// effort request even when its type has no built-in effort policy.
+	ReasoningEffortRequested bool
+	// ClaudeSettings is the --settings JSON carrying ntm's PreToolUse hooks
+	// for a Claude launch (policy.ClaudeAgentLaunchSettings). A template that
+	// references it places it itself; otherwise GenerateAgentCommand appends
+	// --settings to the command's final claude invocation.
+	ClaudeSettings string
 }
 
 // ShellQuote safely quotes a string for use in shell commands.
@@ -295,7 +308,7 @@ func parseArgumentReferencesAnyField(node parse.Node, wanted map[string]struct{}
 // the `N:model@effort` spec shorthand for the same set.
 func agentTypeConsumesReasoningEffort(agentType string) bool {
 	switch strings.ToLower(strings.TrimSpace(agentType)) {
-	case "cc", "claude", "cod", "codex", "grok":
+	case "cc", "claude", "cod", "codex", "grok", "omp", "oh-my-pi":
 		return true
 	default:
 		return false
@@ -332,8 +345,8 @@ func GenerateAgentCommand(tmpl string, vars AgentTemplateVars) (string, error) {
 		if strings.TrimSpace(vars.SystemPromptFile) != "" {
 			return "", personaDropError(vars.AgentType, tmpl)
 		}
-		if !vars.ModelRequested && (strings.TrimSpace(vars.ReasoningEffort) == "" || !agentTypeConsumesReasoningEffort(vars.AgentType)) {
-			return tmpl, nil
+		if !vars.ModelRequested && (strings.TrimSpace(vars.ReasoningEffort) == "" || (!vars.ReasoningEffortRequested && !agentTypeConsumesReasoningEffort(vars.AgentType))) {
+			return attachClaudeSettings(tmpl, vars.ClaudeSettings)
 		}
 		if vars.ModelRequested {
 			requestedModel := vars.Model
@@ -379,7 +392,7 @@ func GenerateAgentCommand(tmpl string, vars AgentTemplateVars) (string, error) {
 	// the default reasoning budget — and a swarm's cost and quality changed
 	// with nothing to notice (bd-ywwam).
 	if strings.TrimSpace(vars.ReasoningEffort) != "" &&
-		agentTypeConsumesReasoningEffort(vars.AgentType) &&
+		(vars.ReasoningEffortRequested || agentTypeConsumesReasoningEffort(vars.AgentType)) &&
 		!templateReferencesAnyField(t, "ReasoningEffort") {
 		return "", fmt.Errorf(
 			"reasoning effort %q was specified but agent command template does not reference .ReasoningEffort; "+
@@ -402,8 +415,244 @@ func GenerateAgentCommand(tmpl string, vars AgentTemplateVars) (string, error) {
 	}
 
 	result := strings.TrimSpace(buf.String())
+	result, err = PinPersonaPromptReader(result, vars.AgentType, vars.SystemPromptFile)
+	if err != nil {
+		return "", err
+	}
+	if templateReferencesAnyField(t, "ClaudeSettings") {
+		return result, nil
+	}
+	return attachClaudeSettings(result, vars.ClaudeSettings)
+}
 
-	return result, nil
+// PinPersonaPromptReader pins the reader in NTM's generated persona syntax.
+// The exact recorded path binds the Codex prefix or the final Antigravity
+// argument. Other commands and literal lookalikes are left untouched.
+// Replay callers keep the original durable command and use this result only
+// in their prepared launch, so model, flags and unrelated shell text survive.
+func PinPersonaPromptReader(command, agentType, promptFile string) (string, error) {
+	if promptFile == "" {
+		return command, nil
+	}
+	quotedPath := ShellQuote(promptFile)
+	for _, reader := range []string{"cat", "/bin/cat"} {
+		var pinned string
+		switch agent.AgentType(agentType).Canonical() {
+		case agent.AgentTypeCodex:
+			prefix := "CODEX_SYSTEM_PROMPT=\"$(" + reader + " " + quotedPath + ")\" "
+			if !strings.HasPrefix(command, prefix) {
+				continue
+			}
+			pinned = "CODEX_SYSTEM_PROMPT=\"$(/bin/cat " + quotedPath + ")\" " + strings.TrimPrefix(command, prefix)
+		case agent.AgentTypeAntigravity:
+			suffix := " --prompt-interactive \"$(" + reader + " " + quotedPath + ")\""
+			prefix, ok := strings.CutSuffix(command, suffix)
+			if !ok {
+				continue
+			}
+			// The suffix is a real argument only when it follows a complete
+			// literal direct invocation, not text inside a quote or script.
+			words, err := shellword.Literal(prefix)
+			if err != nil || len(words) == 0 {
+				continue
+			}
+			binary := filepath.Base(words[0].Value)
+			if binary != "agy" && binary != "agy-locked" {
+				continue
+			}
+			pinned = prefix + " --prompt-interactive \"$(/bin/cat " + quotedPath + ")\""
+		default:
+			return command, nil
+		}
+		info, err := os.Stat("/bin/cat")
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+			return "", errors.New("managed persona prompt requires an executable /bin/cat")
+		}
+		return pinned, nil
+	}
+	return command, nil
+}
+
+// attachClaudeSettings appends `--settings <json>` to a rendered launch
+// command when its final shell command is the claude invocation — true of the
+// built-in template and of every earlier built-in template `ntm config init`
+// wrote into users' configs. A command whose last command is something else
+// (`claude ... | tee log`, a subshell, a wrapper script) or that already
+// passes its own --settings cannot take the hooks safely and is returned
+// unchanged; launch paths report that with ClaudeHooksNotAppliedWarning.
+func attachClaudeSettings(cmd, settings string) (string, error) {
+	if strings.TrimSpace(settings) == "" {
+		return cmd, nil
+	}
+	segment, ok := finalShellCommand(cmd)
+	words := shellWords(segment)
+	hasClaude, hasSettings := false, false
+	for _, w := range words {
+		switch {
+		case w == "--settings" || strings.HasPrefix(w, "--settings="):
+			hasSettings = true
+		case isClaudeProgramWord(w):
+			hasClaude = true
+		}
+	}
+	if !ok || !hasClaude || hasSettings {
+		return cmd, nil
+	}
+	return strings.TrimRight(cmd, " \t") + " --settings " + ShellQuote(settings), nil
+}
+
+// ClaudeHooksNotAppliedWarning explains, for a rendered Claude launch command
+// that should carry settings (ntm's PreToolUse hooks) but does not, how to fix
+// it; it returns "" when the command carries them or there are none.
+func ClaudeHooksNotAppliedWarning(rendered, settings string) string {
+	if strings.TrimSpace(settings) == "" || strings.Contains(rendered, ShellQuote(settings)) {
+		return ""
+	}
+	return "ntm's Claude Code hooks (safety policy, dcg, rch) were not attached: the claude command's final " +
+		"shell command is not a plain claude invocation, or it passes its own --settings, so this agent runs " +
+		"without them. Add --settings {{shellQuote .ClaudeSettings}} to the [agents] claude template, or set " +
+		"[safety] claude_policy_hook = false to silence this. Command: " + rendered
+}
+
+// isClaudeProgramWord recognizes the claude binary, ntm's `cc` alias, and
+// wrappers named after claude (operator-claude, claude-safe): ntm already
+// hands such commands --model/--effort, so they forward arguments.
+func isClaudeProgramWord(word string) bool {
+	if strings.HasPrefix(word, "-") {
+		return false
+	}
+	base := filepath.Base(word)
+	switch {
+	case base == "claude" || base == "cc":
+		return true
+	case strings.HasSuffix(base, "-claude") || strings.HasSuffix(base, "_claude"):
+		return true
+	case strings.HasPrefix(base, "claude-") || strings.HasPrefix(base, "claude_"):
+		return !strings.Contains(base, ".") // claude-session.log is an argument, not a program
+	}
+	return false
+}
+
+// finalShellCommand returns the text after the last unquoted shell control
+// operator (; & && | || newline, subshell parens) outside $(...) and
+// backticks. ok is false when the command ends in an operator or unbalanced
+// quoting, i.e. there is no final simple command to extend.
+func finalShellCommand(cmd string) (segment string, ok bool) {
+	start := 0
+	inSingle, inDouble, inBacktick := false, false, false
+	depth := 0 // $( ... ) nesting
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		switch {
+		case inSingle:
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		case c == '\\':
+			i++ // the next byte is literal
+			continue
+		case inDouble:
+			if c == '"' {
+				inDouble = false
+			} else if c == '$' && i+1 < len(cmd) && cmd[i+1] == '(' {
+				depth++
+				i++
+			} else if c == ')' && depth > 0 {
+				depth--
+			}
+			continue
+		case inBacktick:
+			if c == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '`':
+			inBacktick = true
+		case '$':
+			if i+1 < len(cmd) && cmd[i+1] == '(' {
+				depth++
+				i++
+			}
+		case ')':
+			if depth > 0 {
+				depth--
+			} else {
+				start = i + 1
+			}
+		case '(', ';', '|', '\n':
+			if depth == 0 {
+				start = i + 1
+			}
+		case '&':
+			if depth > 0 {
+				continue
+			}
+			// 2>&1, <&3 and &> are redirections, not the background operator.
+			if (i > 0 && (cmd[i-1] == '>' || cmd[i-1] == '<')) || (i+1 < len(cmd) && cmd[i+1] == '>') {
+				continue
+			}
+			start = i + 1
+		}
+	}
+	if inSingle || inDouble || inBacktick || depth != 0 {
+		return "", false
+	}
+	segment = strings.TrimSpace(cmd[start:])
+	return segment, segment != ""
+}
+
+// shellWords splits a simple command into words, dropping the quote
+// characters (enough to recognize the program and flags, not a full parser).
+func shellWords(segment string) []string {
+	var words []string
+	var cur strings.Builder
+	inSingle, inDouble, inWord := false, false, false
+	flush := func() {
+		if inWord {
+			words = append(words, cur.String())
+			cur.Reset()
+			inWord = false
+		}
+	}
+	for i := 0; i < len(segment); i++ {
+		c := segment[i]
+		switch {
+		case inSingle:
+			if c == '\'' {
+				inSingle = false
+			} else {
+				cur.WriteByte(c)
+			}
+		case inDouble:
+			if c == '"' {
+				inDouble = false
+			} else {
+				cur.WriteByte(c)
+			}
+		case c == '\'':
+			inSingle, inWord = true, true
+		case c == '"':
+			inDouble, inWord = true, true
+		case c == '\\' && i+1 < len(segment):
+			i++
+			cur.WriteByte(segment[i])
+			inWord = true
+		case c == ' ' || c == '\t':
+			flush()
+		default:
+			cur.WriteByte(c)
+			inWord = true
+		}
+	}
+	flush()
+	return words
 }
 
 // IsTemplateCommand checks if a command string uses template syntax
@@ -417,13 +666,13 @@ func IsTemplateCommand(cmd string) bool {
 func DefaultAgentTemplates() AgentConfig {
 	return AgentConfig{
 		Claude: `{{memLimitPrefix}} claude --dangerously-skip-permissions{{if .Model}} --model {{shellQuote .Model}}{{end}} --effort {{shellQuote (.ReasoningEffort | default "` + DefaultClaudeReasoningEffort + `")}}{{if .SystemPromptFile}} --system-prompt-file {{shellQuote .SystemPromptFile}}{{end}}`,
-		Codex:  `{{if .SystemPromptFile}}CODEX_SYSTEM_PROMPT="$(cat {{shellQuote .SystemPromptFile}})" {{end}}codex --dangerously-bypass-approvals-and-sandbox -m {{shellQuote (.Model | default "` + DefaultCodexModel + `")}} -c model_reasoning_effort={{shellQuote (.ReasoningEffort | default "` + DefaultCodexReasoningEffort + `")}} -c model_reasoning_summary_format=experimental --search`,
+		Codex:  `{{if .SystemPromptFile}}CODEX_SYSTEM_PROMPT="$(/bin/cat {{shellQuote .SystemPromptFile}})" {{end}}codex --dangerously-bypass-approvals-and-sandbox -m {{shellQuote (.Model | default "` + DefaultCodexModel + `")}} -c model_reasoning_effort={{shellQuote (.ReasoningEffort | default "` + DefaultCodexReasoningEffort + `")}} -c model_reasoning_summary_format=experimental --search`,
 		// Gemini has no --system-prompt flag; the CLI's documented persona
 		// mechanism is the GEMINI_SYSTEM_MD env var, a path whose file contents
 		// REPLACE the core system prompt (getCoreSystemPrompt resolves it via
 		// resolvePathFromEnv). Same env-prefix shape as the Codex template.
 		Gemini: `{{if .SystemPromptFile}}GEMINI_SYSTEM_MD={{shellQuote .SystemPromptFile}} {{end}}gemini{{if .Model}} --model {{shellQuote .Model}}{{end}} --yolo`,
-		// Antigravity (agy): the model is hard-pinned to "Gemini 3.7 Flash (High)"
+		// Antigravity (agy): the model is hard-pinned to "Gemini 4 Argon (High)"
 		// by ResolveModel, so --model is always injected. --dangerously-skip-permissions
 		// is agy's autonomous (auto-approve) flag — the equivalent of gemini's --yolo —
 		// which the dcg agy guard (F5) backstops. {{agyBinary}} resolves the real
@@ -435,7 +684,7 @@ func DefaultAgentTemplates() AgentConfig {
 		// via --prompt-interactive ("run an initial prompt interactively and
 		// continue the session") — the bead-designed prepend-to-first-prompt
 		// fallback for CLIs without a true system-prompt mechanism.
-		Antigravity: `{{agyBinary}} --model {{shellQuote .Model}} --dangerously-skip-permissions{{if .SystemPromptFile}} --prompt-interactive "$(cat {{shellQuote .SystemPromptFile}})"{{end}}`,
+		Antigravity: `{{agyBinary}} --model {{shellQuote .Model}} --dangerously-skip-permissions{{if .SystemPromptFile}} --prompt-interactive "$(/bin/cat {{shellQuote .SystemPromptFile}})"{{end}}`,
 		// Grok Build owns its default model selection. NTM only supplies --model
 		// for an explicit/configured override, avoiding stale built-in model IDs.
 		// --always-approve is the official autonomous approval flag exposed by
@@ -468,7 +717,34 @@ func DefaultAgentTemplates() AgentConfig {
 		// #7358 still open/unmerged), so injecting it here would make the pane
 		// fail to launch whenever an effort is supplied. See ntm#116, ntm#193.
 		Opencode: DefaultOpencodeCommand,
+		Omp:      DefaultOmpCommand,
 	}
+}
+
+// DefaultOmpCommand is the launch command used when [agents] omp is not
+// configured, verified against `omp --help` (omp v18.2.3):
+//   - --auto-approve ("Auto-approve all tool calls (skip approval prompts)")
+//     is omp's skip-permissions flag, so a swarm pane never blocks on a tool
+//     approval regardless of the operator's tools.approvalMode;
+//   - no --model by default: omp takes its default model from its own config
+//     (modelRoles.default in ~/.omp/agent/config.yml). --model is injected
+//     only for an explicit/configured model, and omp fuzzy-matches it;
+//   - reasoning effort maps to --thinking (off, minimal, low, medium, high,
+//     xhigh, max, auto);
+//   - personas use --append-system-prompt, which reads a file path's
+//     contents ("Append text or file contents to the system prompt") and
+//     keeps omp's own coding-agent system prompt intact.
+const DefaultOmpCommand = `omp --auto-approve{{if .Model}} --model {{shellQuote .Model}}{{end}}{{if .ReasoningEffort}} --thinking {{shellQuote .ReasoningEffort}}{{end}}{{if .SystemPromptFile}} --append-system-prompt {{shellQuote .SystemPromptFile}}{{end}}`
+
+// OmpCommandOrDefault returns the configured [agents] omp launch command, or
+// DefaultOmpCommand when it is unset or blank. Every launch path (spawn, add,
+// restart, respawn, rotation, restore) resolves omp through this one function
+// so an operator override applies everywhere.
+func OmpCommandOrDefault(configured string) string {
+	if strings.TrimSpace(configured) == "" {
+		return DefaultOmpCommand
+	}
+	return configured
 }
 
 // DefaultOpencodeCommand is the launch command used when [agents] oc is not

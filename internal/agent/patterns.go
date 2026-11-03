@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/Dicklesworthstone/ntm/internal/util"
 )
@@ -129,11 +130,16 @@ var (
 	//
 	//   ✻ Cooked for 1m 42s
 	//   ✻ Baked for 44m 28s
+	//   ✻ Crunched for 10s · done 11:09 PM · 1 shell still running
+	//
+	// Current Claude Code appends " · done <time>" and " · N shell(s) still
+	// running" segments; every completion line in a live swarm (2026-10)
+	// carried one, so a bare end-of-line anchor recognized none of them.
 	//
 	// It must NOT match an active spinner ("Whirlpooling… (… · 2m 44s …)") nor a
 	// "thought for 14s" prose annotation, hence: the leading glyph + verb, the
-	// literal " for ", a duration, and a deliberately strict end-of-line anchor
-	// that rejects any trailing "(" / "…" progress decoration.
+	// literal " for ", a duration, then only "·"-separated segments that carry
+	// no "(" / "…" progress decoration up to the end of the line.
 	//
 	// The verb class is the Unicode capitalized-word class `\p{Lu}\p{Ll}+`
 	// rather than ASCII `[A-Z][a-z]+`: Claude's whimsical spinner verbs include
@@ -143,7 +149,7 @@ var (
 	// pane misclassified as still WORKING. `\p{Lu}` (capitalized first letter)
 	// preserves the anti-prose constraint; the whole-line and duration anchors
 	// are unchanged.
-	claudeCompletionLineRe = regexp.MustCompile(`(?m)^\s*[✻✶✳✢✽✦*]\s+\p{Lu}\p{Ll}+\s+for\s+(?:\d+\s*[hms]\s*)+$`)
+	claudeCompletionLineRe = regexp.MustCompile(`(?m)^\s*[✻✶✳✢✽✦*]\s+\p{Lu}\p{Ll}+\s+for\s+(?:\d+\s*[hms]\s*)+(?:·[^\n…(]*)?$`)
 
 	// claudeNewTaskFooterRe matches the post-turn "new task?" hint Claude parks at
 	// after a turn ends (often paired with a "/clear to save … tokens" line). It
@@ -232,10 +238,10 @@ var (
 
 	// codIdlePatterns indicates waiting for input.
 	codIdlePatterns = []*regexp.Regexp{
-		regexp.MustCompile(`>\s*$`),                // Standard prompt
-		regexp.MustCompile(`\?\s*for\s*shortcuts`), // Codex prompt line
-		regexp.MustCompile(`codex>\s*$`),           // Codex prompt
-		regexp.MustCompile(`(?m)^\s*›(?:\s.*)?$`),  // Codex chevron prompt, empty or with prefilled input
+		regexp.MustCompile(`>\s*$`),                  // Standard prompt
+		regexp.MustCompile(`\?\s*for\s*shortcuts`),   // Codex prompt line
+		regexp.MustCompile(`codex>\s*$`),             // Codex prompt
+		regexp.MustCompile(`(?m)^\s*[›»](?:\s.*)?$`), // Codex chevron prompt, empty or with prefilled input ("»" at effort ultra, GH#273)
 	}
 
 	// codErrorPatterns indicates error conditions.
@@ -570,6 +576,382 @@ func OpencodeActivelyWorking(output string, paneWidth int) bool {
 	clean := stripANSICodes(output)
 	tail := util.GetLastNLines(clean, util.WidthAdaptiveTailLines(paneWidth, ocLiveTailLines))
 	return ocInterruptHintRe.MatchString(tail)
+}
+
+// Oh My Pi (omp, https://omp.sh) patterns for state detection.
+//
+// Derived from live tmux captures of omp v18.2.3 launched as
+// `omp --auto-approve`, observed at 120- and 220-column widths under all three
+// symbol presets (nerd, unicode, ascii). omp renders inline (no alternate
+// screen) and pins a bordered composer box to the bottom of its output. The
+// top border carries the status line and the embedded context gauge; the
+// bottom border doubles as the draft's last input row, and a multi-line draft
+// grows the box upward with bordered continuation rows:
+//
+//	╭── 󰵗   Union Alpha   proj ────6%─────────────󰁨──────────262K───╮
+//	│  first line of a multi-line draft                             │
+//	╰─ last line of the draft                                      ─╯
+//
+// (unicode: "╭── π > ⬢ Union Alpha > 🗑 proj ▶────6%…┃…262K───╮";
+// ascii: "+-- pi > [M] Union Alpha > [T] proj >----6%…|…262K---+" over "+- … -+").
+//
+// While a turn is in flight omp replaces the status-line icon with a spinner
+// frame plus an elapsed timer ("╭── ⠧ 1s   Union Alpha", ascii "+-- \ 5s >",
+// "1m" once past a minute) and draws an activity line directly above the box
+// that opens with the Esc interrupt hint: "󱊷 Working…" (nerd), "⎋ Working…"
+// (unicode), "esc Working…" (ascii). During tool calls the label becomes the
+// model's intent ("󱊷 Sleeping 25 seconds") but the hint glyph stays. Both
+// signals vanish the moment the turn ends, so the permanent box is idle
+// evidence only once both are absent.
+//
+// Other verified chrome:
+//   - Esc interrupts a turn and leaves "F5 to Retry" above the idle box;
+//     Ctrl+C does NOT interrupt (it clears the draft, and two presses within
+//     ~0.5s on an empty draft quit omp); Ctrl+D on an empty draft quits.
+//   - A large bracketed paste collapses into a draft token (" #1",
+//     "📄 #1", "txt #1") with a preview box above whose bottom edge reads
+//     "╰ +15 lines ─╯" ("+ +15 lines -+" in ascii).
+//   - Typing "/" opens the slash-command autocomplete list BELOW the box.
+//   - Provider failures end the turn and render a rule-framed block directly
+//     above the quiet composer, ending in "Dismissed when you send your next
+//     message." (" 401 Invalid API Key" from a bad key, " server_error:
+//     ERROR" from an OpenRouter failure in a live swarm pane); sending any
+//     new message dismisses it and resumes. An unknown --model boots with
+//     `Warning: Model "x" not found` and a prompt then fails with "Error: No
+//     model selected.".
+//   - No omp rate-limit frame has been captured yet, so omp has no
+//     rate-limit patterns: transcript text that merely mentions rate limits
+//     must not park a pane in RATE_LIMITED_WAIT. A provider 429 surfaces as a
+//     provider error.
+var (
+	ompWorkingPatterns = []string{
+		"working…",
+		"interrupting…",
+	}
+
+	// ompErrorPatterns are the non-framed error lines; the framed provider
+	// error block is recognised structurally (OmpProviderError).
+	ompErrorPatterns = []string{
+		"error: no model selected",
+		"warning: model \"",
+	}
+
+	// ompHeaderPattern matches the welcome banner's top edge
+	// ("╭─── omp v18.2.3 ───" / "+--- omp v18.2.3 ---").
+	ompHeaderPattern = regexp.MustCompile(`(?m)^\s*(?:╭─+|\+-+)\s+omp\s+v\d+\.\d+`)
+
+	// ompComposerTopRe matches the composer's top border: exactly two rule
+	// glyphs after the corner, whitespace, then the status line. Tool-output
+	// boxes ("╭────╮"), the banner ("╭─── omp v…") and the model selector
+	// ("╭─ Models ─") never have that shape.
+	ompComposerTopRe = regexp.MustCompile(`^\s*(?:╭──|\+--)\s+(\S.*)$`)
+	// ompComposerBottomRe matches the composer's bottom border, which is also
+	// the draft's last input row.
+	ompComposerBottomRe = regexp.MustCompile(`^\s*(?:╰─|\+-)(.*?)(?:─╯|-\+)\s*$`)
+	// Empty omp composers can show right-aligned shortcut hints in the bottom
+	// border (GH#342). Match the shipped symbol presets and known labels only;
+	// left-aligned text and continuation rows remain real draft input.
+	ompComposerBottomHintRe = regexp.MustCompile(`[ \t]{2,}(?:(?:󰘶[ \t]+󰌒|⇧⇥|Shift\+Tab)[ \t]+to change thinking effort|(?:←[ \t]*←|Left[ \t]+Left)[ \t]+to see [1-9][0-9]* running agents?)[ \t]*$`)
+	// ompComposerRowRe matches a bordered continuation row of the draft.
+	ompComposerRowRe = regexp.MustCompile(`^\s*(?:│|\|)(.*?)(?:│|\|)\s*$`)
+	// ompBusyStatusRe matches the in-flight status segment: one spinner frame
+	// then the elapsed timer ("⠧ 1s", "\ 5s", "⠋ 1m").
+	ompBusyStatusRe = regexp.MustCompile(`^\S\s+\d+[smh]\b`)
+	// ompEscHintRe matches the activity line's interrupt hint in every symbol
+	// preset, plus the trailing "⟨esc⟩" form earlier omp v18 builds rendered.
+	ompEscHintRe = regexp.MustCompile(`^\s*(?:󱊷|⎋|esc)\s+\S|(?:⟨esc⟩|\[esc\])\s*$|^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*Working…`)
+	// ompContextGaugeRe extracts the context gauge: the usage percentage and,
+	// when shown, the window size that follows it separated only by rule
+	// fill, dividers and icons ("────6%────┃────262K─", "6.0%/262K", and the
+	// compressed "──69%󰁨262K─" a crowded status line renders). Requiring the
+	// window to follow the percentage keeps a size-like token in the session
+	// title ("… 10K rows") from being read as the window.
+	ompContextGaugeRe = regexp.MustCompile(`(?:^|[\s─\-])(\d{1,3}(?:\.\d+)?)%(?:[^\p{L}\p{N}]*?(\d+(?:\.\d+)?)([KkMm])(?:[^\p{L}\p{N}]|$))?`)
+	// ompPasteTokenRe matches a collapsed bracketed-paste token in the draft.
+	ompPasteTokenRe = regexp.MustCompile(`(?:^|\s)#\d+(?:\s|$)`)
+	// ompPastePreviewFooterRe matches the paste preview box's bottom edge.
+	ompPastePreviewFooterRe = regexp.MustCompile(`^\s*(?:╰|\+) \+\d+ lines [─\-]`)
+	// ompSteeringHeaderRe matches the pending-steering block header omp draws
+	// above the activity line when a message is submitted mid-turn
+	// (" Steering · 1", then "   1. <message>" rows and an edit hint).
+	ompSteeringHeaderRe = regexp.MustCompile(`^\s*Steering\s+·\s+(\d+)\s*$`)
+	// ompSubagentsHeaderRe matches the running-subagents panel header omp
+	// draws in the HUD above the activity line while subagents run
+	// (" Subagents", then "  └─ • <Name> ⟨<role>⟩ <task>…" rows).
+	ompSubagentsHeaderRe = regexp.MustCompile(`^\s*Subagents\s*$`)
+	// ompSubagentRowRe matches one running-subagent row under that header.
+	ompSubagentRowRe = regexp.MustCompile(`^\s*(?:[├└]─|[|\\+` + "`" + `]-)\s+[•*]\s+\S`)
+	// ompRuleRe matches the full-width horizontal rule that frames omp's
+	// dismissable provider-error block.
+	ompRuleRe = regexp.MustCompile(`^\s*(?:─{8,}|-{8,})\s*$`)
+	// ompDismissedRe matches that block's footer line.
+	ompDismissedRe = regexp.MustCompile(`^\s*Dismissed when you send your next message\.\s*$`)
+	// ompRetryHintRe matches the "F5 to Retry" hint omp draws between a failed
+	// or interrupted turn and the composer (nerd preset prefixes a glyph).
+	ompRetryHintRe = regexp.MustCompile(`^\s*(?:\S\s+)?F5 to Retry\s*$`)
+)
+
+const (
+	// ompComposerScanLines bounds how many trailing non-blank rows are searched
+	// for the composer's bottom border. The box is bottom-pinned, but the
+	// slash-command autocomplete list renders below it.
+	ompComposerScanLines = 40
+	// ompComposerMaxRows bounds the continuation rows walked between the
+	// bottom and top borders (omp caps the editor at 18 rows).
+	ompComposerMaxRows = 24
+	// ompSteeringScanLines bounds how far above the composer the pending-
+	// steering header is searched for (header + queued-message previews +
+	// edit hint + activity line).
+	ompSteeringScanLines = 16
+	// ompSubagentsScanLines bounds how far above the composer the subagents
+	// panel header is searched for (header + one row per running subagent +
+	// steering block + activity line).
+	ompSubagentsScanLines = 24
+	// ompProviderErrorMaxRows bounds the error text walked between the
+	// provider-error block's footer and its opening rule.
+	ompProviderErrorMaxRows = 12
+)
+
+// OmpComposer is the parsed live composer box of an omp pane.
+type OmpComposer struct {
+	// Found: a structurally complete composer box (bottom border, bordered
+	// rows, status-line top border) is visible near the bottom of the capture.
+	Found bool
+	// Busy: the top border carries the in-flight spinner + elapsed timer.
+	Busy bool
+	// EscHint: the activity line directly above the box carries the Esc
+	// interrupt hint.
+	EscHint bool
+	// Draft is the unsubmitted composer text (rows joined by "\n"); "" when
+	// the composer is empty.
+	Draft string
+	// PasteToken: the draft holds a collapsed bracketed-paste token ("#1")
+	// with its preview box drawn above the composer.
+	PasteToken bool
+	// RowsBelow counts non-blank rows rendered under the box (the
+	// slash-command autocomplete list, or a shell prompt after omp exited).
+	RowsBelow int
+	// Steering is the count from the pending-steering block ("Steering · N")
+	// omp draws above the activity line after a message is submitted while a
+	// turn runs; 0 when no steering is pending. Pending steering means omp
+	// is busy and will act on it, so it is in-flight evidence too.
+	Steering int
+	// Subagents counts the rows of the running-subagents panel (" Subagents"
+	// header, "└─ • <Name> …" rows) in the HUD above the composer; 0 when no
+	// subagent is listed. Listed subagents are in-flight work.
+	Subagents int
+	// ProviderError is the first line of the dismissable provider-error block
+	// ("server_error: ERROR", "401 Invalid API Key") framed by rules directly
+	// above the composer, with any leading icon glyph removed; "" when no such
+	// block is shown. omp clears it when the next message is sent.
+	ProviderError string
+	// StatusLine is the top border's text after the corner glyphs.
+	StatusLine string
+	// TopLine is the index (in the capture's "\n"-split lines) of the
+	// composer's top border; ActivityLine is the index of the Esc-hint
+	// activity line above it, or -1. Both are meaningful only when Found.
+	TopLine      int
+	ActivityLine int
+}
+
+// Working reports whether the composer shows an in-flight turn.
+func (c OmpComposer) Working() bool {
+	return c.Found && (c.Busy || c.EscHint || c.Steering > 0 || c.Subagents > 0)
+}
+
+// ParseOmpComposer locates and parses the bottom-most omp composer box.
+func ParseOmpComposer(output string) OmpComposer {
+	lines := strings.Split(stripANSICodes(output), "\n")
+	nonBlankSeen := 0
+	rowsBelow := 0
+	for i := len(lines) - 1; i >= 0 && nonBlankSeen < ompComposerScanLines; i-- {
+		if strings.TrimSpace(lines[i]) == "" {
+			continue
+		}
+		nonBlankSeen++
+		bottom := ompComposerBottomRe.FindStringSubmatch(lines[i])
+		if bottom == nil {
+			rowsBelow++
+			continue
+		}
+		composer, ok := parseOmpComposerAt(lines, i, bottom[1])
+		if !ok {
+			rowsBelow++
+			continue
+		}
+		composer.RowsBelow = rowsBelow
+		return composer
+	}
+	return OmpComposer{}
+}
+
+// parseOmpComposerAt validates a candidate bottom border at lines[bottomIdx]
+// by walking up through bordered rows to a status-line top border.
+func parseOmpComposerAt(lines []string, bottomIdx int, bottomText string) (OmpComposer, bool) {
+	bottomText = ompComposerBottomHintRe.ReplaceAllString(bottomText, "")
+	draftRows := []string{strings.TrimSpace(bottomText)}
+	for j := bottomIdx - 1; j >= 0 && bottomIdx-j <= ompComposerMaxRows+1; j-- {
+		line := lines[j]
+		if top := ompComposerTopRe.FindStringSubmatch(line); top != nil {
+			status := strings.TrimSpace(top[1])
+			composer := OmpComposer{
+				Found:        true,
+				Busy:         ompBusyStatusRe.MatchString(status),
+				StatusLine:   status,
+				TopLine:      j,
+				ActivityLine: -1,
+			}
+			// Rows were collected bottom-up; restore reading order and drop
+			// blank leading/trailing rows so an empty box reads as "".
+			for l, r := 0, len(draftRows)-1; l < r; l, r = l+1, r-1 {
+				draftRows[l], draftRows[r] = draftRows[r], draftRows[l]
+			}
+			composer.Draft = strings.TrimSpace(strings.Join(draftRows, "\n"))
+			for k := j - 1; k >= 0 && j-k <= 2; k-- {
+				above := lines[k]
+				if strings.TrimSpace(above) == "" {
+					continue
+				}
+				if ompEscHintRe.MatchString(above) {
+					composer.EscHint = true
+					composer.ActivityLine = k
+				}
+				break
+			}
+			for k := j - 1; k >= 0 && j-k <= ompSteeringScanLines; k-- {
+				if m := ompSteeringHeaderRe.FindStringSubmatch(lines[k]); m != nil {
+					if n, err := strconv.Atoi(m[1]); err == nil {
+						composer.Steering = n
+					}
+					break
+				}
+			}
+			for k := j - 1; k >= 0 && j-k <= ompSubagentsScanLines; k-- {
+				if !ompSubagentsHeaderRe.MatchString(lines[k]) {
+					continue
+				}
+				for r := k + 1; r < j && ompSubagentRowRe.MatchString(lines[r]); r++ {
+					composer.Subagents++
+				}
+				break
+			}
+			composer.ProviderError = ompProviderErrorAbove(lines, j)
+			if composer.Draft != "" && ompPasteTokenRe.MatchString(composer.Draft) {
+				for k := j - 1; k >= 0 && j-k <= 2; k-- {
+					if ompPastePreviewFooterRe.MatchString(lines[k]) {
+						composer.PasteToken = true
+						break
+					}
+				}
+			}
+			return composer, true
+		}
+		row := ompComposerRowRe.FindStringSubmatch(line)
+		if row == nil {
+			return OmpComposer{}, false
+		}
+		draftRows = append(draftRows, strings.TrimSpace(row[1]))
+	}
+	return OmpComposer{}, false
+}
+
+// ompProviderErrorAbove returns the summary line of a provider-error block
+// whose closing rule sits directly above the composer top border at
+// lines[top], or "" when there is none. Blank rows and omp's "F5 to Retry"
+// hint (live swarm capture) may sit between the rule and the composer; any
+// other row means the block is history. The block must be complete: closing
+// rule, "Dismissed when …" footer, error text, opening rule.
+func ompProviderErrorAbove(lines []string, top int) string {
+	k := top - 1
+	for k >= 0 && top-k <= 4 && (strings.TrimSpace(lines[k]) == "" || ompRetryHintRe.MatchString(lines[k])) {
+		k--
+	}
+	if k < 1 || !ompRuleRe.MatchString(lines[k]) || !ompDismissedRe.MatchString(lines[k-1]) {
+		return ""
+	}
+	summary := ""
+	for r := k - 2; r >= 0 && k-2-r < ompProviderErrorMaxRows; r-- {
+		if ompRuleRe.MatchString(lines[r]) {
+			if summary == "" {
+				summary = "provider error"
+			}
+			return summary
+		}
+		if text := strings.TrimLeftFunc(lines[r], func(c rune) bool {
+			return !unicode.IsLetter(c) && !unicode.IsDigit(c)
+		}); strings.TrimSpace(text) != "" {
+			summary = strings.TrimSpace(text) // walking upward: the last kept is the first row
+		}
+	}
+	return ""
+}
+
+// OmpRetryKey is omp's retry key: pressing F5 at the "F5 to Retry" hint
+// re-runs the failed or interrupted turn (verified live, omp v18.2.3).
+const OmpRetryKey = "F5"
+
+// OmpProviderErrorRecovery is the recovery guidance for an omp provider error.
+const OmpProviderErrorRecovery = "retryable: press " + OmpRetryKey + " (omp's retry key) to re-run the failed turn, " +
+	"or send a continue prompt (omp dismisses the error on the next message)"
+
+// OmpProviderError reports the summary of the dismissable provider-error
+// block an omp pane shows after a failed turn ("server_error: ERROR"). It
+// requires the block to sit directly above a quiet composer: once any
+// in-flight signal returns the turn is running again and the pane is not in
+// error. Sending any new message (a "continue" prompt) dismisses the block
+// and retries, so the state is retryable rather than terminal.
+func OmpProviderError(output string) (string, bool) {
+	c := ParseOmpComposer(output)
+	if !c.Found || c.Working() || c.ProviderError == "" {
+		return "", false
+	}
+	return c.ProviderError, true
+}
+
+// OmpActivelyWorking reports whether an omp pane shows an in-flight turn: the
+// composer's top border carries the spinner + elapsed timer, the activity
+// line above it carries the Esc interrupt hint, steering is pending, or the
+// HUD lists running subagents. paneWidth is accepted for
+// parity with the other detectors; omp's chrome is anchored to the composer
+// box, not to a width-dependent tail window.
+func OmpActivelyWorking(output string, _ int) bool {
+	return ParseOmpComposer(output).Working()
+}
+
+// OmpIdlePromptShowing reports whether an omp pane is waiting for input: its
+// composer box is the bottom-most chrome and no in-flight signal is present.
+// A draft in the box still counts as idle (the agent is not working); callers
+// that care about unsubmitted text inspect the composer draft separately.
+func OmpIdlePromptShowing(output string) bool {
+	c := ParseOmpComposer(output)
+	return c.Found && !c.Working() && c.RowsBelow == 0
+}
+
+// OmpContextUsage extracts the context gauge from the composer's status line:
+// the used percentage and, when rendered, the context window in tokens.
+func OmpContextUsage(output string) (usedPct float64, windowTokens int64, ok bool) {
+	c := ParseOmpComposer(output)
+	if !c.Found {
+		return 0, 0, false
+	}
+	m := ompContextGaugeRe.FindStringSubmatch(c.StatusLine)
+	if m == nil {
+		return 0, 0, false
+	}
+	pct, err := strconv.ParseFloat(m[1], 64)
+	if err != nil || pct < 0 || pct > 100 {
+		return 0, 0, false
+	}
+	if m[2] != "" {
+		if size, err := strconv.ParseFloat(m[2], 64); err == nil {
+			multiplier := 1000.0
+			if strings.EqualFold(m[3], "m") {
+				multiplier = 1000000.0
+			}
+			windowTokens = int64(size * multiplier)
+		}
+	}
+	return pct, windowTokens, true
 }
 
 // Ollama (ollama) patterns.

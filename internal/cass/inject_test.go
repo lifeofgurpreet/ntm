@@ -97,26 +97,55 @@ func TestNormalizeScore(t *testing.T) {
 	tests := []struct {
 		name  string
 		input float64
+		best  float64
 		want  float64
 	}{
-		{"zero", 0, 0},
-		{"0.5", 0.5, 0.5},
-		{"1.0", 1.0, 1.0},
-		{"percentage 50", 50.0, 0.5},
-		{"percentage 100", 100.0, 1.0},
-		{"negative stays", -0.5, -0.5},
-		{"1.1 is above 1.0", 1.1, 0.011},
+		{"zero", 0, 1, 0},
+		{"no best", 0.5, 0, 0},
+		{"best hit", 0.0164, 0.0164, 1.0},
+		{"hybrid fused second", 1.0 / 62, 1.0 / 61, 61.0 / 62},
+		{"bm25 half of best", 6, 12, 0.5},
+		{"negative", -0.5, 1, 0},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := normalizeScore(tc.input)
+			got := normalizeScore(tc.input, tc.best)
 			diff := got - tc.want
 			if diff < -0.001 || diff > 0.001 {
-				t.Errorf("normalizeScore(%v) = %v, want %v", tc.input, got, tc.want)
+				t.Errorf("normalizeScore(%v, %v) = %v, want %v", tc.input, tc.best, got, tc.want)
 			}
 		})
+	}
+}
+
+// cass's default hybrid search scores hits by fused rank, ~1/(61+rank). Read
+// as absolute relevance, every hit fell below the default 0.7 threshold, so
+// `ntm send --with-cass` injected nothing while reporting success.
+func TestFilterResultsKeepsHybridSearchHits(t *testing.T) {
+	t.Parallel()
+	filter := FilterConfig{MinRelevance: 0.7, MaxItems: 5, MaxAgeDays: 30, RecencyBoost: 0.3}
+
+	hybrid := []CASSHit{
+		{SourcePath: "/s/a.jsonl", Score: 1.0 / 61},
+		{SourcePath: "/s/b.jsonl", Score: 1.0 / 62},
+		{SourcePath: "/s/c.jsonl", Score: 1.0 / 63},
+	}
+	if got := FilterResults(hybrid, filter); len(got.Hits) != 3 || got.RemovedByScore != 0 {
+		t.Fatalf("hybrid hits kept=%d removed_by_score=%d, want all 3 kept", len(got.Hits), got.RemovedByScore)
+	}
+
+	// BM25 scores keep their gaps: a hit a tenth as relevant as the best
+	// still falls below the threshold.
+	lexical := []CASSHit{
+		{SourcePath: "/s/a.jsonl", Score: 12},
+		{SourcePath: "/s/b.jsonl", Score: 10},
+		{SourcePath: "/s/c.jsonl", Score: 1.2},
+	}
+	got := FilterResults(lexical, filter)
+	if len(got.Hits) != 2 || got.RemovedByScore != 1 || got.Hits[0].SourcePath != "/s/a.jsonl" {
+		t.Fatalf("lexical hits = %+v removed_by_score=%d, want the two strong hits", got.Hits, got.RemovedByScore)
 	}
 }
 
@@ -291,6 +320,9 @@ func TestExtractSessionName(t *testing.T) {
 	}{
 		{"simple path", "sessions/my-session.jsonl", "my-session"},
 		{"nested path", "/data/2026/01/29/my-project.jsonl", "my-project"},
+		{"daily ntm archive", "/archive/my-project_2026-10-25.jsonl", "my-project"},
+		{"rotated ntm archive", "/archive/my-project_2026-10-25_201530.123456789-1234.jsonl", "my-project"},
+		{"dated session in ntm chunk", "/archive/my-project_2026-01-28_2026-10-25_201530.123456789-1234.jsonl", "my-project_2026-01-28"},
 		{"json extension", "path/to/data.json", "data"},
 		{"no extension", "path/to/session", "session"},
 		{"empty path", "", ""},
@@ -855,6 +887,7 @@ func TestInjectContextFromQueryDisabledRecordsHonestSkip(t *testing.T) {
 	queryConfig := DefaultCASSConfig()
 	queryConfig.Enabled = false
 	injectResult, queryResult, _ := InjectContextFromQuery(
+		t.Context(),
 		"test prompt", queryConfig, FilterConfig{}, DefaultInjectConfig())
 	if !injectResult.Success || !queryResult.Success {
 		t.Fatalf("disabled cass must degrade to a successful skip, got inject=%+v query=%+v", injectResult, queryResult)

@@ -47,10 +47,35 @@ func TestSessionOptionTarget(t *testing.T) {
 		{"=foo", "=foo:"},
 		{"%12", "%12"},
 		{"$3", "$3"},
+		{"=foo:", "=foo:"},
+		{"foo:0", "=foo:0"},
 	}
 	for _, c := range cases {
 		if got := SessionOptionTarget(c.in); got != c.want {
 			t.Errorf("SessionOptionTarget(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestSessionPaneTarget(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"", ""},
+		{"foo", "=foo:"},
+		{"=foo", "=foo:"},
+		{"%12", "%12"},
+		{"$3", "$3"},
+		{"@7", "@7"},
+		{":1", ":1"},
+		{".2", ".2"},
+		{"=foo:", "=foo:"},
+		{"foo:1", "=foo:1"},
+		{"foo:1.2", "=foo:1.2"},
+	}
+	for _, c := range cases {
+		if got := SessionPaneTarget(c.in); got != c.want {
+			t.Errorf("SessionPaneTarget(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }

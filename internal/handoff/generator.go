@@ -621,7 +621,7 @@ func (g *Generator) getInProgressBeads(ctx context.Context, agentName string) ([
 		args = append(args, "--assignee", agentName)
 	}
 
-	out, err := g.runCommand(ctx, 10*time.Second, "br", args...)
+	out, err := g.runCommand(ctx, 10*time.Second, "br", bv.BeadsReadArgs(g.projectDir, args)...)
 	if err != nil {
 		if cancelErr := generatorCancellationError(ctx, err, "get in-progress beads"); cancelErr != nil {
 			return nil, cancelErr
@@ -852,6 +852,10 @@ func buildReservationTransfer(opts GenerateHandoffOptions, projectKey string, re
 	}
 	for _, r := range reservations {
 		transfer.Reservations = append(transfer.Reservations, ReservationSnapshot{
+			ID:          r.ID,
+			ProjectID:   r.ProjectID,
+			AgentName:   r.AgentName,
+			CreatedAt:   r.CreatedTS.Time,
 			PathPattern: r.PathPattern,
 			Exclusive:   r.Exclusive,
 			Reason:      r.Reason,
